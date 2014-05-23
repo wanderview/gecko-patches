@@ -1,0 +1,118 @@
+# HG changeset patch
+# Parent b23e34e4f3e00891a906c8f909694ab4def1512d
+# User Ben Kelly <ben@wanderview.com>
+Bug 1013571 Part 2: Enable PBackground in workers.
+
+diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
+--- a/dom/workers/WorkerPrivate.cpp
++++ b/dom/workers/WorkerPrivate.cpp
+@@ -76,16 +76,24 @@
+ #include "Navigator.h"
+ #include "Principal.h"
+ #include "RuntimeService.h"
+ #include "ScriptLoader.h"
+ #include "SharedWorker.h"
+ #include "WorkerFeature.h"
+ #include "WorkerRunnable.h"
+ #include "WorkerScope.h"
++#include "nsIIPCBackgroundChildCreateCallback.h"
++#include "BackgroundChild.h"
++
++// BackgroundChild.h indirectly brings in windows.h via the chromium ipc
++// headers.  This breaks things here due API macro collision.
++#ifdef XP_WIN
++#undef CreateFile
++#endif
+ 
+ // JS_MaybeGC will run once every second during normal execution.
+ #define PERIODIC_GC_TIMER_DELAY_SEC 1
+ 
+ // A shrinking GC will run five seconds after the last event is processed.
+ #define IDLE_GC_TIMER_DELAY_SEC 5
+ 
+ #define PREF_WORKERS_ENABLED "dom.workers.enabled"
+@@ -5633,19 +5641,49 @@ WorkerPrivate::CycleCollectInternal(JSCo
+ 
+   if (aCollectChildren) {
+     for (uint32_t index = 0; index < mChildWorkers.Length(); index++) {
+       mChildWorkers[index]->CycleCollect(aCx, /* dummy = */ false);
+     }
+   }
+ }
+ 
++class WorkerBackgroundChildPrimer MOZ_FINAL :
++  public nsIIPCBackgroundChildCreateCallback
++{
++public:
++  WorkerBackgroundChildPrimer()
++  { }
++
++  NS_DECL_ISUPPORTS
++
++private:
++  ~WorkerBackgroundChildPrimer()
++  { }
++
++  virtual void
++  ActorCreated(PBackgroundChild* aActor) MOZ_OVERRIDE
++  {
++    MOZ_ASSERT(aActor, "Worker failed to create a PBackgroundChild actor!");
++  }
++
++  virtual void
++  ActorFailed() MOZ_OVERRIDE
++  {
++    MOZ_CRASH("Worker failed to create a PBackgroundChild actor!");
++  }
++};
++
++NS_IMPL_ISUPPORTS(WorkerBackgroundChildPrimer, nsIIPCBackgroundChildCreateCallback)
++
+ void
+ WorkerPrivate::SetThread(nsIThread* aThread)
+ {
++  using mozilla::ipc::BackgroundChild;
++
+ #ifdef DEBUG
+   if (aThread) {
+     bool isOnCurrentThread;
+     MOZ_ASSERT(NS_SUCCEEDED(aThread->IsOnCurrentThread(&isOnCurrentThread)));
+     MOZ_ASSERT(isOnCurrentThread);
+ 
+     MOZ_ASSERT(!mPRThread);
+     mPRThread = PRThreadFromThread(aThread);
+@@ -5662,27 +5700,34 @@ WorkerPrivate::SetThread(nsIThread* aThr
+     MutexAutoLock lock(mMutex);
+ 
+     if (aThread) {
+       MOZ_ASSERT(!mThread);
+       MOZ_ASSERT(mStatus == Pending);
+ 
+       mThread = aThread;
+ 
++      nsCOMPtr<nsIIPCBackgroundChildCreateCallback> callback =
++        new WorkerBackgroundChildPrimer();
++      if (!BackgroundChild::GetOrCreateForCurrentThread(callback)) {
++        MOZ_CRASH("Worker failed to create PBackgroundChild!");
++      }
++
+       if (!mPreStartRunnables.IsEmpty()) {
+         for (uint32_t index = 0; index < mPreStartRunnables.Length(); index++) {
+           MOZ_ALWAYS_TRUE(NS_SUCCEEDED(mThread->Dispatch(
+                                                       mPreStartRunnables[index],
+                                                       NS_DISPATCH_NORMAL)));
+         }
+         mPreStartRunnables.Clear();
+       }
+     }
+     else {
+       MOZ_ASSERT(mThread);
++      BackgroundChild::DetachFromCurrentThread();
+       mThread.swap(doomedThread);
+     }
+   }
+ }
+ 
+ WorkerCrossThreadDispatcher*
+ WorkerPrivate::GetCrossThreadDispatcher()
+ {
