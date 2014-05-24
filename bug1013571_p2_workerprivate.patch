@@ -31,8 +31,49 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
  
  using mozilla::MutexAutoLock;
  using mozilla::MutexAutoUnlock;
-@@ -1524,16 +1532,20 @@ RuntimeService::ScheduleWorker(JSContext
-   int32_t priority = aWorkerPrivate->IsChromeWorker() ?
+@@ -901,16 +909,41 @@ public:
+       nsCycleCollector_collect(nullptr);
+     }
+   }
+ 
+ private:
+   WorkerPrivate* mWorkerPrivate;
+ };
+ 
++class WorkerThreadInitPBackgroundRunnable MOZ_FINAL : public nsRunnable
++{
++  WorkerPrivate* mWorkerPrivate;
++  nsRefPtr<RuntimeService::WorkerThread> mThread;
++  JSRuntime* mParentRuntime;
++
++public:
++  WorkerThreadInitPBackgroundRunnable(WorkerPrivate* aWorkerPrivate,
++                                      RuntimeService::WorkerThread* aThread,
++                                      JSRuntime* aParentRuntime)
++  : mWorkerPrivate(aWorkerPrivate), mThread(aThread), mParentRuntime(aParentRuntime)
++  {
++    MOZ_ASSERT(aWorkerPrivate);
++    MOZ_ASSERT(aThread);
++  }
++
++  NS_DECL_ISUPPORTS_INHERITED
++
++private:
++  ~WorkerThreadInitPBackgroundRunnable()
++  { }
++
++  NS_DECL_NSIRUNNABLE
++};
++
+ class WorkerThreadPrimaryRunnable MOZ_FINAL : public nsRunnable
+ {
+   WorkerPrivate* mWorkerPrivate;
+   nsRefPtr<RuntimeService::WorkerThread> mThread;
+   JSRuntime* mParentRuntime;
+ 
+   class FinishedRunnable MOZ_FINAL : public nsRunnable
+   {
+@@ -1525,27 +1558,24 @@ RuntimeService::ScheduleWorker(JSContext
                       nsISupportsPriority::PRIORITY_NORMAL :
                       nsISupportsPriority::PRIORITY_LOW;
  
@@ -40,19 +81,29 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
      NS_WARNING("Could not set the thread's priority!");
    }
  
-+  // XXX Fire worker runnable to attach PBackground here. Execute
-+  //     WorkerThreadPrimaryRunnable and SetAcceptingNonWorkerRunnables(false)
-+  //     in PBackground callback.
-+
    nsCOMPtr<nsIRunnable> runnable =
-     new WorkerThreadPrimaryRunnable(aWorkerPrivate, thread, JS_GetParentRuntime(aCx));
+-    new WorkerThreadPrimaryRunnable(aWorkerPrivate, thread, JS_GetParentRuntime(aCx));
++    new WorkerThreadInitPBackgroundRunnable(aWorkerPrivate, thread,
++                                            JS_GetParentRuntime(aCx));
    if (NS_FAILED(thread->Dispatch(runnable, NS_DISPATCH_NORMAL))) {
      UnregisterWorker(aCx, aWorkerPrivate);
      JS_ReportError(aCx, "Could not dispatch to thread!");
      return false;
    }
  
-@@ -2504,30 +2516,66 @@ LogViolationDetailsRunnable::Run()
+-#ifdef DEBUG
+-  thread->SetAcceptingNonWorkerRunnables(false);
+-#endif
+-
+   return true;
+ }
+ 
+ // static
+ void
+ RuntimeService::ShutdownIdleThreads(nsITimer* aTimer, void* /* aClosure */)
+ {
+   AssertIsOnMainThread();
+@@ -2504,21 +2534,87 @@ LogViolationDetailsRunnable::Run()
    nsRefPtr<MainThreadStopSyncLoopRunnable> response =
      new MainThreadStopSyncLoopRunnable(mWorkerPrivate, mSyncLoopTarget.forget(),
                                         true);
@@ -61,24 +112,30 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
    return NS_OK;
  }
  
-+class WorkerBackgroundChildPrimer MOZ_FINAL :
++class WorkerBackgroundChildCallback MOZ_FINAL :
 +  public nsIIPCBackgroundChildCreateCallback
 +{
++  WorkerPrivate* mWorkerPrivate;
++  nsRefPtr<RuntimeService::WorkerThread> mThread;
++  JSRuntime* mParentRuntime;
++
 +public:
-+  WorkerBackgroundChildPrimer()
-+  { }
++  WorkerBackgroundChildCallback(WorkerPrivate* aWorkerPrivate,
++                                RuntimeService::WorkerThread* aThread,
++                                JSRuntime* aParentRuntime)
++  : mWorkerPrivate(aWorkerPrivate), mThread(aThread), mParentRuntime(aParentRuntime)
++  {
++    MOZ_ASSERT(aWorkerPrivate);
++    MOZ_ASSERT(aThread);
++  }
 +
 +  NS_DECL_ISUPPORTS
 +
 +private:
-+  ~WorkerBackgroundChildPrimer()
++  ~WorkerBackgroundChildCallback()
 +  { }
 +
-+  virtual void
-+  ActorCreated(PBackgroundChild* aActor) MOZ_OVERRIDE
-+  {
-+    MOZ_ASSERT(aActor, "Worker failed to create a PBackgroundChild actor!");
-+  }
++  virtual void ActorCreated(PBackgroundChild* aActor) MOZ_OVERRIDE;
 +
 +  virtual void
 +  ActorFailed() MOZ_OVERRIDE
@@ -87,7 +144,37 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
 +  }
 +};
 +
-+NS_IMPL_ISUPPORTS(WorkerBackgroundChildPrimer, nsIIPCBackgroundChildCreateCallback)
++NS_IMPL_ISUPPORTS(WorkerBackgroundChildCallback, nsIIPCBackgroundChildCreateCallback)
++
++void
++WorkerBackgroundChildCallback::ActorCreated(PBackgroundChild* aActor)
++{
++  MOZ_ASSERT(aActor, "Worker failed to create a PBackgroundChild actor!");
++
++  nsCOMPtr<nsIRunnable> runnable =
++    new WorkerThreadPrimaryRunnable(mWorkerPrivate, mThread, mParentRuntime);
++  MOZ_ALWAYS_TRUE(NS_SUCCEEDED(mThread->Dispatch(runnable, NS_DISPATCH_NORMAL)));
++
++#ifdef DEBUG
++  thread->SetAcceptingNonWorkerRunnables(false);
++#endif
++}
++
++NS_IMPL_ISUPPORTS_INHERITED0(WorkerThreadInitPBackgroundRunnable, nsRunnable)
++
++NS_IMETHODIMP
++WorkerThreadInitPBackgroundRunnable::Run()
++{
++  using mozilla::ipc::BackgroundChild;
++
++  nsCOMPtr<nsIIPCBackgroundChildCreateCallback> callback =
++    new WorkerBackgroundChildCallback(mWorkerPrivate, mThread, mParentRuntime);
++  if (!BackgroundChild::GetOrCreateForCurrentThread(callback)) {
++    MOZ_CRASH("Worker failed to create PBackgroundChild!");
++  }
++
++  return NS_OK;
++}
 +
  NS_IMPL_ISUPPORTS_INHERITED0(WorkerThreadPrimaryRunnable, nsRunnable)
  
@@ -104,22 +191,7 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
      NuwaFreezeCurrentThread();
    }
  #endif
- 
-+  nsCOMPtr<nsIIPCBackgroundChildCreateCallback> callback =
-+    new WorkerBackgroundChildPrimer();
-+  if (!BackgroundChild::GetOrCreateForCurrentThread(callback)) {
-+    MOZ_CRASH("Worker failed to create PBackgroundChild!");
-+  }
-+
-   char stackBaseGuess;
- 
-   nsAutoCString threadName;
-   threadName.AssignLiteral("WebWorker '");
-   threadName.Append(NS_LossyConvertUTF16toASCII(mWorkerPrivate->ScriptURL()));
-   threadName.Append('\'');
- 
-   profiler_register_thread(threadName.get(), &stackBaseGuess);
-@@ -2567,16 +2615,19 @@ WorkerThreadPrimaryRunnable::Run()
+@@ -2567,16 +2663,19 @@ WorkerThreadPrimaryRunnable::Run()
  
  #ifdef MOZ_ENABLE_PROFILER_SPS
        if (stack) {
