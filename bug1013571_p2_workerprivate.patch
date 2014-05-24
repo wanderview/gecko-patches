@@ -1,12 +1,12 @@
 # HG changeset patch
-# Parent e26fbd15fb9d20f9f0126c5d67efc7a93e18aee2
+# Parent f0150d69cad81a6d00f9477dd87c97c278347f80
 # User Ben Kelly <ben@wanderview.com>
 Bug 1013571 Part 2: Enable PBackground in workers.
 
 diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
 --- a/dom/workers/RuntimeService.cpp
 +++ b/dom/workers/RuntimeService.cpp
-@@ -56,16 +56,24 @@
+@@ -56,16 +56,26 @@
  
  #ifdef DEBUG
  #include "nsThreadManager.h"
@@ -20,9 +20,11 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
 +
 +// BackgroundChild.h indirectly brings in windows.h via the chromium ipc
 +// headers.  This breaks things here due API macro collision.
++/*
 +#ifdef XP_WIN
 +#undef CreateFile
 +#endif
++*/
  
  using namespace mozilla;
  using namespace mozilla::dom;
@@ -31,7 +33,7 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
  
  using mozilla::MutexAutoLock;
  using mozilla::MutexAutoUnlock;
-@@ -901,16 +909,41 @@ public:
+@@ -901,16 +911,41 @@ public:
        nsCycleCollector_collect(nullptr);
      }
    }
@@ -73,7 +75,7 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
  
    class FinishedRunnable MOZ_FINAL : public nsRunnable
    {
-@@ -1525,27 +1558,24 @@ RuntimeService::ScheduleWorker(JSContext
+@@ -1525,27 +1560,24 @@ RuntimeService::ScheduleWorker(JSContext
                       nsISupportsPriority::PRIORITY_NORMAL :
                       nsISupportsPriority::PRIORITY_LOW;
  
@@ -103,7 +105,7 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
  RuntimeService::ShutdownIdleThreads(nsITimer* aTimer, void* /* aClosure */)
  {
    AssertIsOnMainThread();
-@@ -2504,21 +2534,87 @@ LogViolationDetailsRunnable::Run()
+@@ -2504,21 +2536,149 @@ LogViolationDetailsRunnable::Run()
    nsRefPtr<MainThreadStopSyncLoopRunnable> response =
      new MainThreadStopSyncLoopRunnable(mWorkerPrivate, mSyncLoopTarget.forget(),
                                         true);
@@ -118,6 +120,30 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
 +  WorkerPrivate* mWorkerPrivate;
 +  nsRefPtr<RuntimeService::WorkerThread> mThread;
 +  JSRuntime* mParentRuntime;
++
++  // XXX: This seems wasteful and we probably should not need it.
++  class RescheduleRunnable MOZ_FINAL : public nsRunnable
++  {
++    nsRefPtr<RuntimeService::WorkerThread> mThread;
++    nsCOMPtr<nsIRunnable> mWorkerRunnable;
++
++  public:
++    RescheduleRunnable(RuntimeService::WorkerThread* aThread,
++                       nsIRunnable* aWorkerRunnable)
++    : mThread(aThread), mWorkerRunnable(aWorkerRunnable)
++    {
++      MOZ_ASSERT(mThread);
++      MOZ_ASSERT(mWorkerRunnable);
++    }
++
++    NS_DECL_ISUPPORTS_INHERITED
++
++  private:
++    ~RescheduleRunnable()
++    { }
++
++    NS_DECL_NSIRUNNABLE
++  };
 +
 +public:
 +  WorkerBackgroundChildCallback(WorkerPrivate* aWorkerPrivate,
@@ -144,6 +170,8 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
 +  }
 +};
 +
++
++
 +NS_IMPL_ISUPPORTS(WorkerBackgroundChildCallback, nsIIPCBackgroundChildCreateCallback)
 +
 +void
@@ -151,13 +179,49 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
 +{
 +  MOZ_ASSERT(aActor, "Worker failed to create a PBackgroundChild actor!");
 +
-+  nsCOMPtr<nsIRunnable> runnable =
++  // XXX: We would like to perform WorkerThreadPrimaryRunnable::Run()
++  //      logic here directly, but can't for a couple reasons:
++  //
++  //      1) We are still in the IPC callback stack which will attempt
++  //         to run additional callbacks.  We would block those callbacks
++  //         until WorkerThreadPrimaryRunnable completed.  This is
++  //         also a problem because we want to detach PBackground at the
++  //         end of WorkerThreadPrimaryRunnable.
++  //      2) We can't just mThread->Dispatch() WorkerThreadPrimaryRunnable,
++  //         though, because at this point WorkerThread expects mWorkerPrivate
++  //         to be set when receiving worker runnables.  Since mWorkerPrivate
++  //         does not get set until WorkerThreadPrimaryRunnable executes, this
++  //         trips assertions.
++  //
++  //      Can this be fixed by adjusting the assertions to understand we may
++  //      fire a worker runnable in this state?
++  //
++  //      For now workaround by bouncing to the main thread.
++
++  nsCOMPtr<nsIRunnable> mainThreadRunnable =
 +    new WorkerThreadPrimaryRunnable(mWorkerPrivate, mThread, mParentRuntime);
-+  MOZ_ALWAYS_TRUE(NS_SUCCEEDED(mThread->Dispatch(runnable, NS_DISPATCH_NORMAL)));
++
++  nsCOMPtr<nsIThread> mainThread = do_GetMainThread();
++  MOZ_ASSERT(mainThread);
++
++  nsCOMPtr<nsIRunnable> runnable =
++    new RescheduleRunnable(mThread, mainThreadRunnable);
++  MOZ_ALWAYS_TRUE(NS_SUCCEEDED(mainThread->Dispatch(runnable, NS_DISPATCH_NORMAL)));
++}
++
++NS_IMPL_ISUPPORTS_INHERITED0(WorkerBackgroundChildCallback::RescheduleRunnable,
++                             nsRunnable)
++
++NS_IMETHODIMP
++WorkerBackgroundChildCallback::RescheduleRunnable::Run()
++{
++  MOZ_ALWAYS_TRUE(NS_SUCCEEDED(mThread->Dispatch(mWorkerRunnable, NS_DISPATCH_NORMAL)));
 +
 +#ifdef DEBUG
-+  thread->SetAcceptingNonWorkerRunnables(false);
++  mThread->SetAcceptingNonWorkerRunnables(false);
 +#endif
++
++  return NS_OK;
 +}
 +
 +NS_IMPL_ISUPPORTS_INHERITED0(WorkerThreadInitPBackgroundRunnable, nsRunnable)
@@ -191,7 +255,7 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
      NuwaFreezeCurrentThread();
    }
  #endif
-@@ -2567,16 +2663,19 @@ WorkerThreadPrimaryRunnable::Run()
+@@ -2567,16 +2727,19 @@ WorkerThreadPrimaryRunnable::Run()
  
  #ifdef MOZ_ENABLE_PROFILER_SPS
        if (stack) {
