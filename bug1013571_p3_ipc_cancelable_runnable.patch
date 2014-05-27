@@ -1,0 +1,131 @@
+# HG changeset patch
+# Parent bf4366cb36f455eaeb7c9e554b378ec82a048845
+# User Ben Kelly <ben@wanderview.com>
+Bug 1013571 Part 3: Allow IPC DoWorkRunnables to be canceled.
+
+
+diff --git a/ipc/glue/MessagePump.cpp b/ipc/glue/MessagePump.cpp
+--- a/ipc/glue/MessagePump.cpp
++++ b/ipc/glue/MessagePump.cpp
+@@ -2,16 +2,17 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "MessagePump.h"
+ 
+ #include "nsIRunnable.h"
+ #include "nsIThread.h"
+ #include "nsITimer.h"
++#include "nsICancelableRunnable.h"
+ 
+ #include "base/basictypes.h"
+ #include "base/logging.h"
+ #include "base/scoped_nsautorelease_pool.h"
+ #include "mozilla/Assertions.h"
+ #include "mozilla/DebugOnly.h"
+ #include "nsComponentManagerUtils.h"
+ #include "nsDebug.h"
+@@ -36,34 +37,38 @@ using namespace mozilla::ipc;
+ NS_DEFINE_NAMED_CID(NS_TIMER_CID);
+ 
+ static mozilla::DebugOnly<MessagePump::Delegate*> gFirstDelegate;
+ 
+ namespace mozilla {
+ namespace ipc {
+ 
+ class DoWorkRunnable MOZ_FINAL : public nsIRunnable,
+-                                 public nsITimerCallback
++                                 public nsITimerCallback,
++                                 public nsICancelableRunnable
+ {
+ public:
+   DoWorkRunnable(MessagePump* aPump)
+   : mPump(aPump)
++  , mCanceled(false)
+   {
+     MOZ_ASSERT(aPump);
+   }
+ 
+   NS_DECL_THREADSAFE_ISUPPORTS
+   NS_DECL_NSIRUNNABLE
+   NS_DECL_NSITIMERCALLBACK
++  NS_DECL_NSICANCELABLERUNNABLE
+ 
+ private:
+   ~DoWorkRunnable()
+   { }
+ 
+   MessagePump* mPump;
++  bool mCanceled;
+ };
+ 
+ } /* namespace ipc */
+ } /* namespace mozilla */
+ 
+ MessagePump::MessagePump()
+ : mThread(nullptr)
+ {
+@@ -206,29 +211,35 @@ void
+ MessagePump::DoDelayedWork(base::MessagePump::Delegate* aDelegate)
+ {
+   aDelegate->DoDelayedWork(&delayed_work_time_);
+   if (!delayed_work_time_.is_null()) {
+     ScheduleDelayedWork(delayed_work_time_);
+   }
+ }
+ 
+-NS_IMPL_ISUPPORTS(DoWorkRunnable, nsIRunnable, nsITimerCallback)
++NS_IMPL_ISUPPORTS(DoWorkRunnable, nsIRunnable, nsITimerCallback,
++                                  nsICancelableRunnable)
+ 
+ NS_IMETHODIMP
+ DoWorkRunnable::Run()
+ {
++  if (mCanceled) {
++    return NS_OK;
++  }
++
+   MessageLoop* loop = MessageLoop::current();
+   MOZ_ASSERT(loop);
+ 
+   bool nestableTasksAllowed = loop->NestableTasksAllowed();
+ 
+   // MessageLoop::RunTask() disallows nesting, but our Frankenventloop will
+   // always dispatch DoWork() below from what looks to MessageLoop like a nested
+   // context.  So we unconditionally allow nesting here.
++  // XXX: Should nesting be terminated somehow if Cancel() is called?
+   loop->SetNestableTasksAllowed(true);
+   loop->DoWork();
+   loop->SetNestableTasksAllowed(nestableTasksAllowed);
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+@@ -237,16 +248,26 @@ DoWorkRunnable::Notify(nsITimer* aTimer)
+   MessageLoop* loop = MessageLoop::current();
+   MOZ_ASSERT(loop);
+ 
+   mPump->DoDelayedWork(loop);
+ 
+   return NS_OK;
+ }
+ 
++NS_IMETHODIMP
++DoWorkRunnable::Cancel()
++{
++  if (!mCanceled) {
++    mCanceled = true;
++    return NS_OK;
++  }
++  return NS_ERROR_UNEXPECTED;
++}
++
+ void
+ MessagePumpForChildProcess::Run(base::MessagePump::Delegate* aDelegate)
+ {
+   if (mFirstRun) {
+     MOZ_ASSERT(aDelegate && !gFirstDelegate);
+     gFirstDelegate = aDelegate;
+ 
+     mFirstRun = false;
