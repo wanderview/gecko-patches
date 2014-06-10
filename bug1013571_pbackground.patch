@@ -1,0 +1,708 @@
+# HG changeset patch
+# Parent 9305a8ec77fe3efc902b73c26807558151e23cdb
+# User Ben Kelly <ben@wanderview.com>
+Bug 1013571 Support PBackground on workers.
+
+diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
+--- a/dom/workers/RuntimeService.cpp
++++ b/dom/workers/RuntimeService.cpp
+@@ -57,16 +57,23 @@
+ #ifdef DEBUG
+ #include "nsThreadManager.h"
+ #endif
+ 
+ #include "ServiceWorker.h"
+ #include "SharedWorker.h"
+ #include "WorkerPrivate.h"
+ #include "WorkerRunnable.h"
++#include "nsIIPCBackgroundChildCreateCallback.h"
++#include "BackgroundChild.h"
++#ifdef ENABLE_TESTS
++#include "BackgroundChildImpl.h"
++#include "mozilla/ipc/PBackgroundChild.h"
++#include "prrng.h"
++#endif
+ 
+ using namespace mozilla;
+ using namespace mozilla::dom;
+ 
+ USING_WORKERS_NAMESPACE
+ 
+ using mozilla::MutexAutoLock;
+ using mozilla::MutexAutoUnlock;
+@@ -155,16 +162,20 @@ const JS::ContextOptions kRequiredContex
+ uint32_t gMaxWorkersPerDomain = MAX_WORKERS_PER_DOMAIN;
+ 
+ // Does not hold an owning reference.
+ RuntimeService* gRuntimeService = nullptr;
+ 
+ // Only non-null during the call to Init.
+ RuntimeService* gRuntimeServiceDuringInit = nullptr;
+ 
++#ifdef ENABLE_TESTS
++bool gTestPBackground = false;
++#endif // ENABLE_TESTS
++
+ enum {
+   ID_Worker = 0,
+   ID_ChromeWorker,
+   ID_Event,
+   ID_MessageEvent,
+   ID_ErrorEvent,
+ 
+   ID_COUNT
+@@ -899,16 +910,48 @@ public:
+       nsCycleCollector_collect(nullptr);
+     }
+   }
+ 
+ private:
+   WorkerPrivate* mWorkerPrivate;
+ };
+ 
++class WorkerBackgroundChildCallback MOZ_FINAL :
++  public nsIIPCBackgroundChildCreateCallback
++{
++  bool& mDone;
++  bool& mSuccess;
++
++public:
++  WorkerBackgroundChildCallback(bool& aDone, bool& aSuccess)
++  : mDone(aDone), mSuccess(aSuccess)
++  { }
++
++  NS_DECL_ISUPPORTS
++
++private:
++  ~WorkerBackgroundChildCallback()
++  { }
++
++  virtual void
++  ActorCreated(PBackgroundChild* aActor) MOZ_OVERRIDE
++  {
++    mDone = true;
++    mSuccess = true;
++  }
++
++  virtual void
++  ActorFailed() MOZ_OVERRIDE
++  {
++    mDone = true;
++    mSuccess = false;
++  }
++};
++
+ class WorkerThreadPrimaryRunnable MOZ_FINAL : public nsRunnable
+ {
+   WorkerPrivate* mWorkerPrivate;
+   nsRefPtr<RuntimeService::WorkerThread> mThread;
+   JSRuntime* mParentRuntime;
+ 
+   class FinishedRunnable MOZ_FINAL : public nsRunnable
+   {
+@@ -941,16 +984,19 @@ public:
+   }
+ 
+   NS_DECL_ISUPPORTS_INHERITED
+ 
+ private:
+   ~WorkerThreadPrimaryRunnable()
+   { }
+ 
++  void
++  SynchronouslyCreatePBackground();
++
+   NS_DECL_NSIRUNNABLE
+ };
+ 
+ class WorkerTaskRunnable MOZ_FINAL : public WorkerRunnable
+ {
+   nsRefPtr<WorkerTask> mTask;
+ 
+ public:
+@@ -1040,16 +1086,37 @@ public:
+   void
+   SetAcceptingNonWorkerRunnables(bool aAcceptingNonWorkerRunnables)
+   {
+     MutexAutoLock lock(mLock);
+     mAcceptingNonWorkerRunnables = aAcceptingNonWorkerRunnables;
+   }
+ #endif
+ 
++#ifdef ENABLE_TESTS
++  void
++  TestPBackground()
++  {
++    using mozilla::ipc::BackgroundChild;
++    using mozilla::ipc::PBackgroundChild;
++    if (gTestPBackground) {
++      // Randomize value to validate workers are not cross-posting messages.
++      uint32_t testValue;
++      PR_GetRandomNoise(&testValue, sizeof(testValue));
++      nsCString testStr;
++      testStr.AppendInt(testValue);
++      PBackgroundChild* existingBackgroundChild =
++        BackgroundChild::GetForCurrentThread();
++      MOZ_RELEASE_ASSERT(existingBackgroundChild);
++      bool ok = existingBackgroundChild->SendPBackgroundTestConstructor(testStr);
++      MOZ_RELEASE_ASSERT(ok);
++    }
++  }
++#endif // #ENABLE_TESTS
++
+ private:
+   WorkerThread()
+   : nsThread(nsThread::NOT_MAIN_THREAD, WORKER_STACK_SIZE),
+     mWorkerPrivate(nullptr)
+ #ifdef DEBUG
+     , mAcceptingNonWorkerRunnables(true)
+ #endif
+   { }
+@@ -1243,16 +1310,20 @@ RuntimeService::GetOrCreateService()
+   if (!gRuntimeService) {
+     nsRefPtr<RuntimeService> service = new RuntimeService();
+     if (NS_FAILED(service->Init())) {
+       NS_WARNING("Failed to initialize!");
+       service->Cleanup();
+       return nullptr;
+     }
+ 
++#ifdef ENABLE_TESTS
++    gTestPBackground = mozilla::Preferences::GetBool("pbackground.testing", false);
++#endif // ENABLE_TESTS
++
+     // The observer service now owns us until shutdown.
+     gRuntimeService = service;
+   }
+ 
+   return gRuntimeService;
+ }
+ 
+ // static
+@@ -1532,20 +1603,16 @@ RuntimeService::ScheduleWorker(JSContext
+   nsCOMPtr<nsIRunnable> runnable =
+     new WorkerThreadPrimaryRunnable(aWorkerPrivate, thread, JS_GetParentRuntime(aCx));
+   if (NS_FAILED(thread->Dispatch(runnable, NS_DISPATCH_NORMAL))) {
+     UnregisterWorker(aCx, aWorkerPrivate);
+     JS_ReportError(aCx, "Could not dispatch to thread!");
+     return false;
+   }
+ 
+-#ifdef DEBUG
+-  thread->SetAcceptingNonWorkerRunnables(false);
+-#endif
+-
+   return true;
+ }
+ 
+ // static
+ void
+ RuntimeService::ShutdownIdleThreads(nsITimer* aTimer, void* /* aClosure */)
+ {
+   AssertIsOnMainThread();
+@@ -2490,18 +2557,23 @@ RuntimeService::WorkerThread::Observer::
+ }
+ 
+ NS_IMETHODIMP
+ RuntimeService::WorkerThread::Observer::OnProcessNextEvent(
+                                                nsIThreadInternal* /* aThread */,
+                                                bool aMayWait,
+                                                uint32_t aRecursionDepth)
+ {
++  using mozilla::ipc::BackgroundChild;
++
+   mWorkerPrivate->AssertIsOnWorkerThread();
+-  MOZ_ASSERT(!aMayWait);
++
++  // If the PBackground child is not created yet, then we must permit
++  // blocking event processing to support SynchronouslyCreatePBackground().
++  MOZ_ASSERT(!aMayWait || !BackgroundChild::GetForCurrentThread());
+ 
+   mWorkerPrivate->OnProcessNextEvent(aRecursionDepth);
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ RuntimeService::WorkerThread::Observer::AfterProcessNextEvent(
+                                                nsIThreadInternal* /* aThread */,
+@@ -2535,21 +2607,25 @@ LogViolationDetailsRunnable::Run()
+   nsRefPtr<MainThreadStopSyncLoopRunnable> response =
+     new MainThreadStopSyncLoopRunnable(mWorkerPrivate, mSyncLoopTarget.forget(),
+                                        true);
+   MOZ_ALWAYS_TRUE(response->Dispatch(nullptr));
+ 
+   return NS_OK;
+ }
+ 
++NS_IMPL_ISUPPORTS(WorkerBackgroundChildCallback, nsIIPCBackgroundChildCreateCallback)
++
+ NS_IMPL_ISUPPORTS_INHERITED0(WorkerThreadPrimaryRunnable, nsRunnable)
+ 
+ NS_IMETHODIMP
+ WorkerThreadPrimaryRunnable::Run()
+ {
++  using mozilla::ipc::BackgroundChild;
++
+ #ifdef MOZ_NUWA_PROCESS
+   if (IsNuwaProcess()) {
+     NS_ASSERTION(NuwaMarkCurrentThread != nullptr,
+                   "NuwaMarkCurrentThread is undefined!");
+     NuwaMarkCurrentThread(nullptr, nullptr);
+     NuwaFreezeCurrentThread();
+   }
+ #endif
+@@ -2558,16 +2634,21 @@ WorkerThreadPrimaryRunnable::Run()
+ 
+   nsAutoCString threadName;
+   threadName.AssignLiteral("WebWorker '");
+   threadName.Append(NS_LossyConvertUTF16toASCII(mWorkerPrivate->ScriptURL()));
+   threadName.Append('\'');
+ 
+   profiler_register_thread(threadName.get(), &stackBaseGuess);
+ 
++  SynchronouslyCreatePBackground();
++#ifdef ENABLE_TESTS
++  mThread->TestPBackground();
++#endif
++
+   mThread->SetWorker(mWorkerPrivate);
+ 
+   mWorkerPrivate->AssertIsOnWorkerThread();
+ 
+   {
+     nsCycleCollector_startup();
+ 
+     WorkerJSRuntime runtime(mParentRuntime, mWorkerPrivate);
+@@ -2616,29 +2697,65 @@ WorkerThreadPrimaryRunnable::Run()
+ 
+   mThread->SetWorker(nullptr);
+ 
+   mWorkerPrivate->ScheduleDeletion(WorkerPrivate::WorkerRan);
+ 
+   // It is no longer safe to touch mWorkerPrivate.
+   mWorkerPrivate = nullptr;
+ 
++#ifdef ENABLE_TESTS
++  mThread->TestPBackground();
++#endif
++  BackgroundChild::CloseForCurrentThread();
++
+   // Now recycle this thread.
+   nsCOMPtr<nsIThread> mainThread = do_GetMainThread();
+   MOZ_ASSERT(mainThread);
+ 
+   nsRefPtr<FinishedRunnable> finishedRunnable =
+     new FinishedRunnable(mThread.forget());
+   MOZ_ALWAYS_TRUE(NS_SUCCEEDED(mainThread->Dispatch(finishedRunnable,
+                                                     NS_DISPATCH_NORMAL)));
+ 
+   profiler_unregister_thread();
+   return NS_OK;
+ }
+ 
++void
++WorkerThreadPrimaryRunnable::SynchronouslyCreatePBackground()
++{
++  using mozilla::ipc::BackgroundChild;
++
++  bool done = false;
++  bool success = false;
++  nsCOMPtr<nsIIPCBackgroundChildCreateCallback> callback =
++    new WorkerBackgroundChildCallback(done, success);
++
++  if (!BackgroundChild::GetOrCreateForCurrentThread(callback)) {
++    MOZ_CRASH("Worker failed to create PBackgroundChild!");
++  }
++
++  while (!done) {
++    if (!NS_ProcessNextEvent(mThread)) {
++      MOZ_CRASH("Worker failed to process event queue!");
++    }
++  }
++
++  if (!success) {
++    MOZ_CRASH("Worker failed to create PBackgroundChild!");
++  }
++
++  MOZ_ASSERT(BackgroundChild::GetForCurrentThread());
++
++#ifdef DEBUG
++  mThread->SetAcceptingNonWorkerRunnables(false);
++#endif
++}
++
+ NS_IMPL_ISUPPORTS_INHERITED0(WorkerThreadPrimaryRunnable::FinishedRunnable,
+                              nsRunnable)
+ 
+ NS_IMETHODIMP
+ WorkerThreadPrimaryRunnable::FinishedRunnable::Run()
+ {
+   AssertIsOnMainThread();
+ 
+diff --git a/ipc/glue/BackgroundChild.h b/ipc/glue/BackgroundChild.h
+--- a/ipc/glue/BackgroundChild.h
++++ b/ipc/glue/BackgroundChild.h
+@@ -32,16 +32,20 @@ class PBackgroundChild;
+ //
+ // Creation of PBackground is asynchronous. GetForCurrentThread() will return
+ // null until the sequence is complete. GetOrCreateForCurrentThread() will start
+ // the creation sequence and will call back via the
+ // nsIIPCBackgroundChildCreateCallback interface when completed. Thereafter
+ // (assuming success) GetForCurrentThread() will return the same actor every
+ // time.
+ //
++// CloseForCurrentThread() will close the current PBackground actor.  Subsequent
++// calls to GetForCurrentThread will return null.  There is no effect if the
++// PBackground actor has not yet completed its creation sequence.
++//
+ // The PBackgroundChild actor and all its sub-protocol actors will be
+ // automatically destroyed when its designated thread completes.
+ class BackgroundChild MOZ_FINAL
+ {
+   friend class mozilla::dom::ContentChild;
+   friend class mozilla::dom::ContentParent;
+ 
+   typedef base::ProcessId ProcessId;
+@@ -51,16 +55,20 @@ public:
+   // See above.
+   static PBackgroundChild*
+   GetForCurrentThread();
+ 
+   // See above.
+   static bool
+   GetOrCreateForCurrentThread(nsIIPCBackgroundChildCreateCallback* aCallback);
+ 
++  // See above.
++  static void
++  CloseForCurrentThread();
++
+ private:
+   // Only called by ContentChild or ContentParent.
+   static void
+   Startup();
+ 
+   // Only called by ContentChild.
+   static PBackgroundChild*
+   Alloc(Transport* aTransport, ProcessId aOtherProcess);
+diff --git a/ipc/glue/BackgroundImpl.cpp b/ipc/glue/BackgroundImpl.cpp
+--- a/ipc/glue/BackgroundImpl.cpp
++++ b/ipc/glue/BackgroundImpl.cpp
+@@ -345,16 +345,18 @@ class ChildImpl MOZ_FINAL : public Backg
+   static bool sShutdownHasStarted;
+ 
+ #ifdef RELEASE_BUILD
+   DebugOnly<nsIThread*> mBoundThread;
+ #else
+   nsIThread* mBoundThread;
+ #endif
+ 
++  DebugOnly<bool> mActorDestroyed;
++
+ public:
+   static bool
+   OpenProtocolOnMainThread(nsIEventTarget* aEventTarget);
+ 
+   static void
+   Shutdown();
+ 
+   void
+@@ -369,16 +371,17 @@ public:
+ #endif
+     THREADSAFETY_ASSERT(
+       NS_SUCCEEDED(mBoundThread->IsOnCurrentThread(&current)));
+     THREADSAFETY_ASSERT(current);
+   }
+ 
+   ChildImpl()
+   : mBoundThread(nullptr)
++  , mActorDestroyed(false)
+   {
+     AssertIsOnMainThread();
+   }
+ 
+   NS_INLINE_DECL_REFCOUNTING(ChildImpl)
+ 
+ private:
+   // Forwarded from BackgroundChild.
+@@ -392,39 +395,55 @@ private:
+   // Forwarded from BackgroundChild.
+   static PBackgroundChild*
+   GetForCurrentThread();
+ 
+   // Forwarded from BackgroundChild.
+   static bool
+   GetOrCreateForCurrentThread(nsIIPCBackgroundChildCreateCallback* aCallback);
+ 
++  // Forwarded from BackgroundChild.
++  static void
++  CloseForCurrentThread();
++
+   // Forwarded from BackgroundChildImpl.
+   static BackgroundChildImpl::ThreadLocal*
+   GetThreadLocalForCurrentThread();
+ 
+   static void
+   ThreadLocalDestructor(void* aThreadLocal)
+   {
+     auto threadLocalInfo = static_cast<ThreadLocalInfo*>(aThreadLocal);
+ 
+     if (threadLocalInfo) {
+       if (threadLocalInfo->mActor) {
+         threadLocalInfo->mActor->Close();
++        // Since the actor is created on the main thread it must only
++        // be released on the main thread as well.
++        if (!NS_IsMainThread()) {
++          ChildImpl* actor;
++          threadLocalInfo->mActor.forget(&actor);
++
++          nsCOMPtr<nsIRunnable> releaser =
++            NS_NewNonOwningRunnableMethod(actor, &ChildImpl::Release);
++          MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(releaser)));
++        }
+       }
+       delete threadLocalInfo;
+     }
+   }
+ 
+   static void
+   DispatchFailureCallback(nsIEventTarget* aEventTarget);
+ 
+   // This class is reference counted.
+   ~ChildImpl()
+-  { }
++  {
++    MOZ_ASSERT(mActorDestroyed, "ChildImpl deleted before ActorDestroy called");
++  }
+ 
+   void
+   SetBoundThread()
+   {
+     THREADSAFETY_ASSERT(!mBoundThread);
+ 
+ #if defined(DEBUG) || !defined(RELEASE_BUILD)
+     mBoundThread = NS_GetCurrentThread();
+@@ -830,16 +849,23 @@ BackgroundChild::GetForCurrentThread()
+ // static
+ bool
+ BackgroundChild::GetOrCreateForCurrentThread(
+                                  nsIIPCBackgroundChildCreateCallback* aCallback)
+ {
+   return ChildImpl::GetOrCreateForCurrentThread(aCallback);
+ }
+ 
++// static
++void
++BackgroundChild::CloseForCurrentThread()
++{
++  ChildImpl::CloseForCurrentThread();
++}
++
+ // -----------------------------------------------------------------------------
+ // BackgroundChildImpl Public Methods
+ // -----------------------------------------------------------------------------
+ 
+ // static
+ BackgroundChildImpl::ThreadLocal*
+ BackgroundChildImpl::GetThreadLocalForCurrentThread()
+ {
+@@ -1573,17 +1599,21 @@ ChildImpl::Alloc(Transport* aTransport, 
+ PBackgroundChild*
+ ChildImpl::GetForCurrentThread()
+ {
+   MOZ_ASSERT(sThreadLocalIndex != kBadThreadLocalIndex);
+ 
+   auto threadLocalInfo =
+     static_cast<ThreadLocalInfo*>(PR_GetThreadPrivate(sThreadLocalIndex));
+ 
+-  return threadLocalInfo ? threadLocalInfo->mActor : nullptr;
++  if (threadLocalInfo) {
++    return threadLocalInfo->mActor;
++  } else {
++    return nullptr;
++  }
+ }
+ 
+ // static
+ bool
+ ChildImpl::GetOrCreateForCurrentThread(
+                                  nsIIPCBackgroundChildCreateCallback* aCallback)
+ {
+   MOZ_ASSERT(aCallback);
+@@ -1637,16 +1667,33 @@ ChildImpl::GetOrCreateForCurrentThread(
+   if (NS_FAILED(NS_DispatchToMainThread(runnable))) {
+     CRASH_IN_CHILD_PROCESS("Failed to dispatch to main thread!");
+     return false;
+   }
+ 
+   return true;
+ }
+ 
++/* static */
++void
++ChildImpl::CloseForCurrentThread()
++{
++  MOZ_ASSERT(sThreadLocalIndex != kBadThreadLocalIndex,
++             "BackgroundChild::Startup() was never called!");
++  auto threadLocalInfo =
++    static_cast<ThreadLocalInfo*>(PR_GetThreadPrivate(sThreadLocalIndex));
++  if (threadLocalInfo) {
++    if (threadLocalInfo->mActor) {
++      threadLocalInfo->mActor->FlushPendingInterruptQueue();
++    }
++    DebugOnly<PRStatus> status = PR_SetThreadPrivate(sThreadLocalIndex, nullptr);
++    MOZ_ASSERT(status == PR_SUCCESS);
++  }
++}
++
+ // static
+ BackgroundChildImpl::ThreadLocal*
+ ChildImpl::GetThreadLocalForCurrentThread()
+ {
+   MOZ_ASSERT(sThreadLocalIndex != kBadThreadLocalIndex,
+              "BackgroundChild::Startup() was never called!");
+ 
+   auto threadLocalInfo =
+@@ -1942,16 +1989,18 @@ ChildImpl::DispatchFailureCallback(nsIEv
+ }
+ 
+ void
+ ChildImpl::ActorDestroy(ActorDestroyReason aWhy)
+ {
+   AssertIsOnBoundThread();
+ 
+   BackgroundChildImpl::ActorDestroy(aWhy);
++
++  mActorDestroyed = true;
+ }
+ 
+ NS_IMPL_ISUPPORTS(ChildImpl::ShutdownObserver, nsIObserver)
+ 
+ NS_IMETHODIMP
+ ChildImpl::ShutdownObserver::Observe(nsISupports* aSubject,
+                                      const char* aTopic,
+                                      const char16_t* aData)
+diff --git a/ipc/glue/MessagePump.cpp b/ipc/glue/MessagePump.cpp
+--- a/ipc/glue/MessagePump.cpp
++++ b/ipc/glue/MessagePump.cpp
+@@ -2,16 +2,17 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "MessagePump.h"
+ 
+ #include "nsIRunnable.h"
+ #include "nsIThread.h"
+ #include "nsITimer.h"
++#include "nsICancelableRunnable.h"
+ 
+ #include "base/basictypes.h"
+ #include "base/logging.h"
+ #include "base/scoped_nsautorelease_pool.h"
+ #include "mozilla/Assertions.h"
+ #include "mozilla/DebugOnly.h"
+ #include "nsComponentManagerUtils.h"
+ #include "nsDebug.h"
+@@ -35,35 +36,38 @@ using namespace mozilla::ipc;
+ 
+ NS_DEFINE_NAMED_CID(NS_TIMER_CID);
+ 
+ static mozilla::DebugOnly<MessagePump::Delegate*> gFirstDelegate;
+ 
+ namespace mozilla {
+ namespace ipc {
+ 
+-class DoWorkRunnable MOZ_FINAL : public nsIRunnable,
++class DoWorkRunnable MOZ_FINAL : public nsICancelableRunnable,
+                                  public nsITimerCallback
+ {
+ public:
+   DoWorkRunnable(MessagePump* aPump)
+   : mPump(aPump)
++  , mCanceled(false)
+   {
+     MOZ_ASSERT(aPump);
+   }
+ 
+   NS_DECL_THREADSAFE_ISUPPORTS
+   NS_DECL_NSIRUNNABLE
+   NS_DECL_NSITIMERCALLBACK
++  NS_DECL_NSICANCELABLERUNNABLE
+ 
+ private:
+   ~DoWorkRunnable()
+   { }
+ 
+   MessagePump* mPump;
++  bool mCanceled;
+ };
+ 
+ } /* namespace ipc */
+ } /* namespace mozilla */
+ 
+ MessagePump::MessagePump()
+ : mThread(nullptr)
+ {
+@@ -206,29 +210,35 @@ void
+ MessagePump::DoDelayedWork(base::MessagePump::Delegate* aDelegate)
+ {
+   aDelegate->DoDelayedWork(&delayed_work_time_);
+   if (!delayed_work_time_.is_null()) {
+     ScheduleDelayedWork(delayed_work_time_);
+   }
+ }
+ 
+-NS_IMPL_ISUPPORTS(DoWorkRunnable, nsIRunnable, nsITimerCallback)
++NS_IMPL_ISUPPORTS(DoWorkRunnable, nsIRunnable, nsITimerCallback,
++                                  nsICancelableRunnable)
+ 
+ NS_IMETHODIMP
+ DoWorkRunnable::Run()
+ {
++  if (mCanceled) {
++    return NS_OK;
++  }
++
+   MessageLoop* loop = MessageLoop::current();
+   MOZ_ASSERT(loop);
+ 
+   bool nestableTasksAllowed = loop->NestableTasksAllowed();
+ 
+   // MessageLoop::RunTask() disallows nesting, but our Frankenventloop will
+   // always dispatch DoWork() below from what looks to MessageLoop like a nested
+   // context.  So we unconditionally allow nesting here.
++  // XXX: Should nesting be terminated somehow if Cancel() is called?
+   loop->SetNestableTasksAllowed(true);
+   loop->DoWork();
+   loop->SetNestableTasksAllowed(nestableTasksAllowed);
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+@@ -237,16 +247,26 @@ DoWorkRunnable::Notify(nsITimer* aTimer)
+   MessageLoop* loop = MessageLoop::current();
+   MOZ_ASSERT(loop);
+ 
+   mPump->DoDelayedWork(loop);
+ 
+   return NS_OK;
+ }
+ 
++NS_IMETHODIMP
++DoWorkRunnable::Cancel()
++{
++  if (!mCanceled) {
++    mCanceled = true;
++    return NS_OK;
++  }
++  return NS_ERROR_UNEXPECTED;
++}
++
+ void
+ MessagePumpForChildProcess::Run(base::MessagePump::Delegate* aDelegate)
+ {
+   if (mFirstRun) {
+     MOZ_ASSERT(aDelegate && !gFirstDelegate);
+     gFirstDelegate = aDelegate;
+ 
+     mFirstRun = false;
