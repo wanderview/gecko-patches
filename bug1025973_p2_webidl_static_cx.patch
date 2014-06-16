@@ -1,0 +1,697 @@
+# HG changeset patch
+# Parent d92b515526b5f266d9d0012d79c4bcf1492042a6
+# User Ben Kelly <ben@wanderview.com>
+Bug 1025973 P2 Do not pass JSContext to static webidl methods in non-worker case. r=bz
+
+diff --git a/dom/activities/src/Activity.h b/dom/activities/src/Activity.h
+--- a/dom/activities/src/Activity.h
++++ b/dom/activities/src/Activity.h
+@@ -20,28 +20,27 @@ class Activity : public DOMRequest
+ public:
+   NS_DECL_ISUPPORTS_INHERITED
+   NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS_INHERITED(Activity, DOMRequest)
+ 
+   virtual JSObject* WrapObject(JSContext* aCx) MOZ_OVERRIDE;
+ 
+   static already_AddRefed<Activity>
+   Constructor(const GlobalObject& aOwner,
+-              JSContext* aCx,
+               const ActivityOptions& aOptions,
+               ErrorResult& aRv)
+   {
+     nsCOMPtr<nsPIDOMWindow> window = do_QueryInterface(aOwner.GetAsSupports());
+     if (!window) {
+       aRv.Throw(NS_ERROR_UNEXPECTED);
+       return nullptr;
+     }
+ 
+     nsRefPtr<Activity> activity = new Activity(window);
+-    aRv = activity->Initialize(window, aCx, aOptions);
++    aRv = activity->Initialize(window, aOwner.Context(), aOptions);
+     return activity.forget();
+   }
+ 
+   Activity(nsPIDOMWindow* aWindow);
+ 
+ protected:
+   nsresult Initialize(nsPIDOMWindow* aWindow,
+                       JSContext* aCx,
+diff --git a/dom/bindings/BindingUtils.cpp b/dom/bindings/BindingUtils.cpp
+--- a/dom/bindings/BindingUtils.cpp
++++ b/dom/bindings/BindingUtils.cpp
+@@ -2433,17 +2433,17 @@ ConvertExceptionToPromise(JSContext* cx,
+ 
+   JS::Rooted<JS::Value> exn(cx);
+   if (!JS_GetPendingException(cx, &exn)) {
+     return false;
+   }
+ 
+   JS_ClearPendingException(cx);
+   ErrorResult rv;
+-  nsRefPtr<Promise> promise = Promise::Reject(global, cx, exn, rv);
++  nsRefPtr<Promise> promise = Promise::Reject(global, exn, rv);
+   if (rv.Failed()) {
+     // We just give up.  Make sure to not leak memory on the
+     // ErrorResult, but then just put the original exception back.
+     ThrowMethodFailedWithDetails(cx, rv, "", "");
+     JS_SetPendingException(cx, exn);
+     return false;
+   }
+ 
+diff --git a/dom/bindings/Codegen.py b/dom/bindings/Codegen.py
+--- a/dom/bindings/Codegen.py
++++ b/dom/bindings/Codegen.py
+@@ -5721,18 +5721,19 @@ def getRetvalDeclarationForType(returnTy
+     raise TypeError("Don't know how to declare return value for %s" %
+                     returnType)
+ 
+ 
+ def isResultAlreadyAddRefed(extendedAttributes):
+     return 'resultNotAddRefed' not in extendedAttributes
+ 
+ 
+-def needCx(returnType, arguments, extendedAttributes, considerTypes):
+-    return (considerTypes and
++def needCx(returnType, arguments, extendedAttributes, considerTypes,
++           static=False):
++    return (not static and considerTypes and
+             (typeNeedsCx(returnType, True) or
+              any(typeNeedsCx(a.type) for a in arguments)) or
+             'implicitJSContext' in extendedAttributes)
+ 
+ 
+ def needScopeObject(returnType, arguments, extendedAttributes,
+                     isWrapperCached, considerTypes, isMember):
+     """
+@@ -6052,20 +6053,21 @@ class CGPerSignatureCall(CGThing):
+                 }
+ 
+                 """,
+                 obj=objForGlobalObject)))
+             argsPre.append("global")
+ 
+         # For JS-implemented interfaces we do not want to base the
+         # needsCx decision on the types involved, just on our extended
+-        # attributes.
++        # attributes. Also, JSContext is not needed for the static case
++        # since GlobalObject already contains the context.
+         needsCx = needCx(returnType, arguments, self.extendedAttributes,
+-                         not descriptor.interface.isJSImplemented())
+-        if needsCx and not (static and descriptor.workers):
++                         not descriptor.interface.isJSImplemented(), static)
++        if needsCx:
+             argsPre.append("cx")
+ 
+         needsUnwrap = False
+         argsPost = []
+         if isConstructor:
+             needsUnwrap = True
+             needsUnwrappedVar = False
+             unwrappedVar = "obj"
+@@ -11703,17 +11705,17 @@ class CGNativeMember(ClassMethod):
+             args.append(Argument("ErrorResult&", "aRv"))
+         # The legacycaller thisval
+         if self.member.isMethod() and self.member.isLegacycaller():
+             # If it has an identifier, we can't deal with it yet
+             assert self.member.isIdentifierLess()
+             args.insert(0, Argument("JS::Value", "aThisVal"))
+         # And jscontext bits.
+         if needCx(returnType, argList, self.extendedAttrs,
+-                  self.passJSBitsAsNeeded):
++                  self.passJSBitsAsNeeded, self.member.isStatic()):
+             args.insert(0, Argument("JSContext*", "cx"))
+             if needScopeObject(returnType, argList, self.extendedAttrs,
+                                self.descriptorProvider.wrapperCache,
+                                self.passJSBitsAsNeeded,
+                                self.member.getExtendedAttribute("StoreInSlot")):
+                 args.insert(1, Argument("JS::Handle<JSObject*>", "obj"))
+         # And if we're static, a global
+         if self.member.isStatic():
+@@ -13642,17 +13644,17 @@ class CGEventMethod(CGNativeMember):
+         name = "a" + name[0].upper() + name[1:]
+         return Argument(decl.define(), name)
+ 
+     def declare(self, cgClass):
+         self.args = list(self.originalArgs)
+         self.args.insert(0, Argument("mozilla::dom::EventTarget*", "aOwner"))
+         constructorForNativeCaller = CGNativeMember.declare(self, cgClass)
+         self.args = list(self.originalArgs)
+-        if needCx(None, self.arguments(), [], True):
++        if needCx(None, self.arguments(), [], considerTypes=True, static=True):
+             self.args.insert(0, Argument("JSContext*", "aCx"))
+         self.args.insert(0, Argument("const GlobalObject&", "aGlobal"))
+         self.args.append(Argument('ErrorResult&', 'aRv'))
+         return constructorForNativeCaller + CGNativeMember.declare(self, cgClass)
+ 
+     def define(self, cgClass):
+         self.args = list(self.originalArgs)
+         members = ""
+@@ -13693,17 +13695,17 @@ class CGEventMethod(CGNativeMember):
+         self.args = list(self.originalArgs)
+         self.body = fill(
+             """
+             nsCOMPtr<mozilla::dom::EventTarget> owner = do_QueryInterface(aGlobal.GetAsSupports());
+             return Constructor(owner, ${arg0}, ${arg1});
+             """,
+             arg0=self.args[0].name,
+             arg1=self.args[1].name)
+-        if needCx(None, self.arguments(), [], True):
++        if needCx(None, self.arguments(), [], considerTypes=True, static=True):
+             self.args.insert(0, Argument("JSContext*", "aCx"))
+         self.args.insert(0, Argument("const GlobalObject&", "aGlobal"))
+         self.args.append(Argument('ErrorResult&', 'aRv'))
+         return constructorForNativeCaller + CGNativeMember.define(self, cgClass)
+ 
+ 
+ class CGEventClass(CGBindingImplClass):
+     """
+diff --git a/dom/bindings/test/TestBindingHeader.h b/dom/bindings/test/TestBindingHeader.h
+--- a/dom/bindings/test/TestBindingHeader.h
++++ b/dom/bindings/test/TestBindingHeader.h
+@@ -146,17 +146,16 @@ public:
+   already_AddRefed<TestInterface> Test(const GlobalObject&, const nsAString&,
+                                        ErrorResult&);
+   static
+   already_AddRefed<TestInterface> Test(const GlobalObject&, const nsACString&,
+                                        ErrorResult&);
+ 
+   static
+   already_AddRefed<TestInterface> Test2(const GlobalObject&,
+-                                        JSContext*,
+                                         const DictForConstructor&,
+                                         JS::Handle<JS::Value>,
+                                         JS::Handle<JSObject*>,
+                                         JS::Handle<JSObject*>,
+                                         const Sequence<Dict>&,
+                                         JS::Handle<JS::Value>,
+                                         const Optional<JS::Handle<JSObject*> >&,
+                                         const Optional<JS::Handle<JSObject*> >&,
+@@ -677,18 +676,17 @@ public:
+ 
+   // Typedefs
+   void ExerciseTypedefInterfaces1(TestInterface&);
+   already_AddRefed<TestInterface> ExerciseTypedefInterfaces2(TestInterface*);
+   void ExerciseTypedefInterfaces3(TestInterface&);
+ 
+   // Static methods and attributes
+   static void StaticMethod(const GlobalObject&, bool);
+-  static void StaticMethodWithContext(const GlobalObject&, JSContext*,
+-                                      JS::Value);
++  static void StaticMethodWithContext(const GlobalObject&, JS::Value);
+   static bool StaticAttribute(const GlobalObject&);
+   static void SetStaticAttribute(const GlobalObject&, bool);
+ 
+   // Overload resolution tests
+   bool Overload1(TestInterface&);
+   TestInterface* Overload1(const nsAString&, TestInterface&);
+   void Overload2(TestInterface&);
+   void Overload2(JSContext*, const Dict&);
+diff --git a/dom/events/MessageEvent.cpp b/dom/events/MessageEvent.cpp
+--- a/dom/events/MessageEvent.cpp
++++ b/dom/events/MessageEvent.cpp
+@@ -109,17 +109,17 @@ MessageEvent::GetSource(Nullable<OwningW
+     aValue.SetValue().SetAsWindowProxy() = mWindowSource;
+   } else if (mPortSource) {
+     aValue.SetValue().SetAsMessagePort() = mPortSource;
+   }
+ }
+ 
+ /* static */ already_AddRefed<MessageEvent>
+ MessageEvent::Constructor(const GlobalObject& aGlobal,
+-                          JSContext* aCx, const nsAString& aType,
++                          const nsAString& aType,
+                           const MessageEventInit& aParam,
+                           ErrorResult& aRv)
+ {
+   nsCOMPtr<EventTarget> t = do_QueryInterface(aGlobal.GetAsSupports());
+   nsRefPtr<MessageEvent> event = new MessageEvent(t, nullptr, nullptr);
+ 
+   aRv = event->InitEvent(aType, aParam.mBubbles, aParam.mCancelable);
+   if (aRv.Failed()) {
+diff --git a/dom/events/MessageEvent.h b/dom/events/MessageEvent.h
+--- a/dom/events/MessageEvent.h
++++ b/dom/events/MessageEvent.h
+@@ -65,17 +65,17 @@ public:
+   }
+ 
+   void SetSource(nsPIDOMWindow* aWindow)
+   {
+     mWindowSource = aWindow;
+   }
+ 
+   static already_AddRefed<MessageEvent>
+-  Constructor(const GlobalObject& aGlobal, JSContext* aCx,
++  Constructor(const GlobalObject& aGlobal,
+               const nsAString& aType,
+               const MessageEventInit& aEventInit,
+               ErrorResult& aRv);
+ 
+ private:
+   JS::Heap<JS::Value> mData;
+   nsString mOrigin;
+   nsString mLastEventId;
+diff --git a/dom/indexedDB/IDBKeyRange.cpp b/dom/indexedDB/IDBKeyRange.cpp
+--- a/dom/indexedDB/IDBKeyRange.cpp
++++ b/dom/indexedDB/IDBKeyRange.cpp
+@@ -209,87 +209,87 @@ IDBKeyRange::GetUpper(JSContext* aCx, JS
+   }
+ 
+   JS::ExposeValueToActiveJS(mCachedUpperVal);
+   aResult.set(mCachedUpperVal);
+ }
+ 
+ // static
+ already_AddRefed<IDBKeyRange>
+-IDBKeyRange::Only(const GlobalObject& aGlobal, JSContext* aCx,
++IDBKeyRange::Only(const GlobalObject& aGlobal,
+                   JS::Handle<JS::Value> aValue, ErrorResult& aRv)
+ {
+   MOZ_ASSERT(NS_IsMainThread(), "Wrong thread!");
+ 
+   nsRefPtr<IDBKeyRange> keyRange =
+     new IDBKeyRange(aGlobal.GetAsSupports(), false, false, true);
+ 
+-  aRv = GetKeyFromJSVal(aCx, aValue, keyRange->Lower());
++  aRv = GetKeyFromJSVal(aGlobal.Context(), aValue, keyRange->Lower());
+   if (aRv.Failed()) {
+     return nullptr;
+   }
+ 
+   return keyRange.forget();
+ }
+ 
+ // static
+ already_AddRefed<IDBKeyRange>
+-IDBKeyRange::LowerBound(const GlobalObject& aGlobal, JSContext* aCx,
++IDBKeyRange::LowerBound(const GlobalObject& aGlobal,
+                         JS::Handle<JS::Value> aValue, bool aOpen,
+                         ErrorResult& aRv)
+ {
+   MOZ_ASSERT(NS_IsMainThread(), "Wrong thread!");
+ 
+   nsRefPtr<IDBKeyRange> keyRange =
+     new IDBKeyRange(aGlobal.GetAsSupports(), aOpen, true, false);
+ 
+-  aRv = GetKeyFromJSVal(aCx, aValue, keyRange->Lower());
++  aRv = GetKeyFromJSVal(aGlobal.Context(), aValue, keyRange->Lower());
+   if (aRv.Failed()) {
+     return nullptr;
+   }
+ 
+   return keyRange.forget();
+ }
+ 
+ // static
+ already_AddRefed<IDBKeyRange>
+-IDBKeyRange::UpperBound(const GlobalObject& aGlobal, JSContext* aCx,
++IDBKeyRange::UpperBound(const GlobalObject& aGlobal,
+                         JS::Handle<JS::Value> aValue, bool aOpen,
+                         ErrorResult& aRv)
+ {
+   MOZ_ASSERT(NS_IsMainThread(), "Wrong thread!");
+ 
+   nsRefPtr<IDBKeyRange> keyRange =
+     new IDBKeyRange(aGlobal.GetAsSupports(), true, aOpen, false);
+ 
+-  aRv = GetKeyFromJSVal(aCx, aValue, keyRange->Upper());
++  aRv = GetKeyFromJSVal(aGlobal.Context(), aValue, keyRange->Upper());
+   if (aRv.Failed()) {
+     return nullptr;
+   }
+ 
+   return keyRange.forget();
+ }
+ 
+ // static
+ already_AddRefed<IDBKeyRange>
+-IDBKeyRange::Bound(const GlobalObject& aGlobal, JSContext* aCx,
++IDBKeyRange::Bound(const GlobalObject& aGlobal,
+                    JS::Handle<JS::Value> aLower, JS::Handle<JS::Value> aUpper,
+                    bool aLowerOpen, bool aUpperOpen, ErrorResult& aRv)
+ {
+   MOZ_ASSERT(NS_IsMainThread(), "Wrong thread!");
+ 
+   nsRefPtr<IDBKeyRange> keyRange =
+     new IDBKeyRange(aGlobal.GetAsSupports(), aLowerOpen, aUpperOpen, false);
+ 
+-  aRv = GetKeyFromJSVal(aCx, aLower, keyRange->Lower());
++  aRv = GetKeyFromJSVal(aGlobal.Context(), aLower, keyRange->Lower());
+   if (aRv.Failed()) {
+     return nullptr;
+   }
+ 
+-  aRv = GetKeyFromJSVal(aCx, aUpper, keyRange->Upper());
++  aRv = GetKeyFromJSVal(aGlobal.Context(), aUpper, keyRange->Upper());
+   if (aRv.Failed()) {
+     return nullptr;
+   }
+ 
+   if (keyRange->Lower() > keyRange->Upper() ||
+       (keyRange->Lower() == keyRange->Upper() && (aLowerOpen || aUpperOpen))) {
+     aRv.Throw(NS_ERROR_DOM_INDEXEDDB_DATA_ERR);
+     return nullptr;
+diff --git a/dom/indexedDB/IDBKeyRange.h b/dom/indexedDB/IDBKeyRange.h
+--- a/dom/indexedDB/IDBKeyRange.h
++++ b/dom/indexedDB/IDBKeyRange.h
+@@ -172,29 +172,29 @@ public:
+ 
+   bool
+   UpperOpen() const
+   {
+     return mUpperOpen;
+   }
+ 
+   static already_AddRefed<IDBKeyRange>
+-  Only(const GlobalObject& aGlobal, JSContext* aCx,
++  Only(const GlobalObject& aGlobal,
+        JS::Handle<JS::Value> aValue, ErrorResult& aRv);
+ 
+   static already_AddRefed<IDBKeyRange>
+-  LowerBound(const GlobalObject& aGlobal, JSContext* aCx,
++  LowerBound(const GlobalObject& aGlobal,
+              JS::Handle<JS::Value> aValue, bool aOpen, ErrorResult& aRv);
+ 
+   static already_AddRefed<IDBKeyRange>
+-  UpperBound(const GlobalObject& aGlobal, JSContext* aCx,
++  UpperBound(const GlobalObject& aGlobal,
+              JS::Handle<JS::Value> aValue, bool aOpen, ErrorResult& aRv);
+ 
+   static already_AddRefed<IDBKeyRange>
+-  Bound(const GlobalObject& aGlobal, JSContext* aCx,
++  Bound(const GlobalObject& aGlobal,
+         JS::Handle<JS::Value> aLower, JS::Handle<JS::Value> aUpper,
+         bool aLowerOpen, bool aUpperOpen, ErrorResult& aRv);
+ 
+ private:
+   IDBKeyRange(nsISupports* aGlobal,
+               bool aLowerOpen,
+               bool aUpperOpen,
+               bool aIsOnly)
+diff --git a/dom/promise/Promise.cpp b/dom/promise/Promise.cpp
+--- a/dom/promise/Promise.cpp
++++ b/dom/promise/Promise.cpp
+@@ -636,63 +636,63 @@ Promise::Constructor(const GlobalObject&
+ 
+     promise->MaybeRejectInternal(cx, value);
+   }
+ 
+   return promise.forget();
+ }
+ 
+ /* static */ already_AddRefed<Promise>
+-Promise::Resolve(const GlobalObject& aGlobal, JSContext* aCx,
++Promise::Resolve(const GlobalObject& aGlobal,
+                  JS::Handle<JS::Value> aValue, ErrorResult& aRv)
+ {
+   // If a Promise was passed, just return it.
+   if (aValue.isObject()) {
+-    JS::Rooted<JSObject*> valueObj(aCx, &aValue.toObject());
++    JS::Rooted<JSObject*> valueObj(aGlobal.Context(), &aValue.toObject());
+     Promise* nextPromise;
+     nsresult rv = UNWRAP_OBJECT(Promise, valueObj, nextPromise);
+ 
+     if (NS_SUCCEEDED(rv)) {
+       nsRefPtr<Promise> addRefed = nextPromise;
+       return addRefed.forget();
+     }
+   }
+ 
+   nsCOMPtr<nsIGlobalObject> global =
+     do_QueryInterface(aGlobal.GetAsSupports());
+   if (!global) {
+     aRv.Throw(NS_ERROR_UNEXPECTED);
+     return nullptr;
+   }
+ 
+-  return Resolve(global, aCx, aValue, aRv);
++  return Resolve(global, aGlobal.Context(), aValue, aRv);
+ }
+ 
+ /* static */ already_AddRefed<Promise>
+ Promise::Resolve(nsIGlobalObject* aGlobal, JSContext* aCx,
+                  JS::Handle<JS::Value> aValue, ErrorResult& aRv)
+ {
+   nsRefPtr<Promise> promise = new Promise(aGlobal);
+ 
+   promise->MaybeResolveInternal(aCx, aValue);
+   return promise.forget();
+ }
+ 
+ /* static */ already_AddRefed<Promise>
+-Promise::Reject(const GlobalObject& aGlobal, JSContext* aCx,
++Promise::Reject(const GlobalObject& aGlobal,
+                 JS::Handle<JS::Value> aValue, ErrorResult& aRv)
+ {
+   nsCOMPtr<nsIGlobalObject> global =
+     do_QueryInterface(aGlobal.GetAsSupports());
+   if (!global) {
+     aRv.Throw(NS_ERROR_UNEXPECTED);
+     return nullptr;
+   }
+ 
+-  return Reject(global, aCx, aValue, aRv);
++  return Reject(global, aGlobal.Context(), aValue, aRv);
+ }
+ 
+ /* static */ already_AddRefed<Promise>
+ Promise::Reject(nsIGlobalObject* aGlobal, JSContext* aCx,
+                 JS::Handle<JS::Value> aValue, ErrorResult& aRv)
+ {
+   nsRefPtr<Promise> promise = new Promise(aGlobal);
+ 
+@@ -859,51 +859,53 @@ NS_IMPL_CYCLE_COLLECTING_ADDREF(AllResol
+ NS_IMPL_CYCLE_COLLECTING_RELEASE(AllResolveHandler)
+ 
+ NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(AllResolveHandler)
+ NS_INTERFACE_MAP_END_INHERITING(PromiseNativeHandler)
+ 
+ NS_IMPL_CYCLE_COLLECTION(AllResolveHandler, mCountdownHolder)
+ 
+ /* static */ already_AddRefed<Promise>
+-Promise::All(const GlobalObject& aGlobal, JSContext* aCx,
++Promise::All(const GlobalObject& aGlobal,
+              const Sequence<JS::Value>& aIterable, ErrorResult& aRv)
+ {
+   nsCOMPtr<nsIGlobalObject> global =
+     do_QueryInterface(aGlobal.GetAsSupports());
+   if (!global) {
+     aRv.Throw(NS_ERROR_UNEXPECTED);
+     return nullptr;
+   }
+ 
++  JSContext* cx = aGlobal.Context();
++
+   if (aIterable.Length() == 0) {
+-    JS::Rooted<JSObject*> empty(aCx, JS_NewArrayObject(aCx, 0));
++    JS::Rooted<JSObject*> empty(cx, JS_NewArrayObject(cx, 0));
+     if (!empty) {
+       aRv.Throw(NS_ERROR_OUT_OF_MEMORY);
+       return nullptr;
+     }
+-    JS::Rooted<JS::Value> value(aCx, JS::ObjectValue(*empty));
+-    return Promise::Resolve(aGlobal, aCx, value, aRv);
++    JS::Rooted<JS::Value> value(cx, JS::ObjectValue(*empty));
++    return Promise::Resolve(aGlobal, value, aRv);
+   }
+ 
+   nsRefPtr<Promise> promise = new Promise(global);
+   nsRefPtr<CountdownHolder> holder =
+     new CountdownHolder(aGlobal, promise, aIterable.Length());
+ 
+-  JS::Rooted<JSObject*> obj(aCx, JS::CurrentGlobalOrNull(aCx));
++  JS::Rooted<JSObject*> obj(cx, JS::CurrentGlobalOrNull(cx));
+   if (!obj) {
+     aRv.Throw(NS_ERROR_UNEXPECTED);
+     return nullptr;
+   }
+ 
+   nsRefPtr<PromiseCallback> rejectCb = new RejectPromiseCallback(promise, obj);
+ 
+   for (uint32_t i = 0; i < aIterable.Length(); ++i) {
+-    JS::Rooted<JS::Value> value(aCx, aIterable.ElementAt(i));
+-    nsRefPtr<Promise> nextPromise = Promise::Resolve(aGlobal, aCx, value, aRv);
++    JS::Rooted<JS::Value> value(cx, aIterable.ElementAt(i));
++    nsRefPtr<Promise> nextPromise = Promise::Resolve(aGlobal, value, aRv);
+ 
+     MOZ_ASSERT(!aRv.Failed());
+ 
+     nsRefPtr<PromiseNativeHandler> resolveHandler =
+       new AllResolveHandler(holder, i);
+ 
+     nsRefPtr<PromiseCallback> resolveCb =
+       new NativePromiseCallback(resolveHandler, Resolved);
+@@ -911,42 +913,44 @@ Promise::All(const GlobalObject& aGlobal
+     // index in the array to the resolution value.
+     nextPromise->AppendCallbacks(resolveCb, rejectCb);
+   }
+ 
+   return promise.forget();
+ }
+ 
+ /* static */ already_AddRefed<Promise>
+-Promise::Race(const GlobalObject& aGlobal, JSContext* aCx,
++Promise::Race(const GlobalObject& aGlobal,
+               const Sequence<JS::Value>& aIterable, ErrorResult& aRv)
+ {
+   nsCOMPtr<nsIGlobalObject> global =
+     do_QueryInterface(aGlobal.GetAsSupports());
+   if (!global) {
+     aRv.Throw(NS_ERROR_UNEXPECTED);
+     return nullptr;
+   }
+ 
+-  JS::Rooted<JSObject*> obj(aCx, JS::CurrentGlobalOrNull(aCx));
++  JSContext* cx = aGlobal.Context();
++
++  JS::Rooted<JSObject*> obj(cx, JS::CurrentGlobalOrNull(cx));
+   if (!obj) {
+     aRv.Throw(NS_ERROR_UNEXPECTED);
+     return nullptr;
+   }
+ 
+   nsRefPtr<Promise> promise = new Promise(global);
+ 
+   nsRefPtr<PromiseCallback> resolveCb =
+     new ResolvePromiseCallback(promise, obj);
+ 
+   nsRefPtr<PromiseCallback> rejectCb = new RejectPromiseCallback(promise, obj);
+ 
+   for (uint32_t i = 0; i < aIterable.Length(); ++i) {
+-    JS::Rooted<JS::Value> value(aCx, aIterable.ElementAt(i));
+-    nsRefPtr<Promise> nextPromise = Promise::Resolve(aGlobal, aCx, value, aRv);
++    JS::Rooted<JS::Value> value(cx, aIterable.ElementAt(i));
++    nsRefPtr<Promise> nextPromise = Promise::Resolve(aGlobal, value, aRv);
+     // According to spec, Resolve can throw, but our implementation never does.
+     // Well it does when window isn't passed on the main thread, but that is an
+     // implementation detail which should never be reached since we are checking
+     // for window above. Remove this when subclassing is supported.
+     MOZ_ASSERT(!aRv.Failed());
+     nextPromise->AppendCallbacks(resolveCb, rejectCb);
+   }
+ 
+diff --git a/dom/promise/Promise.h b/dom/promise/Promise.h
+--- a/dom/promise/Promise.h
++++ b/dom/promise/Promise.h
+@@ -116,44 +116,44 @@ public:
+   virtual JSObject*
+   WrapObject(JSContext* aCx) MOZ_OVERRIDE;
+ 
+   static already_AddRefed<Promise>
+   Constructor(const GlobalObject& aGlobal, PromiseInit& aInit,
+               ErrorResult& aRv);
+ 
+   static already_AddRefed<Promise>
+-  Resolve(const GlobalObject& aGlobal, JSContext* aCx,
++  Resolve(const GlobalObject& aGlobal,
+           JS::Handle<JS::Value> aValue, ErrorResult& aRv);
+ 
+   static already_AddRefed<Promise>
+   Resolve(nsIGlobalObject* aGlobal, JSContext* aCx,
+           JS::Handle<JS::Value> aValue, ErrorResult& aRv);
+ 
+   static already_AddRefed<Promise>
+-  Reject(const GlobalObject& aGlobal, JSContext* aCx,
++  Reject(const GlobalObject& aGlobal,
+          JS::Handle<JS::Value> aValue, ErrorResult& aRv);
+ 
+   static already_AddRefed<Promise>
+   Reject(nsIGlobalObject* aGlobal, JSContext* aCx,
+          JS::Handle<JS::Value> aValue, ErrorResult& aRv);
+ 
+   already_AddRefed<Promise>
+   Then(JSContext* aCx, AnyCallback* aResolveCallback,
+        AnyCallback* aRejectCallback);
+ 
+   already_AddRefed<Promise>
+   Catch(JSContext* aCx, AnyCallback* aRejectCallback);
+ 
+   static already_AddRefed<Promise>
+-  All(const GlobalObject& aGlobal, JSContext* aCx,
++  All(const GlobalObject& aGlobal,
+       const Sequence<JS::Value>& aIterable, ErrorResult& aRv);
+ 
+   static already_AddRefed<Promise>
+-  Race(const GlobalObject& aGlobal, JSContext* aCx,
++  Race(const GlobalObject& aGlobal,
+        const Sequence<JS::Value>& aIterable, ErrorResult& aRv);
+ 
+   void AppendNativeHandler(PromiseNativeHandler* aRunnable);
+ 
+ private:
+   enum PromiseState {
+     Pending,
+     Resolved,
+diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
+--- a/dom/workers/WorkerPrivate.cpp
++++ b/dom/workers/WorkerPrivate.cpp
+@@ -5766,17 +5766,17 @@ WorkerPrivate::ConnectMessagePort(JSCont
+   RootedDictionary<MessageEventInit> init(aCx);
+   init.mBubbles = false;
+   init.mCancelable = false;
+   init.mSource.SetValue().SetAsMessagePort() = port;
+ 
+   ErrorResult rv;
+ 
+   nsRefPtr<MessageEvent> event =
+-    MessageEvent::Constructor(globalObject, aCx,
++    MessageEvent::Constructor(globalObject,
+                               NS_LITERAL_STRING("connect"), init, rv);
+ 
+   event->SetTrusted(true);
+ 
+   nsTArray<nsRefPtr<MessagePortBase>> ports;
+   ports.AppendElement(port);
+ 
+   nsRefPtr<MessagePortList> portList =
+diff --git a/js/xpconnect/src/event_impl_gen.py b/js/xpconnect/src/event_impl_gen.py
+--- a/js/xpconnect/src/event_impl_gen.py
++++ b/js/xpconnect/src/event_impl_gen.py
+@@ -160,18 +160,16 @@ def print_class_declaration(eventname, i
+     fd.write("  NS_DECL_%s\n" % iface.name.upper())
+ 
+     hasVariant = False
+     for a in allattributes:
+         if a.type == "nsIVariant":
+             hasVariant = True
+             break;
+     fd.write("  static already_AddRefed<%s> Constructor(const GlobalObject& aGlobal, " % eventname)
+-    if hasVariant:
+-        fd.write("JSContext* aCx, ")
+     fd.write("const nsAString& aType, ")
+     fd.write("const %sInit& aParam, " % eventname)
+     fd.write("ErrorResult& aRv);\n\n")
+ 
+     fd.write("  virtual JSObject* WrapObject(JSContext* aCx) MOZ_OVERRIDE\n")
+     fd.write("  {\n")
+     fd.write("    return mozilla::dom::%sBinding::Wrap(aCx, this);\n" % eventname)
+     fd.write("  }\n\n")
+@@ -399,28 +397,26 @@ def write_cpp(eventname, iface, fd, conf
+     hasVariant = False
+     for a in allattributes:
+         if a.type == "nsIVariant":
+             hasVariant = True
+             break;
+ 
+     fd.write("already_AddRefed<%s>\n" % eventname)
+     fd.write("%s::Constructor(const GlobalObject& aGlobal, " % eventname)
+-    if hasVariant:
+-        fd.write("JSContext* aCx, ");
+     fd.write("const nsAString& aType, ")
+     fd.write("const %sInit& aParam, " % eventname)
+     fd.write("ErrorResult& aRv)\n")
+     fd.write("{\n")
+     fd.write("  nsCOMPtr<mozilla::dom::EventTarget> t = do_QueryInterface(aGlobal.GetAsSupports());\n")
+     fd.write("  nsRefPtr<%s> e = new %s(t, nullptr, nullptr);\n" % (eventname, eventname))
+     fd.write("  bool trusted = e->Init(t);\n")
+     fd.write("  e->Init%s(" % eventname)
+     if hasVariant:
+-        fd.write("aCx, ");
++        fd.write("aGlobal.Context(), ");
+     fd.write("aType, aParam.mBubbles, aParam.mCancelable")
+     for a in allattributes:
+         fd.write(", aParam.m%s" % firstCap(a.name))
+     fd.write(", aRv);\n")
+     fd.write("  e->SetTrusted(trusted);\n")
+     fd.write("  return e.forget();\n")
+     fd.write("}\n\n")
+ 
