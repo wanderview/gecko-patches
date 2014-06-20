@@ -1,33 +1,160 @@
 # HG changeset patch
-# Parent 6eaee9ac31f36422f194574aea427387e218711e
+# Parent b02854a7c0f035dc3f36436fccef3c5c0f7160ec
 # User Ben Kelly <ben@wanderview.com>
 Bug 1025183 P2 Add ScalarValueString to webidl Codegen.py
 
-diff --git a/dom/bindings/BindingUtils.cpp b/dom/bindings/BindingUtils.cpp
---- a/dom/bindings/BindingUtils.cpp
-+++ b/dom/bindings/BindingUtils.cpp
-@@ -36,16 +36,17 @@
- #include "mozilla/dom/DOMError.h"
- #include "mozilla/dom/DOMErrorBinding.h"
- #include "mozilla/dom/HTMLObjectElement.h"
- #include "mozilla/dom/HTMLObjectElementBinding.h"
- #include "mozilla/dom/HTMLSharedObjectElement.h"
- #include "mozilla/dom/HTMLEmbedElementBinding.h"
- #include "mozilla/dom/HTMLAppletElementBinding.h"
- #include "mozilla/dom/Promise.h"
-+#include "mozilla/dom/ScalarValueString.h"
- #include "WorkerPrivate.h"
+diff --git a/dom/bindings/BindingUtils.h b/dom/bindings/BindingUtils.h
+--- a/dom/bindings/BindingUtils.h
++++ b/dom/bindings/BindingUtils.h
+@@ -23,16 +23,17 @@
+ #include "mozilla/dom/workers/Workers.h"
+ #include "mozilla/ErrorResult.h"
+ #include "mozilla/Likely.h"
+ #include "mozilla/MemoryReporting.h"
+ #include "nsCycleCollector.h"
+ #include "nsIXPConnect.h"
+ #include "MainThreadUtils.h"
+ #include "nsISupportsImpl.h"
++#include "nsUTF8Utils.h"
+ #include "qsObjectHelper.h"
+ #include "xpcpublic.h"
+ #include "nsIVariant.h"
+ #include "pldhash.h" // For PLDHashOperator
  
- namespace mozilla {
- namespace dom {
+ #include "nsWrapperCacheInlines.h"
  
- JSErrorFormatString ErrorFormatString[] = {
- #define MSG_DEF(_name, _argc, _str) \
-   { _str, _argc, JSEXN_TYPEERR },
+ class nsIJSID;
+@@ -1763,31 +1764,125 @@ private:
+                     "Offset of mLength should match");
+       static_assert(offsetof(FakeDependentString, mFlags) ==
+                       offsetof(DepedentStringAsserter, mFlags),
+                     "Offset of mFlags should match");
+     }
+   };
+ };
+ 
++struct ScalarValueString {
++  ScalarValueString()
++  : mConverted(false)
++  {
++  }
++
++  void Truncate() {
++    mConvertedString.Truncate();
++    mConverted = false;
++    mFakeDependentString.Truncate();
++  }
++
++  void SetNull() {
++    mConvertedString.Truncate();
++    mConverted = false;
++    mFakeDependentString.SetNull();
++  }
++
++  void SetData(const nsDependentString::char_type* aData,
++               nsDependentString::size_type aLength)
++  {
++    const nsDependentString::char_type* nextChar = aData;
++    const nsDependentString::char_type* end = aData + aLength;
++    const nsDependentString::char_type* lastChar;
++    uint32_t enumerated;
++
++    // Begin scanning string to see if any conversion is needed
++    do {
++      lastChar = nextChar;
++      enumerated = UTF16CharEnumerator::NextChar(&nextChar, end);
++    } while(enumerated && enumerated != REPLACEMENT_CHAR);
++
++    // If no conversion is needed, then just store a ref in our fake string
++    if (enumerated != REPLACEMENT_CHAR) {
++      mFakeDependentString.SetData(aData, aLength);
++      return;
++    }
++
++    mConvertedString.SetCapacity(aLength);
++
++    // Copy in the section of the string we already scanned that did
++    // not need fixing.
++    mConvertedString.Append(aData, end - lastChar);
++
++    // Copy in the last char which needed conversion
++    mConvertedString.Append(enumerated);
++
++    // Complete scanning the string for further conversions
++    do {
++      enumerated = UTF16CharEnumerator::NextChar(&nextChar, end);
++      mConvertedString.Append(enumerated);
++    } while(enumerated);
++
++    mConverted = true;
++  }
++
++  const nsDependentString::char_type* Data() const
++  {
++    if (mConverted) {
++      return mConvertedString.get();
++    }
++    return mFakeDependentString.Data();
++  }
++
++  nsDependentString::size_type Length() const
++  {
++    if (mConverted) {
++      return mConvertedString.Length();
++    }
++    return mFakeDependentString.Length();
++  }
++
++  const nsAString* ToAStringPtr() const {
++    if (mConverted) {
++      return &mConvertedString;
++    }
++    return mFakeDependentString.ToAStringPtr();
++  }
++
++  operator const nsAString& () const {
++    if (mConverted) {
++      return mConvertedString;
++    }
++    return mFakeDependentString;
++  }
++
++  static const char16_t REPLACEMENT_CHAR = 0xFFFD;
++
++  bool mConverted;
++  binding_detail::FakeDependentString mFakeDependentString;
++  nsString mConvertedString;
++};
++
+ } // namespace binding_detail
+ 
+ enum StringificationBehavior {
+   eStringify,
+   eEmpty,
+   eNull
+ };
+ 
+ // pval must not be null and must point to a rooted JS::Value
++template <typename StringType>
+ static inline bool
+ ConvertJSValueToString(JSContext* cx, JS::Handle<JS::Value> v,
+                        JS::MutableHandle<JS::Value> pval,
+                        StringificationBehavior nullBehavior,
+                        StringificationBehavior undefinedBehavior,
+-                       binding_detail::FakeDependentString& result)
++                       StringType& result)
+ {
+   JSString *s;
+   if (v.isString()) {
+     s = v.toString();
+   } else {
+     StringificationBehavior behavior;
+     if (v.isNull()) {
+       behavior = nullBehavior;
 diff --git a/dom/bindings/Codegen.py b/dom/bindings/Codegen.py
 --- a/dom/bindings/Codegen.py
 +++ b/dom/bindings/Codegen.py
-@@ -4472,16 +4472,79 @@ def getJSToNativeConversionInfo(type, de
+@@ -4470,16 +4470,79 @@ def getJSToNativeConversionInfo(type, de
          # ByteString arguments cannot have a default value.
          assert defaultValue is None
  
@@ -72,7 +199,7 @@ diff --git a/dom/bindings/Codegen.py b/dom/bindings/Codegen.py
 +                fill(
 +                    """
 +                    {
-+                      binding_detail::FakeDependentString str;
++                      binding_detail::ScalarValueString str;
 +                      $*{convert}
 +                      $*{assign}
 +                    }
@@ -84,12 +211,12 @@ diff --git a/dom/bindings/Codegen.py b/dom/bindings/Codegen.py
 +
 +        if isOptional:
 +            declType = "Optional<nsAString>"
-+            holderType = CGGeneric("binding_detail::FakeDependentString")
++            holderType = CGGeneric("binding_detail::ScalarValueString")
 +            conversionCode = ("%s"
-+                              "${declName} = &${holderName};\n" %
++                              "${declName} = ${holderName}.ToAStringPtr();\n" %
 +                              getConversionCode("${holderName}"))
 +        else:
-+            declType = "binding_detail::FakeDependentString"
++            declType = "binding_detail::ScalarValueString"
 +            holderType = None
 +            conversionCode = getConversionCode("${declName}")
 +
@@ -107,7 +234,7 @@ diff --git a/dom/bindings/Codegen.py b/dom/bindings/Codegen.py
          if type.nullable():
              declType = CGTemplatedType("Nullable", declType)
              declType = declType.define()
-@@ -5347,16 +5410,22 @@ def getWrapTemplateForType(type, descrip
+@@ -5345,16 +5408,22 @@ def getWrapTemplateForType(type, descrip
              return (wrapAndSetPtr("xpc::NonVoidStringToJsval(cx, %s, ${jsvalHandle})" % result), False)
  
      if type.isByteString():
@@ -130,7 +257,7 @@ diff --git a/dom/bindings/Codegen.py b/dom/bindings/Codegen.py
          conversion = fill(
              """
              {
-@@ -5613,16 +5682,18 @@ def getRetvalDeclarationForType(returnTy
+@@ -5611,16 +5680,18 @@ def getRetvalDeclarationForType(returnTy
              result = CGTemplatedType("Nullable", result)
          return result, None, None, None
      if returnType.isDOMString():
@@ -149,7 +276,7 @@ diff --git a/dom/bindings/Codegen.py b/dom/bindings/Codegen.py
      if returnType.isGeckoInterface():
          result = CGGeneric(descriptorProvider.getDescriptor(
              returnType.unroll().inner.identifier.name).nativeType)
-@@ -7982,16 +8053,19 @@ def getUnionAccessorSignatureType(type, 
+@@ -7980,16 +8051,19 @@ def getUnionAccessorSignatureType(type, 
          return CGWrapper(typeName, post="&")
  
      if type.isDOMString():
@@ -169,7 +296,7 @@ diff --git a/dom/bindings/Codegen.py b/dom/bindings/Codegen.py
  
      if type.isCallback():
          if type.nullable():
-@@ -11551,16 +11625,22 @@ class CGNativeMember(ClassMethod):
+@@ -11549,16 +11623,22 @@ class CGNativeMember(ClassMethod):
              # Outparam
              return "void", "", "aRetVal = ${declName};\n"
          if type.isByteString():
@@ -192,7 +319,7 @@ diff --git a/dom/bindings/Codegen.py b/dom/bindings/Codegen.py
                  defaultValue = "%s()" % enumName
              else:
                  defaultValue = "%s(0)" % enumName
-@@ -11663,16 +11743,18 @@ class CGNativeMember(ClassMethod):
+@@ -11661,16 +11741,18 @@ class CGNativeMember(ClassMethod):
  
      def getArgs(self, returnType, argList):
          args = [self.getArg(arg) for arg in argList]
@@ -211,7 +338,7 @@ diff --git a/dom/bindings/Codegen.py b/dom/bindings/Codegen.py
              elementDecl = self.getReturnType(returnType.inner, True)
              type = CGTemplatedType("nsTArray", CGGeneric(elementDecl))
              if nullable:
-@@ -11796,16 +11878,23 @@ class CGNativeMember(ClassMethod):
+@@ -11794,16 +11876,23 @@ class CGNativeMember(ClassMethod):
              else:
                  declType = "nsAString"
              return declType, True, False
@@ -235,7 +362,7 @@ diff --git a/dom/bindings/Codegen.py b/dom/bindings/Codegen.py
              if type.nullable():
                  if forceOwningType:
                      declType = "nsRefPtr<%s>"
-@@ -13574,17 +13663,17 @@ class CGEventGetter(CGNativeMember):
+@@ -13572,17 +13661,17 @@ class CGEventGetter(CGNativeMember):
              raise TypeError("Event code generators does not support static attributes")
          return CGNativeMember.getArgs(self, returnType, argList)
  
@@ -254,7 +381,7 @@ diff --git a/dom/bindings/Codegen.py b/dom/bindings/Codegen.py
                    JS::ExposeObjectToActiveJS(${memberName});
                  }
                  aRetVal.set(${memberName});
-@@ -13734,16 +13823,18 @@ class CGEventClass(CGBindingImplClass):
+@@ -13732,16 +13821,18 @@ class CGEventClass(CGBindingImplClass):
                      nativeType = m.type.unroll().inner.identifier.name
                      if m.type.nullable():
                          nativeType = CGTemplatedType("Nullable",
@@ -273,48 +400,103 @@ diff --git a/dom/bindings/Codegen.py b/dom/bindings/Codegen.py
                      nativeType = nativeType.split("::")
                      if nativeType[0] == "mozilla":
                          nativeType.pop(0)
-diff --git a/dom/bindings/ScalarValueString.h b/dom/bindings/ScalarValueString.h
-new file mode 100644
---- /dev/null
-+++ b/dom/bindings/ScalarValueString.h
-@@ -0,0 +1,19 @@
-+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
-+/* vim: set ts=8 sts=2 et sw=2 tw=80: */
-+/* This Source Code Form is subject to the terms of the Mozilla Public
-+ * License, v. 2.0. If a copy of the MPL was not distributed with this
-+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
-+
-+#ifndef mozilla_dom_ScalarValueString_h
-+#define mozilla_dom_ScalarValueString_h
-+
-+namespace mozilla {
-+namespace dom {
-+
-+class MOZ_STACK_CLASS ScalarValueString {
-+};
-+
-+} // namespace dom
-+} // namespace mozilla
-+
-+#endif // mozilla_dom_ScalarValueString_h
-diff --git a/dom/bindings/moz.build b/dom/bindings/moz.build
---- a/dom/bindings/moz.build
-+++ b/dom/bindings/moz.build
-@@ -25,16 +25,17 @@ EXPORTS.mozilla.dom += [
-     'Exceptions.h',
-     'JSSlots.h',
-     'MozMap.h',
-     'NonRefcountedDOMObject.h',
-     'Nullable.h',
-     'OwningNonNull.h',
-     'PrimitiveConversions.h',
-     'RootedDictionary.h',
-+    'ScalarValueString.h',
-     'ToJSValue.h',
-     'TypedArray.h',
-     'UnionMember.h',
- ]
+diff --git a/dom/bindings/parser/WebIDL.py b/dom/bindings/parser/WebIDL.py
+--- a/dom/bindings/parser/WebIDL.py
++++ b/dom/bindings/parser/WebIDL.py
+@@ -2622,16 +2622,18 @@ class IDLValue(IDLObject):
+             return self
+         elif self.type.isFloat() and type.isFloat():
+             if (not type.isUnrestricted() and
+                 (self.value == float("inf") or self.value == float("-inf") or
+                  math.isnan(self.value))):
+                 raise WebIDLError("Trying to convert unrestricted value %s to non-unrestricted"
+                                   % self.value, [location]);
+             return self
++        elif self.type.isString() and type.isString():
++            return self
+         raise WebIDLError("Cannot coerce type %s to type %s." %
+                           (self.type, type), [location])
  
- FAIL_ON_WARNINGS = True
+     def _getDependentObjects(self):
+         return set()
  
- MSVC_ENABLE_PGO = True
+ class IDLNullValue(IDLObject):
+     def __init__(self, location):
+diff --git a/dom/bindings/test/TestBindingHeader.h b/dom/bindings/test/TestBindingHeader.h
+--- a/dom/bindings/test/TestBindingHeader.h
++++ b/dom/bindings/test/TestBindingHeader.h
+@@ -454,24 +454,35 @@ public:
+   // DOMString types
+   void PassString(const nsAString&);
+   void PassNullableString(const nsAString&);
+   void PassOptionalString(const Optional<nsAString>&);
+   void PassOptionalStringWithDefaultValue(const nsAString&);
+   void PassOptionalNullableString(const Optional<nsAString>&);
+   void PassOptionalNullableStringWithDefaultValue(const nsAString&);
+   void PassVariadicString(const Sequence<nsString>&);
++  void ReceiveString(DOMString&);
+ 
+   // ByteString types
+   void PassByteString(const nsCString&);
+   void PassNullableByteString(const nsCString&);
+   void PassOptionalByteString(const Optional<nsCString>&);
+   void PassOptionalNullableByteString(const Optional<nsCString>&);
+   void PassVariadicByteString(const Sequence<nsCString>&);
+ 
++  // ScalarValueString types
++  void PassSVS(const nsAString&);
++  void PassNullableSVS(const nsAString&);
++  void PassOptionalSVS(const Optional<nsAString>&);
++  void PassOptionalSVSWithDefaultValue(const nsAString&);
++  void PassOptionalNullableSVS(const Optional<nsAString>&);
++  void PassOptionalNullableSVSWithDefaultValue(const nsAString&);
++  void PassVariadicSVS(const Sequence<nsString>&);
++  void ReceiveSVS(DOMString&);
++
+   // Enumerated types
+   void PassEnum(TestEnum);
+   void PassNullableEnum(const Nullable<TestEnum>&);
+   void PassOptionalEnum(const Optional<TestEnum>&);
+   void PassEnumWithDefault(TestEnum);
+   void PassOptionalNullableEnum(const Optional<Nullable<TestEnum> >&);
+   void PassOptionalNullableEnumWithDefaultValue(const Nullable<TestEnum>&);
+   void PassOptionalNullableEnumWithDefaultValue2(const Nullable<TestEnum>&);
+diff --git a/dom/bindings/test/TestCodeGen.webidl b/dom/bindings/test/TestCodeGen.webidl
+--- a/dom/bindings/test/TestCodeGen.webidl
++++ b/dom/bindings/test/TestCodeGen.webidl
+@@ -415,24 +415,35 @@ interface TestInterface {
+   // DOMString types
+   void passString(DOMString arg);
+   void passNullableString(DOMString? arg);
+   void passOptionalString(optional DOMString arg);
+   void passOptionalStringWithDefaultValue(optional DOMString arg = "abc");
+   void passOptionalNullableString(optional DOMString? arg);
+   void passOptionalNullableStringWithDefaultValue(optional DOMString? arg = null);
+   void passVariadicString(DOMString... arg);
++  DOMString receiveString();
+ 
+   // ByteString types
+   void passByteString(ByteString arg);
+   void passNullableByteString(ByteString? arg);
+   void passOptionalByteString(optional ByteString arg);
+   void passOptionalNullableByteString(optional ByteString? arg);
+   void passVariadicByteString(ByteString... arg);
+ 
++  // ScalarValueString types
++  void passSVS(ScalarValueString arg);
++  void passNullableSVS(ScalarValueString? arg);
++  void passOptionalSVS(optional ScalarValueString arg);
++  void passOptionalSVSWithDefaultValue(optional ScalarValueString arg = "abc");
++  void passOptionalNullableSVS(optional ScalarValueString? arg);
++  void passOptionalNullableSVSWithDefaultValue(optional ScalarValueString? arg = null);
++  void passVariadicSVS(ScalarValueString... arg);
++  ScalarValueString receiveSVS();
++
+   // Enumerated types
+   void passEnum(TestEnum arg);
+   void passNullableEnum(TestEnum? arg);
+   void passOptionalEnum(optional TestEnum arg);
+   void passEnumWithDefault(optional TestEnum arg = "a");
+   void passOptionalNullableEnum(optional TestEnum? arg);
+   void passOptionalNullableEnumWithDefaultValue(optional TestEnum? arg = null);
+   void passOptionalNullableEnumWithDefaultValue2(optional TestEnum? arg = "a");
