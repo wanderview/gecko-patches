@@ -156,66 +156,13 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
    nsRefPtr<WorkerTask> mTask;
  
  public:
-@@ -1008,17 +1054,17 @@ class RuntimeService::WorkerThread MOZ_F
- 
-     NS_DECL_NSITHREADOBSERVER
-   };
- 
-   WorkerPrivate* mWorkerPrivate;
-   nsRefPtr<Observer> mObserver;
- 
- #ifdef DEBUG
--  // Protected by nsThread::mLock.
-+  ReentrantMonitor mMonitor;
-   bool mAcceptingNonWorkerRunnables;
- #endif
- 
- public:
-   static already_AddRefed<WorkerThread>
-   Create();
- 
-   void
-@@ -1028,33 +1074,77 @@ public:
- 
-   NS_IMETHOD
-   Dispatch(nsIRunnable* aRunnable, uint32_t aFlags) MOZ_OVERRIDE;
- 
- #ifdef DEBUG
-   bool
-   IsAcceptingNonWorkerRunnables()
-   {
--    MutexAutoLock lock(mLock);
-+    // This will re-enter the monitor when
-+    // DispatchAndStopAcceptingNonWorkerRunnables() is called.
-+    ReentrantMonitorAutoEnter lock(mMonitor);
-     return mAcceptingNonWorkerRunnables;
-   }
- 
+@@ -1040,16 +1086,39 @@ public:
    void
    SetAcceptingNonWorkerRunnables(bool aAcceptingNonWorkerRunnables)
    {
--    MutexAutoLock lock(mLock);
-+    mMonitor.AssertNotCurrentThreadIn();
-+    ReentrantMonitorAutoEnter lock(mMonitor);
+     MutexAutoLock lock(mLock);
      mAcceptingNonWorkerRunnables = aAcceptingNonWorkerRunnables;
    }
-+
-+  // Atomically dispatch a runnable to thread and then disable future
-+  // non-worker runnables.  This needs to be atomicsince the worker may
-+  // temporarilly re-enable main thread runnables for things like
-+  // initializing PBackground.
-+  NS_IMETHOD
-+  DispatchAndStopAcceptingNonWorkerRunnables(nsIRunnable* aRunnable,
-+                                             uint32_t aFlags)
-+  {
-+    mMonitor.AssertNotCurrentThreadIn();
-+    ReentrantMonitorAutoEnter lock(mMonitor);
-+    nsresult rv = Dispatch(aRunnable, aFlags);
-+    if (NS_SUCCEEDED(rv)) {
-+      mAcceptingNonWorkerRunnables = false;
-+    }
-+    return rv;
-+  }
  #endif
  
 +#ifdef ENABLE_TESTS
@@ -246,16 +193,10 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
    : nsThread(nsThread::NOT_MAIN_THREAD, WORKER_STACK_SIZE),
      mWorkerPrivate(nullptr)
  #ifdef DEBUG
-+    , mMonitor("WorkerThreadDebugMonitor")
      , mAcceptingNonWorkerRunnables(true)
  #endif
    { }
- 
-   ~WorkerThread()
-   { }
- };
- 
-@@ -1243,16 +1333,20 @@ RuntimeService::GetOrCreateService()
+@@ -1243,16 +1312,20 @@ RuntimeService::GetOrCreateService()
    if (!gRuntimeService) {
      nsRefPtr<RuntimeService> service = new RuntimeService();
      if (NS_FAILED(service->Init())) {
@@ -276,23 +217,10 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
  }
  
  // static
-@@ -1526,26 +1620,28 @@ RuntimeService::ScheduleWorker(JSContext
-                      nsISupportsPriority::PRIORITY_LOW;
- 
-   if (NS_FAILED(thread->SetPriority(priority))) {
-     NS_WARNING("Could not set the thread's priority!");
-   }
- 
+@@ -1532,20 +1605,16 @@ RuntimeService::ScheduleWorker(JSContext
    nsCOMPtr<nsIRunnable> runnable =
      new WorkerThreadPrimaryRunnable(aWorkerPrivate, thread, JS_GetParentRuntime(aCx));
--  if (NS_FAILED(thread->Dispatch(runnable, NS_DISPATCH_NORMAL))) {
-+#ifdef DEBUG
-+  nsresult rv = thread->DispatchAndStopAcceptingNonWorkerRunnables(runnable,
-+                                                                   NS_DISPATCH_NORMAL);
-+#else
-+  nsresult rv = thread->Dispatch(runnable, NS_DISPATCH_NORMAL);
-+#endif
-+  if (NS_FAILED(rv)) {
+   if (NS_FAILED(thread->Dispatch(runnable, NS_DISPATCH_NORMAL))) {
      UnregisterWorker(aCx, aWorkerPrivate);
      JS_ReportError(aCx, "Could not dispatch to thread!");
      return false;
@@ -310,7 +238,7 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
  RuntimeService::ShutdownIdleThreads(nsITimer* aTimer, void* /* aClosure */)
  {
    AssertIsOnMainThread();
-@@ -2487,18 +2583,30 @@ RuntimeService::WorkerThread::Observer::
+@@ -2487,18 +2556,30 @@ RuntimeService::WorkerThread::Observer::
  }
  
  NS_IMETHODIMP
@@ -342,7 +270,7 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
  NS_IMETHODIMP
  RuntimeService::WorkerThread::Observer::AfterProcessNextEvent(
                                                 nsIThreadInternal* /* aThread */,
-@@ -2532,21 +2640,25 @@ LogViolationDetailsRunnable::Run()
+@@ -2532,21 +2613,25 @@ LogViolationDetailsRunnable::Run()
    nsRefPtr<MainThreadStopSyncLoopRunnable> response =
      new MainThreadStopSyncLoopRunnable(mWorkerPrivate, mSyncLoopTarget.forget(),
                                         true);
@@ -368,7 +296,7 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
      NuwaFreezeCurrentThread();
    }
  #endif
-@@ -2555,16 +2667,26 @@ WorkerThreadPrimaryRunnable::Run()
+@@ -2555,16 +2640,26 @@ WorkerThreadPrimaryRunnable::Run()
  
    nsAutoCString threadName;
    threadName.AssignLiteral("WebWorker '");
@@ -395,7 +323,7 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
      nsCycleCollector_startup();
  
      WorkerJSRuntime runtime(mParentRuntime, mWorkerPrivate);
-@@ -2588,16 +2710,22 @@ WorkerThreadPrimaryRunnable::Run()
+@@ -2588,16 +2683,22 @@ WorkerThreadPrimaryRunnable::Run()
        {
          JSAutoRequest ar(cx);
  
@@ -418,7 +346,7 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
      }
  
      // Destroy the main context.  This will unroot the main worker global and
-@@ -2626,16 +2754,53 @@ WorkerThreadPrimaryRunnable::Run()
+@@ -2626,16 +2727,46 @@ WorkerThreadPrimaryRunnable::Run()
      new FinishedRunnable(mThread.forget());
    MOZ_ALWAYS_TRUE(NS_SUCCEEDED(mainThread->Dispatch(finishedRunnable,
                                                      NS_DISPATCH_NORMAL)));
@@ -436,19 +364,12 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
 +  nsCOMPtr<nsIIPCBackgroundChildCreateCallback> callback =
 +    new WorkerBackgroundChildCallback(&done);
 +
-+#ifdef DEBUG
-+  // Actor creation requires bouncing to the main thread, so we must
-+  // briefly allow non-worker runnables while setting up PBackground.
-+  bool wasAcceptingNonWorkerRunnables = mThread->IsAcceptingNonWorkerRunnables();
-+  mThread->SetAcceptingNonWorkerRunnables(true);
-+#endif
-+
 +  if (NS_WARN_IF(!BackgroundChild::GetOrCreateForCurrentThread(callback))) {
 +    return NS_ERROR_FAILURE;
 +  }
 +
 +  while (!done) {
-+    if (NS_WARN_IF(!NS_ProcessNextEvent(mThread, true /* aMayWait */))) {
++    if (NS_WARN_IF(!NS_ProcessNextEvent(mThread, true /* aMayWay */))) {
 +      return NS_ERROR_FAILURE;
 +    }
 +  }
@@ -458,7 +379,7 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
 +  }
 +
 +#ifdef DEBUG
-+  mThread->SetAcceptingNonWorkerRunnables(wasAcceptingNonWorkerRunnables);
++  mThread->SetAcceptingNonWorkerRunnables(false);
 +#endif
 +
 +  return NS_OK;
