@@ -1,0 +1,623 @@
+# HG changeset patch
+# Parent 65247d9dac81ccb8f72571e3fe10171569eaa9a6
+# User Ben Kelly <ben@wanderview.com>
+Bug 1029620 P5 Implement Fetch Headers DOM object.
+
+diff --git a/dom/bindings/Bindings.conf b/dom/bindings/Bindings.conf
+--- a/dom/bindings/Bindings.conf
++++ b/dom/bindings/Bindings.conf
+@@ -470,16 +470,26 @@ DOMInterfaces = {
+ 'GainNode': {
+     'resultNotAddRefed': [ 'gain' ],
+ },
+ 
+ 'Geolocation': {
+     'headerFile': 'nsGeolocation.h'
+ },
+ 
++'Headers': [{
++    'headerFile': 'mozilla/dom/Headers.h',
++    'nativeType': 'mozilla::dom::Headers',
++},
++{
++    'headerFile': 'mozilla/dom/Headers.h',
++    'nativeType': 'mozilla::dom::Headers',
++    'workers': True,
++}],
++
+ 'History': {
+     'headerFile': 'nsHistory.h',
+     'nativeType': 'nsHistory'
+ },
+ 
+ 'HmacKeyAlgorithm': {
+     'resultNotAddRefed': ['hash']
+ },
+diff --git a/dom/bindings/Errors.msg b/dom/bindings/Errors.msg
+--- a/dom/bindings/Errors.msg
++++ b/dom/bindings/Errors.msg
+@@ -49,8 +49,12 @@ MSG_DEF(MSG_INVALID_VERSION, 0, "0 (Zero
+ MSG_DEF(MSG_INVALID_BYTESTRING, 2, "Cannot convert string to ByteString because the character"
+         " at index {0} has value {1} which is greater than 255.")
+ MSG_DEF(MSG_NOT_DATE, 1, "{0} is not a date.")
+ MSG_DEF(MSG_INVALID_ADVANCE_COUNT, 0, "0 (Zero) is not a valid advance count.")
+ MSG_DEF(MSG_DEFINEPROPERTY_ON_GSP, 0, "Not allowed to define a property on the named properties object.")
+ MSG_DEF(MSG_INVALID_URL, 1, "{0} is not a valid URL.")
+ MSG_DEF(MSG_METADATA_NOT_CONFIGURED, 0, "Either size or lastModified should be true.")
+ MSG_DEF(MSG_INVALID_READ_SIZE, 0, "0 (Zero) is not a valid read size.")
++MSG_DEF(MSG_HEADERS_IMMUTABLE, 0, "Headers are immutable and cannot be modified.")
++MSG_DEF(MSG_INVALID_HEADER_NAME, 1, "{0} is an invalid header name.")
++MSG_DEF(MSG_INVALID_HEADER_VALUE, 1, "{0} is an invalid header value.")
++MSG_DEF(MSG_INVALID_HEADER_SEQUENCE, 0, "Headers require name/value tuples when being initialized by a sequence.")
+diff --git a/dom/fetch/Headers.cpp b/dom/fetch/Headers.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/fetch/Headers.cpp
+@@ -0,0 +1,275 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "Headers.h"
++
++#include "mozilla/ErrorResult.h"
++#include "mozilla/dom/UnionTypes.h"
++
++#include "nsCharSeparatedTokenizer.h"
++#include "nsCrossSiteListenerProxy.h" // for IsValidHTTPToken()
++#include "nsDOMString.h"
++#include "nsPIDOMWindow.h"
++#include "nsReadableUtils.h"
++
++namespace mozilla {
++namespace dom {
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF(Headers)
++NS_IMPL_CYCLE_COLLECTING_RELEASE(Headers)
++NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_0(Headers)
++
++NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Headers)
++  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
++  NS_INTERFACE_MAP_ENTRY(nsISupports)
++NS_INTERFACE_MAP_END
++
++// static
++already_AddRefed<Headers>
++Headers::Constructor(const GlobalObject& aGlobal,
++                     const Optional<HeadersOrByteStringSequenceSequenceOrByteStringMozMap>& aInit,
++                     ErrorResult& aRv)
++{
++  nsRefPtr<Headers> headers = new Headers(aGlobal.GetAsSupports());
++
++  if (!aInit.WasPassed()) {
++    return headers.forget();
++  }
++
++  if (aInit.Value().IsHeaders()) {
++    headers->Fill(aInit.Value().GetAsHeaders(), aRv);
++  } else if (aInit.Value().IsByteStringSequenceSequence()) {
++    headers->Fill(aInit.Value().GetAsByteStringSequenceSequence(), aRv);
++  } else if (aInit.Value().IsByteStringMozMap()) {
++    headers->Fill(aInit.Value().GetAsByteStringMozMap(), aRv);
++  }
++
++  if (aRv.Failed()) {
++    return nullptr;
++  }
++
++  return headers.forget();
++}
++
++void
++Headers::Append(const nsACString& aName, const nsACString& aValue,
++                ErrorResult& aRv)
++{
++  nsCString lowerName;
++  ToLowerCase(aName, lowerName);
++
++  if (IsInvalidMutableHeader(lowerName, &aValue, aRv)) {
++    return;
++  }
++
++  ValueList* list = mMap.Get(lowerName);
++
++  if (!list) {
++    list = new ValueList();
++    mMap.Put(lowerName, list);
++  }
++
++  list->AppendElement(aValue);
++}
++
++void
++Headers::Delete(const nsACString& aName, ErrorResult& aRv)
++{
++  nsCString lowerName;
++  ToLowerCase(aName, lowerName);
++
++  if (IsInvalidMutableHeader(lowerName, nullptr, aRv)) {
++    return;
++  }
++
++  mMap.Remove(lowerName);
++}
++
++void
++Headers::Get(const nsACString& aName, nsCString& aValue, ErrorResult& aRv) const
++{
++  nsCString lowerName;
++  ToLowerCase(aName, lowerName);
++
++  if (IsInvalidName(lowerName, aRv)) {
++    return;
++  }
++
++  ValueList* list = mMap.Get(lowerName);
++  if (!list || list->IsEmpty()) {
++    aValue.SetIsVoid(true);
++    return;
++  }
++  aValue = list->ElementAt(0);
++}
++
++void
++Headers::GetAll(const nsACString& aName, nsTArray<nsCString>& aResults,
++                ErrorResult& aRv) const
++{
++  nsCString lowerName;
++  ToLowerCase(aName, lowerName);
++
++  if (IsInvalidName(lowerName, aRv)) {
++    return;
++  }
++
++  ValueList* list = mMap.Get(lowerName);
++  if (!list) {
++    aResults.SetLength(0);
++    return;
++  }
++  aResults = *list;
++}
++
++bool
++Headers::Has(const nsACString& aName, ErrorResult& aRv) const
++{
++  nsCString lowerName;
++  ToLowerCase(aName, lowerName);
++
++  if (IsInvalidName(lowerName, aRv)) {
++    return false;
++  }
++
++  return mMap.Get(lowerName);
++}
++
++void
++Headers::Set(const nsACString& aName, const nsACString& aValue, ErrorResult& aRv)
++{
++  nsCString lowerName;
++  ToLowerCase(aName, lowerName);
++
++  if (IsInvalidMutableHeader(lowerName, &aValue, aRv)) {
++    return;
++  }
++
++  ValueList* list = mMap.Get(lowerName);
++
++  if (list) {
++    list->SetLength(0);
++  } else {
++    list = new ValueList();
++    mMap.Put(lowerName, list);
++  }
++
++  list->AppendElement(aValue);
++}
++
++void
++Headers::SetGuard(HeadersGuardEnum aGuard, ErrorResult& aRv)
++{
++  // Rather than re-validate all current headers, just require code to set
++  // this prior to populating the Headers object.  Allow setting immutable
++  // late, though, as that is pretty much required to have a  useful, immutable
++  // headers object.
++  if (aGuard != HeadersGuardEnum::Immutable && mMap.Count() > 0) {
++    aRv.Throw(NS_ERROR_FAILURE);
++  }
++  mGuard = aGuard;
++}
++
++JSObject*
++Headers::WrapObject(JSContext* aCx)
++{
++  return mozilla::dom::HeadersBinding::Wrap(aCx, this);
++}
++
++Headers::~Headers()
++{
++}
++
++// static
++bool
++Headers::IsSimpleHeader(const nsACString& aName, const nsACString* aValue)
++{
++  return aName.EqualsLiteral("accept") ||
++         aName.EqualsLiteral("accept-language") ||
++         aName.EqualsLiteral("content-language") ||
++         (aName.EqualsLiteral("content-type") &&
++          (!aValue ||
++           (aValue->EqualsLiteral("application/x-www-form-urlencoded") ||
++            aValue->EqualsLiteral("multipart/form-data") ||
++            aValue->EqualsLiteral("text/plain"))));
++}
++
++//static
++bool
++Headers::IsInvalidName(const nsACString& aName, ErrorResult& aRv)
++{
++  if (!IsValidHTTPToken(aName)) {
++    NS_ConvertUTF8toUTF16 label(aName);
++    aRv.ThrowTypeError(MSG_INVALID_HEADER_NAME, &label);
++    return true;
++  }
++
++  return false;
++}
++
++// static
++bool
++Headers::IsInvalidValue(const nsACString& aValue, ErrorResult& aRv)
++{
++  if (aValue.FindChar('\n') != -1 || aValue.FindChar('\r') != -1) {
++    NS_ConvertUTF8toUTF16 label(aValue);
++    aRv.ThrowTypeError(MSG_INVALID_HEADER_VALUE, &label);
++    return true;
++  }
++  return false;
++}
++
++bool
++Headers::IsImmutable(ErrorResult& aRv) const
++{
++  if (mGuard == HeadersGuardEnum::Immutable) {
++    aRv.ThrowTypeError(MSG_HEADERS_IMMUTABLE);
++    return true;
++  }
++  return false;
++}
++
++// static
++PLDHashOperator
++Headers::CopyHeadersMap(const nsACString& aKey, ValueList* aData, void* aCopyTo)
++{
++  Headers* copyTo = static_cast<Headers*>(aCopyTo);
++  ValueList* list = new ValueList(*aData);
++  copyTo->mMap.Put(aKey, list);
++  return PLDHashOperator::PL_DHASH_NEXT;
++}
++
++void
++Headers::Fill(const Headers& aInit, ErrorResult&)
++{
++  aInit.mMap.EnumerateRead(CopyHeadersMap, this);
++}
++
++void
++Headers::Fill(const Sequence<Sequence<nsCString>>& aInit, ErrorResult& aRv)
++{
++  for (uint32_t i = 0; i < aInit.Length() && !aRv.Failed(); ++i) {
++    const Sequence<nsCString>& tuple = aInit[i];
++    if (tuple.Length() != 2) {
++      aRv.ThrowTypeError(MSG_INVALID_HEADER_SEQUENCE);
++      return;
++    }
++    Set(tuple[0], tuple[1], aRv);
++  }
++}
++
++void
++Headers::Fill(const MozMap<nsCString>& aInit, ErrorResult& aRv)
++{
++  nsTArray<nsString> keys;
++  aInit.GetKeys(keys);
++  for (uint32_t i = 0; i < keys.Length() && !aRv.Failed(); ++i) {
++    Set(NS_ConvertUTF16toUTF8(keys[i]), aInit.Get(keys[i]), aRv);
++  }
++}
++
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/fetch/Headers.h b/dom/fetch/Headers.h
+new file mode 100644
+--- /dev/null
++++ b/dom/fetch/Headers.h
+@@ -0,0 +1,119 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_Headers_h
++#define mozilla_dom_Headers_h
++
++#include "mozilla/dom/HeadersBinding.h"
++#include "nsClassHashtable.h"
++#include "nsContentUtils.h"
++#include "nsWrapperCache.h"
++
++class nsPIDOMWindow;
++
++namespace mozilla {
++
++class ErrorResult;
++
++namespace dom {
++
++template<typename T> class MozMap;
++class HeadersOrByteStringSequenceSequenceOrByteStringMozMap;
++
++class Headers MOZ_FINAL : public nsISupports
++                        , public nsWrapperCache
++{
++  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS(Headers)
++
++private:
++  nsISupports* mOwner;
++  HeadersGuardEnum mGuard;
++  typedef nsTArray<nsCString> ValueList;
++  nsClassHashtable<nsCStringHashKey, ValueList> mMap;
++
++public:
++  Headers(nsISupports* aOwner, HeadersGuardEnum aGuard=HeadersGuardEnum::None)
++    : mOwner(aOwner)
++    , mGuard(aGuard)
++  {
++    SetIsDOMBinding();
++  }
++
++  static already_AddRefed<Headers>
++  Constructor(const GlobalObject& aGlobal,
++              const Optional<HeadersOrByteStringSequenceSequenceOrByteStringMozMap>& aInit,
++              ErrorResult& aRv);
++
++  void Append(const nsACString& aName, const nsACString& aValue,
++              ErrorResult& aRv);
++  void Delete(const nsACString& aName, ErrorResult& aRv);
++  void Get(const nsACString& aName, nsCString& aValue, ErrorResult& aRv) const;
++  void GetAll(const nsACString& aName, nsTArray<nsCString>& aResults,
++              ErrorResult& aRv) const;
++  bool Has(const nsACString& aName, ErrorResult& aRv) const;
++  void Set(const nsACString& aName, const nsACString& aValue, ErrorResult& aRv);
++
++  // ChromeOnly for testing
++  HeadersGuardEnum Guard() const { return mGuard; }
++  void SetGuard(HeadersGuardEnum aGuard, ErrorResult& aRv);
++
++  virtual JSObject* WrapObject(JSContext* aCx);
++  nsISupports* GetParentObject() const { return mOwner; }
++
++private:
++  Headers(const Headers& aOther);
++  virtual ~Headers();
++
++  static bool IsSimpleHeader(const nsACString& aName,
++                             const nsACString* aValue=nullptr);
++  static bool IsInvalidName(const nsACString& aName, ErrorResult& aRv);
++  static bool IsInvalidValue(const nsACString& aValue, ErrorResult& aRv);
++  bool IsImmutable(ErrorResult& aRv) const;
++
++  bool IsForbiddenRequestHeader(const nsACString& aName) const
++  {
++    return mGuard == HeadersGuardEnum::Request &&
++           nsContentUtils::IsForbiddenRequestHeader(aName);
++  }
++
++  bool IsForbiddenRequestNoCorsHeader(const nsACString& aName,
++                                      const nsACString* aValue=nullptr) const
++  {
++    return mGuard == HeadersGuardEnum::Request_no_cors &&
++           !IsSimpleHeader(aName, aValue);
++  }
++
++  bool IsForbiddenResponseHeader(const nsACString& aName) const
++  {
++    return mGuard == HeadersGuardEnum::Response &&
++           nsContentUtils::IsForbiddenResponseHeader(aName);
++  }
++
++  bool IsInvalidMutableHeader(const nsACString& aName,
++                              const nsACString* aValue,
++                              ErrorResult& aRv) const
++  {
++    return IsInvalidName(aName, aRv) ||
++           (aValue && IsInvalidValue(*aValue, aRv)) ||
++           IsImmutable(aRv) ||
++           IsForbiddenRequestHeader(aName) ||
++           IsForbiddenRequestNoCorsHeader(aName, aValue) ||
++           IsForbiddenResponseHeader(aName);
++  }
++
++  static PLDHashOperator CopyHeadersMap(const nsACString& aKey,
++                                        ValueList* aData,
++                                        void* aCopyTo);
++  void Fill(const Headers& aInit, ErrorResult& aRv);
++  void Fill(const Sequence<Sequence<nsCString>>& aInit, ErrorResult& aRv);
++  void Fill(const MozMap<nsCString>& aInit, ErrorResult& aRv);
++};
++
++} // namespace dom
++} // namespace mozilla
++
++#endif // mozilla_dom_Headers_h
+diff --git a/dom/fetch/moz.build b/dom/fetch/moz.build
+new file mode 100644
+--- /dev/null
++++ b/dom/fetch/moz.build
+@@ -0,0 +1,17 @@
++# -*- Mode: python; c-basic-offset: 4; indent-tabs-mode: nil; tab-width: 40 -*-
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++EXPORTS.mozilla.dom += [
++    'Headers.h',
++]
++
++UNIFIED_SOURCES += [
++    'Headers.cpp',
++]
++
++FAIL_ON_WARNINGS = True
++MSVC_ENABLE_PGO = True
++FINAL_LIBRARY = 'gklayout'
+diff --git a/dom/moz.build b/dom/moz.build
+--- a/dom/moz.build
++++ b/dom/moz.build
+@@ -46,16 +46,17 @@ PARALLEL_DIRS += [
+     'contacts',
+     'crypto',
+     'phonenumberutils',
+     'alarm',
+     'datastore',
+     'devicestorage',
+     'encoding',
+     'events',
++    'fetch',
+     'filehandle',
+     'filesystem',
+     'fmradio',
+     'asmjscache',
+     'media',
+     'messages',
+     'power',
+     'push',
+diff --git a/dom/tests/mochitest/general/test_interfaces.html b/dom/tests/mochitest/general/test_interfaces.html
+--- a/dom/tests/mochitest/general/test_interfaces.html
++++ b/dom/tests/mochitest/general/test_interfaces.html
+@@ -389,16 +389,18 @@ var interfaceNamesInGlobalScope =
+     {name: "GamepadButtonEvent", b2g: false},
+ // IMPORTANT: Do not change this list without review from a DOM peer!
+     {name: "GamepadButton", b2g: false},
+ // IMPORTANT: Do not change this list without review from a DOM peer!
+     {name: "GamepadEvent", b2g: false},
+ // IMPORTANT: Do not change this list without review from a DOM peer!
+     "HashChangeEvent",
+ // IMPORTANT: Do not change this list without review from a DOM peer!
++    {name: "Headers", pref: "dom.fetch.enabled"},
++// IMPORTANT: Do not change this list without review from a DOM peer!
+     "History",
+ // IMPORTANT: Do not change this list without review from a DOM peer!
+     "HTMLAllCollection",
+ // IMPORTANT: Do not change this list without review from a DOM peer!
+     "HTMLAnchorElement",
+ // IMPORTANT: Do not change this list without review from a DOM peer!
+     "HTMLAppletElement",
+ // IMPORTANT: Do not change this list without review from a DOM peer!
+diff --git a/dom/webidl/Headers.webidl b/dom/webidl/Headers.webidl
+new file mode 100644
+--- /dev/null
++++ b/dom/webidl/Headers.webidl
+@@ -0,0 +1,35 @@
++/* -*- Mode: IDL; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ *
++ * The origin of this IDL file is
++ * http://fetch.spec.whatwg.org/#headers-class
++ */
++
++typedef (Headers or sequence<sequence<ByteString>> or MozMap<ByteString>) HeadersInit;
++
++enum HeadersGuardEnum {
++  "none",
++  "request",
++  "request-no-cors",
++  "response",
++  "immutable"
++};
++
++[Constructor(optional HeadersInit init),
++ // FIXME: Exposed=Window,Worker,
++ Pref="dom.fetch.enabled"]
++interface Headers {
++  [Throws] void append(ByteString name, ByteString value);
++  [Throws] void delete(ByteString name);
++  [Throws] ByteString? get(ByteString name);
++  [Throws] sequence<ByteString> getAll(ByteString name);
++  [Throws] boolean has(ByteString name);
++  [Throws] void set(ByteString name, ByteString value);
++
++  // Used to test different guard states from mochitest.
++  // Note: Must be set prior to populating headers or will throw.
++  [ChromeOnly, SetterThrows] attribute HeadersGuardEnum guard;
++};
+diff --git a/dom/webidl/moz.build b/dom/webidl/moz.build
+--- a/dom/webidl/moz.build
++++ b/dom/webidl/moz.build
+@@ -120,16 +120,17 @@ WEBIDL_FILES = [
+     'FileRequest.webidl',
+     'FocusEvent.webidl',
+     'FormData.webidl',
+     'Function.webidl',
+     'GainNode.webidl',
+     'Geolocation.webidl',
+     'GeometryUtils.webidl',
+     'GetUserMediaRequest.webidl',
++    'Headers.webidl',
+     'History.webidl',
+     'HTMLAllCollection.webidl',
+     'HTMLAnchorElement.webidl',
+     'HTMLAppletElement.webidl',
+     'HTMLAreaElement.webidl',
+     'HTMLAudioElement.webidl',
+     'HTMLBaseElement.webidl',
+     'HTMLBodyElement.webidl',
+diff --git a/dom/workers/RegisterBindings.cpp b/dom/workers/RegisterBindings.cpp
+--- a/dom/workers/RegisterBindings.cpp
++++ b/dom/workers/RegisterBindings.cpp
+@@ -12,16 +12,17 @@
+ #include "js/OldDebugAPI.h"
+ #include "mozilla/dom/BindingUtils.h"
+ #include "mozilla/dom/ConsoleBinding.h"
+ #include "mozilla/dom/DOMExceptionBinding.h"
+ #include "mozilla/dom/EventBinding.h"
+ #include "mozilla/dom/EventHandlerBinding.h"
+ #include "mozilla/dom/EventTargetBinding.h"
+ #include "mozilla/dom/FileReaderSyncBinding.h"
++#include "mozilla/dom/HeadersBinding.h"
+ #include "mozilla/dom/ImageData.h"
+ #include "mozilla/dom/ImageDataBinding.h"
+ #include "mozilla/dom/MessageEventBinding.h"
+ #include "mozilla/dom/MessagePortBinding.h"
+ #include "mozilla/dom/PromiseBinding.h"
+ #include "mozilla/dom/TextDecoderBinding.h"
+ #include "mozilla/dom/TextEncoderBinding.h"
+ #include "mozilla/dom/XMLHttpRequestBinding.h"
+@@ -74,14 +75,20 @@ WorkerPrivate::RegisterBindings(JSContex
+       !URLBinding_workers::GetConstructorObject(aCx, aGlobal) ||
+       !URLSearchParamsBinding::GetConstructorObject(aCx, aGlobal) ||
+       !WorkerBinding::GetConstructorObject(aCx, aGlobal) ||
+       !WorkerLocationBinding_workers::GetConstructorObject(aCx, aGlobal) ||
+       !WorkerNavigatorBinding_workers::GetConstructorObject(aCx, aGlobal)) {
+     return false;
+   }
+ 
++  if (DOMFetchEnabled()) {
++    if (!HeadersBinding_workers::GetConstructorObject(aCx, aGlobal)) {
++      return nullptr;
++    }
++  }
++
+   if (!JS_DefineProfilingFunctions(aCx, aGlobal)) {
+     return false;
+   }
+ 
+   return true;
+ }
