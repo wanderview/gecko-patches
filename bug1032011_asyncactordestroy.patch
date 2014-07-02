@@ -1,0 +1,147 @@
+# HG changeset patch
+# Parent 606848e8adfc4993ee9ed70bee27a439ad556561
+# User Ben Kelly <ben@wanderview.com>
+Bug 1032011 Handle async ActorDestroy() callback when closing PBackground.
+
+diff --git a/ipc/glue/BackgroundImpl.cpp b/ipc/glue/BackgroundImpl.cpp
+--- a/ipc/glue/BackgroundImpl.cpp
++++ b/ipc/glue/BackgroundImpl.cpp
+@@ -345,17 +345,18 @@ class ChildImpl MOZ_FINAL : public Backg
+   static bool sShutdownHasStarted;
+ 
+ #ifdef RELEASE_BUILD
+   DebugOnly<nsIThread*> mBoundThread;
+ #else
+   nsIThread* mBoundThread;
+ #endif
+ 
+-  DebugOnly<bool> mActorDestroyed;
++  bool mActorDestroyed;
++  bool mReleaseOnActorDestroy;
+ 
+ public:
+   static bool
+   OpenProtocolOnMainThread(nsIEventTarget* aEventTarget);
+ 
+   static void
+   Shutdown();
+ 
+@@ -369,25 +370,20 @@ public:
+ #else
+     bool current;
+ #endif
+     THREADSAFETY_ASSERT(
+       NS_SUCCEEDED(mBoundThread->IsOnCurrentThread(&current)));
+     THREADSAFETY_ASSERT(current);
+   }
+ 
+-  void
+-  AssertActorDestroyed()
+-  {
+-    MOZ_ASSERT(mActorDestroyed, "ChildImpl::ActorDestroy not called in time");
+-  }
+-
+   ChildImpl()
+   : mBoundThread(nullptr)
+   , mActorDestroyed(false)
++  , mReleaseOnActorDestroy(false)
+   {
+     AssertIsOnMainThread();
+   }
+ 
+   NS_INLINE_DECL_REFCOUNTING(ChildImpl)
+ 
+ private:
+   // Forwarded from BackgroundChild.
+@@ -409,47 +405,56 @@ private:
+   // Forwarded from BackgroundChild.
+   static void
+   CloseForCurrentThread();
+ 
+   // Forwarded from BackgroundChildImpl.
+   static BackgroundChildImpl::ThreadLocal*
+   GetThreadLocalForCurrentThread();
+ 
++  void
++  DoRelease()
++  {
++    nsCOMPtr<nsIRunnable> releaser =
++      NS_NewNonOwningRunnableMethod(this, &ChildImpl::Release);
++    MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(releaser)));
++  }
++
++  void
++  ReleaseOnActorDestroy()
++  {
++    if (mActorDestroyed) {
++      DoRelease();
++      return;
++    }
++    mReleaseOnActorDestroy = true;
++  }
++
+   static void
+   ThreadLocalDestructor(void* aThreadLocal)
+   {
+     auto threadLocalInfo = static_cast<ThreadLocalInfo*>(aThreadLocal);
+ 
+     if (threadLocalInfo) {
+       if (threadLocalInfo->mActor) {
+         threadLocalInfo->mActor->Close();
+-        threadLocalInfo->mActor->AssertActorDestroyed();
+-        // Since the actor is created on the main thread it must only
+-        // be released on the main thread as well.
+-        if (!NS_IsMainThread()) {
+-          ChildImpl* actor;
+-          threadLocalInfo->mActor.forget(&actor);
+-
+-          nsCOMPtr<nsIRunnable> releaser =
+-            NS_NewNonOwningRunnableMethod(actor, &ChildImpl::Release);
+-          MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(releaser)));
+-        }
++        ChildImpl* actor;
++        threadLocalInfo->mActor.forget(&actor);
++        actor->ReleaseOnActorDestroy();
+       }
+       delete threadLocalInfo;
+     }
+   }
+ 
+   static void
+   DispatchFailureCallback(nsIEventTarget* aEventTarget);
+ 
+   // This class is reference counted.
+   ~ChildImpl()
+   {
+-    AssertActorDestroyed();
+   }
+ 
+   void
+   SetBoundThread()
+   {
+     THREADSAFETY_ASSERT(!mBoundThread);
+ 
+ #if defined(DEBUG) || !defined(RELEASE_BUILD)
+@@ -2003,18 +2008,21 @@ ChildImpl::DispatchFailureCallback(nsIEv
+   }
+ }
+ 
+ void
+ ChildImpl::ActorDestroy(ActorDestroyReason aWhy)
+ {
+   AssertIsOnBoundThread();
+ 
++  BackgroundChildImpl::ActorDestroy(aWhy);
+   mActorDestroyed = true;
+-  BackgroundChildImpl::ActorDestroy(aWhy);
++  if (mReleaseOnActorDestroy) {
++    DoRelease();
++  }
+ }
+ 
+ NS_IMPL_ISUPPORTS(ChildImpl::ShutdownObserver, nsIObserver)
+ 
+ NS_IMETHODIMP
+ ChildImpl::ShutdownObserver::Observe(nsISupports* aSubject,
+                                      const char* aTopic,
+                                      const char16_t* aData)
