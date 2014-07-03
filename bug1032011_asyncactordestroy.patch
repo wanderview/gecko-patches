@@ -1,7 +1,7 @@
 # HG changeset patch
 # Parent 91a55429c78b098926c8f23cacce69beede00178
 # User Ben Kelly <ben@wanderview.com>
-Bug 1032011 Handle async ActorDestroy() callback when closing PBackground.
+Bug 1032011 Handle async ActorDestroy() callback when closing PBackground. r=bent
 
 diff --git a/ipc/glue/BackgroundImpl.cpp b/ipc/glue/BackgroundImpl.cpp
 --- a/ipc/glue/BackgroundImpl.cpp
@@ -49,27 +49,8 @@ diff --git a/ipc/glue/BackgroundImpl.cpp b/ipc/glue/BackgroundImpl.cpp
    }
  
    NS_INLINE_DECL_REFCOUNTING(ChildImpl)
-@@ -409,47 +404,56 @@ private:
-   // Forwarded from BackgroundChild.
-   static void
-   CloseForCurrentThread();
+@@ -416,40 +411,39 @@ private:
  
-   // Forwarded from BackgroundChildImpl.
-   static BackgroundChildImpl::ThreadLocal*
-   GetThreadLocalForCurrentThread();
- 
-+  void
-+  ProxyReleaseToMainThread()
-+  {
-+    // ChildImpl uses non-threadsafe ref counts, so we must release on
-+    // the same thread where it was created; the main thread.
-+    ChildImpl* actor;
-+    mSelfRefWhileWaitingForActorDestroy.forget(&actor);
-+    nsCOMPtr<nsIRunnable> releaser =
-+      NS_NewNonOwningRunnableMethod(actor, &ChildImpl::Release);
-+    MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(releaser)));
-+  }
-+
    static void
    ThreadLocalDestructor(void* aThreadLocal)
    {
@@ -84,19 +65,20 @@ diff --git a/ipc/glue/BackgroundImpl.cpp b/ipc/glue/BackgroundImpl.cpp
 -        if (!NS_IsMainThread()) {
 -          ChildImpl* actor;
 -          threadLocalInfo->mActor.forget(&actor);
--
--          nsCOMPtr<nsIRunnable> releaser =
--            NS_NewNonOwningRunnableMethod(actor, &ChildImpl::Release);
--          MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(releaser)));
--        }
 +        // Close() can call ActorDestroy() either sync or async, so we must
 +        // handle both.  Set a self-reference on actor which will then be
 +        // released automatically when ActorDestroy() is called; either
 +        // immediately or later.
 +        ChildImpl* actor;
 +        threadLocalInfo->mActor.forget(&actor);
+ 
+-          nsCOMPtr<nsIRunnable> releaser =
+-            NS_NewNonOwningRunnableMethod(actor, &ChildImpl::Release);
+-          MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(releaser)));
+-        }
 +        MOZ_ASSERT(!actor->mSelfRefWhileWaitingForActorDestroy);
 +        actor->mSelfRefWhileWaitingForActorDestroy = dont_AddRef(actor);
++
 +        actor->Close();
        }
        delete threadLocalInfo;
@@ -119,17 +101,30 @@ diff --git a/ipc/glue/BackgroundImpl.cpp b/ipc/glue/BackgroundImpl.cpp
      THREADSAFETY_ASSERT(!mBoundThread);
  
  #if defined(DEBUG) || !defined(RELEASE_BUILD)
-@@ -2005,16 +2009,19 @@ ChildImpl::DispatchFailureCallback(nsIEv
+@@ -2003,18 +1997,32 @@ ChildImpl::DispatchFailureCallback(nsIEv
+   }
+ }
  
  void
  ChildImpl::ActorDestroy(ActorDestroyReason aWhy)
  {
    AssertIsOnBoundThread();
  
++  MOZ_ASSERT(!mActorDestroyed);
    mActorDestroyed = true;
++
    BackgroundChildImpl::ActorDestroy(aWhy);
++
 +  if (mSelfRefWhileWaitingForActorDestroy) {
-+    ProxyReleaseToMainThread();
++    // ChildImpl uses non-threadsafe ref counts, so we must release on
++    // the same thread where it was created; the main thread.
++    ChildImpl* actor;
++    mSelfRefWhileWaitingForActorDestroy.forget(&actor);
++    MOZ_ASSERT(actor);
++
++    nsCOMPtr<nsIRunnable> releaser =
++      NS_NewNonOwningRunnableMethod(actor, &ChildImpl::Release);
++    MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(releaser)));
 +  }
  }
  
