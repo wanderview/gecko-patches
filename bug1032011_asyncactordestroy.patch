@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent 606848e8adfc4993ee9ed70bee27a439ad556561
+# Parent 91a55429c78b098926c8f23cacce69beede00178
 # User Ben Kelly <ben@wanderview.com>
 Bug 1032011 Handle async ActorDestroy() callback when closing PBackground.
 
@@ -17,7 +17,7 @@ diff --git a/ipc/glue/BackgroundImpl.cpp b/ipc/glue/BackgroundImpl.cpp
  
 -  DebugOnly<bool> mActorDestroyed;
 +  bool mActorDestroyed;
-+  bool mReleaseOnActorDestroy;
++  nsRefPtr<ChildImpl> mSelfRefWhileWaitingForActorDestroy;
  
  public:
    static bool
@@ -26,7 +26,7 @@ diff --git a/ipc/glue/BackgroundImpl.cpp b/ipc/glue/BackgroundImpl.cpp
    static void
    Shutdown();
  
-@@ -369,25 +370,20 @@ public:
+@@ -369,22 +370,16 @@ public:
  #else
      bool current;
  #endif
@@ -44,16 +44,12 @@ diff --git a/ipc/glue/BackgroundImpl.cpp b/ipc/glue/BackgroundImpl.cpp
    ChildImpl()
    : mBoundThread(nullptr)
    , mActorDestroyed(false)
-+  , mReleaseOnActorDestroy(false)
    {
      AssertIsOnMainThread();
    }
  
    NS_INLINE_DECL_REFCOUNTING(ChildImpl)
- 
- private:
-   // Forwarded from BackgroundChild.
-@@ -409,47 +405,56 @@ private:
+@@ -409,47 +404,56 @@ private:
    // Forwarded from BackgroundChild.
    static void
    CloseForCurrentThread();
@@ -63,21 +59,15 @@ diff --git a/ipc/glue/BackgroundImpl.cpp b/ipc/glue/BackgroundImpl.cpp
    GetThreadLocalForCurrentThread();
  
 +  void
-+  DoRelease()
++  ProxyReleaseToMainThread()
 +  {
++    // ChildImpl uses non-threadsafe ref counts, so we must release on
++    // the same thread where it was created; the main thread.
++    ChildImpl* actor;
++    mSelfRefWhileWaitingForActorDestroy.forget(&actor);
 +    nsCOMPtr<nsIRunnable> releaser =
-+      NS_NewNonOwningRunnableMethod(this, &ChildImpl::Release);
++      NS_NewNonOwningRunnableMethod(actor, &ChildImpl::Release);
 +    MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(releaser)));
-+  }
-+
-+  void
-+  ReleaseOnActorDestroy()
-+  {
-+    if (mActorDestroyed) {
-+      DoRelease();
-+      return;
-+    }
-+    mReleaseOnActorDestroy = true;
 +  }
 +
    static void
@@ -87,7 +77,7 @@ diff --git a/ipc/glue/BackgroundImpl.cpp b/ipc/glue/BackgroundImpl.cpp
  
      if (threadLocalInfo) {
        if (threadLocalInfo->mActor) {
-         threadLocalInfo->mActor->Close();
+-        threadLocalInfo->mActor->Close();
 -        threadLocalInfo->mActor->AssertActorDestroyed();
 -        // Since the actor is created on the main thread it must only
 -        // be released on the main thread as well.
@@ -99,9 +89,15 @@ diff --git a/ipc/glue/BackgroundImpl.cpp b/ipc/glue/BackgroundImpl.cpp
 -            NS_NewNonOwningRunnableMethod(actor, &ChildImpl::Release);
 -          MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(releaser)));
 -        }
++        // Close() can call ActorDestroy() either sync or async, so we must
++        // handle both.  Set a self-reference on actor which will then be
++        // released automatically when ActorDestroy() is called; either
++        // immediately or later.
 +        ChildImpl* actor;
 +        threadLocalInfo->mActor.forget(&actor);
-+        actor->ReleaseOnActorDestroy();
++        MOZ_ASSERT(!actor->mSelfRefWhileWaitingForActorDestroy);
++        actor->mSelfRefWhileWaitingForActorDestroy = dont_AddRef(actor);
++        actor->Close();
        }
        delete threadLocalInfo;
      }
@@ -114,6 +110,7 @@ diff --git a/ipc/glue/BackgroundImpl.cpp b/ipc/glue/BackgroundImpl.cpp
    ~ChildImpl()
    {
 -    AssertActorDestroyed();
++    MOZ_ASSERT(mActorDestroyed);
    }
  
    void
@@ -122,20 +119,17 @@ diff --git a/ipc/glue/BackgroundImpl.cpp b/ipc/glue/BackgroundImpl.cpp
      THREADSAFETY_ASSERT(!mBoundThread);
  
  #if defined(DEBUG) || !defined(RELEASE_BUILD)
-@@ -2003,18 +2008,21 @@ ChildImpl::DispatchFailureCallback(nsIEv
-   }
- }
+@@ -2005,16 +2009,19 @@ ChildImpl::DispatchFailureCallback(nsIEv
  
  void
  ChildImpl::ActorDestroy(ActorDestroyReason aWhy)
  {
    AssertIsOnBoundThread();
  
-+  BackgroundChildImpl::ActorDestroy(aWhy);
    mActorDestroyed = true;
--  BackgroundChildImpl::ActorDestroy(aWhy);
-+  if (mReleaseOnActorDestroy) {
-+    DoRelease();
+   BackgroundChildImpl::ActorDestroy(aWhy);
++  if (mSelfRefWhileWaitingForActorDestroy) {
++    ProxyReleaseToMainThread();
 +  }
  }
  
@@ -148,7 +142,18 @@ diff --git a/ipc/glue/BackgroundImpl.cpp b/ipc/glue/BackgroundImpl.cpp
 diff --git a/ipc/glue/MessagePump.cpp b/ipc/glue/MessagePump.cpp
 --- a/ipc/glue/MessagePump.cpp
 +++ b/ipc/glue/MessagePump.cpp
-@@ -54,16 +54,24 @@ public:
+@@ -43,34 +43,32 @@ namespace mozilla {
+ namespace ipc {
+ 
+ class DoWorkRunnable MOZ_FINAL : public nsICancelableRunnable,
+                                  public nsITimerCallback
+ {
+ public:
+   DoWorkRunnable(MessagePump* aPump)
+   : mPump(aPump)
+-  , mCanceled(false)
+-  , mCallingRunWhileCanceled(false)
+   {
      MOZ_ASSERT(aPump);
    }
  
@@ -157,37 +162,75 @@ diff --git a/ipc/glue/MessagePump.cpp b/ipc/glue/MessagePump.cpp
    NS_DECL_NSITIMERCALLBACK
    NS_DECL_NSICANCELABLERUNNABLE
  
-+  // The pump reuses the same DoWorkRunnable object, so allow
-+  // the cancel to be cleared before rescheduling.
-+  void ClearCancel()
-+  {
-+    MOZ_ASSERT(!mCallingRunWhileCanceled);
-+    mCanceled = false;
-+  }
-+
  private:
    ~DoWorkRunnable()
    { }
  
    MessagePump* mPump;
-   bool mCanceled;
-   bool mCallingRunWhileCanceled;
+-  bool mCanceled;
+-  bool mCallingRunWhileCanceled;
++  // DoWorkRunnable is designed as a stateless singleton.  Don't add stateful
++  // members here!
  };
-@@ -151,16 +159,17 @@ if (did_work && delayed_work_time_.is_nu
-   keep_running_ = true;
+ 
+ } /* namespace ipc */
+ } /* namespace mozilla */
+ 
+ MessagePump::MessagePump()
+ : mThread(nullptr)
+ {
+@@ -219,21 +217,16 @@ MessagePump::DoDelayedWork(base::Message
+ }
+ 
+ NS_IMPL_ISUPPORTS(DoWorkRunnable, nsIRunnable, nsITimerCallback,
+                                   nsICancelableRunnable)
+ 
+ NS_IMETHODIMP
+ DoWorkRunnable::Run()
+ {
+-  MOZ_ASSERT(!mCanceled || mCallingRunWhileCanceled);
+-  if (mCanceled && !mCallingRunWhileCanceled) {
+-    return NS_OK;
+-  }
+-
+   MessageLoop* loop = MessageLoop::current();
+   MOZ_ASSERT(loop);
+ 
+   bool nestableTasksAllowed = loop->NestableTasksAllowed();
+ 
+   // MessageLoop::RunTask() disallows nesting, but our Frankenventloop will
+   // always dispatch DoWork() below from what looks to MessageLoop like a nested
+   // context.  So we unconditionally allow nesting here.
+@@ -253,26 +246,23 @@ DoWorkRunnable::Notify(nsITimer* aTimer)
+   mPump->DoDelayedWork(loop);
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ DoWorkRunnable::Cancel()
+ {
+-  MOZ_ASSERT(!mCanceled);
+-  MOZ_ASSERT(!mCallingRunWhileCanceled);
+-
+   // Workers require cancelable runnables, but we can't really cancel cleanly
+-  // here.  If we don't process all of these then we will leave something
+-  // unprocessed in the chromium queue.  Therefore, eagerly complete our work
+-  // instead by immediately calling Run().
+-  mCanceled = true;
+-  mozilla::AutoRestore<bool> guard(mCallingRunWhileCanceled);
+-  mCallingRunWhileCanceled = true;
++  // here.  If we don't process this runnable then we will leave something
++  // unprocessed in the message_loop.  Therefore, eagerly complete our work
++  // instead by immediately calling Run().  Run() should not be called
++  // separately after this.  Unfortunately we cannot use flags to verify this
++  // because DoWorkRunnable is a stateless singleton that can be in the event
++  // queue multiple times simultaneously.
+   Run();
+   return NS_OK;
  }
  
  void
- MessagePump::ScheduleWork()
+ MessagePumpForChildProcess::Run(base::MessagePump::Delegate* aDelegate)
  {
-   // Make sure the event loop wakes up.
-   if (mThread) {
-+    mDoWorkEvent->ClearCancel();
-     mThread->Dispatch(mDoWorkEvent, NS_DISPATCH_NORMAL);
-   }
-   else {
-     // Some things (like xpcshell) don't use the app shell and so Run hasn't
-     // been called. We still need to wake up the main thread.
-     NS_DispatchToMainThread(mDoWorkEvent);
-   }
-   event_.Signal();
+   if (mFirstRun) {
