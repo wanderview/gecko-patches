@@ -6,7 +6,58 @@ Bug 1032011 Handle async ActorDestroy() callback when closing PBackground. r=ben
 diff --git a/ipc/glue/BackgroundImpl.cpp b/ipc/glue/BackgroundImpl.cpp
 --- a/ipc/glue/BackgroundImpl.cpp
 +++ b/ipc/glue/BackgroundImpl.cpp
-@@ -345,17 +345,18 @@ class ChildImpl MOZ_FINAL : public Backg
+@@ -1,30 +1,32 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+  * You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "base/process_util.h"
+ #include "mozilla/Assertions.h"
+ #include "mozilla/Atomics.h"
++#include "mozilla/AutoRestore.h"
+ #include "mozilla/ClearOnShutdown.h"
+ #include "mozilla/DebugOnly.h"
+ #include "mozilla/Services.h"
+ #include "mozilla/StaticPtr.h"
+ #include "mozilla/unused.h"
+ #include "mozilla/dom/ContentChild.h"
+ #include "mozilla/dom/ContentParent.h"
+ #include "mozilla/ipc/ProtocolTypes.h"
+ #include "BackgroundChild.h"
+ #include "BackgroundChildImpl.h"
+ #include "BackgroundParent.h"
+ #include "BackgroundParentImpl.h"
+ #include "GeckoProfiler.h"
+ #include "nsAutoPtr.h"
+ #include "nsCOMPtr.h"
++#include "nsICancelableRunnable.h"
+ #include "nsIEventTarget.h"
+ #include "nsIIPCBackgroundChildCreateCallback.h"
+ #include "nsIObserver.h"
+ #include "nsIObserverService.h"
+ #include "nsIRunnable.h"
+ #include "nsISupportsImpl.h"
+ #include "nsIThread.h"
+ #include "nsITimer.h"
+@@ -310,16 +312,17 @@ class ChildImpl MOZ_FINAL : public Backg
+   typedef mozilla::ipc::Transport Transport;
+ 
+   class ShutdownObserver;
+   class CreateActorRunnable;
+   class ParentCreateCallback;
+   class CreateCallbackRunnable;
+   class OpenChildProcessActorRunnable;
+   class OpenMainProcessActorRunnable;
++  class DelayedReleaseRunnable;
+ 
+   // A thread-local index that is not valid.
+   static const unsigned int kBadThreadLocalIndex =
+     static_cast<unsigned int>(-1);
+ 
+   // This is only modified on the main thread. It is the thread-local index that
+   // we use to store the BackgroundChild for each thread.
+   static unsigned int sThreadLocalIndex;
+@@ -345,17 +348,18 @@ class ChildImpl MOZ_FINAL : public Backg
    static bool sShutdownHasStarted;
  
  #ifdef RELEASE_BUILD
@@ -16,8 +67,8 @@ diff --git a/ipc/glue/BackgroundImpl.cpp b/ipc/glue/BackgroundImpl.cpp
  #endif
  
 -  DebugOnly<bool> mActorDestroyed;
-+  bool mActorDestroyed;
 +  nsRefPtr<ChildImpl> mSelfRefWhileWaitingForActorDestroy;
++  bool mActorDestroyed;
  
  public:
    static bool
@@ -26,7 +77,7 @@ diff --git a/ipc/glue/BackgroundImpl.cpp b/ipc/glue/BackgroundImpl.cpp
    static void
    Shutdown();
  
-@@ -369,22 +370,16 @@ public:
+@@ -369,22 +373,16 @@ public:
  #else
      bool current;
  #endif
@@ -49,7 +100,7 @@ diff --git a/ipc/glue/BackgroundImpl.cpp b/ipc/glue/BackgroundImpl.cpp
    }
  
    NS_INLINE_DECL_REFCOUNTING(ChildImpl)
-@@ -416,40 +411,39 @@ private:
+@@ -416,40 +414,40 @@ private:
  
    static void
    ThreadLocalDestructor(void* aThreadLocal)
@@ -76,6 +127,7 @@ diff --git a/ipc/glue/BackgroundImpl.cpp b/ipc/glue/BackgroundImpl.cpp
 -            NS_NewNonOwningRunnableMethod(actor, &ChildImpl::Release);
 -          MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(releaser)));
 -        }
++        MOZ_ASSERT(!actor->mActorDestroyed);
 +        MOZ_ASSERT(!actor->mSelfRefWhileWaitingForActorDestroy);
 +        actor->mSelfRefWhileWaitingForActorDestroy = dont_AddRef(actor);
 +
@@ -101,7 +153,104 @@ diff --git a/ipc/glue/BackgroundImpl.cpp b/ipc/glue/BackgroundImpl.cpp
      THREADSAFETY_ASSERT(!mBoundThread);
  
  #if defined(DEBUG) || !defined(RELEASE_BUILD)
-@@ -2003,18 +1997,32 @@ ChildImpl::DispatchFailureCallback(nsIEv
+@@ -772,16 +770,44 @@ public:
+ 
+ private:
+   ~OpenMainProcessActorRunnable()
+   { }
+ 
+   NS_DECL_NSIRUNNABLE
+ };
+ 
++class ChildImpl::DelayedReleaseRunnable MOZ_FINAL :
++  public nsICancelableRunnable
++{
++private:
++  nsRefPtr<ChildImpl> mActor;
++  bool mCanceled;
++  bool mCallingRunWhileCanceled;
++
++public:
++
++  DelayedReleaseRunnable(already_AddRefed<ChildImpl> aActor)
++    : mActor(aActor)
++    , mCanceled(false)
++    , mCallingRunWhileCanceled(false)
++  {
++    MOZ_ASSERT(mActor);
++  }
++
++  NS_DECL_ISUPPORTS
++
++private:
++  ~DelayedReleaseRunnable()
++  { }
++
++  NS_DECL_NSIRUNNABLE
++  NS_DECL_NSICANCELABLERUNNABLE
++};
++
+ } // anonymous namespace
+ 
+ namespace mozilla {
+ namespace ipc {
+ 
+ bool
+ IsOnBackgroundThread()
+ {
+@@ -1889,16 +1915,51 @@ ChildImpl::OpenMainProcessActorRunnable:
+   while (callback) {
+     callback->ActorCreated(childActor);
+     callback = GetNextCallback();
+   }
+ 
+   return NS_OK;
+ }
+ 
++NS_IMPL_ISUPPORTS(ChildImpl::DelayedReleaseRunnable, nsIRunnable,
++                                                     nsICancelableRunnable);
++
++NS_IMETHODIMP
++ChildImpl::DelayedReleaseRunnable::Run()
++{
++  MOZ_ASSERT(!mCanceled || mCallingRunWhileCanceled);
++
++  // ChildImpl uses non-threadsafe ref counts, so we must release on
++  // the same thread where it was created; the main thread.
++  ChildImpl* actor;
++  mActor.forget(&actor);
++  MOZ_ASSERT(actor);
++
++  nsCOMPtr<nsIRunnable> releaser =
++    NS_NewNonOwningRunnableMethod(actor, &ChildImpl::Release);
++  MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(releaser)));
++
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++ChildImpl::DelayedReleaseRunnable::Cancel()
++{
++  MOZ_ASSERT(!mCanceled);
++  mCanceled = true;
++
++  AutoRestore<bool> restore(mCallingRunWhileCanceled);
++  mCallingRunWhileCanceled = true;
++
++  MOZ_ALWAYS_TRUE(NS_SUCCEEDED(Run()));
++
++  return NS_OK;
++}
++
+ NS_IMPL_ISUPPORTS_INHERITED0(ChildImpl::CreateActorRunnable, nsRunnable)
+ 
+ NS_IMETHODIMP
+ ChildImpl::CreateActorRunnable::Run()
+ {
+   AssertIsOnMainThread();
+ 
+   if (!OpenProtocolOnMainThread(mEventTarget)) {
+@@ -2003,18 +2064,28 @@ ChildImpl::DispatchFailureCallback(nsIEv
    }
  }
  
@@ -115,17 +264,13 @@ diff --git a/ipc/glue/BackgroundImpl.cpp b/ipc/glue/BackgroundImpl.cpp
 +
    BackgroundChildImpl::ActorDestroy(aWhy);
 +
-+  if (mSelfRefWhileWaitingForActorDestroy) {
-+    // ChildImpl uses non-threadsafe ref counts, so we must release on
-+    // the same thread where it was created; the main thread.
-+    ChildImpl* actor;
-+    mSelfRefWhileWaitingForActorDestroy.forget(&actor);
-+    MOZ_ASSERT(actor);
-+
-+    nsCOMPtr<nsIRunnable> releaser =
-+      NS_NewNonOwningRunnableMethod(actor, &ChildImpl::Release);
-+    MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(releaser)));
-+  }
++  // We need to release, but there is additional teardown work for the actor
++  // after leaving ActorDestroy().  Therefore, dispatch to the current thread
++  // to guarantee this work has completed before starting the release.
++  MOZ_ASSERT(mSelfRefWhileWaitingForActorDestroy);
++  nsCOMPtr<nsIRunnable> delayedRelease =
++    new DelayedReleaseRunnable(mSelfRefWhileWaitingForActorDestroy.forget());
++  MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToCurrentThread(delayedRelease)));
  }
  
  NS_IMPL_ISUPPORTS(ChildImpl::ShutdownObserver, nsIObserver)
@@ -137,7 +282,25 @@ diff --git a/ipc/glue/BackgroundImpl.cpp b/ipc/glue/BackgroundImpl.cpp
 diff --git a/ipc/glue/MessagePump.cpp b/ipc/glue/MessagePump.cpp
 --- a/ipc/glue/MessagePump.cpp
 +++ b/ipc/glue/MessagePump.cpp
-@@ -43,34 +43,32 @@ namespace mozilla {
+@@ -8,17 +8,16 @@
+ #include "nsIThread.h"
+ #include "nsITimer.h"
+ #include "nsICancelableRunnable.h"
+ 
+ #include "base/basictypes.h"
+ #include "base/logging.h"
+ #include "base/scoped_nsautorelease_pool.h"
+ #include "mozilla/Assertions.h"
+-#include "mozilla/AutoRestore.h"
+ #include "mozilla/DebugOnly.h"
+ #include "nsComponentManagerUtils.h"
+ #include "nsDebug.h"
+ #include "nsServiceManagerUtils.h"
+ #include "nsString.h"
+ #include "nsThreadUtils.h"
+ #include "nsTimerImpl.h"
+ #include "nsXULAppAPI.h"
+@@ -43,34 +42,32 @@ namespace mozilla {
  namespace ipc {
  
  class DoWorkRunnable MOZ_FINAL : public nsICancelableRunnable,
@@ -174,7 +337,7 @@ diff --git a/ipc/glue/MessagePump.cpp b/ipc/glue/MessagePump.cpp
  MessagePump::MessagePump()
  : mThread(nullptr)
  {
-@@ -219,21 +217,16 @@ MessagePump::DoDelayedWork(base::Message
+@@ -219,21 +216,16 @@ MessagePump::DoDelayedWork(base::Message
  }
  
  NS_IMPL_ISUPPORTS(DoWorkRunnable, nsIRunnable, nsITimerCallback,
@@ -196,7 +359,7 @@ diff --git a/ipc/glue/MessagePump.cpp b/ipc/glue/MessagePump.cpp
    // MessageLoop::RunTask() disallows nesting, but our Frankenventloop will
    // always dispatch DoWork() below from what looks to MessageLoop like a nested
    // context.  So we unconditionally allow nesting here.
-@@ -253,26 +246,23 @@ DoWorkRunnable::Notify(nsITimer* aTimer)
+@@ -253,26 +245,23 @@ DoWorkRunnable::Notify(nsITimer* aTimer)
    mPump->DoDelayedWork(loop);
  
    return NS_OK;
