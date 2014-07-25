@@ -1,0 +1,158 @@
+# HG changeset patch
+# Parent f14c1dc5862cb730def0f583525adbd21fbaff04
+# User Ben Kelly <ben@wanderview.com>
+try: -b do -p emulator -u mochitests -t none
+
+diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
+--- a/dom/workers/RuntimeService.cpp
++++ b/dom/workers/RuntimeService.cpp
+@@ -2734,19 +2734,22 @@ WorkerThreadPrimaryRunnable::Run()
+       {
+         JSAutoRequest ar(cx);
+ 
+         mWorkerPrivate->DoRunLoop(cx);
+ 
+         JS_ReportPendingException(cx);
+       }
+ 
+-      // WorkerPrivate should have closed the actor when it cleared
+-      // its event loop on close/cancel/terminate.
+-      MOZ_ASSERT(!BackgroundChild::GetForCurrentThread());
++      // WorkerPrivate may have closed the actor when it cleared
++      // its event loop on terminate/cancel/kill.  Some paths, however,
++      // do not close the actor, so catch those here.
++      if (BackgroundChild::GetForCurrentThread()) {
++        BackgroundChild::CloseForCurrentThread();
++      }
+ 
+ #ifdef MOZ_ENABLE_PROFILER_SPS
+       if (stack) {
+         stack->sampleRuntime(nullptr);
+       }
+ #endif
+     }
+ 
+diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
+--- a/dom/workers/WorkerPrivate.cpp
++++ b/dom/workers/WorkerPrivate.cpp
+@@ -4515,43 +4515,42 @@ WorkerPrivate::ProcessAllControlRunnable
+ 
+ void
+ WorkerPrivate::ClearMainEventQueue(WorkerRanOrNot aRanOrNot)
+ {
+   using mozilla::ipc::BackgroundChild;
+ 
+   AssertIsOnWorkerThread();
+ 
++  MOZ_ASSERT(!mCancelAllPendingRunnables);
++  mCancelAllPendingRunnables = true;
++
+   // In order to ensure that the event queue remains empty
+   // we must stop any IPC traffic in progress.
+-  // XXX: This prevents PBackground usage by the script after
+-  //      it calls close().  Also, prevents usage during close
++  // XXX: This prevents PBackground usage by script in the close
+   //      event handler.
+-  if (BackgroundChild::GetForCurrentThread()) {
++  if (mStatus >= Terminating && BackgroundChild::GetForCurrentThread()) {
+     BackgroundChild::CloseForCurrentThread();
+   }
+ 
+-  MOZ_ASSERT(!mCancelAllPendingRunnables);
+-  mCancelAllPendingRunnables = true;
+-
+   if (WorkerNeverRan == aRanOrNot) {
+     for (uint32_t count = mPreStartRunnables.Length(), index = 0;
+          index < count;
+          index++) {
+       nsRefPtr<WorkerRunnable> runnable = mPreStartRunnables[index].forget();
+       static_cast<nsIRunnable*>(runnable.get())->Run();
+     }
+   } else {
+     nsIThread* currentThread = NS_GetCurrentThread();
+     MOZ_ASSERT(currentThread);
+ 
+     NS_ProcessPendingEvents(currentThread);
+     // XXX: If we must permit PBackground IPC traffic after we leave the
+     //      Running state, then this assertion cannot be guaranteed.
+-    MOZ_ASSERT(!NS_HasPendingEvents(currentThread));
++    MOZ_ASSERT(mStatus >= Terminating && !NS_HasPendingEvents(currentThread));
+   }
+ 
+   MOZ_ASSERT(mCancelAllPendingRunnables);
+   mCancelAllPendingRunnables = false;
+ }
+ 
+ uint32_t
+ WorkerPrivate::RemainingRunTimeMS() const
+diff --git a/ipc/glue/MessageChannel.h b/ipc/glue/MessageChannel.h
+--- a/ipc/glue/MessageChannel.h
++++ b/ipc/glue/MessageChannel.h
+@@ -37,16 +37,18 @@ class RefCountedMonitor : public Monitor
+     NS_INLINE_DECL_THREADSAFE_REFCOUNTING(RefCountedMonitor)
+ 
+   private:
+     ~RefCountedMonitor() {}
+ };
+ 
+ class MessageChannel : HasResultCodes
+ {
++#define AssertWorkerThread() _AssertWorkerThread(__FILE__, __LINE__)
++
+     friend class ProcessLink;
+     friend class ThreadLink;
+     friend class AutoEnterRPCTransaction;
+ 
+     class CxxStackFrame;
+     class InterruptFrame;
+ 
+     typedef mozilla::Monitor Monitor;
+@@ -351,18 +353,22 @@ class MessageChannel : HasResultCodes
+ 
+   private:
+     // Run on the not current thread.
+     void NotifyChannelClosed();
+     void NotifyMaybeChannelError();
+ 
+   private:
+     // Can be run on either thread
+-    void AssertWorkerThread() const
++    void _AssertWorkerThread(const char* file, uint32_t line) const
+     {
++        if (mWorkerLoopID != MessageLoop::current()->id()) {
++          printf_stderr("### ### AssertWorkerThread() failed - mWorkerLoopID:%d current:%d at %s:%lu\n",
++                        mWorkerLoopID, MessageLoop::current()->id(), file, line);
++        }
+         NS_ABORT_IF_FALSE(mWorkerLoopID == MessageLoop::current()->id(),
+                           "not on worker thread!");
+     }
+ 
+     // The "link" thread is either the I/O thread (ProcessLink) or the
+     // other actor's work thread (ThreadLink).  In either case, it is
+     // NOT our worker thread.
+     void AssertLinkThread() const
+diff --git a/ipc/glue/MessageLink.cpp b/ipc/glue/MessageLink.cpp
+--- a/ipc/glue/MessageLink.cpp
++++ b/ipc/glue/MessageLink.cpp
+@@ -337,16 +337,21 @@ ProcessLink::OnTakeConnectedChannel()
+ 
+ void
+ ProcessLink::OnChannelConnected(int32_t peer_pid)
+ {
+     AssertIOThread();
+ 
+     {
+         MonitorAutoLock lock(*mChan->mMonitor);
++        // Do not proceed if channel was closed or errored before connection
++        // could be completed.
++        if (mChan->mChannelState != ChannelOpening) {
++          return;
++        }
+         mChan->mChannelState = ChannelConnected;
+         mChan->mMonitor->Notify();
+     }
+ 
+     if (mExistingListener)
+         mExistingListener->OnChannelConnected(peer_pid);
+ 
+     mChan->OnChannelConnected(peer_pid);
