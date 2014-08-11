@@ -1,0 +1,197 @@
+# HG changeset patch
+# Parent e66e1130da318dd06853572df55373a3196f9d10
+# User Ben Kelly <ben@wanderview.com>
+Bug 1049801 Cancel the DispatchOnChannelConnected runnable when destructing the MessageChannel.
+
+diff --git a/ipc/glue/MessageChannel.cpp b/ipc/glue/MessageChannel.cpp
+--- a/ipc/glue/MessageChannel.cpp
++++ b/ipc/glue/MessageChannel.cpp
+@@ -200,29 +200,35 @@ MessageChannel::MessageChannel(MessageLi
+     mPendingSyncReplies(0),
+     mPendingUrgentReplies(0),
+     mPendingRPCReplies(0),
+     mCurrentRPCTransaction(0),
+     mDispatchingSyncMessage(false),
+     mDispatchingUrgentMessageCount(0),
+     mRemoteStackDepthGuess(false),
+     mSawInterruptOutMsg(false),
+-    mAbortOnError(false)
++    mAbortOnError(false),
++    mPeerPidSet(false),
++    mPeerPid(-1)
+ {
+     MOZ_COUNT_CTOR(ipc::MessageChannel);
+ 
+ #ifdef OS_WIN
+     mTopFrame = nullptr;
+     mIsSyncWaitingOnNonMainThread = false;
+ #endif
+ 
+     mDequeueOneTask = new RefCountedTask(NewRunnableMethod(
+                                                  this,
+                                                  &MessageChannel::OnMaybeDequeueOne));
+ 
++    mOnChannelConnectedTask = new RefCountedTask(NewRunnableMethod(
++        this,
++        &MessageChannel::DispatchOnChannelConnected));
++
+ #ifdef OS_WIN
+     mEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+     NS_ASSERTION(mEvent, "CreateEvent failed! Nothing is going to work!");
+ #endif
+ }
+ 
+ MessageChannel::~MessageChannel()
+ {
+@@ -275,16 +281,18 @@ MessageChannel::Clear()
+     // before mListener.  But just to be safe, mListener is a weak pointer.
+ 
+     mDequeueOneTask->Cancel();
+ 
+     mWorkerLoop = nullptr;
+     delete mLink;
+     mLink = nullptr;
+ 
++    mOnChannelConnectedTask->Cancel();
++
+     if (mChannelErrorTask) {
+         mChannelErrorTask->Cancel();
+         mChannelErrorTask = nullptr;
+     }
+ 
+     // Free up any memory used by pending messages.
+     mPending.clear();
+     mPendingUrgentRequest = nullptr;
+@@ -1415,29 +1423,40 @@ MessageChannel::SetReplyTimeoutMs(int32_
+     mTimeoutMs = (aTimeoutMs <= 0)
+                  ? kNoTimeout
+                  : (int32_t)ceil((double)aTimeoutMs / 2.0);
+ }
+ 
+ void
+ MessageChannel::OnChannelConnected(int32_t peer_id)
+ {
+-    mWorkerLoop->PostTask(
+-        FROM_HERE,
+-        NewRunnableMethod(this,
+-                          &MessageChannel::DispatchOnChannelConnected,
+-                          peer_id));
++    {
++      MonitorAutoLock lock(*mMonitor);
++      MOZ_ASSERT(!mPeerPidSet);
++      mPeerPid = peer_id;
++      mPeerPidSet = true;
++    }
++    mWorkerLoop->PostTask(FROM_HERE, new DequeueTask(mOnChannelConnectedTask));
+ }
+ 
+ void
+-MessageChannel::DispatchOnChannelConnected(int32_t peer_pid)
++MessageChannel::DispatchOnChannelConnected()
+ {
+     AssertWorkerThread();
+-    if (mListener)
+-        mListener->OnChannelConnected(peer_pid);
++    if (!mListener) {
++      return;
++    }
++
++    int32_t peerPid;
++    {
++      MonitorAutoLock lock(*mMonitor);
++      MOZ_ASSERT(mPeerPidSet);
++      peerPid = mPeerPid;
++    }
++    mListener->OnChannelConnected(peerPid);
+ }
+ 
+ void
+ MessageChannel::ReportMessageRouteError(const char* channelName) const
+ {
+     PrintErrorMessage(mSide, channelName, "Need a route");
+     mListener->OnProcessingError(MsgRouteError);
+ }
+diff --git a/ipc/glue/MessageChannel.h b/ipc/glue/MessageChannel.h
+--- a/ipc/glue/MessageChannel.h
++++ b/ipc/glue/MessageChannel.h
+@@ -6,16 +6,17 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef ipc_glue_MessageChannel_h
+ #define ipc_glue_MessageChannel_h 1
+ 
+ #include "base/basictypes.h"
+ #include "base/message_loop.h"
+ 
++#include "mozilla/DebugOnly.h"
+ #include "mozilla/Monitor.h"
+ #include "mozilla/Vector.h"
+ #include "mozilla/WeakPtr.h"
+ #include "mozilla/ipc/Transport.h"
+ #include "MessageLink.h"
+ #include "nsAutoPtr.h"
+ 
+ #include <deque>
+@@ -184,17 +185,17 @@ class MessageChannel : HasResultCodes
+     void OnNotifyMaybeChannelError();
+     void ReportConnectionError(const char* aChannelName) const;
+     void ReportMessageRouteError(const char* channelName) const;
+     bool MaybeHandleError(Result code, const char* channelName);
+ 
+     void Clear();
+ 
+     // Send OnChannelConnected notification to listeners.
+-    void DispatchOnChannelConnected(int32_t peer_pid);
++    void DispatchOnChannelConnected();
+ 
+     // Any protocol that requires blocking until a reply arrives, will send its
+     // outgoing message through this function. Currently, two protocols do this:
+     //
+     //  sync, which can only initiate messages from child to parent.
+     //  urgent, which can only initiate messages from parent to child.
+     //
+     // SendAndWait() expects that the worker thread owns the monitor, and that
+@@ -634,14 +635,18 @@ class MessageChannel : HasResultCodes
+ 
+ #ifdef OS_WIN
+     HANDLE mEvent;
+ #endif
+ 
+     // Should the channel abort the process from the I/O thread when
+     // a channel error occurs?
+     bool mAbortOnError;
++
++    nsRefPtr<RefCountedTask> mOnChannelConnectedTask;
++    DebugOnly<bool> mPeerPidSet;
++    int32_t mPeerPid;
+ };
+ 
+ } // namespace ipc
+ } // namespace mozilla
+ 
+ #endif  // ifndef ipc_glue_MessageChannel_h
+diff --git a/ipc/glue/MessageLink.cpp b/ipc/glue/MessageLink.cpp
+--- a/ipc/glue/MessageLink.cpp
++++ b/ipc/glue/MessageLink.cpp
+@@ -337,16 +337,21 @@ ProcessLink::OnTakeConnectedChannel()
+ 
+ void
+ ProcessLink::OnChannelConnected(int32_t peer_pid)
+ {
+     AssertIOThread();
+ 
+     {
+         MonitorAutoLock lock(*mChan->mMonitor);
++        // If the channel has errored out for some reason, do not force
++        // it back into the connected state.
++        if (NS_WARN_IF(mChan->mChannelState != ChannelOpening)) {
++          return;
++        }
+         mChan->mChannelState = ChannelConnected;
+         mChan->mMonitor->Notify();
+     }
+ 
+     if (mExistingListener)
+         mExistingListener->OnChannelConnected(peer_pid);
+ 
+     mChan->OnChannelConnected(peer_pid);
