@@ -1,0 +1,524 @@
+# HG changeset patch
+# Parent 019dba95698e0b3700534089c54799906901f46a
+# User Ben Kelly <ben@wanderview.com>
+Implement reading/writing Body data in Cache.
+
+diff --git a/dom/cache/CacheBodyManager.cpp b/dom/cache/CacheBodyManager.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/CacheBodyManager.cpp
+@@ -0,0 +1,358 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "mozilla/dom/CacheBodyManager.h"
++
++#include "mozilla/dom/CacheBodyManagerListener.h"
++#include "mozilla/dom/CacheQuotaRunnable.h"
++#include "nsIAsyncInputStream.h"
++#include "nsIUUIDGenerator.h"
++
++namespace {
++
++using mozilla::dom::CacheBodyManager;
++using mozilla::dom::CacheQuotaRunnable;
++
++static const uint32_t BUF_SIZE = 512;
++static const uint32_t NUM_BUFFERS = 3;
++
++class StreamCallback;
++
++class WriteRunnable MOZ_FINAL : public CacheQuotaRunnable
++{
++public:
++  WriteRunnable(const nsACString& aOrigin, const nsACString& aBaseDomain,
++                const nsACString& aQuotaId, const nsID& aBodyId)
++    : CacheQuotaRunnable(aOrigin, aBaseDomain, aQuotaId)
++    , mCallback(nullptr)
++    , mBodyId(aBodyId)
++    , mLength(0)
++    , mComplete(false)
++  {
++  }
++
++  void SetCallback(StreamCallback* aCallback) {
++    MOZ_ASSERT(!mComplete);
++    MOZ_ASSERT(!mCallback);
++    mCallback = aCallback;
++    MOZ_ASSERT(mCallback);
++  }
++
++  virtual void RunOnQuotaIOThread(const nsACString& aOrigin,
++                                  const nsACString& aBaseDomain,
++                                  nsIFile* aQuotaDir) MOZ_OVERRIDE
++  {
++    mResult = aQuotaDir->Append(NS_LITERAL_STRING("cache"));
++    if (NS_FAILED(mResult)) { return; }
++
++    mResult = aQuotaDir->Append(NS_LITERAL_STRING("data"));
++    if (NS_FAILED(mResult)) { return; }
++
++    bool exists;
++    mResult = aQuotaDir->Exists(&exists);
++    if (NS_FAILED(mResult)) { return; }
++
++    if (!exists) {
++      mResult = aQuotaDir->Create(nsIFile::DIRECTORY_TYPE, 0755);
++      if (NS_FAILED(mResult)) { return; }
++    }
++
++    nsCOMPtr<nsIFile> tmpFile;
++    mResult = aQuotaDir->Clone(getter_AddRefs(tmpFile));
++    if (NS_FAILED(mResult)) { return; }
++
++    char bodyIdBuf[NSID_LENGTH];
++    mBodyId.ToProvidedString(bodyIdBuf);
++
++    nsAutoCString tmpFileName(bodyIdBuf);
++    tmpFileName.Append(".tmp");
++
++    // TODO: consider NS_OpenAnonymousTemporaryFile() for auto-delete files
++    mResult = tmpFile->Append(NS_ConvertUTF8toUTF16(tmpFileName));
++    if (NS_FAILED(mResult)) { return; }
++
++    nsAutoCString finalFileName(bodyIdBuf);
++    finalFileName.Append(".final");
++
++    nsCOMPtr<nsIFile> finalFile;
++    mResult = aQuotaDir->Clone(getter_AddRefs(finalFile));
++    if (NS_FAILED(mResult)) { return; }
++
++    mResult = finalFile->Append(NS_ConvertUTF8toUTF16(finalFileName));
++    if (NS_FAILED(mResult)) { return; }
++
++    // Verify the final file for this body resource does not exist yet.
++    mResult = finalFile->Exists(&exists);
++    if (NS_FAILED(mResult)) { return; }
++    if (exists) {
++      mResult = NS_ERROR_UNEXPECTED;
++      return;
++    }
++
++    mResult = tmpFile->Exists(&exists);
++    if (NS_FAILED(mResult)) { return; }
++
++    if (!exists) {
++      mResult = tmpFile->Create(nsIFile::NORMAL_FILE_TYPE, 0644);
++      if (NS_FAILED(mResult)) { return; }
++    }
++
++    if (mLength > 0) {
++      AppendToTmpFile(tmpFile);
++      return;
++    }
++
++    mResult = finalFile->RenameTo(aQuotaDir, NS_ConvertUTF8toUTF16(finalFileName));
++    if (NS_FAILED(mResult)) { return; }
++
++    mComplete = true;
++  }
++
++  virtual void CompleteOnInitiatingThread(nsresult aRv) MOZ_OVERRIDE;
++
++  char* Buffer() { return mBuffer; }
++  uint32_t Capacity() const { return BUF_SIZE; }
++  uint32_t& Length() { return mLength; }
++  bool Busy() const { return !!mCallback; }
++
++private:
++  virtual ~WriteRunnable() { MOZ_ASSERT(!Busy()); }
++
++  void AppendToTmpFile(nsIFile* aTmpFile)
++  {
++    MOZ_ASSERT(aTmpFile);
++    bool exists;
++    mResult = aTmpFile->Exists(&exists);
++    if (NS_FAILED(mResult)) { return; }
++
++    nsCOMPtr<nsIOutputStream> outputStream;
++    mResult = NS_NewLocalFileOutputStream(getter_AddRefs(outputStream),
++                                aTmpFile, PR_APPEND, 0600);
++    if (NS_FAILED(mResult)) { return; }
++
++    MOZ_ASSERT(mLength < Capacity());
++
++    uint32_t curr = 0;
++    uint32_t remaining = mLength;
++    while (remaining > 0) {
++      uint32_t numWritten;
++      mResult = outputStream->Write(mBuffer + curr, remaining, &numWritten);
++      if (NS_FAILED(mResult)) { return; }
++      MOZ_ASSERT(numWritten <= remaining);
++      remaining -= numWritten;
++      curr += numWritten;
++    }
++  }
++
++  nsRefPtr<StreamCallback> mCallback;
++  const nsID mBodyId;
++  char mBuffer[BUF_SIZE];
++  uint32_t mLength;
++  bool mComplete;
++};
++
++class StreamCallback MOZ_FINAL : public nsIInputStreamCallback
++{
++public:
++  StreamCallback(CacheBodyManager* aManager, const nsID& aBodyId,
++                 const nsTArray<nsRefPtr<WriteRunnable>>& aBufferList)
++    : mManager(aManager)
++    , mBodyId(aBodyId)
++    , mBufferList(aBufferList)
++    , mNextBufferIndex(0)
++    , mPending(false)
++    , mFailure(NS_OK)
++  {
++    MOZ_ASSERT(mManager);
++    MOZ_ASSERT(mBufferList.Length() > 0);
++  }
++
++  NS_METHOD OnInputStreamReady(nsIAsyncInputStream* aStream)
++  {
++    MOZ_ASSERT(aStream);
++    MOZ_ASSERT(!mStream || mStream == aStream);
++    if (!mStream) {
++      mStream = aStream;
++    }
++
++    WriteRunnable* writer = mBufferList[mNextBufferIndex];
++    MOZ_ASSERT(writer);
++    if (writer->Busy()) {
++      mPending = true;
++      return NS_OK;
++    }
++
++    mNextBufferIndex += 1;
++    mNextBufferIndex %= mBufferList.Length();
++
++    nsresult rv = aStream->Read(writer->Buffer(), writer->Capacity(),
++                                &writer->Length());
++    if (NS_FAILED(rv)) {
++      mManager->OnWrite(mBodyId, rv);
++      return NS_OK;
++    }
++
++    writer->SetCallback(this);
++    rv = writer->Dispatch();
++    if (NS_FAILED(rv)) {
++      mManager->OnWrite(mBodyId, rv);
++    }
++
++    return NS_OK;
++  }
++
++  void OnWrite(nsresult aRv, bool mComplete)
++  {
++    // Completed cleanly
++    if (mComplete) {
++#ifdef DEBUG
++      for (uint32_t i = 0; i < mBufferList.Length(); ++i) {
++        MOZ_ASSERT(!mBufferList[i]->Busy());
++      }
++#endif
++      mBufferList.Clear();
++      mManager->OnWrite(mBodyId, aRv);
++      return;
++    }
++
++    // Check for failures and drain active buffers before terminating
++    mFailure = NS_FAILED(mFailure) ? mFailure : aRv;
++    if (NS_FAILED(mFailure)) {
++      for (uint32_t i = 0; i < mBufferList.Length(); ++i) {
++        if (mBufferList[i]->Busy()) {
++          return;
++        }
++      }
++      mBufferList.Clear();
++      mManager->OnWrite(mBodyId, aRv);
++      return;
++    }
++
++    // Handle any pending operations due to back pressue
++    if (mPending) {
++      OnInputStreamReady(mStream);
++      return;
++    }
++
++    // Otherwise schedule next buffer on available data
++    WriteRunnable* nextWriter = mBufferList[mNextBufferIndex];
++    MOZ_ASSERT(nextWriter);
++
++    aRv = mStream->AsyncWait(this, 0, nextWriter->Capacity(),
++                             NS_GetCurrentThread());
++    if (NS_FAILED(aRv)) { MOZ_CRASH("AsyncWait() failed"); }
++  }
++
++private:
++  ~StreamCallback() { }
++
++  nsRefPtr<CacheBodyManager> mManager;
++  const nsID mBodyId;
++  nsTArray<nsRefPtr<WriteRunnable>> mBufferList;
++  uint32_t mNextBufferIndex;
++  nsCOMPtr<nsIAsyncInputStream> mStream;
++  bool mPending;
++  nsresult mFailure;
++
++public:
++  NS_DECL_ISUPPORTS
++};
++
++NS_IMPL_ISUPPORTS(StreamCallback, nsIInputStreamCallback);
++
++void
++WriteRunnable::CompleteOnInitiatingThread(nsresult aRv)
++{
++  MOZ_ASSERT(mCallback);
++  StreamCallback* callback = mCallback;
++  mCallback = nullptr;
++  callback->OnWrite(aRv, mComplete);
++}
++
++} // anonymous namespace
++
++namespace mozilla {
++namespace dom {
++
++CacheBodyManager::CacheBodyManager(CacheBodyManagerListener* aListener,
++                                   const nsACString& aOrigin,
++                                   const nsACString& aBaseDomain,
++                                   const nsID& aCacheId)
++  : mListener(aListener)
++  , mOrigin(aOrigin)
++  , mBaseDomain(aBaseDomain)
++  , mCacheId(aCacheId)
++{
++}
++
++void
++CacheBodyManager::ClearListener()
++{
++  MOZ_ASSERT(mListener);
++  mListener = nullptr;
++}
++
++nsresult
++CacheBodyManager::Write(nsIAsyncInputStream* aSource, nsID* aBodyIdOut)
++{
++  MOZ_ASSERT(aSource);
++  MOZ_ASSERT(aBodyIdOut);
++
++  nsresult rv;
++  nsCOMPtr<nsIUUIDGenerator> uuidgen =
++    do_GetService("@mozilla.org/uuid-generator;1", &rv);
++  if (NS_FAILED(rv)) { return rv; }
++  MOZ_ASSERT(uuidgen);
++
++  rv = uuidgen->GenerateUUIDInPlace(aBodyIdOut);
++  if (NS_FAILED(rv)) { return rv; }
++
++  nsAutoCString quotaId("CacheBody:");
++  char bodyIdBuf[NSID_LENGTH];
++  aBodyIdOut->ToProvidedString(bodyIdBuf);
++  quotaId.Append(bodyIdBuf);
++
++  nsTArray<nsRefPtr<WriteRunnable>> bufferList;
++  for (uint32_t i = 0; i < NUM_BUFFERS; ++i) {
++    nsRefPtr<WriteRunnable>* el = bufferList.AppendElement();
++    if (!el) { return NS_ERROR_OUT_OF_MEMORY; }
++
++    *el = new WriteRunnable(mOrigin, mBaseDomain, quotaId, *aBodyIdOut);
++    if (!el) { return NS_ERROR_OUT_OF_MEMORY; }
++  }
++
++  nsRefPtr<StreamCallback> callback = new StreamCallback(this, *aBodyIdOut,
++                                                         bufferList);
++  if (!callback) { return NS_ERROR_OUT_OF_MEMORY; }
++
++  rv = aSource->AsyncWait(callback, 0, BUF_SIZE, NS_GetCurrentThread());
++  if (NS_FAILED(rv)) { return rv; }
++
++  return NS_OK;
++}
++
++void
++CacheBodyManager::Read(const nsID& aBodyID, nsIAsyncOutputStream* aDest)
++{
++  MOZ_ASSERT(aDest);
++  // TODO: implement me
++}
++
++void
++CacheBodyManager::OnWrite(const nsID& aBodyId, nsresult aRv)
++{
++  if (mListener) {
++    mListener->OnWrite(aBodyId, aRv);
++  }
++}
++
++CacheBodyManager::~CacheBodyManager()
++{
++  MOZ_ASSERT(!mListener);
++}
++
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/cache/CacheBodyManager.h b/dom/cache/CacheBodyManager.h
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/CacheBodyManager.h
+@@ -0,0 +1,53 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_cache_CacheBodyManager_h
++#define mozilla_dom_cache_CacheBodyManager_h
++
++#include "nsID.h"
++#include "nsISupportsImpl.h"
++
++class nsIAsyncInputStream;
++class nsIAsyncOutputStream;
++
++namespace mozilla {
++namespace dom {
++
++class CacheBodyManagerListener;
++
++class CacheBodyManager MOZ_FINAL
++{
++public:
++  CacheBodyManager(CacheBodyManagerListener* aListener,
++                   const nsACString& aOrigin, const nsACString& aBaseDomain,
++                   const nsID& aCacheId);
++
++  void ClearListener();
++
++  nsresult Write(nsIAsyncInputStream* aSource, nsID* aBodyIdOut);
++  void Read(const nsID& aBodyID, nsIAsyncOutputStream* aDest);
++
++  void OnWrite(const nsID& aBodyId, nsresult aRv);
++
++private:
++  ~CacheBodyManager();
++
++  CacheBodyManager() MOZ_DELETE;
++  CacheBodyManager& operator=(CacheBodyManager&) MOZ_DELETE;
++
++  CacheBodyManagerListener* mListener;
++  const nsCString mOrigin;
++  const nsCString mBaseDomain;
++  const nsID mCacheId;
++
++public:
++  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(CacheBodyManager)
++};
++
++} // namespace dom
++} // namespace mozilla
++
++#endif
+diff --git a/dom/cache/CacheBodyManagerListener.h b/dom/cache/CacheBodyManagerListener.h
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/CacheBodyManagerListener.h
+@@ -0,0 +1,31 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_cache_CacheBodyManagerListener_h
++#define mozilla_dom_cache_CacheBodyManagerListener_h
++
++#include "nsID.h"
++#include "nsISupportsImpl.h"
++
++class nsIAsyncInputStream;
++
++namespace mozilla {
++namespace dom {
++
++class CacheBodyManagerListener
++{
++public:
++  virtual ~CacheBodyManagerListener() { }
++
++  virtual void OnWrite(const nsID& aBodyId, nsresult aRv)=0;
++  virtual void OnRead(const nsID& aBodyId, nsresult aRv,
++                      nsIAsyncInputStream* aSource)=0;
++};
++
++} // namespace dom
++} // namespace mozilla
++
++#endif // mozilla_dom_cache_CacheBodyManagerListener_h
+diff --git a/dom/cache/CacheQuotaRunnable.h b/dom/cache/CacheQuotaRunnable.h
+--- a/dom/cache/CacheQuotaRunnable.h
++++ b/dom/cache/CacheQuotaRunnable.h
+@@ -45,16 +45,18 @@ private:
+ 
+   void DispatchError(nsresult aRv);
+ 
+   const nsCString mOrigin;
+   const nsCString mBaseDomain;
+   const nsCString mQuotaId;
+   nsCOMPtr<nsIThread> mInitiatingThread;
+   State mState;
++
++protected:
+   nsresult mResult;
+ 
+ public:
+   NS_DECL_THREADSAFE_ISUPPORTS
+   NS_DECL_NSIRUNNABLE
+ };
+ 
+ } // namespace dom
+diff --git a/dom/cache/moz.build b/dom/cache/moz.build
+--- a/dom/cache/moz.build
++++ b/dom/cache/moz.build
+@@ -1,16 +1,18 @@
+ # -*- Mode: python; c-basic-offset: 4; indent-tabs-mode: nil; tab-width: 40 -*-
+ # vim: set filetype=python:
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ EXPORTS.mozilla.dom += [
+     'Cache.h',
++    'CacheBodyManager.h',
++    'CacheBodyManagerListener.h',
+     'CacheChild.h',
+     'CacheChildListener.h',
+     'CacheDBConnection.h',
+     'CacheDBListener.h',
+     'CacheDBSchema.h',
+     'CacheParent.h',
+     'CacheQuotaRunnable.h',
+     'CacheStorage.h',
+@@ -20,16 +22,17 @@ EXPORTS.mozilla.dom += [
+     'CacheStorageDBListener.h',
+     'CacheStorageDBSchema.h',
+     'CacheStorageParent.h',
+     'CacheTypes.h',
+ ]
+ 
+ UNIFIED_SOURCES += [
+     'Cache.cpp',
++    'CacheBodyManager.cpp',
+     'CacheChild.cpp',
+     'CacheDBConnection.cpp',
+     'CacheDBSchema.cpp',
+     'CacheParent.cpp',
+     'CacheQuotaRunnable.cpp',
+     'CacheStorage.cpp',
+     'CacheStorageChild.cpp',
+     'CacheStorageDBConnection.cpp',
