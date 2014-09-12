@@ -7,7 +7,7 @@ diff --git a/dom/cache/CacheBodyManager.cpp b/dom/cache/CacheBodyManager.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/CacheBodyManager.cpp
-@@ -0,0 +1,358 @@
+@@ -0,0 +1,445 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -18,18 +18,21 @@ new file mode 100644
 +
 +#include "mozilla/dom/CacheBodyManagerListener.h"
 +#include "mozilla/dom/CacheQuotaRunnable.h"
++#include "mozilla/dom/quota/FileStreams.h"
 +#include "nsIAsyncInputStream.h"
++#include "nsIAsyncOutputStream.h"
 +#include "nsIUUIDGenerator.h"
 +
 +namespace {
 +
++using mozilla::dom::quota::FileOutputStream;
++using mozilla::dom::quota::PERSISTENCE_TYPE_PERSISTENT;
 +using mozilla::dom::CacheBodyManager;
 +using mozilla::dom::CacheQuotaRunnable;
 +
-+static const uint32_t BUF_SIZE = 512;
 +static const uint32_t NUM_BUFFERS = 3;
 +
-+class StreamCallback;
++class WriteCallback;
 +
 +class WriteRunnable MOZ_FINAL : public CacheQuotaRunnable
 +{
@@ -37,18 +40,15 @@ new file mode 100644
 +  WriteRunnable(const nsACString& aOrigin, const nsACString& aBaseDomain,
 +                const nsACString& aQuotaId, const nsID& aBodyId)
 +    : CacheQuotaRunnable(aOrigin, aBaseDomain, aQuotaId)
-+    , mCallback(nullptr)
-+    , mBodyId(aBodyId)
-+    , mLength(0)
-+    , mComplete(false)
++    , mFields(nullptr, aBodyId, 0, false)
 +  {
 +  }
 +
-+  void SetCallback(StreamCallback* aCallback) {
-+    MOZ_ASSERT(!mComplete);
-+    MOZ_ASSERT(!mCallback);
-+    mCallback = aCallback;
-+    MOZ_ASSERT(mCallback);
++  void SetCallback(WriteCallback* aCallback) {
++    MOZ_ASSERT(!mFields.mComplete);
++    MOZ_ASSERT(!mFields.mCallback);
++    mFields.mCallback = aCallback;
++    MOZ_ASSERT(mFields.mCallback);
 +  }
 +
 +  virtual void RunOnQuotaIOThread(const nsACString& aOrigin,
@@ -75,7 +75,7 @@ new file mode 100644
 +    if (NS_FAILED(mResult)) { return; }
 +
 +    char bodyIdBuf[NSID_LENGTH];
-+    mBodyId.ToProvidedString(bodyIdBuf);
++    mFields.mBodyId.ToProvidedString(bodyIdBuf);
 +
 +    nsAutoCString tmpFileName(bodyIdBuf);
 +    tmpFileName.Append(".tmp");
@@ -110,28 +110,29 @@ new file mode 100644
 +      if (NS_FAILED(mResult)) { return; }
 +    }
 +
-+    if (mLength > 0) {
-+      AppendToTmpFile(tmpFile);
++    if (mFields.mLength > 0) {
++      AppendToTmpFile(aOrigin, aBaseDomain, tmpFile);
 +      return;
 +    }
 +
 +    mResult = finalFile->RenameTo(aQuotaDir, NS_ConvertUTF8toUTF16(finalFileName));
 +    if (NS_FAILED(mResult)) { return; }
 +
-+    mComplete = true;
++    mFields.mComplete = true;
 +  }
 +
 +  virtual void CompleteOnInitiatingThread(nsresult aRv) MOZ_OVERRIDE;
 +
 +  char* Buffer() { return mBuffer; }
-+  uint32_t Capacity() const { return BUF_SIZE; }
-+  uint32_t& Length() { return mLength; }
-+  bool Busy() const { return !!mCallback; }
++  uint32_t Capacity() const { return kBufferSize; }
++  uint32_t& Length() { return mFields.mLength; }
++  bool Busy() const { return !!mFields.mCallback; }
 +
 +private:
 +  virtual ~WriteRunnable() { MOZ_ASSERT(!Busy()); }
 +
-+  void AppendToTmpFile(nsIFile* aTmpFile)
++  void AppendToTmpFile(const nsACString& aOrigin, const nsACString& aBaseDomain,
++                       nsIFile* aTmpFile)
 +  {
 +    MOZ_ASSERT(aTmpFile);
 +    bool exists;
@@ -139,14 +140,18 @@ new file mode 100644
 +    if (NS_FAILED(mResult)) { return; }
 +
 +    nsCOMPtr<nsIOutputStream> outputStream;
-+    mResult = NS_NewLocalFileOutputStream(getter_AddRefs(outputStream),
-+                                aTmpFile, PR_APPEND, 0600);
-+    if (NS_FAILED(mResult)) { return; }
++    outputStream = FileOutputStream::Create(PERSISTENCE_TYPE_PERSISTENT,
++                                            aBaseDomain, aOrigin, aTmpFile,
++                                            PR_APPEND);
++    if (!outputStream) {
++      mResult = NS_ERROR_UNEXPECTED;
++      return;
++    }
 +
-+    MOZ_ASSERT(mLength < Capacity());
++    MOZ_ASSERT(mFields.mLength < Capacity());
 +
 +    uint32_t curr = 0;
-+    uint32_t remaining = mLength;
++    uint32_t remaining = mFields.mLength;
 +    while (remaining > 0) {
 +      uint32_t numWritten;
 +      mResult = outputStream->Write(mBuffer + curr, remaining, &numWritten);
@@ -157,17 +162,31 @@ new file mode 100644
 +    }
 +  }
 +
-+  nsRefPtr<StreamCallback> mCallback;
-+  const nsID mBodyId;
-+  char mBuffer[BUF_SIZE];
-+  uint32_t mLength;
-+  bool mComplete;
++  struct Fields {
++    Fields(WriteCallback* aCallback, const nsID& aBodyId, uint32_t aLength,
++           bool aComplete)
++      : mCallback(aCallback)
++      , mBodyId(aBodyId)
++      , mLength(aLength)
++      , mComplete(aComplete)
++    { }
++
++    nsRefPtr<WriteCallback> mCallback;
++    const nsID mBodyId;
++    uint32_t mLength;
++    bool mComplete;
++  };
++
++  static const uint32_t kBufferSize = 1024 - sizeof(Fields);
++
++  Fields mFields;
++  char mBuffer[kBufferSize];
 +};
 +
-+class StreamCallback MOZ_FINAL : public nsIInputStreamCallback
++class WriteCallback MOZ_FINAL : public nsIInputStreamCallback
 +{
 +public:
-+  StreamCallback(CacheBodyManager* aManager, const nsID& aBodyId,
++  WriteCallback(CacheBodyManager* aManager, const nsID& aBodyId,
 +                 const nsTArray<nsRefPtr<WriteRunnable>>& aBufferList)
 +    : mManager(aManager)
 +    , mBodyId(aBodyId)
@@ -180,7 +199,7 @@ new file mode 100644
 +    MOZ_ASSERT(mBufferList.Length() > 0);
 +  }
 +
-+  NS_METHOD OnInputStreamReady(nsIAsyncInputStream* aStream)
++  NS_IMETHOD OnInputStreamReady(nsIAsyncInputStream* aStream)
 +  {
 +    MOZ_ASSERT(aStream);
 +    MOZ_ASSERT(!mStream || mStream == aStream);
@@ -257,7 +276,7 @@ new file mode 100644
 +  }
 +
 +private:
-+  ~StreamCallback() { }
++  ~WriteCallback() { }
 +
 +  nsRefPtr<CacheBodyManager> mManager;
 +  const nsID mBodyId;
@@ -271,16 +290,75 @@ new file mode 100644
 +  NS_DECL_ISUPPORTS
 +};
 +
-+NS_IMPL_ISUPPORTS(StreamCallback, nsIInputStreamCallback);
++NS_IMPL_ISUPPORTS(WriteCallback, nsIInputStreamCallback);
 +
 +void
 +WriteRunnable::CompleteOnInitiatingThread(nsresult aRv)
 +{
-+  MOZ_ASSERT(mCallback);
-+  StreamCallback* callback = mCallback;
-+  mCallback = nullptr;
-+  callback->OnWrite(aRv, mComplete);
++  MOZ_ASSERT(mFields.mCallback);
++  WriteCallback* callback = mFields.mCallback;
++  mFields.mCallback = nullptr;
++  callback->OnWrite(aRv, mFields.mComplete);
 +}
++
++class ReadCallback;
++
++class ReadRunnable MOZ_FINAL : public CacheQuotaRunnable
++{
++public:
++  ReadRunnable(const nsACString& aOrigin, const nsACString& aBaseDomain,
++                const nsACString& aQuotaId, const nsID& aBodyId)
++    : CacheQuotaRunnable(aOrigin, aBaseDomain, aQuotaId)
++    , mFields(aBodyId)
++  { }
++
++  void PrepareRead(ReadCallback* aCallback, uint64_t aOffset)
++  {
++    MOZ_ASSERT(!mFields.mCallback);
++    mFields.mCallback = aCallback;
++    mFields.mOffset = aOffset;
++    MOZ_ASSERT(mFields.mCallback);
++  }
++
++  virtual void RunOnQuotaIOThread(const nsACString& aOrigin,
++                                  const nsACString& aBaseDomain,
++                                  nsIFile* aQuotaDir) MOZ_OVERRIDE
++  {
++  }
++
++  virtual void CompleteOnInitiatingThread(nsresult aRv) MOZ_OVERRIDE
++  {
++  }
++
++private:
++  struct Fields
++  {
++    Fields(const nsID& aBodyId)
++      : mBodyId(aBodyId), mOffset(0)
++    { }
++
++    nsID mBodyId;
++    nsRefPtr<ReadCallback> mCallback;
++    uint64_t mOffset;
++  };
++
++  Fields mFields;
++};
++
++class ReadCallback MOZ_FINAL : public nsIOutputStreamCallback
++{
++public:
++  NS_IMETHOD OnOutputStreamReady(nsIAsyncOutputStream* aStream) MOZ_OVERRIDE
++  {
++    return NS_OK;
++  }
++private:
++  virtual ~ReadCallback() { }
++public:
++  NS_DECL_ISUPPORTS
++};
++
++NS_IMPL_ISUPPORTS(ReadCallback, nsIOutputStreamCallback);
 +
 +} // anonymous namespace
 +
@@ -334,11 +412,12 @@ new file mode 100644
 +    if (!el) { return NS_ERROR_OUT_OF_MEMORY; }
 +  }
 +
-+  nsRefPtr<StreamCallback> callback = new StreamCallback(this, *aBodyIdOut,
-+                                                         bufferList);
++  nsRefPtr<WriteCallback> callback = new WriteCallback(this, *aBodyIdOut,
++                                                       bufferList);
 +  if (!callback) { return NS_ERROR_OUT_OF_MEMORY; }
 +
-+  rv = aSource->AsyncWait(callback, 0, BUF_SIZE, NS_GetCurrentThread());
++  rv = aSource->AsyncWait(callback, 0, bufferList[0]->Capacity(),
++                          NS_GetCurrentThread());
 +  if (NS_FAILED(rv)) { return rv; }
 +
 +  return NS_OK;
@@ -359,6 +438,14 @@ new file mode 100644
 +  }
 +}
 +
++void
++CacheBodyManager::OnRead(const nsID& aBodyId, nsresult aRv)
++{
++  if (mListener) {
++    mListener->OnRead(aBodyId, aRv);
++  }
++}
++
 +CacheBodyManager::~CacheBodyManager()
 +{
 +  MOZ_ASSERT(!mListener);
@@ -370,7 +457,7 @@ diff --git a/dom/cache/CacheBodyManager.h b/dom/cache/CacheBodyManager.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/CacheBodyManager.h
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,54 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -404,6 +491,7 @@ new file mode 100644
 +  void Read(const nsID& aBodyID, nsIAsyncOutputStream* aDest);
 +
 +  void OnWrite(const nsID& aBodyId, nsresult aRv);
++  void OnRead(const nsID& aBodyId, nsresult aRv);
 +
 +private:
 +  ~CacheBodyManager();
@@ -428,7 +516,7 @@ diff --git a/dom/cache/CacheBodyManagerListener.h b/dom/cache/CacheBodyManagerLi
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/CacheBodyManagerListener.h
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,30 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -452,8 +540,7 @@ new file mode 100644
 +  virtual ~CacheBodyManagerListener() { }
 +
 +  virtual void OnWrite(const nsID& aBodyId, nsresult aRv)=0;
-+  virtual void OnRead(const nsID& aBodyId, nsresult aRv,
-+                      nsIAsyncInputStream* aSource)=0;
++  virtual void OnRead(const nsID& aBodyId, nsresult aRv)=0;
 +};
 +
 +} // namespace dom
