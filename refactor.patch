@@ -7,18 +7,19 @@ diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/Context.cpp
-@@ -0,0 +1,405 @@
+@@ -0,0 +1,478 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 +
-+#include "mozilla/DebugOnly.h"
 +#include "mozilla/dom/cache/Context.h"
++
++#include "mozilla/DebugOnly.h"
++#include "mozilla/dom/cache/Action.h"
 +#include "mozilla/dom/quota/OriginOrPatternString.h"
 +#include "mozilla/dom/quota/QuotaManager.h"
-+#include "mozilla/ipc/BackgroundParent.h"
 +#include "nsIFile.h"
 +#include "nsIRunnable.h"
 +#include "nsThreadUtils.h"
@@ -75,17 +76,15 @@ new file mode 100644
 +using mozilla::dom::quota::PERSISTENCE_TYPE_PERSISTENT;
 +using mozilla::dom::quota::PersistenceType;
 +
-+NS_IMPL_ISUPPORTS0(Context::ActionResolver);
-+
 +class Context::QuotaInitRunnable MOZ_FINAL : public nsIRunnable
-+                                           , public Context::ActionResolver
++                                           , public Action::Resolver
 +{
 +public:
 +  QuotaInitRunnable(Context* aContext,
 +                    const nsACString& aOrigin,
 +                    const nsACString& aBaseDomain,
 +                    const nsACString& aQuotaId,
-+                    Context::Action* aQuotaIOThreadAction)
++                    Action* aQuotaIOThreadAction)
 +    : mContext(aContext)
 +    , mOrigin(aOrigin)
 +    , mBaseDomain(aBaseDomain)
@@ -101,8 +100,8 @@ new file mode 100644
 +
 +  nsresult Dispatch()
 +  {
++    NS_ASSERT_OWNINGTHREAD(Action::Resolver);
 +    MOZ_ASSERT(mState == STATE_INIT);
-+    MOZ_ASSERT(NS_GetCurrentThread() == mInitiatingThread);
 +
 +    mState = STATE_CALL_WAIT_FOR_OPEN_ALLOWED;
 +    nsresult rv = NS_DispatchToMainThread(this, nsIThread::DISPATCH_NORMAL);
@@ -154,7 +153,7 @@ new file mode 100644
 +  const nsCString mOrigin;
 +  const nsCString mBaseDomain;
 +  const nsCString mQuotaId;
-+  nsRefPtr<Context::Action> mQuotaIOThreadAction;
++  nsRefPtr<Action> mQuotaIOThreadAction;
 +  nsCOMPtr<nsIThread> mInitiatingThread;
 +  State mState;
 +  nsresult mResult;
@@ -165,7 +164,7 @@ new file mode 100644
 +  NS_DECL_NSIRUNNABLE
 +};
 +
-+NS_IMPL_ISUPPORTS_INHERITED(Context::QuotaInitRunnable, Context::ActionResolver,
++NS_IMPL_ISUPPORTS_INHERITED(Context::QuotaInitRunnable, Action::Resolver,
 +                            nsIRunnable);
 +
 +NS_IMETHODIMP
@@ -192,6 +191,7 @@ new file mode 100644
 +      }
 +      break;
 +    case STATE_WAIT_FOR_OPEN_ALLOWED:
++      MOZ_ASSERT(NS_IsMainThread());
 +      qm = QuotaManager::Get();
 +      MOZ_ASSERT(qm);
 +      mState = STATE_ENSURE_ORIGIN_INITIALIZED;
@@ -222,9 +222,9 @@ new file mode 100644
 +      }
 +      break;
 +    case STATE_COMPLETING:
-+      MOZ_ASSERT(NS_GetCurrentThread() == mInitiatingThread);
++      NS_ASSERT_OWNINGTHREAD(Action::Resolver);
 +      if (mQuotaIOThreadAction) {
-+        mQuotaIOThreadAction->CompleteOnInitiatingThread(mResult);
++        mQuotaIOThreadAction->CompleteOnInitiatingThread(mResult, false);
 +      }
 +      mContext->OnQuotaInit(mResult, mQuotaDir);
 +      mState = STATE_COMPLETE;
@@ -238,18 +238,21 @@ new file mode 100644
 +}
 +
 +class Context::ActionRunnable MOZ_FINAL : public nsIRunnable
-+                                        , public ActionResolver
++                                        , public Action::Resolver
 +{
 +public:
-+  ActionRunnable(nsIEventTarget* aTarget, Context::Action* aAction,
++  ActionRunnable(Context* aContext, nsIEventTarget* aTarget, Action* aAction,
 +                 nsIFile* aQuotaDir)
-+    : mTarget(aTarget)
++    : mContext(aContext)
++    , mTarget(aTarget)
 +    , mAction(aAction)
 +    , mQuotaDir(aQuotaDir)
 +    , mInitiatingThread(NS_GetCurrentThread())
 +    , mState(STATE_INIT)
 +    , mResult(NS_OK)
++    , mCanceled(false)
 +  {
++    MOZ_ASSERT(mContext);
 +    MOZ_ASSERT(mTarget);
 +    MOZ_ASSERT(mAction);
 +    MOZ_ASSERT(mQuotaDir);
@@ -258,8 +261,8 @@ new file mode 100644
 +
 +  nsresult Dispatch()
 +  {
++    NS_ASSERT_OWNINGTHREAD(Action::Resolver);
 +    MOZ_ASSERT(mState == STATE_INIT);
-+    MOZ_ASSERT(NS_GetCurrentThread() == mInitiatingThread);
 +
 +    mState = STATE_RUN_ON_TARGET;
 +    nsresult rv = mTarget->Dispatch(this, nsIEventTarget::DISPATCH_NORMAL);
@@ -267,6 +270,33 @@ new file mode 100644
 +      mState = STATE_COMPLETE;
 +    }
 +    return rv;
++  }
++
++  void Cancel()
++  {
++    NS_ASSERT_OWNINGTHREAD(Action::Resolver);
++    nsresult rv;
++    switch(mState) {
++      case STATE_INIT:
++        mState = STATE_COMPLETE;
++        break;
++      case STATE_RUN_ON_TARGET:
++        mState = STATE_CANCELING;
++        break;
++      case STATE_RUNNING:
++        mState = STATE_CANCELING;
++        rv = mTarget->Dispatch(this, nsIEventTarget::DISPATCH_NORMAL);
++        if (NS_FAILED(rv)) {
++          MOZ_CRASH("Failed to dispatch ActionRunnable to target thread.");
++        }
++      case STATE_CANCELING:
++      case STATE_COMPLETING:
++      case STATE_COMPLETE:
++        break;
++      default:
++        MOZ_CRASH("unexpected state");
++        break;
++    }
 +  }
 +
 +  virtual void Resolve(nsresult aRv) MOZ_OVERRIDE
@@ -283,45 +313,61 @@ new file mode 100644
 +private:
 +  virtual ~ActionRunnable()
 +  {
++    NS_ASSERT_OWNINGTHREAD(Action::Resolver);
 +    MOZ_ASSERT(mState == STATE_COMPLETE);
++    mContext->OnActionRunnableComplete(this);
 +  }
 +
 +  enum State
 +  {
 +    STATE_INIT,
 +    STATE_RUN_ON_TARGET,
++    STATE_CANCELING,
 +    STATE_RUNNING,
 +    STATE_COMPLETING,
 +    STATE_COMPLETE
 +  };
 +
++  nsRefPtr<Context> mContext;
 +  nsCOMPtr<nsIEventTarget> mTarget;
-+  nsRefPtr<Context::Action> mAction;
++  nsRefPtr<Action> mAction;
 +  nsCOMPtr<nsIFile> mQuotaDir;
 +  nsCOMPtr<nsIThread> mInitiatingThread;
 +  State mState;
 +  nsresult mResult;
++  bool mCanceled;
 +
 +public:
 +  NS_DECL_ISUPPORTS_INHERITED
 +  NS_DECL_NSIRUNNABLE
 +};
 +
-+NS_IMPL_ISUPPORTS_INHERITED(Context::ActionRunnable, Context::ActionResolver,
++NS_IMPL_ISUPPORTS_INHERITED(Context::ActionRunnable, Action::Resolver,
 +                            nsIRunnable);
 +
 +NS_IMETHODIMP
 +Context::ActionRunnable::Run()
 +{
++  nsresult rv;
 +  switch(mState) {
 +    case STATE_RUN_ON_TARGET:
 +      MOZ_ASSERT(NS_GetCurrentThread() == mTarget);
 +      mState = STATE_RUNNING;
 +      mAction->RunOnTarget(this, mQuotaDir);
 +      break;
++    case STATE_CANCELING:
++      MOZ_ASSERT(NS_GetCurrentThread() == mTarget);
++      mState = STATE_COMPLETING;
++      mCanceled = true;
++      mAction->CancelOnTarget();
++      rv = mInitiatingThread->Dispatch(this, nsIThread::DISPATCH_NORMAL);
++      if (NS_FAILED(rv)) {
++        MOZ_CRASH("Failed to dispatch ActionRunnable to initiating thread.");
++      }
++      break;
 +    case STATE_COMPLETING:
-+      MOZ_ASSERT(NS_GetCurrentThread() == mInitiatingThread);
-+      mAction->CompleteOnInitiatingThread(mResult);
++      NS_ASSERT_OWNINGTHREAD(Action::Resolver);
++      mAction->CompleteOnInitiatingThread(mResult, mCanceled);
 +      mState = STATE_COMPLETE;
 +      break;
 +    default:
@@ -337,7 +383,6 @@ new file mode 100644
 +  , mOrigin(aOrigin)
 +  , mState(STATE_CONTEXT_INIT)
 +{
-+  mozilla::ipc::AssertIsOnBackgroundThread();
 +  MOZ_ASSERT(mListener);
 +
 +  nsRefPtr<QuotaInitRunnable> runnable =
@@ -350,34 +395,40 @@ new file mode 100644
 +}
 +
 +void
-+Context::Execute(RequestId aRequestId, nsIEventTarget* aTarget, Action* aAction)
++Context::Dispatch(nsIEventTarget* aTarget, Action* aAction)
 +{
-+  mozilla::ipc::AssertIsOnBackgroundThread();
++  NS_ASSERT_OWNINGTHREAD(Context);
 +  MOZ_ASSERT(aTarget);
 +  MOZ_ASSERT(aAction);
 +
-+  if (mState != STATE_CONTEXT_READY) {
++  if (mState == STATE_CONTEXT_CANCELED) {
++    return;
++  } else if (mState == STATE_CONTEXT_INIT) {
 +    PendingAction* pending = mPendingActions.AppendElement();
-+    pending->mRequestId = aRequestId;
 +    pending->mTarget = aTarget;
 +    pending->mAction = aAction;
 +    return;
 +  }
 +
-+  nsRefPtr<ActionRunnable> runnable = new ActionRunnable(aTarget, aAction,
-+                                                         mQuotaDir);
-+  nsresult rv = runnable->Dispatch();
-+  if (NS_FAILED(rv)) {
-+    MOZ_CRASH("Failed to dispatch ActionRunnable to target thread.");
++  MOZ_ASSERT(STATE_CONTEXT_READY);
++  DispatchAction(aTarget, aAction);
++}
++
++void
++Context::CancelAll()
++{
++  NS_ASSERT_OWNINGTHREAD(Context);
++  mState = STATE_CONTEXT_CANCELED;
++  mPendingActions.Clear();
++  for (uint32_t i = 0; i < mActionRunnables.Length(); ++i) {
++    mActionRunnables[i]->Cancel();
 +  }
 +}
 +
-+
 +Context::~Context()
 +{
-+  mozilla::ipc::AssertIsOnBackgroundThread();
++  NS_ASSERT_OWNINGTHREAD(Context);
 +  MOZ_ASSERT(mListener);
-+  mListener->RemoveContext(this);
 +
 +  // Unlock the quota dir as we go out of scope.
 +  nsCOMPtr<nsIRunnable> runnable =
@@ -386,28 +437,50 @@ new file mode 100644
 +  if (NS_FAILED(rv)) {
 +    MOZ_CRASH("Failed to dispatch QuotaReleaseRunnable to main thread.");
 +  }
++
++  mListener->RemoveContext(this);
++}
++
++void
++Context::DispatchAction(nsIEventTarget* aTarget, Action* aAction)
++{
++  NS_ASSERT_OWNINGTHREAD(Context);
++  nsRefPtr<ActionRunnable> runnable =
++    new ActionRunnable(this, aTarget, aAction, mQuotaDir);
++  mActionRunnables.AppendElement(runnable);
++  nsresult rv = runnable->Dispatch();
++  if (NS_FAILED(rv)) {
++    MOZ_CRASH("Failed to dispatch ActionRunnable to target thread.");
++  }
 +}
 +
 +void
 +Context::OnQuotaInit(nsresult aRv, nsIFile* aQuotaDir)
 +{
-+  mozilla::ipc::AssertIsOnBackgroundThread();
++  NS_ASSERT_OWNINGTHREAD(Context);
 +  MOZ_ASSERT(mState == STATE_CONTEXT_INIT);
 +  mQuotaDir = aQuotaDir;
 +  MOZ_ASSERT(mQuotaDir);
 +  mState = STATE_CONTEXT_READY;
 +
 +  for (uint32_t i = 0; i < mPendingActions.Length(); ++i) {
-+    nsRefPtr<ActionRunnable> runnable =
-+      new ActionRunnable(mPendingActions[i].mTarget,
-+                         mPendingActions[i].mAction,
-+                         mQuotaDir);
-+    nsresult rv = runnable->Dispatch();
-+    if (NS_FAILED(rv)) {
-+      MOZ_CRASH("Failed to dispatch ActionRunnable to target thread.");
-+    }
++    DispatchAction(mPendingActions[i].mTarget, mPendingActions[i].mAction);
 +  }
 +  mPendingActions.Clear();
++}
++
++void
++Context::OnActionRunnableComplete(ActionRunnable* aActionRunnable)
++{
++  NS_ASSERT_OWNINGTHREAD(Context);
++  MOZ_ASSERT(aActionRunnable);
++  for (uint32_t i = 0; i < mActionRunnables.Length(); ++i) {
++    if (aActionRunnable == mActionRunnables[i]) {
++      mActionRunnables.RemoveElementAt(i);
++      return;
++    }
++  }
++  MOZ_ASSERT(false);
 +}
 +
 +} // namespace cache
@@ -417,7 +490,7 @@ diff --git a/dom/cache/Context.h b/dom/cache/Context.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/Context.h
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,92 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -427,7 +500,6 @@ new file mode 100644
 +#ifndef mozilla_dom_cache_Context_h
 +#define mozilla_dom_cache_Context_h
 +
-+#include "mozilla/dom/CacheTypes.h"
 +#include "nsAutoPtr.h"
 +#include "nsCOMPtr.h"
 +#include "nsISupportsImpl.h"
@@ -441,6 +513,8 @@ new file mode 100644
 +namespace dom {
 +namespace cache {
 +
++class Action;
++
 +class Context MOZ_FINAL
 +{
 +public:
@@ -448,30 +522,26 @@ new file mode 100644
 +  {
 +  public:
 +    virtual ~Listener() { }
++    // Called from the Context destructor on the thread that originally
++    // created the Context.
 +    virtual void RemoveContext(Context* aContext)=0;
-+  };
-+
-+  class ActionResolver : public nsISupports
-+  {
-+  public:
-+    virtual ~ActionResolver() { }
-+    virtual void Resolve(nsresult aRv)=0;
-+    NS_DECL_THREADSAFE_ISUPPORTS
-+  };
-+
-+  class Action
-+  {
-+  public:
-+    virtual ~Action() { }
-+    virtual void RunOnTarget(ActionResolver* aResolver, nsIFile* aQuotaDir)=0;
-+    virtual void CompleteOnInitiatingThread(nsresult aRv)=0;
-+    NS_INLINE_DECL_REFCOUNTING(Action)
 +  };
 +
 +  Context(Listener* aListener, const nsACString& aOrigin,
 +          const nsACString& aBaseDomain, Action* aQuotaIOThreadAction);
 +
-+  void Execute(RequestId aRequestId, nsIEventTarget* aTarget, Action* aAction);
++  // Execute given action on the target once the quota manager has been
++  // initialized.
++  //
++  // Only callable from the thread that created the Context.
++  void Dispatch(nsIEventTarget* aTarget, Action* aAction);
++
++  // Cancel any Actions running or waiting to run.  This should allow the
++  // Context to be released and Listener::RemoveContext() will be called
++  // when complete.
++  //
++  // Only callable from the thread that created the Context.
++  void CancelAll();
 +
 +private:
 +  class QuotaInitRunnable;
@@ -480,25 +550,29 @@ new file mode 100644
 +  enum State
 +  {
 +    STATE_CONTEXT_INIT,
-+    STATE_CONTEXT_READY
++    STATE_CONTEXT_READY,
++    STATE_CONTEXT_CANCELED
 +  };
 +
 +  struct PendingAction
 +  {
-+    RequestId mRequestId;
 +    nsCOMPtr<nsIEventTarget> mTarget;
 +    nsRefPtr<Action> mAction;
 +  };
 +
 +  ~Context();
-+  nsresult DispatchAction(nsIEventTarget* aTarget, Action* aAction);
++  void DispatchAction(nsIEventTarget* aTarget, Action* aAction);
 +  void OnQuotaInit(nsresult aRv, nsIFile* aQuotaDir);
++  void OnActionRunnableComplete(ActionRunnable* const aAction);
 +
 +  Listener* mListener;
 +  const nsCString mOrigin;
 +  State mState;
 +  nsCOMPtr<nsIFile> mQuotaDir;
 +  nsTArray<PendingAction> mPendingActions;
++
++  // weak refs since ~ActionRunnable() removes itself from this list
++  nsTArray<ActionRunnable*> mActionRunnables;
 +
 +public:
 +  NS_INLINE_DECL_REFCOUNTING(Manager)
@@ -654,7 +728,7 @@ new file mode 100644
 diff --git a/dom/cache/moz.build b/dom/cache/moz.build
 --- a/dom/cache/moz.build
 +++ b/dom/cache/moz.build
-@@ -19,28 +19,35 @@ EXPORTS.mozilla.dom += [
+@@ -19,28 +19,37 @@ EXPORTS.mozilla.dom += [
      'CacheStorageChildListener.h',
      'CacheStorageDBConnection.h',
      'CacheStorageDBListener.h',
@@ -665,11 +739,13 @@ diff --git a/dom/cache/moz.build b/dom/cache/moz.build
  
 -UNIFIED_SOURCES += [
 +EXPORTS.mozilla.dom.cache += [
++    'Action.h',
 +    'Context.h',
 +    'Manager.h',
 +]
 +
 +SOURCES += [
++    'Action.cpp',
      'Cache.cpp',
      'CacheChild.cpp',
      'CacheDBConnection.cpp',
