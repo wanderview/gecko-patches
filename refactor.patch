@@ -20,8 +20,8 @@ new file mode 100644
 +namespace dom {
 +namespace cache {
 +
-+NS_IMPL_ISUPPORTS0(Action);
-+NS_IMPL_ISUPPORTS0(Action::Resolver);
++NS_IMPL_ISUPPORTS0(mozilla::dom::cache::Action);
++NS_IMPL_ISUPPORTS0(mozilla::dom::cache::Action::Resolver);
 +
 +} // namespace cache
 +} // namespace dom
@@ -87,7 +87,7 @@ new file mode 100644
 +  // Executed on the initiating thread and is passed the nsresult given to
 +  // Resolver::Resolve().
 +  virtual void CompleteOnInitiatingThread(nsresult aRv,
-+                                          Resolution aResolution=Resolved)=0;
++                                          Resolution aResolution=Resolved) { }
 +
 +  NS_DECL_THREADSAFE_ISUPPORTS
 +};
@@ -97,11 +97,112 @@ new file mode 100644
 +} // namespace mozilla
 +
 +#endif // mozilla_dom_cache_Action_h
+diff --git a/dom/cache/CacheDBConnection.cpp b/dom/cache/CacheDBConnection.cpp
+--- a/dom/cache/CacheDBConnection.cpp
++++ b/dom/cache/CacheDBConnection.cpp
+@@ -55,17 +55,17 @@ protected:
+ 
+   virtual ~OpenRunnable() { }
+   virtual void RunOnQuotaIOThread(const nsACString& aOrigin,
+                                   const nsACString& aBaseDomain,
+                                   nsIFile* aQuotaDir) MOZ_OVERRIDE
+   {
+     MOZ_ASSERT(aQuotaDir);
+ 
+-    mResult = aQuotaDir->Append(NS_LITERAL_STRING("cache"));
++    mResult = aQuotaDir->Append(NS_LITERAL_STRING("cache-old"));
+     if (NS_FAILED(mResult)) { return; }
+ 
+     char cacheIdBuf[NSID_LENGTH];
+     mCacheId.ToProvidedString(cacheIdBuf);
+     mResult = aQuotaDir->Append(NS_ConvertUTF8toUTF16(cacheIdBuf));
+     if (NS_FAILED(mResult)) { return; }
+ 
+     bool exists;
+diff --git a/dom/cache/CacheStorageParent.cpp b/dom/cache/CacheStorageParent.cpp
+--- a/dom/cache/CacheStorageParent.cpp
++++ b/dom/cache/CacheStorageParent.cpp
+@@ -3,31 +3,34 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/CacheStorageParent.h"
+ 
+ #include "mozilla/dom/CacheParent.h"
+ #include "mozilla/dom/CacheStorageDBConnection.h"
++#include "mozilla/dom/cache/Manager.h"
+ #include "mozilla/ipc/PBackgroundParent.h"
+ #include "mozilla/unused.h"
+ #include "nsCOMPtr.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
++using mozilla::dom::cache::Manager;
+ using mozilla::dom::cache::RequestId;
+ 
+ CacheStorageParent::CacheStorageParent(cache::Namespace aNamespace,
+                                        const nsACString& aOrigin,
+                                        const nsACString& aBaseDomain)
+   : mNamespace(aNamespace)
+   , mOrigin(aOrigin)
+   , mBaseDomain(aBaseDomain)
++  , mManager(Manager::ForOrigin(aOrigin, aBaseDomain))
+ {
+   mDBConnection = new CacheStorageDBConnection(this, mNamespace, mOrigin,
+                                                mBaseDomain);
+   MOZ_ASSERT(mDBConnection);
+ }
+ 
+ CacheStorageParent::~CacheStorageParent()
+ {
+diff --git a/dom/cache/CacheStorageParent.h b/dom/cache/CacheStorageParent.h
+--- a/dom/cache/CacheStorageParent.h
++++ b/dom/cache/CacheStorageParent.h
+@@ -11,16 +11,20 @@
+ #include "mozilla/dom/CacheTypes.h"
+ #include "mozilla/dom/PCacheStorageParent.h"
+ 
+ template <class T> class nsRefPtr;
+ 
+ namespace mozilla {
+ namespace dom {
+ 
++namespace cache {
++  class Manager;
++}
++
+ class CacheStorageDBConnection;
+ class CacheStorageManager;
+ 
+ class CacheStorageParent MOZ_FINAL : public PCacheStorageParent
+                                    , public CacheStorageDBListener
+ {
+ public:
+   CacheStorageParent(cache::Namespace aNamespace, const nsACString& aOrigin,
+@@ -51,15 +55,15 @@ public:
+   virtual void OnKeys(cache::RequestId aRequestId, nsresult aRv,
+                       const nsTArray<nsString>& aKeys) MOZ_OVERRIDE;
+ 
+ private:
+   const cache::Namespace mNamespace;
+   const nsCString mOrigin;
+   const nsCString mBaseDomain;
+   nsRefPtr<CacheStorageDBConnection> mDBConnection;
+-  nsTArray<nsString> mKeys;
++  nsRefPtr<cache::Manager> mManager;
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_cache_CacheStorageParent_h
 diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/Context.cpp
-@@ -0,0 +1,505 @@
+@@ -0,0 +1,524 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -201,13 +302,14 @@ new file mode 100644
 +    nsresult rv = NS_DispatchToMainThread(this, nsIThread::DISPATCH_NORMAL);
 +    if (NS_FAILED(rv)) {
 +      mState = STATE_COMPLETE;
++      Clear();
 +    }
 +    return rv;
 +  }
 +
 +  virtual void Resolve(nsresult aRv) MOZ_OVERRIDE
 +  {
-+    MOZ_ASSERT(mState == STATE_RUNNING);
++    MOZ_ASSERT(mState == STATE_RUNNING || NS_FAILED(aRv));
 +    mResult = aRv;
 +    mState = STATE_COMPLETING;
 +    nsresult rv = mInitiatingThread->Dispatch(this, nsIThread::DISPATCH_NORMAL);
@@ -220,6 +322,8 @@ new file mode 100644
 +  virtual ~QuotaInitRunnable()
 +  {
 +    MOZ_ASSERT(mState == STATE_COMPLETE);
++    MOZ_ASSERT(!mContext);
++    MOZ_ASSERT(!mQuotaIOThreadAction);
 +  }
 +
 +private:
@@ -234,13 +338,12 @@ new file mode 100644
 +    STATE_COMPLETE
 +  };
 +
-+  void DispatchError(nsresult aRv)
++  void Clear()
 +  {
-+    mResult = aRv;
-+    mState = STATE_COMPLETE;
-+    DebugOnly<nsresult> rv;
-+    rv = mInitiatingThread->Dispatch(this, nsIThread::DISPATCH_NORMAL);
-+    MOZ_ASSERT(NS_SUCCEEDED(rv));
++    NS_ASSERT_OWNINGTHREAD(Action::Resolver);
++    MOZ_ASSERT(mContext);
++    mContext = nullptr;
++    mQuotaIOThreadAction = nullptr;
 +  }
 +
 +  nsRefPtr<Context> mContext;
@@ -258,8 +361,8 @@ new file mode 100644
 +  NS_DECL_NSIRUNNABLE
 +};
 +
-+NS_IMPL_ISUPPORTS_INHERITED(Context::QuotaInitRunnable, Action::Resolver,
-+                            nsIRunnable);
++NS_IMPL_ISUPPORTS_INHERITED(mozilla::dom::cache::Context::QuotaInitRunnable,
++                            Action::Resolver, nsIRunnable);
 +
 +NS_IMETHODIMP
 +Context::QuotaInitRunnable::Run()
@@ -272,7 +375,7 @@ new file mode 100644
 +      MOZ_ASSERT(NS_IsMainThread());
 +      qm = QuotaManager::GetOrCreate();
 +      if (!qm) {
-+        DispatchError(NS_ERROR_FAILURE);
++        Resolve(NS_ERROR_FAILURE);
 +        return NS_OK;
 +      }
 +      mState = STATE_WAIT_FOR_OPEN_ALLOWED;
@@ -280,7 +383,7 @@ new file mode 100644
 +                                  Nullable<PersistenceType>(PERSISTENCE_TYPE_PERSISTENT),
 +                                  mQuotaId, this);
 +      if (NS_FAILED(rv)) {
-+        DispatchError(rv);
++        Resolve(rv);
 +        return NS_OK;
 +      }
 +      break;
@@ -291,7 +394,7 @@ new file mode 100644
 +      mState = STATE_ENSURE_ORIGIN_INITIALIZED;
 +      rv = qm->IOThread()->Dispatch(this, nsIThread::DISPATCH_NORMAL);
 +      if (NS_FAILED(rv)) {
-+        DispatchError(rv);
++        Resolve(rv);
 +        return NS_OK;
 +      }
 +      break;
@@ -305,7 +408,7 @@ new file mode 100644
 +                                         true, // aTrackQuota
 +                                         getter_AddRefs(mQuotaDir));
 +      if (NS_FAILED(rv)) {
-+        DispatchError(rv);
++        Resolve(rv);
 +        return NS_OK;
 +      }
 +      mState = STATE_RUNNING;
@@ -322,6 +425,9 @@ new file mode 100644
 +      }
 +      mContext->OnQuotaInit(mResult, mQuotaDir);
 +      mState = STATE_COMPLETE;
++      // Explicitly cleanup here as the destructor could fire on any of
++      // the threads we have bounced through.
++      Clear();
 +      break;
 +    default:
 +      MOZ_CRASH("unexpected state in QuotaInitRunnable");
@@ -362,6 +468,7 @@ new file mode 100644
 +    nsresult rv = mTarget->Dispatch(this, nsIEventTarget::DISPATCH_NORMAL);
 +    if (NS_FAILED(rv)) {
 +      mState = STATE_COMPLETE;
++      Clear();
 +    }
 +    return rv;
 +  }
@@ -407,9 +514,19 @@ new file mode 100644
 +private:
 +  virtual ~ActionRunnable()
 +  {
-+    NS_ASSERT_OWNINGTHREAD(Action::Resolver);
 +    MOZ_ASSERT(mState == STATE_COMPLETE);
++    MOZ_ASSERT(!mContext);
++    MOZ_ASSERT(!mAction);
++  }
++
++  void Clear()
++  {
++    NS_ASSERT_OWNINGTHREAD(Action::Resolver);
++    MOZ_ASSERT(mContext);
++    MOZ_ASSERT(mAction);
 +    mContext->OnActionRunnableComplete(this);
++    mContext = nullptr;
++    mAction = nullptr;
 +  }
 +
 +  enum State
@@ -436,8 +553,8 @@ new file mode 100644
 +  NS_DECL_NSIRUNNABLE
 +};
 +
-+NS_IMPL_ISUPPORTS_INHERITED(Context::ActionRunnable, Action::Resolver,
-+                            nsIRunnable);
++NS_IMPL_ISUPPORTS_INHERITED(mozilla::dom::cache::Context::ActionRunnable,
++                            Action::Resolver, nsIRunnable);
 +
 +NS_IMETHODIMP
 +Context::ActionRunnable::Run()
@@ -463,6 +580,9 @@ new file mode 100644
 +      NS_ASSERT_OWNINGTHREAD(Action::Resolver);
 +      mAction->CompleteOnInitiatingThread(mResult, mResolution);
 +      mState = STATE_COMPLETE;
++      // Explicitly cleanup here as the destructor could fire on any of
++      // the threads we have bounced through.
++      Clear();
 +      break;
 +    default:
 +      MOZ_CRASH("unexpected state in ActionRunnable");
@@ -698,7 +818,7 @@ new file mode 100644
 +  nsTArray<ActionRunnable*> mActionRunnables;
 +
 +public:
-+  NS_INLINE_DECL_REFCOUNTING(Manager)
++  NS_INLINE_DECL_REFCOUNTING(mozilla::dom::cache::Context)
 +};
 +
 +} // namespace cache
@@ -1064,7 +1184,7 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/Manager.cpp
-@@ -0,0 +1,153 @@
+@@ -0,0 +1,147 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1095,12 +1215,6 @@ new file mode 100644
 +                  mozIStorageConnection* aConnection) MOZ_OVERRIDE
 +  {
 +    return DBSchema::Create(aConnection);
-+  }
-+
-+  virtual void CompleteOnInitiatingThread(nsresult aRv,
-+                                          Resolution aResolution) MOZ_OVERRIDE
-+  {
-+    // Nothing to do here. Errors in setup are handled by Context.
 +  }
 +
 +protected:
@@ -1265,7 +1379,7 @@ new file mode 100644
 +  Context* mContext;
 +
 +public:
-+  NS_INLINE_DECL_REFCOUNTING(Manager)
++  NS_INLINE_DECL_REFCOUNTING(mozilla::dom::cache::Manager)
 +};
 +
 +} // namespace cache
