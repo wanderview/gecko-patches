@@ -3,11 +3,105 @@
 # User Ben Kelly <ben@wanderview.com>
 Refactor Cache/CacheStorage backend.
 
+diff --git a/dom/cache/Action.cpp b/dom/cache/Action.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/Action.cpp
+@@ -0,0 +1,18 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "mozilla/dom/cache/Action.h"
++
++namespace mozilla {
++namespace dom {
++namespace cache {
++
++NS_IMPL_ISUPPORTS0(Action);
++NS_IMPL_ISUPPORTS0(Action::Resolver);
++
++} // namespace cache
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/cache/Action.h b/dom/cache/Action.h
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/Action.h
+@@ -0,0 +1,66 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_cache_Action_h
++#define mozilla_dom_cache_Action_h
++
++#include "nsISupportsImpl.h"
++
++class nsIFile;
++
++namespace mozilla {
++namespace dom {
++namespace cache {
++
++class Action : public nsISupports
++{
++protected:
++  virtual ~Action() { }
++
++public:
++  enum Resolution
++  {
++    Resolved,
++    Canceled
++  };
++
++  class Resolver : public nsISupports
++  {
++  protected:
++    virtual ~Resolver() { }
++
++  public:
++
++    // Note: Action must drop Resolver ref after calling Resolve()!
++    // Note: Must be called on Action's target thread.
++    virtual void Resolve(nsresult aRv)=0;
++
++    NS_DECL_THREADSAFE_ISUPPORTS
++  };
++
++  // Execute operations on target thread. Once complete call
++  // Resolver::Resolve().  This can be done sync or async.
++  // Note: Action should hold Resolver ref until its ready to call Resolve().
++  virtual void RunOnTarget(Resolver* aResolver, nsIFile* aQuotaDir)=0;
++
++  // Called on target thread if the Action is being canceled.  Simply
++  // clean up and do not call Resolver::Resolve() in this case.
++  // Note: Action must drop Resolver ref if CancelOnTarget() is called!
++  virtual void CancelOnTarget() { }
++
++  // Executed on the initiating thread and is passed the nsresult given to
++  // Resolver::Resolve().
++  virtual void CompleteOnInitiatingThread(nsresult aRv,
++                                          Resolution aResolution=Resolved)=0;
++
++  NS_DECL_THREADSAFE_ISUPPORTS
++};
++
++} // namespace cache
++} // namespace dom
++} // namespace mozilla
++
++#endif // mozilla_dom_cache_Action_h
 diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/Context.cpp
-@@ -0,0 +1,478 @@
+@@ -0,0 +1,505 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -224,7 +318,7 @@ new file mode 100644
 +    case STATE_COMPLETING:
 +      NS_ASSERT_OWNINGTHREAD(Action::Resolver);
 +      if (mQuotaIOThreadAction) {
-+        mQuotaIOThreadAction->CompleteOnInitiatingThread(mResult, false);
++        mQuotaIOThreadAction->CompleteOnInitiatingThread(mResult);
 +      }
 +      mContext->OnQuotaInit(mResult, mQuotaDir);
 +      mState = STATE_COMPLETE;
@@ -250,7 +344,7 @@ new file mode 100644
 +    , mInitiatingThread(NS_GetCurrentThread())
 +    , mState(STATE_INIT)
 +    , mResult(NS_OK)
-+    , mCanceled(false)
++    , mResolution(Action::Resolved)
 +  {
 +    MOZ_ASSERT(mContext);
 +    MOZ_ASSERT(mTarget);
@@ -335,7 +429,7 @@ new file mode 100644
 +  nsCOMPtr<nsIThread> mInitiatingThread;
 +  State mState;
 +  nsresult mResult;
-+  bool mCanceled;
++  Action::Resolution mResolution;
 +
 +public:
 +  NS_DECL_ISUPPORTS_INHERITED
@@ -358,7 +452,7 @@ new file mode 100644
 +    case STATE_CANCELING:
 +      MOZ_ASSERT(NS_GetCurrentThread() == mTarget);
 +      mState = STATE_COMPLETING;
-+      mCanceled = true;
++      mResolution = Action::Canceled;
 +      mAction->CancelOnTarget();
 +      rv = mInitiatingThread->Dispatch(this, nsIThread::DISPATCH_NORMAL);
 +      if (NS_FAILED(rv)) {
@@ -367,7 +461,7 @@ new file mode 100644
 +      break;
 +    case STATE_COMPLETING:
 +      NS_ASSERT_OWNINGTHREAD(Action::Resolver);
-+      mAction->CompleteOnInitiatingThread(mResult, mCanceled);
++      mAction->CompleteOnInitiatingThread(mResult, mResolution);
 +      mState = STATE_COMPLETE;
 +      break;
 +    default:
@@ -392,6 +486,14 @@ new file mode 100644
 +  if (NS_FAILED(rv)) {
 +    MOZ_CRASH("Failed to dispatch QuotaInitRunnable.");
 +  }
++}
++
++void
++Context::ClearListener()
++{
++  NS_ASSERT_OWNINGTHREAD(Context);
++  MOZ_ASSERT(mListener);
++  mListener = nullptr;
 +}
 +
 +void
@@ -428,7 +530,6 @@ new file mode 100644
 +Context::~Context()
 +{
 +  NS_ASSERT_OWNINGTHREAD(Context);
-+  MOZ_ASSERT(mListener);
 +
 +  // Unlock the quota dir as we go out of scope.
 +  nsCOMPtr<nsIRunnable> runnable =
@@ -438,17 +539,27 @@ new file mode 100644
 +    MOZ_CRASH("Failed to dispatch QuotaReleaseRunnable to main thread.");
 +  }
 +
-+  mListener->RemoveContext(this);
++  if (mListener) {
++    mListener->RemoveContext(this);
++  }
 +}
 +
 +void
 +Context::DispatchAction(nsIEventTarget* aTarget, Action* aAction)
 +{
 +  NS_ASSERT_OWNINGTHREAD(Context);
++
++  nsCOMPtr<nsIFile> quotaDir;
++  nsresult rv = mQuotaDir->Clone(getter_AddRefs(quotaDir));
++  if (NS_FAILED(rv)) {
++    aAction->CompleteOnInitiatingThread(rv);
++    return;
++  }
++
 +  nsRefPtr<ActionRunnable> runnable =
-+    new ActionRunnable(this, aTarget, aAction, mQuotaDir);
++    new ActionRunnable(this, aTarget, aAction, quotaDir);
 +  mActionRunnables.AppendElement(runnable);
-+  nsresult rv = runnable->Dispatch();
++  rv = runnable->Dispatch();
 +  if (NS_FAILED(rv)) {
 +    MOZ_CRASH("Failed to dispatch ActionRunnable to target thread.");
 +  }
@@ -459,6 +570,16 @@ new file mode 100644
 +{
 +  NS_ASSERT_OWNINGTHREAD(Context);
 +  MOZ_ASSERT(mState == STATE_CONTEXT_INIT);
++
++  if (NS_FAILED(aRv)) {
++    for (uint32_t i = 0; i < mPendingActions.Length(); ++i) {
++      mPendingActions[i].mAction->CompleteOnInitiatingThread(aRv);
++    }
++    mPendingActions.Clear();
++    // Context will destruct after return here and last ref is released.
++    return;
++  }
++
 +  mQuotaDir = aQuotaDir;
 +  MOZ_ASSERT(mQuotaDir);
 +  mState = STATE_CONTEXT_READY;
@@ -490,7 +611,7 @@ diff --git a/dom/cache/Context.h b/dom/cache/Context.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/Context.h
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,94 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -529,6 +650,8 @@ new file mode 100644
 +
 +  Context(Listener* aListener, const nsACString& aOrigin,
 +          const nsACString& aBaseDomain, Action* aQuotaIOThreadAction);
++
++  void ClearListener();
 +
 +  // Execute given action on the target once the quota manager has been
 +  // initialized.
@@ -583,11 +706,365 @@ new file mode 100644
 +} // namespace mozilla
 +
 +#endif // mozilla_dom_cache_Context_h
+diff --git a/dom/cache/DBAction.cpp b/dom/cache/DBAction.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/DBAction.cpp
+@@ -0,0 +1,136 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "mozilla/dom/cache/DBAction.h"
++
++#include "mozilla/dom/quota/PersistenceType.h"
++#include "mozIStorageConnection.h"
++#include "mozIStorageService.h"
++#include "mozStorageCID.h"
++#include "nsIFile.h"
++#include "nsIURI.h"
++#include "nsNetUtil.h"
++
++namespace mozilla {
++namespace dom {
++namespace cache {
++
++using mozilla::dom::quota::PERSISTENCE_TYPE_PERSISTENT;
++using mozilla::dom::quota::PersistenceType;
++
++DBAction::DBAction(Mode aMode, const nsACString& aOrigin,
++                   const nsACString& aBaseDomain)
++  : mMode(aMode)
++  , mOrigin(aOrigin)
++  , mBaseDomain(aBaseDomain)
++{
++}
++
++void
++DBAction::RunOnTarget(Resolver* aResolver, nsIFile* aQuotaDir)
++{
++  MOZ_ASSERT(aResolver);
++  MOZ_ASSERT(aQuotaDir);
++
++  nsresult rv = aQuotaDir->Append(NS_LITERAL_STRING("cache"));
++  if (NS_FAILED(rv)) {
++    aResolver->Resolve(rv);
++    return;
++  }
++
++  nsCOMPtr<mozIStorageConnection> conn;
++  rv = OpenConnection(aQuotaDir, getter_AddRefs(conn));
++  if (NS_FAILED(rv)) {
++    aResolver->Resolve(rv);
++    return;
++  }
++  MOZ_ASSERT(conn);
++  rv = RunSyncOnTarget(aQuotaDir, conn);
++  aResolver->Resolve(rv);
++}
++
++nsresult
++DBAction::OpenConnection(nsIFile* aDBDir, mozIStorageConnection** aConnOut)
++{
++  MOZ_ASSERT(aDBDir);
++  MOZ_ASSERT(aConnOut);
++
++  bool exists;
++  nsresult rv = aDBDir->Exists(&exists);
++  if (NS_FAILED(rv)) { return rv; }
++
++  if (!exists) {
++    if (mMode != Create) {  return NS_ERROR_FILE_NOT_FOUND; }
++    rv = aDBDir->Create(nsIFile::DIRECTORY_TYPE, 0755);
++    if (NS_FAILED(rv)) { return rv; }
++  }
++
++  nsCOMPtr<nsIFile> dbFile;
++  rv = aDBDir->Clone(getter_AddRefs(dbFile));
++  if (NS_FAILED(rv)) { return rv; }
++
++  rv = dbFile->Append(NS_LITERAL_STRING("db.sqlite"));
++  if (NS_FAILED(rv)) { return rv; }
++
++  rv = dbFile->Exists(&exists);
++  if (NS_FAILED(rv)) { return rv; }
++
++  nsCOMPtr<nsIFile> dbTmpDir;
++  rv = aDBDir->Clone(getter_AddRefs(dbTmpDir));
++  if (NS_FAILED(rv)) { return rv; }
++
++  rv = dbTmpDir->Append(NS_LITERAL_STRING("db"));
++  if (NS_FAILED(rv)) { return rv; }
++
++  // XXX: Jonas tells me nsIFileURL usage off-main-thread is dangerous,
++  //      but this is what IDB does to access mozIStorageConnection so
++  //      it seems at least this corner case mostly works.
++  nsCOMPtr<nsIURI> uri;
++  rv = NS_NewFileURI(getter_AddRefs(uri), dbFile);
++  if (NS_FAILED(rv)) { return rv; }
++
++  nsCOMPtr<nsIFileURL> dbFileUrl = do_QueryInterface(uri);
++  if (NS_WARN_IF(!dbFileUrl)) { return NS_ERROR_UNEXPECTED; }
++
++  nsAutoCString type;
++  PersistenceTypeToText(PERSISTENCE_TYPE_PERSISTENT, type);
++
++  rv = dbFileUrl->SetQuery(NS_LITERAL_CSTRING("persistenceType=") + type +
++                           NS_LITERAL_CSTRING("&group=") + mBaseDomain +
++                           NS_LITERAL_CSTRING("&origin=") + mOrigin);
++  if (NS_FAILED(rv)) { return rv; }
++
++  nsCOMPtr<mozIStorageService> ss =
++    do_GetService(MOZ_STORAGE_SERVICE_CONTRACTID);
++  if (NS_WARN_IF(!ss)) { return NS_ERROR_UNEXPECTED; }
++
++  rv = ss->OpenDatabaseWithFileURL(dbFileUrl, aConnOut);
++  if (rv == NS_ERROR_FILE_CORRUPTED) {
++    dbFile->Remove(false);
++    if (NS_FAILED(rv)) { return rv; }
++
++    rv = dbTmpDir->Exists(&exists);
++    if (NS_FAILED(rv)) { return rv; }
++
++    if (exists) {
++      bool isDir;
++      rv = dbTmpDir->IsDirectory(&isDir);
++      if (NS_FAILED(rv)) { return rv; }
++      if (!isDir) { return NS_ERROR_UNEXPECTED; }
++      rv = dbTmpDir->Remove(true);
++      if (NS_FAILED(rv)) { return rv; }
++    }
++
++    rv = ss->OpenDatabaseWithFileURL(dbFileUrl, aConnOut);
++  }
++  if (NS_FAILED(rv)) { return rv; }
++  MOZ_ASSERT(*aConnOut);
++  return rv;
++}
++
++} // namespace cache
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/cache/DBAction.h b/dom/cache/DBAction.h
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/DBAction.h
+@@ -0,0 +1,57 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_cache_DBAction_h
++#define mozilla_dom_cache_DBAction_h
++
++#include "mozilla/dom/cache/Action.h"
++#include "nsString.h"
++
++class mozIStorageConnection;
++class nsIFile;
++
++namespace mozilla {
++namespace dom {
++namespace cache {
++
++class DBAction : public Action
++{
++public:
++  enum Mode
++  {
++    Existing,
++    Create
++  };
++
++  DBAction(Mode aMode, const nsACString& aOrigin,
++           const nsACString& aBaseDomain);
++
++  virtual ~DBAction() { }
++
++  virtual nsresult RunSyncOnTarget(nsIFile* aDBDir,
++                                   mozIStorageConnection* aConnection)=0;
++
++  virtual
++  void RunOnTarget(Resolver* aResolver, nsIFile* aQuotaDir) MOZ_OVERRIDE;
++
++  // Called on target thread if the DBAction is being canceled.  Simply
++  // clean up and do not call Resolver::Resolve() in this case.
++  // Note: DBAction must drop Resolver ref if CancelOnTarget() is called!
++  virtual void CancelOnTarget() { }
++
++private:
++  nsresult OpenConnection(nsIFile* aQuotaDir, mozIStorageConnection** aConnOut);
++
++  const Mode mMode;
++  const nsCString mOrigin;
++  const nsCString mBaseDomain;
++};
++
++} // namespace cache
++} // namespace dom
++} // namespace mozilla
++
++#endif // mozilla_dom_cache_DBAction_h
+diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/DBSchema.cpp
+@@ -0,0 +1,106 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "mozilla/dom/cache/DBSchema.h"
++
++#include "mozilla/dom/CacheDBConnection.h"
++#include "mozilla/dom/PCacheQueryParams.h"
++#include "mozilla/dom/PCacheRequest.h"
++#include "mozilla/dom/PCacheResponse.h"
++#include "mozIStorageConnection.h"
++#include "mozIStorageStatement.h"
++#include "mozStorageHelper.h"
++
++namespace mozilla {
++namespace dom {
++namespace cache {
++
++// static
++nsresult
++DBSchema::Create(mozIStorageConnection* aConn)
++{
++  MOZ_ASSERT(aConn);
++
++  nsAutoCString pragmas(
++#if defined(MOZ_WIDGET_ANDROID) || defined(MOZ_WIDGET_GONK)
++    // Switch the journaling mode to TRUNCATE to avoid changing the directory
++    // structure at the conclusion of every transaction for devices with slower
++    // file systems.
++    "PRAGMA journal_mode = TRUNCATE; "
++#endif
++    "PRAGMA foreign_keys = ON; "
++  );
++
++  nsresult rv = aConn->ExecuteSimpleSQL(pragmas);
++  if (NS_FAILED(rv)) { return rv; }
++
++  int32_t schemaVersion;
++  rv = aConn->GetSchemaVersion(&schemaVersion);
++  if (NS_FAILED(rv)) { return rv; }
++
++  if (schemaVersion == kLatestSchemaVersion) {
++    return NS_OK;
++  }
++
++  mozStorageTransaction trans(aConn, false,
++                              mozIStorageConnection::TRANSACTION_IMMEDIATE);
++
++  if (!schemaVersion) {
++    rv = aConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING(
++      "CREATE TABLE map ("
++        "id INTEGER NOT NULL PRIMARY KEY, "
++        "request_method TEXT NOT NULL, "
++        "request_url TEXT NOT NULL, "
++        "request_url_no_query TEXT NOT NULL, "
++        "request_mode INTEGER NOT NULL, "
++        "request_credentials INTEGER NOT NULL, "
++        //"request_body_file TEXT NOT NULL, "
++        "response_type INTEGER NOT NULL, "
++        "response_status INTEGER NOT NULL, "
++        "response_status_text TEXT NOT NULL "
++        //"response_body_file TEXT NOT NULL "
++      ");"
++    ));
++    if (NS_FAILED(rv)) { return rv; }
++
++    rv = aConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING(
++      "CREATE TABLE request_headers ("
++        "name TEXT NOT NULL, "
++        "value TEXT NOT NULL, "
++        "map_id INTEGER NOT NULL REFERENCES map(id) "
++      ");"
++    ));
++    if (NS_FAILED(rv)) { return rv; }
++
++    rv = aConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING(
++      "CREATE TABLE response_headers ("
++        "name TEXT NOT NULL, "
++        "value TEXT NOT NULL, "
++        "map_id INTEGER NOT NULL REFERENCES map(id) "
++      ");"
++    ));
++    if (NS_FAILED(rv)) { return rv; }
++
++    rv = aConn->SetSchemaVersion(kLatestSchemaVersion);
++    if (NS_FAILED(rv)) { return rv; }
++
++    rv = aConn->GetSchemaVersion(&schemaVersion);
++    if (NS_FAILED(rv)) { return rv; }
++  }
++
++  if (schemaVersion != kLatestSchemaVersion) {
++    return NS_ERROR_FAILURE;
++  }
++
++  rv = trans.Commit();
++  if (NS_FAILED(rv)) { return rv; }
++
++  return rv;
++}
++
++} // namespace cache
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/cache/DBSchema.h b/dom/cache/DBSchema.h
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/DBSchema.h
+@@ -0,0 +1,35 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_cache_DBSchema_h
++#define mozilla_dom_cache_DBSchema_h
++
++#include "mozilla/Attributes.h"
++#include "nsError.h"
++
++class mozIStorageConnection;
++
++namespace mozilla {
++namespace dom {
++namespace cache {
++
++class DBSchema MOZ_FINAL
++{
++public:
++  static nsresult Create(mozIStorageConnection* aConn);
++
++private:
++  DBSchema() MOZ_DELETE;
++  ~DBSchema() MOZ_DELETE;
++
++  static const int32_t kLatestSchemaVersion = 1;
++};
++
++} // namespace cache
++} // namespace dom
++} // namespace mozilla
++
++#endif // mozilla_dom_cache_DBSchema_h
 diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/Manager.cpp
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,153 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -595,8 +1072,42 @@ new file mode 100644
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 +
 +#include "mozilla/dom/cache/Manager.h"
++
++#include "mozilla/dom/cache/DBAction.h"
++#include "mozilla/dom/cache/DBSchema.h"
 +#include "mozilla/ipc/BackgroundParent.h"
 +#include "nsAutoPtr.h"
++
++namespace {
++
++using mozilla::dom::cache::DBAction;
++using mozilla::dom::cache::DBSchema;
++
++class SetupAction MOZ_FINAL : public DBAction
++{
++public:
++  SetupAction(const nsACString& aOrigin, const nsACString& aBaseDomain)
++    : DBAction(DBAction::Create, aOrigin, aBaseDomain)
++  { }
++
++  virtual nsresult
++  RunSyncOnTarget(nsIFile* aDBDir,
++                  mozIStorageConnection* aConnection) MOZ_OVERRIDE
++  {
++    return DBSchema::Create(aConnection);
++  }
++
++  virtual void CompleteOnInitiatingThread(nsresult aRv,
++                                          Resolution aResolution) MOZ_OVERRIDE
++  {
++    // Nothing to do here. Errors in setup are handled by Context.
++  }
++
++protected:
++  virtual ~SetupAction() { }
++};
++
++} // anonymous namespace
 +
 +namespace mozilla {
 +namespace dom {
@@ -605,14 +1116,8 @@ new file mode 100644
 +class Manager::Factory
 +{
 +private:
-+  struct Entry
-+  {
-+    nsCString mOrigin;
-+    Manager* mManager;
-+  };
-+
 +  static Factory* sFactory;
-+  nsTArray<Entry> mManagerList;
++  nsTArray<Manager*> mManagerList;
 +
 +public:
 +  static Factory& Instance()
@@ -625,22 +1130,21 @@ new file mode 100644
 +    return *sFactory;
 +  }
 +
-+  already_AddRefed<Manager> GetOrCreate(const nsACString& aOrigin)
++  already_AddRefed<Manager> GetOrCreate(const nsACString& aOrigin,
++                                        const nsACString& aBaseDomain)
 +  {
 +    mozilla::ipc::AssertIsOnBackgroundThread();
 +
 +    for (uint32_t i = 0; i < mManagerList.Length(); ++i) {
-+      if (mManagerList[i].mOrigin == aOrigin) {
-+        nsRefPtr<Manager> ref = mManagerList[i].mManager;
++      if (mManagerList[i]->Origin() == aOrigin) {
++        nsRefPtr<Manager> ref = mManagerList[i];
 +        return ref.forget();
 +      }
 +    }
 +
-+    nsRefPtr<Manager> ref = new Manager();
++    nsRefPtr<Manager> ref = new Manager(aOrigin, aBaseDomain);
 +
-+    Entry* entry = mManagerList.AppendElement();
-+    entry->mOrigin = aOrigin;
-+    entry->mManager = ref;
++    mManagerList.AppendElement(ref);
 +
 +    return ref.forget();
 +  }
@@ -651,8 +1155,13 @@ new file mode 100644
 +    MOZ_ASSERT(aManager);
 +
 +    for (uint32_t i = 0; i < mManagerList.Length(); ++i) {
-+      if (mManagerList[i].mManager == aManager) {
++      if (mManagerList[i] == aManager) {
 +        mManagerList.RemoveElementAt(i);
++
++        if (mManagerList.Length() < 1) {
++          delete sFactory;
++          sFactory = nullptr;
++        }
 +        return;
 +      }
 +    }
@@ -664,21 +1173,46 @@ new file mode 100644
 +
 +// static
 +already_AddRefed<Manager>
-+Manager::ForOrigin(const nsACString& aOrigin)
++Manager::ForOrigin(const nsACString& aOrigin, const nsACString& aBaseDomain)
 +{
 +  mozilla::ipc::AssertIsOnBackgroundThread();
-+  return Factory::Instance().GetOrCreate(aOrigin);
++  return Factory::Instance().GetOrCreate(aOrigin, aBaseDomain);
 +}
 +
-+Manager::Manager()
++void
++Manager::RemoveContext(Context* aContext)
 +{
-+  mozilla::ipc::AssertIsOnBackgroundThread();
++  NS_ASSERT_OWNINGTHREAD(Manager);
++  MOZ_ASSERT(mContext);
++  MOZ_ASSERT(mContext == aContext);
++  mContext = nullptr;
++}
++
++Manager::Manager(const nsACString& aOrigin, const nsACString& aBaseDomain)
++  : mOrigin(aOrigin)
++  , mBaseDomain(aBaseDomain)
++  , mContext(nullptr)
++{
 +}
 +
 +Manager::~Manager()
 +{
-+  mozilla::ipc::AssertIsOnBackgroundThread();
++  NS_ASSERT_OWNINGTHREAD(Manager);
 +  Factory::Instance().Remove(this);
++  if (mContext) {
++    mContext->ClearListener();
++  }
++}
++
++Context*
++Manager::GetContext()
++{
++  NS_ASSERT_OWNINGTHREAD(Manager);
++  if (!mContext) {
++    nsRefPtr<Action> setupAction = new SetupAction(mOrigin, mBaseDomain);
++    mContext = new Context(this, mOrigin, mBaseDomain, setupAction);
++  }
++  return mContext;
 +}
 +
 +} // namespace cache
@@ -688,7 +1222,7 @@ diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/Manager.h
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,50 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -698,6 +1232,7 @@ new file mode 100644
 +#ifndef mozilla_dom_cache_Manager_h
 +#define mozilla_dom_cache_Manager_h
 +
++#include "mozilla/dom/cache/Context.h"
 +#include "nsCOMPtr.h"
 +#include "nsISupportsImpl.h"
 +
@@ -705,16 +1240,29 @@ new file mode 100644
 +namespace dom {
 +namespace cache {
 +
-+class Manager MOZ_FINAL
++class Manager MOZ_FINAL : public Context::Listener
 +{
 +public:
-+  static already_AddRefed<Manager> ForOrigin(const nsACString& aOrigin);
++  static already_AddRefed<Manager> ForOrigin(const nsACString& aOrigin,
++                                             const nsACString& aBaseDomain);
++
++  const nsCString& Origin() const { return mOrigin; }
++
++  // Context::Listener methods
++  virtual void RemoveContext(Context* aContext) MOZ_OVERRIDE;
 +
 +private:
-+  Manager();
-+  ~Manager();
-+
 +  class Factory;
++
++  Manager(const nsACString& aOrigin, const nsACString& aBaseDomain);
++  ~Manager();
++  Context* GetContext();
++
++  const nsCString mOrigin;
++  const nsCString mBaseDomain;
++
++  // weak ref as Context destructor clears this pointer
++  Context* mContext;
 +
 +public:
 +  NS_INLINE_DECL_REFCOUNTING(Manager)
@@ -728,7 +1276,7 @@ new file mode 100644
 diff --git a/dom/cache/moz.build b/dom/cache/moz.build
 --- a/dom/cache/moz.build
 +++ b/dom/cache/moz.build
-@@ -19,28 +19,37 @@ EXPORTS.mozilla.dom += [
+@@ -19,28 +19,41 @@ EXPORTS.mozilla.dom += [
      'CacheStorageChildListener.h',
      'CacheStorageDBConnection.h',
      'CacheStorageDBListener.h',
@@ -741,6 +1289,8 @@ diff --git a/dom/cache/moz.build b/dom/cache/moz.build
 +EXPORTS.mozilla.dom.cache += [
 +    'Action.h',
 +    'Context.h',
++    'DBAction.h',
++    'DBSchema.h',
 +    'Manager.h',
 +]
 +
@@ -758,6 +1308,8 @@ diff --git a/dom/cache/moz.build b/dom/cache/moz.build
      'CacheStorageDBSchema.cpp',
      'CacheStorageParent.cpp',
 +    'Context.cpp',
++    'DBAction.cpp',
++    'DBSchema.cpp',
 +    'Manager.cpp',
  ]
  
