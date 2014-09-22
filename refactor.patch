@@ -182,7 +182,7 @@ diff --git a/dom/cache/Action.h b/dom/cache/Action.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/Action.h
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,64 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -192,6 +192,7 @@ new file mode 100644
 +#ifndef mozilla_dom_cache_Action_h
 +#define mozilla_dom_cache_Action_h
 +
++#include "mozilla/dom/cache/Types.h"
 +#include "nsISupportsImpl.h"
 +
 +class nsIFile;
@@ -233,6 +234,10 @@ new file mode 100644
 +  // Executed on the initiating thread and is passed the nsresult given to
 +  // Resolver::Resolve().
 +  virtual void CompleteOnInitiatingThread(nsresult aRv) { }
++
++  // Executed on the initiating thread.  If this Action will operate on the
++  // given cache ID then override this to return true.
++  virtual bool MatchesCacheId(CacheId aCacheId) { return false; }
 +
 +  NS_DECL_THREADSAFE_ISUPPORTS
 +};
@@ -938,7 +943,7 @@ diff --git a/dom/cache/CacheDBSchema.h b/dom/cache/CacheDBSchema.h
 diff --git a/dom/cache/CacheParent.cpp b/dom/cache/CacheParent.cpp
 --- a/dom/cache/CacheParent.cpp
 +++ b/dom/cache/CacheParent.cpp
-@@ -1,26 +1,26 @@
+@@ -1,55 +1,53 @@
  /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
  /* vim: set ts=8 sts=2 et sw=2 tw=80: */
  /* This Source Code Form is subject to the terms of the Mozilla Public
@@ -960,15 +965,57 @@ diff --git a/dom/cache/CacheParent.cpp b/dom/cache/CacheParent.cpp
  using mozilla::unused;
  using mozilla::void_t;
 -using mozilla::dom::cache::RequestId;
+-
+-CacheParent::CacheParent(const nsACString& aOrigin,
+-                         const nsACString& aBaseDomain)
+-  : mOrigin(aOrigin)
+-  , mBaseDomain(aBaseDomain)
+-{
+-  mDBConnection = CacheDBConnection::Create(this, aOrigin, aBaseDomain);
+-  MOZ_ASSERT(mDBConnection);
+-}
  
  CacheParent::CacheParent(const nsACString& aOrigin,
-                          const nsACString& aBaseDomain)
-   : mOrigin(aOrigin)
-   , mBaseDomain(aBaseDomain)
+                          const nsACString& aBaseDomain,
+-                         const nsID& aExistingCacheId)
+-  : mOrigin(aOrigin)
+-  , mBaseDomain(aBaseDomain)
++                         CacheId aCacheId)
++  : mCacheId(aCacheId)
++  , mManager(Manager::ForOrigin(aOrigin, aBaseDomain))
  {
-   mDBConnection = CacheDBConnection::Create(this, aOrigin, aBaseDomain);
+-  mDBConnection = new CacheDBConnection(this, aOrigin, aBaseDomain,
+-                                        aExistingCacheId);
+-  MOZ_ASSERT(mDBConnection);
++  MOZ_ASSERT(mManager);
++  mManager->AddRefCacheId(mCacheId);
++
++  // TODO: remove this stuff
++  nsID bogusId;
++  mDBConnection = new CacheDBConnection(this, aOrigin, aBaseDomain, bogusId);
+ }
+ 
+ CacheParent::~CacheParent()
+ {
+   MOZ_ASSERT(!mDBConnection);
+ }
+ 
+ void
+ CacheParent::ActorDestroy(ActorDestroyReason aReason)
+ {
++  MOZ_ASSERT(mManager);
++  mManager->RemoveListener(this);
++  mManager->ReleaseCacheId(mCacheId);
++  mManager = nullptr;
    MOZ_ASSERT(mDBConnection);
-@@ -105,24 +105,24 @@ bool
+   mDBConnection->ClearListener();
+   mDBConnection = nullptr;
+ }
+ 
+ bool
+ CacheParent::RecvMatch(const RequestId& aRequestId, const PCacheRequest& aRequest,
+                        const PCacheQueryParams& aParams)
+@@ -105,24 +103,24 @@ bool
  CacheParent::RecvKeys(const RequestId& aRequestId,
                        const PCacheRequestOrVoid& aRequest,
                        const PCacheQueryParams& aParams)
@@ -995,7 +1042,7 @@ diff --git a/dom/cache/CacheParent.cpp b/dom/cache/CacheParent.cpp
  void
  CacheParent::OnPut(RequestId aRequestId, nsresult aRv,
                     const PCacheResponseOrVoid& aResponse)
-@@ -132,10 +132,11 @@ CacheParent::OnPut(RequestId aRequestId,
+@@ -132,10 +130,11 @@ CacheParent::OnPut(RequestId aRequestId,
  
  void
  CacheParent::OnDelete(RequestId aRequestId, nsresult aRv,
@@ -1010,7 +1057,7 @@ diff --git a/dom/cache/CacheParent.cpp b/dom/cache/CacheParent.cpp
 diff --git a/dom/cache/CacheParent.h b/dom/cache/CacheParent.h
 --- a/dom/cache/CacheParent.h
 +++ b/dom/cache/CacheParent.h
-@@ -2,25 +2,26 @@
+@@ -2,35 +2,37 @@
  /* vim: set ts=8 sts=2 et sw=2 tw=80: */
  /* This Source Code Form is subject to the terms of the Mozilla Public
   * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -1023,8 +1070,9 @@ diff --git a/dom/cache/CacheParent.h b/dom/cache/CacheParent.h
 -#include "mozilla/dom/CacheTypes.h"
 -#include "mozilla/dom/PCacheParent.h"
 +#include "mozilla/dom/cache/CacheDBListener.h"
-+#include "mozilla/dom/cache/Types.h"
++#include "mozilla/dom/cache/Manager.h"
 +#include "mozilla/dom/cache/PCacheParent.h"
++#include "mozilla/dom/cache/Types.h"
  
  struct nsID;
  template <class T> class nsRefPtr;
@@ -1037,10 +1085,22 @@ diff --git a/dom/cache/CacheParent.h b/dom/cache/CacheParent.h
  
  class CacheParent MOZ_FINAL : public PCacheParent
                              , public CacheDBListener
++                            , public Manager::Listener
  {
  public:
-   CacheParent(const nsACString& aOrigin, const nsACString& aBaseDomain);
-@@ -48,27 +49,28 @@ public:
+-  CacheParent(const nsACString& aOrigin, const nsACString& aBaseDomain);
+   CacheParent(const nsACString& aOrigin, const nsACString& aBaseDomain,
+-              const nsID& aExistingCacheId);
++              CacheId aCacheId);
+   virtual ~CacheParent();
+   virtual void ActorDestroy(ActorDestroyReason aReason) MOZ_OVERRIDE;
+ 
+   // PCacheParent method
+   virtual bool
+   RecvMatch(const RequestId& aRequestId, const PCacheRequest& aRequest,
+             const PCacheQueryParams& aParams) MOZ_OVERRIDE;
+   virtual bool
+@@ -48,27 +50,28 @@ public:
    virtual bool
    RecvDelete(const RequestId& aRequestId, const PCacheRequest& aRequest,
               const PCacheQueryParams& aParams) MOZ_OVERRIDE;
@@ -1063,8 +1123,10 @@ diff --git a/dom/cache/CacheParent.h b/dom/cache/CacheParent.h
                          bool aSuccess) MOZ_OVERRIDE;
  
  private:
-   const nsCString mOrigin;
-   const nsCString mBaseDomain;
+-  const nsCString mOrigin;
+-  const nsCString mBaseDomain;
++  const CacheId mCacheId;
++  nsRefPtr<mozilla::dom::cache::Manager> mManager;
    nsRefPtr<CacheDBConnection> mDBConnection;
  };
  
@@ -2395,7 +2457,7 @@ deleted file mode 100644
 diff --git a/dom/cache/CacheStorageParent.cpp b/dom/cache/CacheStorageParent.cpp
 --- a/dom/cache/CacheStorageParent.cpp
 +++ b/dom/cache/CacheStorageParent.cpp
-@@ -1,154 +1,137 @@
+@@ -1,154 +1,133 @@
  /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
  /* vim: set ts=8 sts=2 et sw=2 tw=80: */
  /* This Source Code Form is subject to the terms of the Mozilla Public
@@ -2518,15 +2580,14 @@ diff --git a/dom/cache/CacheStorageParent.cpp b/dom/cache/CacheStorageParent.cpp
    }
  
 -  // TODO: create cache parent for given uuid
-+  // TODO: create cache parent for given CacheId
-   CacheParent* actor = new CacheParent(mOrigin, mBaseDomain);
+-  CacheParent* actor = new CacheParent(mOrigin, mBaseDomain);
 -  if (actor) {
 -    PCacheParent* base = Manager()->SendPCacheConstructor(actor, mOrigin,
 -                                                          mBaseDomain);
 -    actor = static_cast<CacheParent*>(base);
 -  }
-+  PCacheParent* base = Manager()->SendPCacheConstructor(actor, mOrigin,
-+                                                        mBaseDomain);
++  CacheParent* actor = new CacheParent(mOrigin, mBaseDomain, aCacheId);
++  PCacheParent* base = Manager()->SendPCacheConstructor(actor);
 +  actor = static_cast<CacheParent*>(base);
    unused << SendGetResponse(aRequestId, aRv, actor);
  }
@@ -2560,10 +2621,8 @@ diff --git a/dom/cache/CacheStorageParent.cpp b/dom/cache/CacheStorageParent.cpp
 -      actor = static_cast<CacheParent*>(base);
 -    }
 -  }
-+  // TODO: use cache ID
-+  CacheParent* actor = new CacheParent(mOrigin, mBaseDomain);
-+  PCacheParent* base = Manager()->SendPCacheConstructor(actor, mOrigin,
-+                                                        mBaseDomain);
++  CacheParent* actor = new CacheParent(mOrigin, mBaseDomain, aCacheId);
++  PCacheParent* base = Manager()->SendPCacheConstructor(actor);
 +  actor = static_cast<CacheParent*>(base);
    unused << SendCreateResponse(aRequestId, aRv, actor);
  }
@@ -2722,7 +2781,7 @@ diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/Context.cpp
-@@ -0,0 +1,528 @@
+@@ -0,0 +1,546 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -2998,6 +3057,11 @@ new file mode 100644
 +    return rv;
 +  }
 +
++  bool MatchesCacheId(CacheId aCacheId) {
++    NS_ASSERT_OWNINGTHREAD(Action::Resolver);
++    return mAction->MatchesCacheId(aCacheId);
++  }
++
 +  void Cancel()
 +  {
 +    NS_ASSERT_OWNINGTHREAD(Action::Resolver);
@@ -3171,6 +3235,19 @@ new file mode 100644
 +  }
 +}
 +
++void
++Context::CancelForCacheId(CacheId aCacheId)
++{
++  NS_ASSERT_OWNINGTHREAD(Context);
++  mState = STATE_CONTEXT_CANCELED;
++  mPendingActions.Clear();
++  for (uint32_t i = 0; i < mActionRunnables.Length(); ++i) {
++    if (mActionRunnables[i]->MatchesCacheId(aCacheId)) {
++      mActionRunnables[i]->Cancel();
++    }
++  }
++}
++
 +Context::~Context()
 +{
 +  NS_ASSERT_OWNINGTHREAD(Context);
@@ -3255,7 +3332,7 @@ diff --git a/dom/cache/Context.h b/dom/cache/Context.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/Context.h
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,101 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -3265,6 +3342,7 @@ new file mode 100644
 +#ifndef mozilla_dom_cache_Context_h
 +#define mozilla_dom_cache_Context_h
 +
++#include "mozilla/dom/cache/Types.h"
 +#include "nsAutoPtr.h"
 +#include "nsCOMPtr.h"
 +#include "nsISupportsImpl.h"
@@ -3309,6 +3387,12 @@ new file mode 100644
 +  //
 +  // Only callable from the thread that created the Context.
 +  void CancelAll();
++
++  // Cancel any Actions running or waiting to run that operate on the given
++  // cache ID.
++  //
++  // Only callable from the thread that created the Context.
++  void CancelForCacheId(CacheId aCacheId);
 +
 +private:
 +  class QuotaInitRunnable;
@@ -3557,7 +3641,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/DBSchema.cpp
-@@ -0,0 +1,282 @@
+@@ -0,0 +1,339 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -3623,7 +3707,7 @@ new file mode 100644
 +        "response_status INTEGER NOT NULL, "
 +        "response_status_text TEXT NOT NULL, "
 +        //"response_body_file TEXT NOT NULL "
-+        "cache_id INTEGER NOT NULL REFERENCES caches(id) "
++        "cache_id INTEGER NOT NULL REFERENCES caches(id) ON DELETE CASCADE"
 +      ");"
 +    ));
 +    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
@@ -3644,7 +3728,7 @@ new file mode 100644
 +      "CREATE TABLE request_headers ("
 +        "name TEXT NOT NULL, "
 +        "value TEXT NOT NULL, "
-+        "entry_id INTEGER NOT NULL REFERENCES entries(id) "
++        "entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE"
 +      ");"
 +    ));
 +    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
@@ -3653,7 +3737,7 @@ new file mode 100644
 +      "CREATE TABLE response_headers ("
 +        "name TEXT NOT NULL, "
 +        "value TEXT NOT NULL, "
-+        "entry_id INTEGER NOT NULL REFERENCES entries(id) "
++        "entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE"
 +      ");"
 +    ));
 +    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
@@ -3715,6 +3799,63 @@ new file mode 100644
 +
 +  rv = state->GetInt32(0, aCacheIdOut);
 +  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  return rv;
++}
++
++// static
++nsresult
++DBSchema::DeleteCache(mozIStorageConnection* aConn, CacheId aCacheId)
++{
++  MOZ_ASSERT(aConn);
++
++  // Dependent data removed by ON DELETE CASCADE in schema definition.
++
++  nsCOMPtr<mozIStorageStatement> state;
++  nsresult rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
++    "DELETE FROM caches WHERE id=?1;"
++  ), getter_AddRefs(state));
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  rv = state->BindInt32Parameter(0, aCacheId);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  rv = state->Execute();
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  return rv;
++}
++
++// static
++nsresult
++DBSchema::IsCacheOrphaned(mozIStorageConnection* aConn,
++                          CacheId aCacheId, bool* aOrphanedOut)
++{
++  MOZ_ASSERT(aConn);
++  MOZ_ASSERT(aOrphanedOut);
++
++  // err on the side of not deleting user data
++  *aOrphanedOut = false;
++
++  nsCOMPtr<mozIStorageStatement> state;
++  nsresult rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
++    "SELECT COUNT(*) FROM storage WHERE cache_id=?1;"
++  ), getter_AddRefs(state));
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  rv = state->BindInt32Parameter(0, aCacheId);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  bool hasMoreData;
++  rv = state->ExecuteStep(&hasMoreData);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++  MOZ_ASSERT(hasMoreData);
++
++  int32_t refCount;
++  rv = state->GetInt32(0, &refCount);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  *aOrphanedOut = refCount < 1;
 +
 +  return rv;
 +}
@@ -3844,7 +3985,7 @@ diff --git a/dom/cache/DBSchema.h b/dom/cache/DBSchema.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/DBSchema.h
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,59 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -3870,8 +4011,13 @@ new file mode 100644
 +{
 +public:
 +  static nsresult CreateSchema(mozIStorageConnection* aConn);
++
 +  static nsresult CreateCache(mozIStorageConnection* aConn,
 +                              CacheId* aCacheIdOut);
++  static nsresult DeleteCache(mozIStorageConnection* aConn, CacheId aCacheId);
++
++  static nsresult IsCacheOrphaned(mozIStorageConnection* aConn,
++                                  CacheId aCacheId, bool* aOrphanedOut);
 +
 +  static nsresult StorageGetCacheId(mozIStorageConnection* aConn,
 +                                    Namespace aNamespace, const nsAString& aKey,
@@ -3935,7 +4081,7 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/Manager.cpp
-@@ -0,0 +1,474 @@
+@@ -0,0 +1,586 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -3971,6 +4117,7 @@ new file mode 100644
 +    // TODO: create body directory structure
 +    // TODO: init maintainance marker
 +    // TODO: perform maintainance if necessary
++    // TODO: find orphaned caches in database
 +
 +    mozStorageTransaction trans(aConn, false,
 +                                mozIStorageConnection::TRANSACTION_IMMEDIATE);
@@ -4079,6 +4226,82 @@ new file mode 100644
 +  nsRefPtr<Manager> mManager;
 +  const ListenerId mListenerId;
 +  const RequestId mRequestId;
++};
++
++class Manager::DeleteOrphanedCacheAction MOZ_FINAL : public DBAction
++{
++public:
++  DeleteOrphanedCacheAction(Manager* aManager, CacheId aCacheId)
++    : DBAction(DBAction::Existing, aManager->Origin(), aManager->BaseDomain())
++    , mManager(aManager)
++    , mCacheId(aCacheId)
++  { }
++
++  virtual nsresult
++  RunSyncOnTarget(nsIFile* aDBDir, mozIStorageConnection* aConn) MOZ_OVERRIDE
++  {
++    mozStorageTransaction trans(aConn, false,
++                                mozIStorageConnection::TRANSACTION_IMMEDIATE);
++
++    // TODO: get body data file names
++
++    nsresult rv =  DBSchema::DeleteCache(aConn, mCacheId);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    rv = trans.Commit();
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    // TODO: delete body data files
++
++    return rv;
++  }
++
++  virtual void
++  CompleteOnInitiatingThread(nsresult aRv) MOZ_OVERRIDE { }
++
++private:
++  virtual ~DeleteOrphanedCacheAction() { }
++  nsRefPtr<Manager> mManager;
++  const CacheId mCacheId;
++};
++
++class Manager::CheckCacheOrphanedAction MOZ_FINAL : public DBAction
++{
++public:
++  CheckCacheOrphanedAction(Manager* aManager, CacheId aCacheId)
++    : DBAction(DBAction::Existing, aManager->Origin(), aManager->BaseDomain())
++    , mManager(aManager)
++    , mCacheId(aCacheId)
++    , mOrphaned(false)
++  { }
++
++  virtual nsresult
++  RunSyncOnTarget(nsIFile* aDBDir, mozIStorageConnection* aConn) MOZ_OVERRIDE
++  {
++    // Note: We need to do the check separately from the delete so we have the
++    //       opportunity to cancel pending IO actions in
++    //       CompleteOnInitiatingThread().
++    return DBSchema::IsCacheOrphaned(aConn, mCacheId, &mOrphaned);
++  }
++
++  virtual void
++  CompleteOnInitiatingThread(nsresult aRv) MOZ_OVERRIDE
++  {
++    if (!mOrphaned) {
++      return;
++    }
++
++    mManager->CurrentContext()->CancelForCacheId(mCacheId);
++
++    nsRefPtr<Action> action = new DeleteOrphanedCacheAction(mManager, mCacheId);
++    mManager->CurrentContext()->Dispatch(mManager->mIOThread, action);
++  }
++
++private:
++  virtual ~CheckCacheOrphanedAction() { }
++  nsRefPtr<Manager> mManager;
++  const CacheId mCacheId;
++  bool mOrphaned;
 +};
 +
 +class Manager::StorageGetAction : public Manager::BaseAction
@@ -4275,6 +4498,41 @@ new file mode 100644
 +}
 +
 +void
++Manager::AddRefCacheId(CacheId aCacheId)
++{
++  NS_ASSERT_OWNINGTHREAD(Manager);
++  for (uint32_t i = 0; i < mCacheIdRefs.Length(); ++i) {
++    if (mCacheIdRefs[i].mCacheId == aCacheId) {
++      mCacheIdRefs[i].mCount += 1;
++      return;
++    }
++  }
++  CacheIdRefCounter* entry = mCacheIdRefs.AppendElement();
++  entry->mCacheId = aCacheId;
++  entry->mCount = 1;
++}
++
++void
++Manager::ReleaseCacheId(CacheId aCacheId)
++{
++  NS_ASSERT_OWNINGTHREAD(Manager);
++  for (uint32_t i = 0; i < mCacheIdRefs.Length(); ++i) {
++    if (mCacheIdRefs[i].mCacheId == aCacheId) {
++      DebugOnly<uint32_t> oldRef = mCacheIdRefs[i].mCount;
++      mCacheIdRefs[i].mCount -= 1;
++      MOZ_ASSERT(mCacheIdRefs[i].mCount < oldRef);
++      if (mCacheIdRefs[i].mCount < 1) {
++        mCacheIdRefs.RemoveElementAt(i);
++        nsRefPtr<Action> action = new CheckCacheOrphanedAction(this, aCacheId);
++        CurrentContext()->Dispatch(mIOThread, action);
++      }
++      return;
++    }
++  }
++  MOZ_ASSERT_UNREACHABLE("Attempt to release CacheId that is not referenced!");
++}
++
++void
 +Manager::StorageGet(Listener* aListener, RequestId aRequestId,
 +                    Namespace aNamespace, const nsAString& aKey)
 +{
@@ -4414,7 +4672,7 @@ diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/Manager.h
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,108 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -4445,21 +4703,23 @@ new file mode 100644
 +  public:
 +    virtual ~Listener() { }
 +    virtual void OnStorageGet(RequestId aRequestId, nsresult aRv,
-+                              bool aCacheFound, CacheId aCacheId)=0;
++                              bool aCacheFound, CacheId aCacheId) { }
 +    virtual void OnStorageHas(RequestId aRequestId, nsresult aRv,
-+                              bool aCacheFound)=0;
++                              bool aCacheFound) { }
 +    virtual void OnStorageCreate(RequestId aRequestId, nsresult aRv,
-+                                 CacheId aCacheId)=0;
++                                 CacheId aCacheId) { }
 +    virtual void OnStorageDelete(RequestId aRequestId, nsresult aRv,
-+                                 bool aCacheDeleted)=0;
++                                 bool aCacheDeleted) { }
 +    virtual void OnStorageKeys(RequestId aRequestId, nsresult aRv,
-+                               const nsTArray<nsString>& aKeys)=0;
++                               const nsTArray<nsString>& aKeys) { }
 +  };
 +
 +  static already_AddRefed<Manager> ForOrigin(const nsACString& aOrigin,
 +                                             const nsACString& aBaseDomain);
 +
 +  void RemoveListener(Listener* aListener);
++  void AddRefCacheId(CacheId aCacheId);
++  void ReleaseCacheId(CacheId aCacheId);
 +
 +  void StorageGet(Listener* aListener, RequestId aRequestId,
 +                  Namespace aNamespace, const nsAString& aKey);
@@ -4481,6 +4741,8 @@ new file mode 100644
 +private:
 +  class Factory;
 +  class BaseAction;
++  class CheckCacheOrphanedAction;
++  class DeleteOrphanedCacheAction;
 +  class StorageGetAction;
 +  class StorageHasAction;
 +  class StorageCreateAction;
@@ -4499,6 +4761,13 @@ new file mode 100644
 +  const nsCString mBaseDomain;
 +  nsCOMPtr<nsIThread> mIOThread;
 +  nsTArray<Listener*> mListeners;
++
++  struct CacheIdRefCounter
++  {
++    CacheId mCacheId;
++    uint32_t mCount;
++  };
++  nsTArray<CacheIdRefCounter> mCacheIdRefs;
 +
 +  // weak ref as Context destructor clears this pointer
 +  Context* mContext;
@@ -4977,6 +5246,26 @@ diff --git a/ipc/glue/BackgroundChildImpl.cpp b/ipc/glue/BackgroundChildImpl.cpp
    friend class mozilla::ipc::BackgroundChildImpl;
  
    nsCString mTestArg;
+@@ -113,18 +113,17 @@ BackgroundChildImpl::DeallocPCacheStorag
+ {
+   // The CacheStorageChild actor is provided to the PBackground manager, but
+   // we own the object and must delete it.
+   delete aActor;
+   return true;
+ }
+ 
+ PCacheChild*
+-BackgroundChildImpl::AllocPCacheChild(const nsCString& aOrigin,
+-                                      const nsCString& aBaseDomain)
++BackgroundChildImpl::AllocPCacheChild()
+ {
+   return new CacheChild();
+ }
+ 
+ bool
+ BackgroundChildImpl::DeallocPCacheChild(PCacheChild* aActor)
+ {
+   // The CacheChild actor is provided to the PBackground manager, but
 diff --git a/ipc/glue/BackgroundChildImpl.h b/ipc/glue/BackgroundChildImpl.h
 --- a/ipc/glue/BackgroundChildImpl.h
 +++ b/ipc/glue/BackgroundChildImpl.h
@@ -5002,7 +5291,7 @@ diff --git a/ipc/glue/BackgroundChildImpl.h b/ipc/glue/BackgroundChildImpl.h
  class BackgroundChildImpl : public PBackgroundChild
  {
  public:
-@@ -40,30 +42,30 @@ protected:
+@@ -40,30 +42,28 @@ protected:
    ActorDestroy(ActorDestroyReason aWhy) MOZ_OVERRIDE;
  
    virtual PBackgroundTestChild*
@@ -5022,9 +5311,9 @@ diff --git a/ipc/glue/BackgroundChildImpl.h b/ipc/glue/BackgroundChildImpl.h
 +  DeallocPCacheStorageChild(mozilla::dom::cache::PCacheStorageChild* aActor) MOZ_OVERRIDE;
  
 -  virtual mozilla::dom::PCacheChild*
-+  virtual mozilla::dom::cache::PCacheChild*
-   AllocPCacheChild(const nsCString& aOrigin,
-                    const nsCString& aBaseDomain) MOZ_OVERRIDE;
+-  AllocPCacheChild(const nsCString& aOrigin,
+-                   const nsCString& aBaseDomain) MOZ_OVERRIDE;
++  virtual mozilla::dom::cache::PCacheChild* AllocPCacheChild() MOZ_OVERRIDE;
  
    virtual bool
 -  DeallocPCacheChild(mozilla::dom::PCacheChild* aActor) MOZ_OVERRIDE;
@@ -5040,7 +5329,7 @@ diff --git a/ipc/glue/BackgroundChildImpl.h b/ipc/glue/BackgroundChildImpl.h
 diff --git a/ipc/glue/BackgroundParentImpl.cpp b/ipc/glue/BackgroundParentImpl.cpp
 --- a/ipc/glue/BackgroundParentImpl.cpp
 +++ b/ipc/glue/BackgroundParentImpl.cpp
-@@ -1,27 +1,31 @@
+@@ -1,27 +1,30 @@
  /* This Source Code Form is subject to the terms of the Mozilla Public
   * License, v. 2.0. If a copy of the MPL was not distributed with this file,
   * You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -5049,8 +5338,8 @@ diff --git a/ipc/glue/BackgroundParentImpl.cpp b/ipc/glue/BackgroundParentImpl.c
  
  #include "mozilla/Assertions.h"
 +#include "mozilla/dom/MessagePortParent.h"
-+#include "mozilla/dom/cache/CacheParent.h"
 +#include "mozilla/dom/cache/CacheStorageParent.h"
++#include "mozilla/dom/cache/PCacheParent.h"
  #include "mozilla/ipc/BackgroundParent.h"
 -#include "mozilla/dom/MessagePortParent.h"
  #include "mozilla/ipc/PBackgroundTestParent.h"
@@ -5064,7 +5353,6 @@ diff --git a/ipc/glue/BackgroundParentImpl.cpp b/ipc/glue/BackgroundParentImpl.c
  
  using namespace mozilla::dom;
 +using mozilla::dom::cache::PCacheParent;
-+using mozilla::dom::cache::CacheParent;
 +using mozilla::dom::cache::CacheStorageParent;
 +using mozilla::dom::cache::PCacheStorageParent;
  
@@ -5075,6 +5363,37 @@ diff --git a/ipc/glue/BackgroundParentImpl.cpp b/ipc/glue/BackgroundParentImpl.c
  {
    MOZ_ASSERT(XRE_GetProcessType() == GeckoProcessType_Default);
  }
+@@ -124,25 +127,27 @@ BackgroundParentImpl::AllocPCacheStorage
+ bool
+ BackgroundParentImpl::DeallocPCacheStorageParent(PCacheStorageParent* aActor)
+ {
+   delete aActor;
+   return true;
+ }
+ 
+ PCacheParent*
+-BackgroundParentImpl::AllocPCacheParent(const nsCString& aOrigin,
+-                                        const nsCString& aBaseDomain)
++BackgroundParentImpl::AllocPCacheParent()
+ {
+-  return new CacheParent(aOrigin, aBaseDomain);
++  MOZ_CRASH("CacheParent actor must be provided to PBackground manager");
++  return nullptr;
+ }
+ 
+ bool
+ BackgroundParentImpl::DeallocPCacheParent(PCacheParent* aActor)
+ {
++  // The CacheParent actor is provided to the PBackground manager, but
++  // we own the object and must delete it.
+   delete aActor;
+   return true;
+ }
+ 
+ PMessagePortParent*
+ BackgroundParentImpl::AllocPMessagePortParent()
+ {
+   AssertIsInMainProcess();
 diff --git a/ipc/glue/BackgroundParentImpl.h b/ipc/glue/BackgroundParentImpl.h
 --- a/ipc/glue/BackgroundParentImpl.h
 +++ b/ipc/glue/BackgroundParentImpl.h
@@ -5100,7 +5419,7 @@ diff --git a/ipc/glue/BackgroundParentImpl.h b/ipc/glue/BackgroundParentImpl.h
  class BackgroundParentImpl : public PBackgroundParent
  {
  protected:
-@@ -31,30 +33,30 @@ protected:
+@@ -31,30 +33,28 @@ protected:
  
    virtual bool
    RecvPBackgroundTestConstructor(PBackgroundTestParent* aActor,
@@ -5120,9 +5439,9 @@ diff --git a/ipc/glue/BackgroundParentImpl.h b/ipc/glue/BackgroundParentImpl.h
 +  DeallocPCacheStorageParent(mozilla::dom::cache::PCacheStorageParent* aActor) MOZ_OVERRIDE;
  
 -  virtual mozilla::dom::PCacheParent*
-+  virtual mozilla::dom::cache::PCacheParent*
-   AllocPCacheParent(const nsCString& aOrigin,
-                     const nsCString& aBaseDomain) MOZ_OVERRIDE;
+-  AllocPCacheParent(const nsCString& aOrigin,
+-                    const nsCString& aBaseDomain) MOZ_OVERRIDE;
++  virtual mozilla::dom::cache::PCacheParent* AllocPCacheParent() MOZ_OVERRIDE;
  
    virtual bool
 -  DeallocPCacheParent(mozilla::dom::PCacheParent* aActor) MOZ_OVERRIDE;
@@ -5157,3 +5476,20 @@ diff --git a/ipc/glue/PBackground.ipdl b/ipc/glue/PBackground.ipdl
  {
    manages PBackgroundTest;
    manages PCacheStorage;
+@@ -22,14 +22,14 @@ protocol PBackground
+ parent:
+   // Only called at startup during mochitests to check the basic infrastructure.
+   PBackgroundTest(nsCString testArg);
+ 
+   PCacheStorage(Namespace namespaceEnum, nsCString origin, nsCString baseDomain);
+ 
+   PMessagePort();
+ 
+-both:
+-  PCache(nsCString origin, nsCString baseDomain);
++child:
++  PCache();
+ };
+ 
+ } // namespace ipc
+ } // namespace mozilla
