@@ -3,7 +3,6 @@
 # User Ben Kelly <ben@wanderview.com>
 Implement cache body reading and writing.
 
-
 diff --git a/dom/cache/CacheParent.cpp b/dom/cache/CacheParent.cpp
 --- a/dom/cache/CacheParent.cpp
 +++ b/dom/cache/CacheParent.cpp
@@ -48,7 +47,7 @@ diff --git a/dom/cache/CacheParent.cpp b/dom/cache/CacheParent.cpp
 +  }
 +
 +  nsCOMPtr<nsIInputStream> responseStream;
-+  rv = NS_NewCStringInputStream(getter_AddRefs(requestStream),
++  rv = NS_NewCStringInputStream(getter_AddRefs(responseStream),
 +                NS_LITERAL_CSTRING("response body stream hooray!"));
 +  if (NS_WARN_IF(NS_FAILED(rv))) {
 +    OnCachePut(aRequestId, rv, PCacheResponseOrVoid(void_t()));
@@ -112,17 +111,23 @@ diff --git a/dom/cache/DBAction.h b/dom/cache/DBAction.h
 diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
 --- a/dom/cache/Manager.cpp
 +++ b/dom/cache/Manager.cpp
-@@ -10,17 +10,20 @@
+@@ -7,26 +7,34 @@
+ #include "mozilla/dom/cache/Manager.h"
+ 
+ #include "mozilla/dom/cache/DBAction.h"
  #include "mozilla/dom/cache/DBSchema.h"
  #include "mozilla/dom/cache/PCacheQueryParams.h"
  #include "mozilla/dom/cache/PCacheRequest.h"
  #include "mozilla/dom/cache/PCacheResponse.h"
  #include "mozilla/dom/cache/Types.h"
++#include "mozilla/dom/quota/FileStreams.h"
  #include "mozilla/ipc/BackgroundParent.h"
  #include "mozStorageHelper.h"
  #include "nsAutoPtr.h"
 +#include "nsIInputStream.h"
 +#include "nsID.h"
++#include "nsIFile.h"
++#include "nsIUUIDGenerator.h"
  #include "nsIThread.h"
 +#include "nsStreamUtils.h"
  #include "nsThreadUtils.h"
@@ -131,9 +136,118 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
  
  using mozilla::dom::cache::DBSchema;
  using mozilla::dom::cache::SyncDBAction;
++using mozilla::dom::quota::FileOutputStream;
++using mozilla::dom::quota::PERSISTENCE_TYPE_PERSISTENT;
  
  class SetupAction MOZ_FINAL : public SyncDBAction
-@@ -224,17 +227,17 @@ public:
+ {
+ public:
+   SetupAction(const nsACString& aOrigin, const nsACString& aBaseDomain)
+     : SyncDBAction(DBAction::Create, aOrigin, aBaseDomain)
+   { }
+ 
+@@ -34,32 +42,99 @@ public:
+   RunSyncWithDBOnTarget(nsIFile* aDBDir,
+                         mozIStorageConnection* aConn) MOZ_OVERRIDE
+   {
+     // TODO: create body directory structure
+     // TODO: init maintainance marker
+     // TODO: perform maintainance if necessary
+     // TODO: find orphaned caches in database
+ 
++    nsCOMPtr<nsIFile> aBodyDir;
++    nsresult rv = aDBDir->Clone(getter_AddRefs(aBodyDir));
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    rv = aBodyDir->Append(NS_LITERAL_STRING("body"));
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    bool exists;
++    rv = aBodyDir->Exists(&exists);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    if (!exists) {
++      rv = aBodyDir->Create(nsIFile::DIRECTORY_TYPE, 0755);
++      if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++    } else {
++      bool isDir;
++      rv = aBodyDir->IsDirectory(&isDir);
++      if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++      if (NS_WARN_IF(!isDir)) { return NS_ERROR_FILE_NOT_DIRECTORY; }
++    }
++
+     mozStorageTransaction trans(aConn, false,
+                                 mozIStorageConnection::TRANSACTION_IMMEDIATE);
+ 
+-    nsresult rv = DBSchema::CreateSchema(aConn);
++    rv = DBSchema::CreateSchema(aConn);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+     rv = trans.Commit();
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+     return rv;
+   }
+ 
+ private:
+   virtual ~SetupAction() { }
+ };
+ 
++enum BodyFileType
++{
++  BODY_FILE_FINAL,
++  BODY_FILE_TMP
++};
++
++static nsresult
++BodyIdToFile(nsIFile* aBaseDir, const nsID& aId, BodyFileType aType,
++             nsIFile** aBodyFileOut)
++{
++  MOZ_ASSERT(aBaseDir);
++  MOZ_ASSERT(aBodyFileOut);
++
++  nsresult rv = aBaseDir->Clone(aBodyFileOut);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  rv = (*aBodyFileOut)->Append(NS_LITERAL_STRING("body"));
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  bool exists;
++  rv = (*aBodyFileOut)->Exists(&exists);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++  if (!exists) { return NS_ERROR_FILE_NOT_FOUND; }
++
++  bool isDir;
++  rv = (*aBodyFileOut)->IsDirectory(&isDir);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++  if (NS_WARN_IF(!isDir)) { return NS_ERROR_FILE_NOT_DIRECTORY; }
++
++  char idString[NSID_LENGTH];
++  aId.ToProvidedString(idString);
++
++  NS_ConvertUTF8toUTF16 fileName(idString);
++
++  if (aType == BODY_FILE_FINAL) {
++    fileName.Append(NS_LITERAL_STRING(".final"));
++  } else {
++    fileName.Append(NS_LITERAL_STRING(".tmp"));
++  }
++
++  rv = (*aBodyFileOut)->Append(fileName);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  return rv;
++}
++
+ } // anonymous namespace
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ class Manager::Factory
+ {
+@@ -224,17 +299,17 @@ public:
  
  private:
    virtual ~CheckCacheOrphanedAction() { }
@@ -152,7 +266,7 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
                     const PCacheQueryParams& aParams)
      : BaseAction(aManager, aListenerId, aRequestId)
      , mCacheId(aCacheId)
-@@ -260,17 +263,17 @@ public:
+@@ -260,17 +335,17 @@ public:
  protected:
    virtual ~CacheMatchAction() { }
    const CacheId mCacheId;
@@ -171,7 +285,7 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
                        const PCacheQueryParams& aParams)
      : BaseAction(aManager, aListenerId, aRequestId)
      , mCacheId(aCacheId)
-@@ -295,63 +298,170 @@ public:
+@@ -295,63 +370,321 @@ public:
  protected:
    virtual ~CacheMatchAllAction() { }
    const CacheId mCacheId;
@@ -217,15 +331,18 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
 +    MOZ_ASSERT(aDBDir);
 +    MOZ_ASSERT(aConn);
 +    MOZ_ASSERT(!mResolver);
++    MOZ_ASSERT(!mDBDir);
 +    MOZ_ASSERT(!mConn);
 +
 +    mResolver = aResolver;
++    mDBDir = aDBDir;
 +    mConn = aConn;
 +
 +    mExpectedAsyncCopyCompletions = mRequestBodyStream ? 1 : 0;
 +    mExpectedAsyncCopyCompletions += mResponseBodyStream ? 1 : 0;
 +
 +    if (mExpectedAsyncCopyCompletions < 1) {
++      mExpectedAsyncCopyCompletions = 1;
 +      OnAsyncCopyComplete(NS_OK);
 +      return;
 +    }
@@ -253,7 +370,14 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
 +  {
 +    MOZ_ASSERT(mConn);
 +    MOZ_ASSERT(mResolver);
++    MOZ_ASSERT(mExpectedAsyncCopyCompletions > 0);
 +
++    if (NS_FAILED(aRv)) {
++      DoResolve(aRv);
++      return;
++    }
++
++    mExpectedAsyncCopyCompletions -= 1;
 +    if (mExpectedAsyncCopyCompletions > 0) {
 +      return;
 +    }
@@ -261,53 +385,189 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
 +    mRequestBodyCopyContext = nullptr;
 +    mResponseBodyCopyContext = nullptr;
 +
++    nsresult rv = FinalizeStreamCopy(mRequestBodyStream, mRequestBodyId);
++    if (NS_WARN_IF(NS_FAILED(rv))) {
++      DoResolve(rv);
++      return;
++    }
++
++    rv = FinalizeStreamCopy(mResponseBodyStream, mResponseBodyId);
++    if (NS_WARN_IF(NS_FAILED(rv))) {
++      DoResolve(rv);
++      return;
++    }
++
 +    mozStorageTransaction trans(mConn, false,
                                  mozIStorageConnection::TRANSACTION_IMMEDIATE);
  
 -    nsresult rv = DBSchema::CachePut(aConn, mCacheId, mRequest, mResponse);
--    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
-+    nsresult rv = DBSchema::CachePut(mConn, mCacheId, mRequest, mResponse);
++    // TODO: persist body IDs to DB
++
++    rv = DBSchema::CachePut(mConn, mCacheId, mRequest, mResponse);
 +    if (NS_WARN_IF(NS_FAILED(rv))) {
 +      DoResolve(rv);
 +      return;
 +    }
- 
-     rv = trans.Commit();
--    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    rv = trans.Commit();
 +    if (NS_WARN_IF(NS_FAILED(rv))) {
 +      DoResolve(rv);
 +      return;
 +    }
- 
-     // TODO: replace this with a read stream of the written files
-     mResponseOrVoid = mResponse;
- 
--    return rv;
++
++    // TODO: replace this with a read stream of the written files
++    //       or hopefully spec drops need to return response
++    mResponseOrVoid = mResponse;
++
 +    DoResolve(rv);
-   }
- 
-   virtual void
--  Complete(Listener* aListener, nsresult aRv) MOZ_OVERRIDE
++  }
++
++  virtual void
 +  CompleteOnInitiatingThread(nsresult aRv) MOZ_OVERRIDE
-   {
--    aListener->OnCachePut(mRequestId, aRv, mResponseOrVoid);
++  {
 +    NS_ASSERT_OWNINGTHREAD(Action);
 +    Listener* listener = mManager->GetListener(mListenerId);
 +    if (!listener) {
 +      return;
 +    }
 +    listener->OnCachePut(mRequestId, aRv, mResponseOrVoid);
-   }
- 
--protected:
++  }
++
++  virtual void
++  CancelOnTarget() MOZ_OVERRIDE
++  {
++    CancelStreamCopy(mRequestBodyStream, mRequestBodyCopyContext,
++                     mRequestBodyId);
++    CancelStreamCopy(mResponseBodyStream, mResponseBodyCopyContext,
++                     mResponseBodyId);
++    mConn = nullptr;
++    mResolver = nullptr;
++  }
++
 +private:
-   virtual ~CachePutAction() { }
++  virtual ~CachePutAction() { }
 +
 +  nsresult
 +  StartStreamCopy(nsIInputStream* aSource, nsID* aIdOut,
 +                  nsISupports** aCopyContextOut)
 +  {
-+    return NS_OK;
++    MOZ_ASSERT(aIdOut);
++    MOZ_ASSERT(aCopyContextOut);
++    MOZ_ASSERT(mDBDir);
++
++    if (!aSource) {
++      return NS_OK;
++    }
++
++    nsresult rv;
++    if (!mIdGenerator) {
++      mIdGenerator = do_GetService("@mozilla.org/uuid-generator;1", &rv);
++      if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++    }
++
++    rv = mIdGenerator->GenerateUUIDInPlace(aIdOut);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+-    rv = trans.Commit();
++    nsCOMPtr<nsIFile> finalBodyFile;
++    rv = BodyIdToFile(mDBDir, *aIdOut, BODY_FILE_FINAL,
++                      getter_AddRefs(finalBodyFile));
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+-    // TODO: replace this with a read stream of the written files
+-    mResponseOrVoid = mResponse;
++    bool exists;
++    rv = finalBodyFile->Exists(&exists);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++    if (exists) { return NS_ERROR_FILE_ALREADY_EXISTS; }
++
++    nsCOMPtr<nsIFile> bodyFile;
++    rv = BodyIdToFile(mDBDir, *aIdOut, BODY_FILE_TMP, getter_AddRefs(bodyFile));
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    rv = bodyFile->Exists(&exists);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++    if (exists) { return NS_ERROR_FILE_ALREADY_EXISTS; }
++
++    nsCOMPtr<nsIOutputStream> fileStream =
++      FileOutputStream::Create(PERSISTENCE_TYPE_PERSISTENT,
++                               mManager->BaseDomain(),
++                               mManager->Origin(), bodyFile);
++    if (NS_WARN_IF(!fileStream)) { return NS_ERROR_UNEXPECTED; }
++
++    rv = NS_AsyncCopy(aSource, fileStream, NS_GetCurrentThread(),
++                      NS_ASYNCCOPY_VIA_READSEGMENTS,
++                      4096, // chunk size
++                      AsyncCopyCompleteFunc, this,
++                      true, true, // close streams
++                      aCopyContextOut);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+     return rv;
+   }
+ 
+-  virtual void
+-  Complete(Listener* aListener, nsresult aRv) MOZ_OVERRIDE
++  nsresult
++  FinalizeStreamCopy(nsIInputStream* aSource, const nsID& aId)
+   {
+-    aListener->OnCachePut(mRequestId, aRv, mResponseOrVoid);
++    MOZ_ASSERT(mDBDir);
++
++    if (!aSource) {
++      return NS_OK;
++    }
++
++    nsCOMPtr<nsIFile> tmpFile;
++    nsresult rv = BodyIdToFile(mDBDir, aId, BODY_FILE_TMP,
++                               getter_AddRefs(tmpFile));
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    bool exists;
++    rv = tmpFile->Exists(&exists);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++    if (NS_WARN_IF(!exists)) { return NS_ERROR_FILE_NOT_FOUND; }
++
++    nsCOMPtr<nsIFile> finalFile;
++    rv = BodyIdToFile(mDBDir, aId, BODY_FILE_FINAL, getter_AddRefs(finalFile));
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    rv = finalFile->Exists(&exists);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++    if (NS_WARN_IF(exists)) { return NS_ERROR_FILE_ALREADY_EXISTS; }
++
++    nsCOMPtr<nsIFile> finalDir;
++    rv = finalFile->GetParent(getter_AddRefs(finalDir));
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    nsAutoString finalFileName;
++    rv = finalFile->GetLeafName(finalFileName);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    rv = tmpFile->RenameTo(finalDir, finalFileName);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    return rv;
+   }
+ 
+-protected:
+-  virtual ~CachePutAction() { }
++  void
++  CancelStreamCopy(nsIInputStream* aSource, nsISupports* aCopyContext,
++                   const nsID& aId)
++  {
++    if (!aSource || !aCopyContext) {
++      return;
++    }
++    NS_CancelAsyncCopy(aCopyContext, NS_ERROR_ABORT);
++
++    nsCOMPtr<nsIFile> tmpFile;
++    nsresult rv = BodyIdToFile(mDBDir, aId, BODY_FILE_TMP,
++                               getter_AddRefs(tmpFile));
++    if (NS_WARN_IF(NS_FAILED(rv))) { return; }
++
++    rv = tmpFile->Remove(false);
++    NS_WARN_IF(NS_FAILED(rv));
 +  }
 +
 +  static void
@@ -321,7 +581,12 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
 +  void
 +  DoResolve(nsresult aRv)
 +  {
-+    NS_ASSERT_OWNINGTHREAD(Action);
++    if (NS_FAILED(aRv)) {
++      CancelStreamCopy(mRequestBodyStream, mRequestBodyCopyContext,
++                       mRequestBodyId);
++      CancelStreamCopy(mResponseBodyStream, mResponseBodyCopyContext,
++                       mResponseBodyId);
++    }
 +    mConn = nullptr;
 +    if (mResolver) {
 +      mResolver->Resolve(aRv);
@@ -339,12 +604,14 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
 +  nsCOMPtr<nsIInputStream> mResponseBodyStream;
    PCacheResponseOrVoid mResponseOrVoid;
 +  nsRefPtr<Resolver> mResolver;
++  nsCOMPtr<nsIFile> mDBDir;
 +  nsCOMPtr<mozIStorageConnection> mConn;
 +  uint32_t mExpectedAsyncCopyCompletions;
 +  nsID mRequestBodyId;
 +  nsID mResponseBodyId;
 +  nsCOMPtr<nsISupports> mRequestBodyCopyContext;
 +  nsCOMPtr<nsISupports> mResponseBodyCopyContext;
++  nsCOMPtr<nsIUUIDGenerator> mIdGenerator;
  };
  
 -class Manager::CacheDeleteAction : public Manager::BaseAction
@@ -357,7 +624,7 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
                      const PCacheQueryParams& aParams)
      : BaseAction(aManager, aListenerId, aRequestId)
      , mCacheId(aCacheId)
-@@ -651,23 +761,27 @@ Manager::CacheMatchAll(Listener* aListen
+@@ -651,23 +984,27 @@ Manager::CacheMatchAll(Listener* aListen
    nsRefPtr<Action> action = new CacheMatchAllAction(this, listenerId, aRequestId,
                                                      aCacheId, aRequest, aParams);
    CurrentContext()->Dispatch(mIOThread, action);
