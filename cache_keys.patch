@@ -1,0 +1,538 @@
+# HG changeset patch
+# Parent e4a11b8b298e628cd5f9fe88a7b94749cb95a562
+# User Ben Kelly <ben@wanderview.com>
+Implement Cache::Keys().
+
+diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
+--- a/dom/cache/Cache.cpp
++++ b/dom/cache/Cache.cpp
+@@ -445,17 +445,18 @@ Cache::RecvKeysResponse(RequestId aReque
+ 
+   if (NS_FAILED(aRv)) {
+     promise->MaybeReject(aRv);
+     return;
+   }
+ 
+   nsTArray<nsRefPtr<Request>> requests;
+   for (uint32_t i = 0; i < aRequests.Length(); ++i) {
+-    MOZ_CRASH("not implemented - can't construct new Request()");
++    NS_WARNING("can't construct new Request() - skipping");
++    continue;
+     //nsRefPtr<Request> request = new Request(mOwner);
+     nsRefPtr<Request> request = nullptr;
+     if (!request) {
+       promise->MaybeReject(NS_ERROR_OUT_OF_MEMORY);
+       return;
+     }
+     TypeUtils::ToRequest(*request, aRequests[i]);
+     requests.AppendElement(request);
+diff --git a/dom/cache/CacheParent.cpp b/dom/cache/CacheParent.cpp
+--- a/dom/cache/CacheParent.cpp
++++ b/dom/cache/CacheParent.cpp
+@@ -115,17 +115,19 @@ CacheParent::RecvDelete(const RequestId&
+   return true;
+ }
+ 
+ bool
+ CacheParent::RecvKeys(const RequestId& aRequestId,
+                       const PCacheRequestOrVoid& aRequest,
+                       const PCacheQueryParams& aParams)
+ {
+-  return false;
++  MOZ_ASSERT(mManager);
++  mManager->CacheKeys(this, aRequestId, mCacheId, aRequest, aParams);
++  return true;
+ }
+ 
+ void
+ CacheParent::OnCacheMatch(RequestId aRequestId, nsresult aRv,
+                           const SavedResponse* aSavedResponse)
+ {
+   PCacheResponseOrVoid responseOrVoid;
+ 
+@@ -202,11 +204,33 @@ CacheParent::OnCachePut(RequestId aReque
+ }
+ 
+ void
+ CacheParent::OnCacheDelete(RequestId aRequestId, nsresult aRv, bool aSuccess)
+ {
+   unused << SendDeleteResponse(aRequestId, aRv, aSuccess);
+ }
+ 
++void
++CacheParent::OnCacheKeys(RequestId aRequestId, nsresult aRv,
++                         const nsTArray<SavedRequest>& aSavedRequests)
++{
++  nsTArray<PCacheRequest> requests;
++  nsTArray<nsCOMPtr<nsIOutputStream>> requestStreams;
++  for (uint32_t i = 0; i < aSavedRequests.Length(); ++i) {
++    requests.AppendElement(aSavedRequests[i].mValue);
++
++    if (!aSavedRequests[i].mHasBodyId) {
++      requestStreams.AppendElement();
++    } else {
++      // TODO: remove stream test code
++      requestStreams.AppendElement(MemoryOutputStream::Create(4096));
++      mManager->CacheReadBody(mCacheId, aSavedRequests[i].mBodyId,
++                              requestStreams[i]);
++    }
++  }
++
++  unused << SendKeysResponse(aRequestId, aRv, requests);
++}
++
+ } // namespace cache
+ } // namespace dom
+ } // namesapce mozilla
+diff --git a/dom/cache/CacheParent.h b/dom/cache/CacheParent.h
+--- a/dom/cache/CacheParent.h
++++ b/dom/cache/CacheParent.h
+@@ -58,16 +58,18 @@ public:
+   virtual void OnCacheMatch(RequestId aRequestId, nsresult aRv,
+                             const SavedResponse* aSavedResponse) MOZ_OVERRIDE;
+   virtual void OnCacheMatchAll(RequestId aRequestId, nsresult aRv,
+                    const nsTArray<SavedResponse>& aSavedResponses) MOZ_OVERRIDE;
+   virtual void OnCachePut(RequestId aRequestId, nsresult aRv,
+                           const SavedResponse* aSavedResponse) MOZ_OVERRIDE;
+   virtual void OnCacheDelete(RequestId aRequestId, nsresult aRv,
+                              bool aSuccess) MOZ_OVERRIDE;
++  virtual void OnCacheKeys(RequestId aRequestId, nsresult aRv,
++                     const nsTArray<SavedRequest>& aSavedRequests) MOZ_OVERRIDE;
+ 
+ private:
+   const CacheId mCacheId;
+   nsRefPtr<mozilla::dom::cache::Manager> mManager;
+ };
+ 
+ } // namespace cache
+ } // namespace dom
+diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
+--- a/dom/cache/DBSchema.cpp
++++ b/dom/cache/DBSchema.cpp
+@@ -342,16 +342,46 @@ DBSchema::CacheDelete(mozIStorageConnect
+ 
+   *aSuccessOut = true;
+ 
+   return rv;
+ }
+ 
+ // static
+ nsresult
++DBSchema::CacheKeys(mozIStorageConnection* aConn, CacheId aCacheId,
++                    const PCacheRequestOrVoid& aRequestOrVoid,
++                    const PCacheQueryParams& aParams,
++                    nsTArray<SavedRequest>& aSavedRequestsOut)
++{
++  MOZ_ASSERT(aConn);
++  nsresult rv;
++
++  nsTArray<EntryId> matches;
++  if (aRequestOrVoid.type() == PCacheRequestOrVoid::Tvoid_t) {
++    rv = QueryAll(aConn, aCacheId, matches);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++  } else {
++    rv = QueryCache(aConn, aCacheId, aRequestOrVoid, aParams, matches);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++  }
++
++  // TODO: replace this with a bulk load using SQL IN clause
++  for (uint32_t i = 0; i < matches.Length(); ++i) {
++    SavedRequest *savedRequest = aSavedRequestsOut.AppendElement();
++    rv = ReadRequest(aConn, matches[i], savedRequest);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++    savedRequest->mCacheId = aCacheId;
++  }
++
++  return rv;
++}
++
++// static
++nsresult
+ DBSchema::StorageMatch(mozIStorageConnection* aConn,
+                        Namespace aNamespace,
+                        const PCacheRequest& aRequest,
+                        const PCacheQueryParams& aParams,
+                        bool* aFoundResponseOut,
+                        SavedResponse* aSavedResponseOut)
+ {
+   MOZ_ASSERT(aConn);
+@@ -1032,16 +1062,100 @@ DBSchema::ReadResponse(mozIStorageConnec
+     rv = state->GetUTF8String(1, header->value());
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+   }
+ 
+   return rv;
+ }
+ 
+ // static
++nsresult
++DBSchema::ReadRequest(mozIStorageConnection* aConn, EntryId aEntryId,
++                      SavedRequest* aSavedRequestOut)
++{
++  MOZ_ASSERT(aConn);
++  MOZ_ASSERT(aSavedRequestOut);
++
++  nsCOMPtr<mozIStorageStatement> state;
++  nsresult rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
++    "SELECT "
++      "request_method, "
++      "request_url, "
++      "request_url_no_query, "
++      "request_mode, "
++      "request_credentials, "
++      "request_body_id "
++    "FROM entries "
++    "WHERE id=?1;"
++  ), getter_AddRefs(state));
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  rv = state->BindInt32Parameter(0, aEntryId);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  bool hasMoreData;
++  rv = state->ExecuteStep(&hasMoreData);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  rv = state->GetUTF8String(0, aSavedRequestOut->mValue.method());
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  rv = state->GetString(1, aSavedRequestOut->mValue.url());
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  rv = state->GetString(2, aSavedRequestOut->mValue.urlWithoutQuery());
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  int32_t mode;
++  rv = state->GetInt32(3, &mode);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++  aSavedRequestOut->mValue.mode() = static_cast<RequestMode>(mode);
++
++  int32_t credentials;
++  rv = state->GetInt32(4, &credentials);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++  aSavedRequestOut->mValue.credentials() =
++    static_cast<RequestCredentials>(credentials);
++
++  bool nullBody;
++  rv = state->GetIsNull(5, &nullBody);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++  aSavedRequestOut->mHasBodyId = !nullBody;
++
++  if (aSavedRequestOut->mHasBodyId) {
++    rv = ExtractId(state, 5, &aSavedRequestOut->mBodyId);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++  }
++
++  rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
++    "SELECT "
++      "name, "
++      "value "
++    "FROM request_headers "
++    "WHERE entry_id=?1;"
++  ), getter_AddRefs(state));
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  rv = state->BindInt32Parameter(0, aEntryId);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  while(NS_SUCCEEDED(state->ExecuteStep(&hasMoreData)) && hasMoreData) {
++    PHeadersEntry* header = aSavedRequestOut->mValue.headers().AppendElement();
++
++    rv = state->GetUTF8String(0, header->name());
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    rv = state->GetUTF8String(1, header->value());
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++  }
++
++  return rv;
++}
++
++// static
+ void
+ DBSchema::AppendListParamsToQuery(nsACString& aQuery,
+                                   const nsTArray<EntryId>& aEntryIdList,
+                                   uint32_t aPos, int32_t aLen)
+ {
+   MOZ_ASSERT((aPos + aLen) <= aEntryIdList.Length());
+   for (int32_t i = aPos; i < aLen; ++i) {
+     if (i == 0) {
+diff --git a/dom/cache/DBSchema.h b/dom/cache/DBSchema.h
+--- a/dom/cache/DBSchema.h
++++ b/dom/cache/DBSchema.h
+@@ -21,16 +21,17 @@ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ class PCacheQueryParams;
+ class PCacheRequest;
+ class PCacheRequestOrVoid;
+ class PCacheResponse;
+ class PCacheResponseOrVoid;
++struct SavedRequest;
+ struct SavedResponse;
+ 
+ class DBSchema MOZ_FINAL
+ {
+ public:
+   static nsresult CreateSchema(mozIStorageConnection* aConn);
+ 
+   static nsresult CreateCache(mozIStorageConnection* aConn,
+@@ -57,16 +58,20 @@ public:
+                            const nsID* aResponseBodyId,
+                            nsTArray<nsID>& aDeletedBodyIdListOut,
+                            SavedResponse* aSavedResponseOut);
+   static nsresult CacheDelete(mozIStorageConnection* aConn, CacheId aCacheId,
+                               const PCacheRequest& aRequest,
+                               const PCacheQueryParams& aParams,
+                               nsTArray<nsID>& aDeletedBodyIdListOut,
+                               bool* aSuccessOut);
++  static nsresult CacheKeys(mozIStorageConnection* aConn, CacheId aCacheId,
++                            const PCacheRequestOrVoid& aRequestOrVoid,
++                            const PCacheQueryParams& aParams,
++                            nsTArray<SavedRequest>& aSavedRequestsOut);
+ 
+   static nsresult StorageMatch(mozIStorageConnection* aConn,
+                                Namespace aNamespace,
+                                const PCacheRequest& aRequest,
+                                const PCacheQueryParams& aParams,
+                                bool* aFoundResponseOut,
+                                SavedResponse* aSavedResponseOut);
+   static nsresult StorageGetCacheId(mozIStorageConnection* aConn,
+@@ -101,16 +106,18 @@ private:
+   static nsresult InsertEntry(mozIStorageConnection* aConn, CacheId aCacheId,
+                               const PCacheRequest& aRequest,
+                               const nsID* aRequestBodyId,
+                               const PCacheResponse& aResponse,
+                               const nsID* aResponseBodyId,
+                               SavedResponse* aSavedResponseOut);
+   static nsresult ReadResponse(mozIStorageConnection* aConn, EntryId aEntryId,
+                                SavedResponse* aSavedResponseOut);
++  static nsresult ReadRequest(mozIStorageConnection* aConn, EntryId aEntryId,
++                              SavedRequest* aSavedRequestOut);
+ 
+   static void AppendListParamsToQuery(nsACString& aQuery,
+                                       const nsTArray<EntryId>& aEntryIdList,
+                                       uint32_t aPos, int32_t aLen);
+   static nsresult BindListParamsToQuery(mozIStorageStatement* aState,
+                                         const nsTArray<EntryId>& aEntryIdList,
+                                         uint32_t aPos, int32_t aLen);
+   static nsresult BindId(mozIStorageStatement* aState, uint32_t aPos,
+diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
+--- a/dom/cache/Manager.cpp
++++ b/dom/cache/Manager.cpp
+@@ -635,16 +635,56 @@ public:
+ protected:
+   virtual ~CacheDeleteAction() { }
+   const CacheId mCacheId;
+   const PCacheRequest mRequest;
+   const PCacheQueryParams mParams;
+   bool mSuccess;
+ };
+ 
++class Manager::CacheKeysAction MOZ_FINAL : public Manager::BaseAction
++{
++public:
++  CacheKeysAction(Manager* aManager, ListenerId aListenerId,
++                    RequestId aRequestId, CacheId aCacheId,
++                    const PCacheRequestOrVoid& aRequestOrVoid,
++                    const PCacheQueryParams& aParams)
++    : BaseAction(aManager, aListenerId, aRequestId)
++    , mCacheId(aCacheId)
++    , mRequestOrVoid(aRequestOrVoid)
++    , mParams(aParams)
++  { }
++
++  virtual nsresult
++  RunSyncWithDBOnTarget(nsIFile* aDBDir,
++                        mozIStorageConnection* aConn) MOZ_OVERRIDE
++  {
++    return DBSchema::CacheKeys(aConn, mCacheId, mRequestOrVoid, mParams,
++                               mSavedRequests);
++  }
++
++  virtual void
++  Complete(Listener* aListener, nsresult aRv) MOZ_OVERRIDE
++  {
++    aListener->OnCacheKeys(mRequestId, aRv, mSavedRequests);
++  }
++
++  virtual bool MatchesCacheId(CacheId aCacheId) MOZ_OVERRIDE
++  {
++    return aCacheId == mCacheId;
++  }
++
++protected:
++  virtual ~CacheKeysAction() { }
++  const CacheId mCacheId;
++  const PCacheRequestOrVoid mRequestOrVoid;
++  const PCacheQueryParams mParams;
++  nsTArray<SavedRequest> mSavedRequests;
++};
++
+ class Manager::CacheReadBodyAction MOZ_FINAL : public Action
+ {
+ public:
+   CacheReadBodyAction(Manager* aManager, CacheId aCacheId,
+                       const nsID& aBodyId,
+                       nsIOutputStream* aStream)
+     : mManager(aManager)
+     , mCacheId(aCacheId)
+@@ -1103,16 +1143,30 @@ Manager::CacheDelete(Listener* aListener
+   MOZ_ASSERT(aListener);
+   ListenerId listenerId = SaveListener(aListener);
+   nsRefPtr<Action> action = new CacheDeleteAction(this, listenerId, aRequestId,
+                                                   aCacheId, aRequest, aParams);
+   CurrentContext()->Dispatch(mIOThread, action);
+ }
+ 
+ void
++Manager::CacheKeys(Listener* aListener, RequestId aRequestId,
++                   CacheId aCacheId, const PCacheRequestOrVoid& aRequestOrVoid,
++                   const PCacheQueryParams& aParams)
++{
++  NS_ASSERT_OWNINGTHREAD(Manager);
++  MOZ_ASSERT(aListener);
++  ListenerId listenerId = SaveListener(aListener);
++  nsRefPtr<Action> action = new CacheKeysAction(this, listenerId, aRequestId,
++                                                aCacheId, aRequestOrVoid,
++                                                aParams);
++  CurrentContext()->Dispatch(mIOThread, action);
++}
++
++void
+ Manager::CacheReadBody(CacheId aCacheId, const nsID& aBodyId,
+                        nsIOutputStream* aStream)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(aStream);
+   nsRefPtr<Action> action = new CacheReadBodyAction(this, aCacheId, aBodyId,
+                                                     aStream);
+   CurrentContext()->Dispatch(mIOThread, action);
+diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
+--- a/dom/cache/Manager.h
++++ b/dom/cache/Manager.h
+@@ -20,16 +20,17 @@ class nsIInputStream;
+ class nsIOutputStream;
+ class nsIThread;
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ class PCacheQueryParams;
++struct SavedRequest;
+ struct SavedResponse;
+ 
+ class Manager MOZ_FINAL : public Context::Listener
+ {
+ public:
+   class Listener
+   {
+   public:
+@@ -38,16 +39,18 @@ public:
+     virtual void OnCacheMatch(RequestId aRequestId, nsresult aRv,
+                               const SavedResponse* aResponse) { }
+     virtual void OnCacheMatchAll(RequestId aRequestId, nsresult aRv,
+                              const nsTArray<SavedResponse>& aSavedResponses) { }
+     virtual void OnCachePut(RequestId aRequestId, nsresult aRv,
+                             const SavedResponse* aSavedResponse) { }
+     virtual void OnCacheDelete(RequestId aRequestId, nsresult aRv,
+                                bool aSuccess) { }
++    virtual void OnCacheKeys(RequestId aRequestId, nsresult aRv,
++                             const nsTArray<SavedRequest>& aSavedRequests) { }
+ 
+     virtual void OnStorageMatch(RequestId aRequestId, nsresult aRv,
+                                 const SavedResponse* aResponse) { }
+     virtual void OnStorageGet(RequestId aRequestId, nsresult aRv,
+                               bool aCacheFound, CacheId aCacheId) { }
+     virtual void OnStorageHas(RequestId aRequestId, nsresult aRv,
+                               bool aCacheFound) { }
+     virtual void OnStorageCreate(RequestId aRequestId, nsresult aRv,
+@@ -76,16 +79,19 @@ public:
+   void CachePut(Listener* aListener, RequestId aRequestId, CacheId aCacheId,
+                 const PCacheRequest& aRequest,
+                 nsIInputStream* aRequestBodyStream,
+                 const PCacheResponse& aResponse,
+                 nsIInputStream* aResponseBodyStream);
+   void CacheDelete(Listener* aListener, RequestId aRequestId,
+                    CacheId aCacheId, const PCacheRequest& aRequest,
+                    const PCacheQueryParams& aParams);
++  void CacheKeys(Listener* aListener, RequestId aRequestId,
++                 CacheId aCacheId, const PCacheRequestOrVoid& aRequestOrVoid,
++                 const PCacheQueryParams& aParams);
+   void CacheReadBody(CacheId aCacheId, const nsID& aBodyId,
+                      nsIOutputStream* aStream);
+ 
+   void StorageMatch(Listener* aListener, RequestId aRequestId,
+                     Namespace aNamespace, const PCacheRequest& aRequest,
+                     const PCacheQueryParams& aParams);
+   void StorageGet(Listener* aListener, RequestId aRequestId,
+                   Namespace aNamespace, const nsAString& aKey);
+@@ -109,16 +115,17 @@ private:
+   class BaseAction;
+   class CheckCacheOrphanedAction;
+   class DeleteOrphanedCacheAction;
+ 
+   class CacheMatchAction;
+   class CacheMatchAllAction;
+   class CachePutAction;
+   class CacheDeleteAction;
++  class CacheKeysAction;
+   class CacheReadBodyAction;
+ 
+   class StorageMatchAction;
+   class StorageGetAction;
+   class StorageHasAction;
+   class StorageCreateAction;
+   class StorageDeleteAction;
+   class StorageKeysAction;
+diff --git a/dom/tests/mochitest/cache/test_cache_frame.html b/dom/tests/mochitest/cache/test_cache_frame.html
+--- a/dom/tests/mochitest/cache/test_cache_frame.html
++++ b/dom/tests/mochitest/cache/test_cache_frame.html
+@@ -21,16 +21,24 @@
+       success = success && !!createCache;
+       return caches.get("foobar");
+     }).then(function(getCache) {
+       success = success && !!getCache;
+       c = getCache;
+       return c.put(request, response);
+     }).then(function(putResponse) {
+       success = success && !!putResponse;
++      return c.keys(request);
++    }).then(function(keys) {
++      success = success && !!keys;
++      // TODO: success = success && keys.length === 1;
++      return c.keys();
++    }).then(function(keys) {
++      success = success && !!keys;
++      // TODO: success = success && keys.length === 1;
+       return c.matchAll(request);
+     }).then(function(matchAllResponses) {
+       success = success && !!matchAllResponses &&
+                 matchAllResponses.length === 1;
+       return c.match(request);
+     }).then(function(matchResponse) {
+       success = success && !!matchResponse;
+       return caches.match(request);
+@@ -41,16 +49,20 @@
+       success = success && !!storageMatchResponse;
+       var request2 = new Request("http://example.com/hmm?q=snafu");
+       return c.match(request2, {ignoreSearch:true});
+     }).then(function(match2Response) {
+       success = success && !!match2Response;
+       return c.delete(request);
+     }).then(function(deleteResult) {
+       success = success && deleteResult;
++      return c.keys();
++    }).then(function(keys) {
++      success = success && !!keys;
++      success = success && keys.length === 0;
+       return c.matchAll(request);
+     }).then(function(matchAll2Responses) {
+       success = success && !!matchAll2Responses &&
+                 matchAll2Responses.length === 0;
+       return caches.has("foobar");
+     }).then(function(hasResult) {
+       success = success && hasResult;
+       return caches.keys();

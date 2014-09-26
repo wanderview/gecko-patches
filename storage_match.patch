@@ -1,0 +1,1531 @@
+# HG changeset patch
+# Parent 76cffa3e4e261d5c9bb0574589a2f8e8b2499546
+# User Ben Kelly <ben@wanderview.com>
+Implement CacheStorage::Match().
+
+diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
+--- a/dom/cache/Cache.cpp
++++ b/dom/cache/Cache.cpp
+@@ -6,172 +6,29 @@
+ 
+ #include "mozilla/dom/cache/Cache.h"
+ 
+ #include "mozilla/dom/Headers.h"
+ #include "mozilla/dom/Promise.h"
+ #include "mozilla/dom/WorkerPrivate.h"
+ #include "mozilla/dom/CacheBinding.h"
+ #include "mozilla/dom/cache/CacheChild.h"
++#include "mozilla/dom/cache/TypeUtils.h"
+ #include "mozilla/ErrorResult.h"
+ #include "mozilla/Preferences.h"
+ #include "mozilla/unused.h"
+ #include "nsIGlobalObject.h"
+ #include "nsNetUtil.h"
+-#include "nsURLParsers.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ using mozilla::ErrorResult;
+ using mozilla::unused;
+-using mozilla::void_t;
+-
+-// Utility function to remove the query from a URL.  We're not using nsIURL
+-// or URL to do this because they require going to the main thread.
+-static nsresult
+-GetURLWithoutQuery(const nsAString& aUrl, nsAString& aUrlWithoutQueryOut)
+-{
+-  NS_ConvertUTF16toUTF8 flatURL(aUrl);
+-  const char* url = flatURL.get();
+-
+-  nsCOMPtr<nsIURLParser> urlParser = new nsStdURLParser();
+-  NS_ENSURE_TRUE(urlParser, NS_ERROR_OUT_OF_MEMORY);
+-
+-  uint32_t pathPos;
+-  int32_t pathLen;
+-
+-  nsresult rv = urlParser->ParseURL(url, flatURL.Length(),
+-                                    nullptr, nullptr,       // ignore scheme
+-                                    nullptr, nullptr,       // ignore authority
+-                                    &pathPos, &pathLen);
+-  NS_ENSURE_SUCCESS(rv, rv);
+-
+-  uint32_t queryPos;
+-  int32_t queryLen;
+-
+-  rv = urlParser->ParsePath(url + pathPos, flatURL.Length() - pathPos,
+-                            nullptr, nullptr,               // ignore filepath
+-                            &queryPos, &queryLen,
+-                            nullptr, nullptr);              // ignore ref
+-  NS_ENSURE_SUCCESS(rv, rv);
+-
+-  // ParsePath gives us query position relative to the start of the path
+-  queryPos += pathPos;
+-
+-  // We want everything before and after the query
+-  aUrlWithoutQueryOut = Substring(aUrl, 0, queryPos);
+-  aUrlWithoutQueryOut.Append(Substring(aUrl, queryPos + queryLen,
+-                                       aUrl.Length() - queryPos - queryLen));
+-
+-  return NS_OK;
+-}
+-
+-static void
+-ToPCacheRequest(PCacheRequest& aOut, const Request& aIn)
+-{
+-  aIn.GetMethod(aOut.method());
+-  aIn.GetUrl(aOut.url());
+-  if(NS_WARN_IF(NS_FAILED(GetURLWithoutQuery(aOut.url(),
+-                                              aOut.urlWithoutQuery())))) {
+-    // Fallback to just not providing ignoreSearch support
+-    // TODO: Should we error out here instead?
+-    aIn.GetUrl(aOut.urlWithoutQuery());
+-  }
+-  nsRefPtr<Headers> headers = aIn.Headers_();
+-  MOZ_ASSERT(headers);
+-  headers->GetPHeaders(aOut.headers());
+-  aOut.mode() = aIn.Mode();
+-  aOut.credentials() = aIn.Credentials();
+-}
+-
+-static void
+-ToPCacheRequest(PCacheRequest& aOut, const RequestOrScalarValueString& aIn)
+-{
+-  nsRefPtr<Request> request;
+-  if (aIn.IsRequest()) {
+-    request = &aIn.GetAsRequest();
+-  } else {
+-    MOZ_ASSERT(aIn.IsScalarValueString());
+-    // TODO: see nsIStandardURL.init() if Request does not provide something...
+-    MOZ_CRASH("implement me");
+-  }
+-  ToPCacheRequest(aOut, *request);
+-}
+-
+-static void
+-ToPCacheRequestOrVoid(PCacheRequestOrVoid& aOut,
+-                      const Optional<RequestOrScalarValueString>& aIn)
+-{
+-  if (!aIn.WasPassed()) {
+-    aOut = void_t();
+-    return;
+-  }
+-  PCacheRequest request;
+-  ToPCacheRequest(request, aIn.Value());
+-  aOut = request;
+-}
+-
+-static void
+-ToPCacheRequest(PCacheRequest& aOut,
+-                const OwningRequestOrScalarValueString& aIn)
+-{
+-  nsRefPtr<Request> request;
+-  if (aIn.IsRequest()) {
+-    request = &static_cast<Request&>(aIn.GetAsRequest());
+-  } else {
+-    MOZ_ASSERT(aIn.IsScalarValueString());
+-    MOZ_CRASH("implement me");
+-  }
+-  ToPCacheRequest(aOut, *request);
+-}
+-
+-static void
+-ToPCacheResponse(PCacheResponse& aOut, const Response& aIn)
+-{
+-  aOut.type() = aIn.Type();
+-  aIn.GetUrl(aOut.url());
+-  aOut.status() = aIn.Status();
+-  aIn.GetStatusText(aOut.statusText());
+-  nsRefPtr<Headers> headers = aIn.Headers_();
+-  MOZ_ASSERT(headers);
+-  headers->GetPHeaders(aOut.headers());
+-}
+-
+-static void
+-ToPCacheQueryParams(PCacheQueryParams& aOut, const QueryParams& aIn)
+-{
+-  aOut.ignoreSearch() = aIn.mIgnoreSearch.WasPassed() &&
+-                        aIn.mIgnoreSearch.Value();
+-  aOut.ignoreMethod() = aIn.mIgnoreMethod.WasPassed() &&
+-                        aIn.mIgnoreMethod.Value();
+-  aOut.ignoreVary() = aIn.mIgnoreVary.WasPassed() &&
+-                      aIn.mIgnoreVary.Value();
+-  aOut.prefixMatch() = aIn.mPrefixMatch.WasPassed() &&
+-                       aIn.mPrefixMatch.Value();
+-  aOut.cacheNameSet() = aIn.mCacheName.WasPassed();
+-  if (aOut.cacheNameSet()) {
+-    aOut.cacheName() = aIn.mCacheName.Value();
+-  }
+-}
+-
+-static void
+-ToResponse(Response& aOut, const PCacheResponse& aIn)
+-{
+-  // TODO: implement once real Request/Response are available
+-  NS_WARNING("Not filling in contents of Response returned from Cache.");
+-}
+-
+-static void
+-ToRequest(Request& aOut, const PCacheRequest& aIn)
+-{
+-  // TODO: implement once real Request/Response are available
+-  NS_WARNING("Not filling in contents of Request returned from Cache.");
+-}
+ 
+ NS_IMPL_CYCLE_COLLECTING_ADDREF(mozilla::dom::cache::Cache);
+ NS_IMPL_CYCLE_COLLECTING_RELEASE(mozilla::dom::cache::Cache);
+ NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(Cache, mOwner, mGlobal)
+ 
+ NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Cache)
+   NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+   NS_INTERFACE_MAP_ENTRY(nsISupports)
+@@ -203,20 +60,20 @@ Cache::Match(const RequestOrScalarValueS
+   }
+ 
+   RequestId requestId = AddRequestPromise(promise, aRv);
+   if (requestId == INVALID_REQUEST_ID) {
+     return nullptr;
+   }
+ 
+   PCacheRequest request;
+-  ToPCacheRequest(request, aRequest);
++  TypeUtils::ToPCacheRequest(request, aRequest);
+ 
+   PCacheQueryParams params;
+-  ToPCacheQueryParams(params, aParams);
++  TypeUtils::ToPCacheQueryParams(params, aParams);
+ 
+   unused << mActor->SendMatch(requestId, request, params);
+ 
+   return promise.forget();
+ }
+ 
+ already_AddRefed<Promise>
+ Cache::MatchAll(const Optional<RequestOrScalarValueString>& aRequest,
+@@ -230,20 +87,20 @@ Cache::MatchAll(const Optional<RequestOr
+   }
+ 
+   RequestId requestId = AddRequestPromise(promise, aRv);
+   if (requestId == INVALID_REQUEST_ID) {
+     return nullptr;
+   }
+ 
+   PCacheRequestOrVoid request;
+-  ToPCacheRequestOrVoid(request, aRequest);
++  TypeUtils::ToPCacheRequestOrVoid(request, aRequest);
+ 
+   PCacheQueryParams params;
+-  ToPCacheQueryParams(params, aParams);
++  TypeUtils::ToPCacheQueryParams(params, aParams);
+ 
+   unused << mActor->SendMatchAll(requestId, request, params);
+ 
+   return promise.forget();
+ }
+ 
+ already_AddRefed<Promise>
+ Cache::Add(const RequestOrScalarValueString& aRequest, ErrorResult& aRv)
+@@ -256,17 +113,17 @@ Cache::Add(const RequestOrScalarValueStr
+   }
+ 
+   RequestId requestId = AddRequestPromise(promise, aRv);
+   if (requestId == INVALID_REQUEST_ID) {
+     return nullptr;
+   }
+ 
+   PCacheRequest request;
+-  ToPCacheRequest(request, aRequest);
++  TypeUtils::ToPCacheRequest(request, aRequest);
+ 
+   unused << mActor->SendAdd(requestId, request);
+ 
+   return promise.forget();
+ }
+ 
+ already_AddRefed<Promise>
+ Cache::AddAll(const Sequence<OwningRequestOrScalarValueString>& aRequests,
+@@ -286,17 +143,17 @@ Cache::AddAll(const Sequence<OwningReque
+ 
+   nsTArray<PCacheRequest> requests;
+   for(uint32_t i = 0; i < aRequests.Length(); ++i) {
+     PCacheRequest* request = requests.AppendElement();
+     if (!request) {
+       aRv.Throw(NS_ERROR_OUT_OF_MEMORY);
+       return nullptr;
+     }
+-    ToPCacheRequest(*request, aRequests[i]);
++    TypeUtils::ToPCacheRequest(*request, aRequests[i]);
+   }
+ 
+   unused << mActor->SendAddAll(requestId, requests);
+ 
+   return promise.forget();
+ }
+ 
+ already_AddRefed<Promise>
+@@ -311,20 +168,20 @@ Cache::Put(const RequestOrScalarValueStr
+   }
+ 
+   RequestId requestId = AddRequestPromise(promise, aRv);
+   if (requestId == INVALID_REQUEST_ID) {
+     return nullptr;
+   }
+ 
+   PCacheRequest request;
+-  ToPCacheRequest(request, aRequest);
++  TypeUtils::ToPCacheRequest(request, aRequest);
+ 
+   PCacheResponse response;
+-  ToPCacheResponse(response, aResponse);
++  TypeUtils::ToPCacheResponse(response, aResponse);
+ 
+   unused << mActor->SendPut(requestId, request, response);
+ 
+   return promise.forget();
+ }
+ 
+ already_AddRefed<Promise>
+ Cache::Delete(const RequestOrScalarValueString& aRequest,
+@@ -338,20 +195,20 @@ Cache::Delete(const RequestOrScalarValue
+   }
+ 
+   RequestId requestId = AddRequestPromise(promise, aRv);
+   if (requestId == INVALID_REQUEST_ID) {
+     return nullptr;
+   }
+ 
+   PCacheRequest request;
+-  ToPCacheRequest(request, aRequest);
++  TypeUtils::ToPCacheRequest(request, aRequest);
+ 
+   PCacheQueryParams params;
+-  ToPCacheQueryParams(params, aParams);
++  TypeUtils::ToPCacheQueryParams(params, aParams);
+ 
+   unused << mActor->SendDelete(requestId, request, params);
+ 
+   return promise.forget();
+ }
+ 
+ already_AddRefed<Promise>
+ Cache::Keys(const Optional<RequestOrScalarValueString>& aRequest,
+@@ -365,20 +222,20 @@ Cache::Keys(const Optional<RequestOrScal
+   }
+ 
+   RequestId requestId = AddRequestPromise(promise, aRv);
+   if (requestId == INVALID_REQUEST_ID) {
+     return nullptr;
+   }
+ 
+   PCacheRequestOrVoid request;
+-  ToPCacheRequestOrVoid(request, aRequest);
++  TypeUtils::ToPCacheRequestOrVoid(request, aRequest);
+ 
+   PCacheQueryParams params;
+-  ToPCacheQueryParams(params, aParams);
++  TypeUtils::ToPCacheQueryParams(params, aParams);
+ 
+   unused << mActor->SendKeys(requestId, request, params);
+ 
+   return promise.forget();
+ }
+ 
+ // static
+ bool
+@@ -448,17 +305,17 @@ Cache::RecvMatchResponse(RequestId aRequ
+     return;
+   }
+ 
+   nsRefPtr<Response> response = new Response(mOwner);
+   if (!response) {
+     promise->MaybeReject(NS_ERROR_OUT_OF_MEMORY);
+     return;
+   }
+-  ToResponse(*response, aResponse);
++  TypeUtils::ToResponse(*response, aResponse);
+   promise->MaybeResolve(response);
+ }
+ 
+ void
+ Cache::RecvMatchAllResponse(RequestId aRequestId, nsresult aRv,
+                             const nsTArray<PCacheResponse>& aResponses)
+ {
+   nsRefPtr<Promise> promise = RemoveRequestPromise(aRequestId);
+@@ -473,17 +330,17 @@ Cache::RecvMatchAllResponse(RequestId aR
+ 
+   nsTArray<nsRefPtr<Response>> responses;
+   for (uint32_t i = 0; i < aResponses.Length(); ++i) {
+     nsRefPtr<Response> response = new Response(mOwner);
+     if (!response) {
+       promise->MaybeReject(NS_ERROR_OUT_OF_MEMORY);
+       return;
+     }
+-    ToResponse(*response, aResponses[i]);
++    TypeUtils::ToResponse(*response, aResponses[i]);
+     responses.AppendElement(response);
+   }
+   promise->MaybeResolve(responses);
+ }
+ 
+ void
+ Cache::RecvAddResponse(RequestId aRequestId, nsresult aRv,
+                        const PCacheResponse& aResponse)
+@@ -498,17 +355,17 @@ Cache::RecvAddResponse(RequestId aReques
+     return;
+   }
+ 
+   nsRefPtr<Response> response = new Response(mOwner);
+   if (!response) {
+     promise->MaybeReject(NS_ERROR_OUT_OF_MEMORY);
+     return;
+   }
+-  ToResponse(*response, aResponse);
++  TypeUtils::ToResponse(*response, aResponse);
+   promise->MaybeResolve(response);
+ }
+ 
+ void
+ Cache::RecvAddAllResponse(RequestId aRequestId, nsresult aRv,
+                           const nsTArray<PCacheResponse>& aResponses)
+ {
+   nsRefPtr<Promise> promise = RemoveRequestPromise(aRequestId);
+@@ -523,17 +380,17 @@ Cache::RecvAddAllResponse(RequestId aReq
+ 
+   nsTArray<nsRefPtr<Response>> responses;
+   for (uint32_t i = 0; i < aResponses.Length(); ++i) {
+     nsRefPtr<Response> response = new Response(mOwner);
+     if (!response) {
+       promise->MaybeReject(NS_ERROR_OUT_OF_MEMORY);
+       return;
+     }
+-    ToResponse(*response, aResponses[i]);
++    TypeUtils::ToResponse(*response, aResponses[i]);
+     responses.AppendElement(response);
+   }
+   promise->MaybeResolve(responses);
+ }
+ 
+ void
+ Cache::RecvPutResponse(RequestId aRequestId, nsresult aRv,
+                        const PCacheResponseOrVoid& aResponse)
+@@ -552,17 +409,17 @@ Cache::RecvPutResponse(RequestId aReques
+     promise->MaybeResolve(nullptr);
+     return;
+   }
+   nsRefPtr<Response> response = new Response(mOwner);
+   if (!response) {
+     promise->MaybeReject(NS_ERROR_OUT_OF_MEMORY);
+     return;
+   }
+-  ToResponse(*response, aResponse);
++  TypeUtils::ToResponse(*response, aResponse);
+   promise->MaybeResolve(response);
+ }
+ 
+ void
+ Cache::RecvDeleteResponse(RequestId aRequestId, nsresult aRv, bool aSuccess)
+ {
+   nsRefPtr<Promise> promise = RemoveRequestPromise(aRequestId);
+   if (NS_WARN_IF(!promise)) {
+@@ -595,17 +452,17 @@ Cache::RecvKeysResponse(RequestId aReque
+   for (uint32_t i = 0; i < aRequests.Length(); ++i) {
+     MOZ_CRASH("not implemented - can't construct new Request()");
+     //nsRefPtr<Request> request = new Request(mOwner);
+     nsRefPtr<Request> request = nullptr;
+     if (!request) {
+       promise->MaybeReject(NS_ERROR_OUT_OF_MEMORY);
+       return;
+     }
+-    ToRequest(*request, aRequests[i]);
++    TypeUtils::ToRequest(*request, aRequests[i]);
+     requests.AppendElement(request);
+   }
+   promise->MaybeResolve(requests);
+ }
+ 
+ 
+ Cache::~Cache()
+ {
+diff --git a/dom/cache/CacheStorage.cpp b/dom/cache/CacheStorage.cpp
+--- a/dom/cache/CacheStorage.cpp
++++ b/dom/cache/CacheStorage.cpp
+@@ -3,20 +3,22 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/CacheStorage.h"
+ 
+ #include "mozilla/unused.h"
+ #include "mozilla/dom/Promise.h"
++#include "mozilla/dom/Response.h"
+ #include "mozilla/dom/CacheStorageBinding.h"
+ #include "mozilla/dom/cache/Cache.h"
+ #include "mozilla/dom/cache/PCacheChild.h"
+ #include "mozilla/dom/cache/CacheStorageChild.h"
++#include "mozilla/dom/cache/TypeUtils.h"
+ #include "mozilla/ipc/BackgroundChild.h"
+ #include "mozilla/ipc/PBackgroundChild.h"
+ #include "nsIGlobalObject.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+@@ -69,17 +71,37 @@ CacheStorage::CacheStorage(Namespace aNa
+     }
+   }
+ }
+ 
+ already_AddRefed<Promise>
+ CacheStorage::Match(const RequestOrScalarValueString& aRequest,
+                     const QueryParams& aParams, ErrorResult& aRv)
+ {
+-  MOZ_CRASH("not implemented");
++  MOZ_ASSERT(mActor);
++
++  nsRefPtr<Promise> promise = Promise::Create(mGlobal, aRv);
++  if (!promise) {
++    return nullptr;
++  }
++
++  RequestId requestId = AddRequestPromise(promise, aRv);
++  if (requestId == INVALID_REQUEST_ID) {
++    return nullptr;
++  }
++
++  PCacheRequest request;
++  TypeUtils::ToPCacheRequest(request, aRequest);
++
++  PCacheQueryParams params;
++  TypeUtils::ToPCacheQueryParams(params, aParams);
++
++  unused << mActor->SendMatch(requestId, request, params);
++
++  return promise.forget();
+ }
+ 
+ already_AddRefed<Promise>
+ CacheStorage::Get(const nsAString& aKey, ErrorResult& aRv)
+ {
+   MOZ_ASSERT(mActor);
+ 
+   nsRefPtr<Promise> promise = Promise::Create(mGlobal, aRv);
+@@ -233,16 +255,40 @@ CacheStorage::ActorDestroy(IProtocol& aA
+ {
+   MOZ_ASSERT(mActor);
+   MOZ_ASSERT(mActor == &aActor);
+   mActor->ClearListener();
+   mActor = nullptr;
+ }
+ 
+ void
++CacheStorage::RecvMatchResponse(RequestId aRequestId, nsresult aRv,
++                                const PCacheResponseOrVoid& aResponse)
++{
++  nsRefPtr<Promise> promise = RemoveRequestPromise(aRequestId);
++  if (NS_WARN_IF(!promise)) {
++    return;
++  }
++
++  if (NS_FAILED(aRv)) {
++    promise->MaybeReject(aRv);
++    return;
++  }
++
++  if (aResponse.type() == PCacheResponseOrVoid::Tvoid_t) {
++    promise->MaybeReject(NS_ERROR_DOM_NOT_FOUND_ERR);
++    return;
++  }
++
++  nsRefPtr<Response> response = new Response(mOwner);
++  TypeUtils::ToResponse(*response, aResponse);
++  promise->MaybeResolve(response);
++}
++
++void
+ CacheStorage::RecvGetResponse(RequestId aRequestId, nsresult aRv,
+                               PCacheChild* aActor)
+ {
+   nsRefPtr<Promise> promise = RemoveRequestPromise(aRequestId);
+   if (NS_WARN_IF(!promise)) {
+     if (aActor) {
+       PCacheChild::Send__delete__(aActor);
+     }
+diff --git a/dom/cache/CacheStorage.h b/dom/cache/CacheStorage.h
+--- a/dom/cache/CacheStorage.h
++++ b/dom/cache/CacheStorage.h
+@@ -63,16 +63,18 @@ public:
+   virtual JSObject* WrapObject(JSContext* aContext) MOZ_OVERRIDE;
+ 
+   // nsIIPCbackgroundChildCreateCallback methods
+   virtual void ActorCreated(PBackgroundChild* aActor) MOZ_OVERRIDE;
+   virtual void ActorFailed() MOZ_OVERRIDE;
+ 
+   // CacheStorageChildListener methods
+   virtual void ActorDestroy(mozilla::ipc::IProtocol& aActor) MOZ_OVERRIDE;
++  virtual void RecvMatchResponse(RequestId aRequestId, nsresult aRv,
++                           const PCacheResponseOrVoid& aResponse) MOZ_OVERRIDE;
+   virtual void RecvGetResponse(RequestId aRequestId, nsresult aRv,
+                                PCacheChild* aActor) MOZ_OVERRIDE;
+   virtual void RecvHasResponse(RequestId aRequestId, nsresult aRv,
+                                bool aSuccess) MOZ_OVERRIDE;
+   virtual void RecvCreateResponse(RequestId aRequestId, nsresult aRv,
+                                   PCacheChild* aActor) MOZ_OVERRIDE;
+   virtual void RecvDeleteResponse(RequestId aRequestId, nsresult aRv,
+                                   bool aSuccess) MOZ_OVERRIDE;
+diff --git a/dom/cache/CacheStorageChild.cpp b/dom/cache/CacheStorageChild.cpp
+--- a/dom/cache/CacheStorageChild.cpp
++++ b/dom/cache/CacheStorageChild.cpp
+@@ -28,16 +28,26 @@ CacheStorageChild::ActorDestroy(ActorDes
+   // If the listener is destroyed before we are, then they will clear
+   // their registration.
+   if (mListener) {
+     mListener->ActorDestroy(*this);
+   }
+ }
+ 
+ bool
++CacheStorageChild::RecvMatchResponse(const RequestId& aRequestId,
++                                     const nsresult& aRv,
++                                     const PCacheResponseOrVoid& aResponseOrVoid)
++{
++  MOZ_ASSERT(mListener);
++  mListener->RecvMatchResponse(aRequestId, aRv, aResponseOrVoid);
++  return true;
++}
++
++bool
+ CacheStorageChild::RecvGetResponse(const RequestId& aRequestId,
+                                    const nsresult& aRv,
+                                    PCacheChild* aActor)
+ {
+   MOZ_ASSERT(mListener);
+   mListener->RecvGetResponse(aRequestId, aRv, aActor);
+   return true;
+ }
+diff --git a/dom/cache/CacheStorageChild.h b/dom/cache/CacheStorageChild.h
+--- a/dom/cache/CacheStorageChild.h
++++ b/dom/cache/CacheStorageChild.h
+@@ -18,16 +18,19 @@ class CacheStorageChildListener;
+ class PCacheChild;
+ 
+ class CacheStorageChild MOZ_FINAL : public PCacheStorageChild
+ {
+ public:
+   CacheStorageChild(CacheStorageChildListener& aListener);
+   virtual ~CacheStorageChild();
+   virtual void ActorDestroy(ActorDestroyReason aReason) MOZ_OVERRIDE;
++  virtual bool RecvMatchResponse(const RequestId& requestId,
++                             const nsresult& aRv,
++                             const PCacheResponseOrVoid& response) MOZ_OVERRIDE;
+   virtual bool RecvGetResponse(const cache::RequestId& aRequestId,
+                                const nsresult& aRv,
+                                PCacheChild* aActor) MOZ_OVERRIDE;
+   virtual bool RecvHasResponse(const cache::RequestId& aRequestId,
+                                const nsresult& aRv,
+                                const bool& aSuccess) MOZ_OVERRIDE;
+   virtual bool RecvCreateResponse(const cache::RequestId& aRequestId,
+                                   const nsresult& aRv,
+diff --git a/dom/cache/CacheStorageChildListener.h b/dom/cache/CacheStorageChildListener.h
+--- a/dom/cache/CacheStorageChildListener.h
++++ b/dom/cache/CacheStorageChildListener.h
+@@ -18,22 +18,25 @@ namespace mozilla {
+ namespace ipc {
+   class IProtocol;
+ }
+ 
+ namespace dom {
+ namespace cache {
+ 
+ class PCacheChild;
++class PCacheResponseOrVoid;
+ 
+ class CacheStorageChildListener
+ {
+ public:
+   virtual ~CacheStorageChildListener() { }
+   virtual void ActorDestroy(mozilla::ipc::IProtocol& aActor)=0;
++  virtual void RecvMatchResponse(RequestId aRequestId, nsresult aRv,
++                                 const PCacheResponseOrVoid& aResponse)=0;
+   virtual void RecvGetResponse(cache::RequestId aRequestId,
+                                nsresult aRv, PCacheChild* aActor)=0;
+   virtual void RecvHasResponse(cache::RequestId aRequestId, nsresult aRv,
+                                bool aSuccess)=0;
+   virtual void RecvCreateResponse(cache::RequestId aRequestId, nsresult aRv,
+                                   PCacheChild* aActor)=0;
+   virtual void RecvDeleteResponse(cache::RequestId aRequestId, nsresult aRv,
+                                   bool aSuccess)=0;
+diff --git a/dom/cache/CacheStorageParent.cpp b/dom/cache/CacheStorageParent.cpp
+--- a/dom/cache/CacheStorageParent.cpp
++++ b/dom/cache/CacheStorageParent.cpp
+@@ -3,20 +3,24 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/CacheStorageParent.h"
+ 
+ #include "mozilla/dom/cache/CacheParent.h"
+ #include "mozilla/dom/cache/Manager.h"
++#include "mozilla/dom/cache/SavedTypes.h"
+ #include "mozilla/ipc/PBackgroundParent.h"
+ #include "mozilla/unused.h"
+ #include "nsCOMPtr.h"
+ 
++// TODO: remove testing only headers
++#include "../../dom/filehandle/MemoryStreams.h"
++
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ CacheStorageParent::CacheStorageParent(Namespace aNamespace,
+                                        const nsACString& aOrigin,
+                                        const nsACString& aBaseDomain)
+   : mNamespace(aNamespace)
+@@ -36,16 +40,25 @@ void
+ CacheStorageParent::ActorDestroy(ActorDestroyReason aReason)
+ {
+   MOZ_ASSERT(mManager);
+   mManager->RemoveListener(this);
+   mManager = nullptr;
+ }
+ 
+ bool
++CacheStorageParent::RecvMatch(const RequestId& aRequestId,
++                              const PCacheRequest& aRequest,
++                              const PCacheQueryParams& aParams)
++{
++  mManager->StorageMatch(this, aRequestId, mNamespace, aRequest, aParams);
++  return true;
++}
++
++bool
+ CacheStorageParent::RecvGet(const RequestId& aRequestId, const nsString& aKey)
+ {
+   mManager->StorageGet(this, aRequestId, mNamespace, aKey);
+   return true;
+ }
+ 
+ bool
+ CacheStorageParent::RecvHas(const RequestId& aRequestId, const nsString& aKey)
+@@ -73,16 +86,45 @@ CacheStorageParent::RecvDelete(const Req
+ bool
+ CacheStorageParent::RecvKeys(const RequestId& aRequestId)
+ {
+   mManager->StorageKeys(this, aRequestId, mNamespace);
+   return true;
+ }
+ 
+ void
++CacheStorageParent::OnStorageMatch(RequestId aRequestId, nsresult aRv,
++                                   const SavedResponse* aSavedResponse)
++{
++  PCacheResponseOrVoid responseOrVoid;
++
++  // no match
++  if (NS_FAILED(aRv) || !aSavedResponse) {
++    responseOrVoid = void_t();
++    unused << SendMatchResponse(aRequestId, aRv, responseOrVoid);
++    return;
++  }
++
++  // match without body data to stream
++  if (!aSavedResponse->mHasBodyId) {
++    responseOrVoid = aSavedResponse->mValue;
++    unused << SendMatchResponse(aRequestId, aRv, responseOrVoid);
++    return;
++  }
++
++  // TODO: remove stream test code
++  nsCOMPtr<nsIOutputStream> stream = MemoryOutputStream::Create(4096);
++
++  mManager->CacheReadBody(aSavedResponse->mCacheId, aSavedResponse->mBodyId,
++                          stream);
++  responseOrVoid = aSavedResponse->mValue;
++  unused << SendMatchResponse(aRequestId, aRv, responseOrVoid);
++}
++
++void
+ CacheStorageParent::OnStorageGet(RequestId aRequestId, nsresult aRv,
+                                  bool aCacheFound, CacheId aCacheId)
+ {
+   if (NS_FAILED(aRv) || !aCacheFound) {
+     unused << SendGetResponse(aRequestId, aRv, nullptr);
+     return;
+   }
+ 
+diff --git a/dom/cache/CacheStorageParent.h b/dom/cache/CacheStorageParent.h
+--- a/dom/cache/CacheStorageParent.h
++++ b/dom/cache/CacheStorageParent.h
+@@ -22,27 +22,32 @@ class CacheStorageParent MOZ_FINAL : pub
+ {
+ public:
+   CacheStorageParent(Namespace aNamespace, const nsACString& aOrigin,
+                      const nsACString& mBaseDomain);
+   virtual ~CacheStorageParent();
+ 
+   // PCacheStorageParent methods
+   virtual void ActorDestroy(ActorDestroyReason aReason) MOZ_OVERRIDE;
++  virtual bool RecvMatch(const RequestId& aRequestId,
++                         const PCacheRequest& aRequest,
++                         const PCacheQueryParams& aParams) MOZ_OVERRIDE;
+   virtual bool RecvGet(const RequestId& aRequestId,
+                        const nsString& aKey) MOZ_OVERRIDE;
+   virtual bool RecvHas(const RequestId& aRequestId,
+                        const nsString& aKey) MOZ_OVERRIDE;
+   virtual bool RecvCreate(const RequestId& aRequestId,
+                           const nsString& aKey) MOZ_OVERRIDE;
+   virtual bool RecvDelete(const RequestId& aRequestId,
+                           const nsString& aKey) MOZ_OVERRIDE;
+   virtual bool RecvKeys(const RequestId& aRequestId) MOZ_OVERRIDE;
+ 
+   // Manager::Listener methods
++  virtual void OnStorageMatch(RequestId aRequestId, nsresult aRv,
++                              const SavedResponse* aResponse) MOZ_OVERRIDE;
+   virtual void OnStorageGet(RequestId aRequestId, nsresult aRv,
+                             bool aCacheFound,
+                             CacheId aCacheId) MOZ_OVERRIDE;
+   virtual void OnStorageHas(RequestId aRequestId, nsresult aRv,
+                             bool aCacheFound) MOZ_OVERRIDE;
+   virtual void OnStorageCreate(RequestId aRequestId, nsresult aRv,
+                                CacheId aCacheId) MOZ_OVERRIDE;
+   virtual void OnStorageDelete(RequestId aRequestId, nsresult aRv,
+diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
+--- a/dom/cache/DBSchema.cpp
++++ b/dom/cache/DBSchema.cpp
+@@ -248,16 +248,17 @@ DBSchema::CacheMatch(mozIStorageConnecti
+   if (matches.Length() < 1) {
+     *aFoundResponseOut = false;
+     return rv;
+   }
+ 
+   rv = ReadResponse(aConn, matches[0], aSavedResponseOut);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
++  aSavedResponseOut->mCacheId = aCacheId;
+   *aFoundResponseOut = true;
+ 
+   return rv;
+ }
+ 
+ // static
+ nsresult
+ DBSchema::CacheMatchAll(mozIStorageConnection* aConn, CacheId aCacheId,
+@@ -277,16 +278,17 @@ DBSchema::CacheMatchAll(mozIStorageConne
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+   }
+ 
+   // TODO: replace this with a bulk load using SQL IN clause
+   for (uint32_t i = 0; i < matches.Length(); ++i) {
+     SavedResponse *savedResponse = aSavedResponsesOut.AppendElement();
+     rv = ReadResponse(aConn, matches[i], savedResponse);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++    savedResponse->mCacheId = aCacheId;
+   }
+ 
+   return rv;
+ }
+ 
+ // static
+ nsresult
+ DBSchema::CachePut(mozIStorageConnection* aConn, CacheId aCacheId,
+@@ -340,16 +342,83 @@ DBSchema::CacheDelete(mozIStorageConnect
+ 
+   *aSuccessOut = true;
+ 
+   return rv;
+ }
+ 
+ // static
+ nsresult
++DBSchema::StorageMatch(mozIStorageConnection* aConn,
++                       Namespace aNamespace,
++                       const PCacheRequest& aRequest,
++                       const PCacheQueryParams& aParams,
++                       bool* aFoundResponseOut,
++                       SavedResponse* aSavedResponseOut)
++{
++  MOZ_ASSERT(aConn);
++  MOZ_ASSERT(aFoundResponseOut);
++  MOZ_ASSERT(aSavedResponseOut);
++
++  nsresult rv;
++
++  // If we are given a cache to check, then simply find its cache ID
++  // and perform the match.
++  if (!aParams.cacheName().EqualsLiteral("")) {
++    bool foundCache;
++    CacheId cacheId;
++    rv = StorageGetCacheId(aConn, aNamespace, aParams.cacheName(), &foundCache,
++                           &cacheId);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++    if (!foundCache) { return NS_ERROR_DOM_NOT_FOUND_ERR; }
++
++    rv = CacheMatch(aConn, cacheId, aRequest, aParams, aFoundResponseOut,
++                    aSavedResponseOut);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    return rv;
++  }
++
++  // Otherwise we need to get a list of all the cache IDs in this namespace.
++
++  nsCOMPtr<mozIStorageStatement> state;
++  rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
++    "SELECT cache_id FROM storage WHERE namespace=?1 ORDER BY rowid;"
++  ), getter_AddRefs(state));
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  rv = state->BindInt32Parameter(0, aNamespace);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  nsTArray<CacheId> cacheIdList;
++
++  bool hasMoreData;
++  while(NS_SUCCEEDED(state->ExecuteStep(&hasMoreData)) && hasMoreData) {
++    CacheId* cacheId = cacheIdList.AppendElement();
++    rv = state->GetInt32(0, cacheId);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++  }
++
++  // Now try to find a match in each cache in order
++  for (uint32_t i = 0; i < cacheIdList.Length(); ++i) {
++    rv = CacheMatch(aConn, cacheIdList[i], aRequest, aParams, aFoundResponseOut,
++                    aSavedResponseOut);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    if (*aFoundResponseOut) {
++      aSavedResponseOut->mCacheId = cacheIdList[i];
++      return rv;
++    }
++  }
++
++  return NS_ERROR_DOM_NOT_FOUND_ERR;
++}
++
++// static
++nsresult
+ DBSchema::StorageGetCacheId(mozIStorageConnection* aConn, Namespace aNamespace,
+                             const nsAString& aKey, bool* aFoundCacheOut,
+                             CacheId* aCacheIdOut)
+ {
+   MOZ_ASSERT(aConn);
+   MOZ_ASSERT(aFoundCacheOut);
+   MOZ_ASSERT(aCacheIdOut);
+ 
+@@ -878,16 +947,18 @@ DBSchema::InsertEntry(mozIStorageConnect
+ 
+     rv = state->Execute();
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+   }
+ 
+   rv = ReadResponse(aConn, entryId, aSavedResponseOut);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
++  aSavedResponseOut->mCacheId = aCacheId;
++
+   return NS_OK;
+ }
+ 
+ // static
+ nsresult
+ DBSchema::ReadResponse(mozIStorageConnection* aConn, EntryId aEntryId,
+                        SavedResponse* aSavedResponseOut)
+ {
+diff --git a/dom/cache/DBSchema.h b/dom/cache/DBSchema.h
+--- a/dom/cache/DBSchema.h
++++ b/dom/cache/DBSchema.h
+@@ -58,16 +58,22 @@ public:
+                            nsTArray<nsID>& aDeletedBodyIdListOut,
+                            SavedResponse* aSavedResponseOut);
+   static nsresult CacheDelete(mozIStorageConnection* aConn, CacheId aCacheId,
+                               const PCacheRequest& aRequest,
+                               const PCacheQueryParams& aParams,
+                               nsTArray<nsID>& aDeletedBodyIdListOut,
+                               bool* aSuccessOut);
+ 
++  static nsresult StorageMatch(mozIStorageConnection* aConn,
++                               Namespace aNamespace,
++                               const PCacheRequest& aRequest,
++                               const PCacheQueryParams& aParams,
++                               bool* aFoundResponseOut,
++                               SavedResponse* aSavedResponseOut);
+   static nsresult StorageGetCacheId(mozIStorageConnection* aConn,
+                                     Namespace aNamespace, const nsAString& aKey,
+                                     bool* aFoundCacheOut, CacheId* aCacheIdOut);
+   static nsresult StoragePutCache(mozIStorageConnection* aConn,
+                                   Namespace aNamespace, const nsAString& aKey,
+                                   CacheId aCacheId);
+   static nsresult StorageForgetCache(mozIStorageConnection* aConn,
+                                      Namespace aNamespace,
+diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
+--- a/dom/cache/Manager.cpp
++++ b/dom/cache/Manager.cpp
+@@ -747,16 +747,57 @@ private:
+   nsRefPtr<Manager> mManager;
+   const CacheId mCacheId;
+   const nsID mBodyId;
+   nsCOMPtr<nsIOutputStream> mStream;
+   nsRefPtr<Resolver> mResolver;
+   nsCOMPtr<nsISupports> mCopyContext;
+ };
+ 
++class Manager::StorageMatchAction MOZ_FINAL : public Manager::BaseAction
++{
++public:
++  StorageMatchAction(Manager* aManager, ListenerId aListenerId,
++                     RequestId aRequestId, Namespace aNamespace,
++                     const PCacheRequest& aRequest,
++                     const PCacheQueryParams& aParams)
++    : BaseAction(aManager, aListenerId, aRequestId)
++    , mNamespace(aNamespace)
++    , mRequest(aRequest)
++    , mParams(aParams)
++    , mFoundResponse(false)
++  { }
++
++  virtual nsresult
++  RunSyncWithDBOnTarget(nsIFile* aDBDir,
++                        mozIStorageConnection* aConn) MOZ_OVERRIDE
++  {
++    return DBSchema::StorageMatch(aConn, mNamespace, mRequest, mParams,
++                                  &mFoundResponse, &mSavedResponse);
++  }
++
++  virtual void
++  Complete(Listener* aListener, nsresult aRv) MOZ_OVERRIDE
++  {
++    if (!mFoundResponse) {
++      aListener->OnStorageMatch(mRequestId, aRv, nullptr);
++    } else {
++      aListener->OnStorageMatch(mRequestId, aRv, &mSavedResponse);
++    }
++  }
++
++protected:
++  virtual ~StorageMatchAction() { }
++  const Namespace mNamespace;
++  const PCacheRequest mRequest;
++  const PCacheQueryParams mParams;
++  bool mFoundResponse;
++  SavedResponse mSavedResponse;
++};
++
+ class Manager::StorageGetAction : public Manager::BaseAction
+ {
+ public:
+   StorageGetAction(Manager* aManager, ListenerId aListenerId,
+                    RequestId aRequestId, Namespace aNamespace,
+                    const nsAString& aKey)
+     : BaseAction(aManager, aListenerId, aRequestId)
+     , mNamespace(aNamespace)
+@@ -1073,16 +1114,30 @@ Manager::CacheReadBody(CacheId aCacheId,
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(aStream);
+   nsRefPtr<Action> action = new CacheReadBodyAction(this, aCacheId, aBodyId,
+                                                     aStream);
+   CurrentContext()->Dispatch(mIOThread, action);
+ }
+ 
+ void
++Manager::StorageMatch(Listener* aListener, RequestId aRequestId,
++                      Namespace aNamespace, const PCacheRequest& aRequest,
++                      const PCacheQueryParams& aParams)
++{
++  NS_ASSERT_OWNINGTHREAD(Manager);
++  MOZ_ASSERT(aListener);
++  ListenerId listenerId = SaveListener(aListener);
++  nsRefPtr<Action> action = new StorageMatchAction(this, listenerId, aRequestId,
++                                                   aNamespace, aRequest,
++                                                   aParams);
++  CurrentContext()->Dispatch(mIOThread, action);
++}
++
++void
+ Manager::StorageGet(Listener* aListener, RequestId aRequestId,
+                     Namespace aNamespace, const nsAString& aKey)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(aListener);
+   ListenerId listenerId = SaveListener(aListener);
+   nsRefPtr<Action> action = new StorageGetAction(this, listenerId, aRequestId,
+                                                  aNamespace, aKey);
+diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
+--- a/dom/cache/Manager.h
++++ b/dom/cache/Manager.h
+@@ -39,16 +39,18 @@ public:
+                               const SavedResponse* aResponse) { }
+     virtual void OnCacheMatchAll(RequestId aRequestId, nsresult aRv,
+                              const nsTArray<SavedResponse>& aSavedResponses) { }
+     virtual void OnCachePut(RequestId aRequestId, nsresult aRv,
+                             const SavedResponse* aSavedResponse) { }
+     virtual void OnCacheDelete(RequestId aRequestId, nsresult aRv,
+                                bool aSuccess) { }
+ 
++    virtual void OnStorageMatch(RequestId aRequestId, nsresult aRv,
++                                const SavedResponse* aResponse) { }
+     virtual void OnStorageGet(RequestId aRequestId, nsresult aRv,
+                               bool aCacheFound, CacheId aCacheId) { }
+     virtual void OnStorageHas(RequestId aRequestId, nsresult aRv,
+                               bool aCacheFound) { }
+     virtual void OnStorageCreate(RequestId aRequestId, nsresult aRv,
+                                  CacheId aCacheId) { }
+     virtual void OnStorageDelete(RequestId aRequestId, nsresult aRv,
+                                  bool aCacheDeleted) { }
+@@ -77,16 +79,19 @@ public:
+                 const PCacheResponse& aResponse,
+                 nsIInputStream* aResponseBodyStream);
+   void CacheDelete(Listener* aListener, RequestId aRequestId,
+                    CacheId aCacheId, const PCacheRequest& aRequest,
+                    const PCacheQueryParams& aParams);
+   void CacheReadBody(CacheId aCacheId, const nsID& aBodyId,
+                      nsIOutputStream* aStream);
+ 
++  void StorageMatch(Listener* aListener, RequestId aRequestId,
++                    Namespace aNamespace, const PCacheRequest& aRequest,
++                    const PCacheQueryParams& aParams);
+   void StorageGet(Listener* aListener, RequestId aRequestId,
+                   Namespace aNamespace, const nsAString& aKey);
+   void StorageHas(Listener* aListener, RequestId aRequestId,
+                   Namespace aNamespace, const nsAString& aKey);
+   void StorageCreate(Listener* aListener, RequestId aRequestId,
+                      Namespace aNamespace, const nsAString& aKey);
+   void StorageDelete(Listener* aListener, RequestId aRequestId,
+                      Namespace aNamespace, const nsAString& aKey);
+@@ -106,16 +111,17 @@ private:
+   class DeleteOrphanedCacheAction;
+ 
+   class CacheMatchAction;
+   class CacheMatchAllAction;
+   class CachePutAction;
+   class CacheDeleteAction;
+   class CacheReadBodyAction;
+ 
++  class StorageMatchAction;
+   class StorageGetAction;
+   class StorageHasAction;
+   class StorageCreateAction;
+   class StorageDeleteAction;
+   class StorageKeysAction;
+ 
+   typedef uintptr_t ListenerId;
+ 
+diff --git a/dom/cache/PCacheStorage.ipdl b/dom/cache/PCacheStorage.ipdl
+--- a/dom/cache/PCacheStorage.ipdl
++++ b/dom/cache/PCacheStorage.ipdl
+@@ -1,33 +1,40 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+  * You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ include protocol PBackground;
+ include protocol PCache;
++include PCacheQueryParams;
++include PCacheRequest;
++include PCacheResponse;
+ 
+ using mozilla::dom::cache::RequestId from "mozilla/dom/cache/IPCUtils.h";
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ protocol PCacheStorage
+ {
+   manager PBackground;
+ 
+ parent:
++  Match(RequestId aRequestId, PCacheRequest aRequest,
++        PCacheQueryParams aParams);
+   Get(RequestId aRequestId, nsString aKey);
+   Has(RequestId aRequestId, nsString aKey);
+   Create(RequestId aRequestId, nsString aKey);
+   Delete(RequestId aRequestId, nsString aKey);
+   Keys(RequestId aRequestId);
+ 
+ child:
++  MatchResponse(RequestId aRequestId, nsresult aRv,
++                PCacheResponseOrVoid aResponseOrVoid);
+   GetResponse(RequestId aRequestId, nsresult aRv, nullable PCache aActor);
+   HasResponse(RequestId aRequestId, nsresult aRv, bool aSuccess);
+   CreateResponse(RequestId aRequestId, nsresult aRv, nullable PCache aActor);
+   DeleteResponse(RequestId aRequestId, nsresult aRv, bool aSuccess);
+   KeysResponse(RequestId aRequestId, nsresult aRv, nsString[] aKeys);
+ 
+ both:
+   __delete__();
+diff --git a/dom/cache/SavedTypes.h b/dom/cache/SavedTypes.h
+--- a/dom/cache/SavedTypes.h
++++ b/dom/cache/SavedTypes.h
+@@ -7,16 +7,17 @@
+ #ifndef mozilla_dom_cache_SavedTypes_h
+ #define mozilla_dom_cache_SavedTypes_h
+ 
+ // NOTE: This cannot be rolled into Types.h because the IPC dependency.
+ //       breaks webidl unified builds.
+ 
+ #include "mozilla/dom/cache/PCacheRequest.h"
+ #include "mozilla/dom/cache/PCacheResponse.h"
++#include "mozilla/dom/cache/Types.h"
+ #include "nsCOMPtr.h"
+ #include "nsID.h"
+ #include "nsIOutputStream.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+@@ -26,23 +27,25 @@ struct StreamHolder
+ };
+ 
+ struct SavedRequest
+ {
+   SavedRequest() : mHasBodyId(false) { }
+   PCacheRequest mValue;
+   bool mHasBodyId;
+   nsID mBodyId;
++  CacheId mCacheId;
+ };
+ 
+ struct SavedResponse
+ {
+   SavedResponse() : mHasBodyId(false) { }
+   PCacheResponse mValue;
+   bool mHasBodyId;
+   nsID mBodyId;
++  CacheId mCacheId;
+ };
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_cache_SavedTypes_h
+diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/TypeUtils.cpp
+@@ -0,0 +1,184 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "mozilla/dom/cache/TypeUtils.h"
++
++#include "mozilla/dom/CacheBinding.h"
++#include "mozilla/dom/Request.h"
++#include "mozilla/dom/Response.h"
++#include "mozilla/dom/cache/PCacheQueryParams.h"
++#include "mozilla/dom/cache/PCacheRequest.h"
++#include "mozilla/dom/cache/PCacheResponse.h"
++#include "nsCOMPtr.h"
++#include "nsString.h"
++#include "nsURLParsers.h"
++
++namespace {
++
++// Utility function to remove the query from a URL.  We're not using nsIURL
++// or URL to do this because they require going to the main thread.
++static nsresult
++GetURLWithoutQuery(const nsAString& aUrl, nsAString& aUrlWithoutQueryOut)
++{
++  NS_ConvertUTF16toUTF8 flatURL(aUrl);
++  const char* url = flatURL.get();
++
++  nsCOMPtr<nsIURLParser> urlParser = new nsStdURLParser();
++  NS_ENSURE_TRUE(urlParser, NS_ERROR_OUT_OF_MEMORY);
++
++  uint32_t pathPos;
++  int32_t pathLen;
++
++  nsresult rv = urlParser->ParseURL(url, flatURL.Length(),
++                                    nullptr, nullptr,       // ignore scheme
++                                    nullptr, nullptr,       // ignore authority
++                                    &pathPos, &pathLen);
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  uint32_t queryPos;
++  int32_t queryLen;
++
++  rv = urlParser->ParsePath(url + pathPos, flatURL.Length() - pathPos,
++                            nullptr, nullptr,               // ignore filepath
++                            &queryPos, &queryLen,
++                            nullptr, nullptr);              // ignore ref
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  // ParsePath gives us query position relative to the start of the path
++  queryPos += pathPos;
++
++  // We want everything before and after the query
++  aUrlWithoutQueryOut = Substring(aUrl, 0, queryPos);
++  aUrlWithoutQueryOut.Append(Substring(aUrl, queryPos + queryLen,
++                                       aUrl.Length() - queryPos - queryLen));
++
++  return NS_OK;
++}
++
++} // anonymous namespace
++
++namespace mozilla {
++namespace dom {
++namespace cache {
++
++using mozilla::void_t;
++
++// static
++void
++TypeUtils::ToPCacheRequest(PCacheRequest& aOut, const Request& aIn)
++{
++  aIn.GetMethod(aOut.method());
++  aIn.GetUrl(aOut.url());
++  if(NS_WARN_IF(NS_FAILED(GetURLWithoutQuery(aOut.url(),
++                                              aOut.urlWithoutQuery())))) {
++    // Fallback to just not providing ignoreSearch support
++    // TODO: Should we error out here instead?
++    aIn.GetUrl(aOut.urlWithoutQuery());
++  }
++  nsRefPtr<Headers> headers = aIn.Headers_();
++  MOZ_ASSERT(headers);
++  headers->GetPHeaders(aOut.headers());
++  aOut.mode() = aIn.Mode();
++  aOut.credentials() = aIn.Credentials();
++}
++
++// static
++void
++TypeUtils::ToPCacheRequest(PCacheRequest& aOut,
++                           const RequestOrScalarValueString& aIn)
++{
++  nsRefPtr<Request> request;
++  if (aIn.IsRequest()) {
++    request = &aIn.GetAsRequest();
++  } else {
++    MOZ_ASSERT(aIn.IsScalarValueString());
++    // TODO: see nsIStandardURL.init() if Request does not provide something...
++    MOZ_CRASH("implement me");
++  }
++  ToPCacheRequest(aOut, *request);
++}
++
++// static
++void
++TypeUtils::ToPCacheRequestOrVoid(PCacheRequestOrVoid& aOut,
++                                 const Optional<RequestOrScalarValueString>& aIn)
++{
++  if (!aIn.WasPassed()) {
++    aOut = void_t();
++    return;
++  }
++  PCacheRequest request;
++  ToPCacheRequest(request, aIn.Value());
++  aOut = request;
++}
++
++// static
++void
++TypeUtils::ToPCacheRequest(PCacheRequest& aOut,
++                           const OwningRequestOrScalarValueString& aIn)
++{
++  nsRefPtr<Request> request;
++  if (aIn.IsRequest()) {
++    request = &static_cast<Request&>(aIn.GetAsRequest());
++  } else {
++    MOZ_ASSERT(aIn.IsScalarValueString());
++    MOZ_CRASH("implement me");
++  }
++  ToPCacheRequest(aOut, *request);
++}
++
++// static
++void
++TypeUtils::ToPCacheResponse(PCacheResponse& aOut, const Response& aIn)
++{
++  aOut.type() = aIn.Type();
++  aIn.GetUrl(aOut.url());
++  aOut.status() = aIn.Status();
++  aIn.GetStatusText(aOut.statusText());
++  nsRefPtr<Headers> headers = aIn.Headers_();
++  MOZ_ASSERT(headers);
++  headers->GetPHeaders(aOut.headers());
++}
++
++// static
++void
++TypeUtils:: ToPCacheQueryParams(PCacheQueryParams& aOut, const QueryParams& aIn)
++{
++  aOut.ignoreSearch() = aIn.mIgnoreSearch.WasPassed() &&
++                        aIn.mIgnoreSearch.Value();
++  aOut.ignoreMethod() = aIn.mIgnoreMethod.WasPassed() &&
++                        aIn.mIgnoreMethod.Value();
++  aOut.ignoreVary() = aIn.mIgnoreVary.WasPassed() &&
++                      aIn.mIgnoreVary.Value();
++  aOut.prefixMatch() = aIn.mPrefixMatch.WasPassed() &&
++                       aIn.mPrefixMatch.Value();
++  aOut.cacheNameSet() = aIn.mCacheName.WasPassed();
++  if (aOut.cacheNameSet()) {
++    aOut.cacheName() = aIn.mCacheName.Value();
++  } else {
++    aOut.cacheName() = NS_LITERAL_STRING("");
++  }
++}
++
++// static
++void
++TypeUtils::ToResponse(Response& aOut, const PCacheResponse& aIn)
++{
++  // TODO: implement once real Request/Response are available
++  NS_WARNING("Not filling in contents of Response returned from Cache.");
++}
++
++// static
++void
++TypeUtils::ToRequest(Request& aOut, const PCacheRequest& aIn)
++{
++  // TODO: implement once real Request/Response are available
++  NS_WARNING("Not filling in contents of Request returned from Cache.");
++}
++
++} // namespace cache
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/cache/TypeUtils.h b/dom/cache/TypeUtils.h
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/TypeUtils.h
+@@ -0,0 +1,67 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_cache_TypesUtils_h
++#define mozilla_dom_cache_TypesUtils_h
++
++#include "mozilla/Attributes.h"
++
++namespace mozilla {
++namespace dom {
++
++class OwningRequestOrScalarValueString;
++struct QueryParams;
++class Request;
++class RequestOrScalarValueString;
++class Response;
++template<typename T> class Optional;
++
++namespace cache {
++
++class PCacheQueryParams;
++class PCacheRequest;
++class PCacheRequestOrVoid;
++class PCacheResponse;
++
++class TypeUtils
++{
++public:
++  static void
++  ToPCacheRequest(PCacheRequest& aOut, const Request& aIn);
++
++  static void
++  ToPCacheRequest(PCacheRequest& aOut, const RequestOrScalarValueString& aIn);
++
++  static void
++  ToPCacheRequestOrVoid(PCacheRequestOrVoid& aOut,
++                        const Optional<RequestOrScalarValueString>& aIn);
++
++  static void
++  ToPCacheRequest(PCacheRequest& aOut,
++                  const OwningRequestOrScalarValueString& aIn);
++
++  static void
++  ToPCacheResponse(PCacheResponse& aOut, const Response& aIn);
++
++  static void
++  ToPCacheQueryParams(PCacheQueryParams& aOut, const QueryParams& aIn);
++
++  static void
++  ToResponse(Response& aOut, const PCacheResponse& aIn);
++
++  static void
++  ToRequest(Request& aOut, const PCacheRequest& aIn);
++
++private:
++  TypeUtils() MOZ_DELETE;
++  ~TypeUtils() MOZ_DELETE;
++};
++
++} // namespace cache
++} // namespace dom
++} // namespace mozilla
++
++#endif // mozilla_dom_cache_TypesUtils_h
+diff --git a/dom/cache/moz.build b/dom/cache/moz.build
+--- a/dom/cache/moz.build
++++ b/dom/cache/moz.build
+@@ -18,32 +18,34 @@ EXPORTS.mozilla.dom.cache += [
+     'Context.h',
+     'DBAction.h',
+     'DBSchema.h',
+     'FileUtils.h',
+     'IPCUtils.h',
+     'Manager.h',
+     'SavedTypes.h',
+     'Types.h',
++    'TypeUtils.h',
+ ]
+ 
+ SOURCES += [
+     'Action.cpp',
+     'Cache.cpp',
+     'CacheChild.cpp',
+     'CacheParent.cpp',
+     'CacheQuotaRunnable.cpp',
+     'CacheStorage.cpp',
+     'CacheStorageChild.cpp',
+     'CacheStorageParent.cpp',
+     'Context.cpp',
+     'DBAction.cpp',
+     'DBSchema.cpp',
+     'FileUtils.cpp',
+     'Manager.cpp',
++    'TypeUtils.cpp',
+ ]
+ 
+ IPDL_SOURCES += [
+     'PCache.ipdl',
+     'PCacheQueryParams.ipdlh',
+     'PCacheRequest.ipdlh',
+     'PCacheResponse.ipdlh',
+     'PCacheStorage.ipdl',
+diff --git a/dom/tests/mochitest/cache/test_cache_frame.html b/dom/tests/mochitest/cache/test_cache_frame.html
+--- a/dom/tests/mochitest/cache/test_cache_frame.html
++++ b/dom/tests/mochitest/cache/test_cache_frame.html
+@@ -28,16 +28,22 @@
+       success = success && !!putResponse;
+       return c.matchAll(request);
+     }).then(function(matchAllResponses) {
+       success = success && !!matchAllResponses &&
+                 matchAllResponses.length === 1;
+       return c.match(request);
+     }).then(function(matchResponse) {
+       success = success && !!matchResponse;
++      return caches.match(request);
++    }).then(function(storageMatchResponse) {
++      success = success && !!storageMatchResponse;
++      return caches.match(request, {cacheName:"foobar"});
++    }).then(function(storageMatchResponse) {
++      success = success && !!storageMatchResponse;
+       var request2 = new Request("http://example.com/hmm?q=snafu");
+       return c.match(request2, {ignoreSearch:true});
+     }).then(function(match2Response) {
+       success = success && !!match2Response;
+       return c.delete(request);
+     }).then(function(deleteResult) {
+       success = success && deleteResult;
+       return c.matchAll(request);
