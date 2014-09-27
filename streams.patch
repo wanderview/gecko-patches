@@ -1,0 +1,430 @@
+# HG changeset patch
+# Parent 820513fcc5c58a36233588ea15f3ada95a616751
+# User Ben Kelly <ben@wanderview.com>
+Send Cache Request/Response streams across IPC.
+
+
+diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
+--- a/dom/cache/Cache.cpp
++++ b/dom/cache/Cache.cpp
+@@ -168,17 +168,17 @@ Cache::Put(const RequestOrScalarValueStr
+   }
+ 
+   RequestId requestId = AddRequestPromise(promise, aRv);
+   if (requestId == INVALID_REQUEST_ID) {
+     return nullptr;
+   }
+ 
+   PCacheRequest request;
+-  TypeUtils::ToPCacheRequest(request, aRequest);
++  TypeUtils::ToPCacheRequestWithStream(request, aRequest);
+ 
+   PCacheResponse response;
+   TypeUtils::ToPCacheResponse(response, aResponse);
+ 
+   unused << mActor->SendPut(requestId, request, response);
+ 
+   return promise.forget();
+ }
+diff --git a/dom/cache/PCache.ipdl b/dom/cache/PCache.ipdl
+--- a/dom/cache/PCache.ipdl
++++ b/dom/cache/PCache.ipdl
+@@ -1,15 +1,17 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+  * You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ include protocol PBackground;
+ include PCacheTypes;
+ 
++include protocol PBlob; // FIXME: bug 792908
++
+ using mozilla::dom::cache::RequestId from "mozilla/dom/cache/Types.h";
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ protocol PCache
+ {
+diff --git a/dom/cache/PCacheStorage.ipdl b/dom/cache/PCacheStorage.ipdl
+--- a/dom/cache/PCacheStorage.ipdl
++++ b/dom/cache/PCacheStorage.ipdl
+@@ -1,16 +1,18 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+  * You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ include protocol PBackground;
+ include protocol PCache;
+ include PCacheTypes;
+ 
++include protocol PBlob; // FIXME: bug 792908
++
+ using mozilla::dom::cache::RequestId from "mozilla/dom/cache/IPCUtils.h";
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ protocol PCacheStorage
+ {
+diff --git a/dom/cache/PCacheTypes.ipdlh b/dom/cache/PCacheTypes.ipdlh
+--- a/dom/cache/PCacheTypes.ipdlh
++++ b/dom/cache/PCacheTypes.ipdlh
+@@ -1,13 +1,14 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ include PHeaders;
++include InputStreamParams;
+ 
+ using HeadersGuardEnum from "mozilla/dom/FetchIPCUtils.h";
+ using RequestCredentials from "mozilla/dom/FetchIPCUtils.h";
+ using RequestMode from "mozilla/dom/FetchIPCUtils.h";
+ using mozilla::dom::ResponseType from "mozilla/dom/FetchIPCUtils.h";
+ using mozilla::void_t from "ipc/IPCMessageUtils.h";
+ 
+ namespace mozilla {
+@@ -29,32 +30,36 @@ struct PCacheRequest
+   nsCString method;
+   nsString url;
+   nsString urlWithoutQuery;
+   PHeadersEntry[] headers;
+   HeadersGuardEnum headersGuard;
+   nsString referrer;
+   RequestMode mode;
+   RequestCredentials credentials;
++  OptionalInputStreamParams body;
++  // TODO: fdset
+ };
+ 
+ union PCacheRequestOrVoid
+ {
+   void_t;
+   PCacheRequest;
+ };
+ 
+ struct PCacheResponse
+ {
+   ResponseType type;
+   nsString url;
+   uint32_t status;
+   nsCString statusText;
+   PHeadersEntry[] headers;
+   HeadersGuardEnum headersGuard;
++  OptionalInputStreamParams body;
++  // TODO: fdset
+ };
+ 
+ union PCacheResponseOrVoid
+ {
+   void_t;
+   PCacheResponse;
+ };
+ 
+diff --git a/dom/cache/SavedTypes.h b/dom/cache/SavedTypes.h
+--- a/dom/cache/SavedTypes.h
++++ b/dom/cache/SavedTypes.h
+@@ -22,26 +22,32 @@ namespace cache {
+ 
+ struct StreamHolder
+ {
+   nsCOMPtr<nsIOutputStream> mValue;
+ };
+ 
+ struct SavedRequest
+ {
+-  SavedRequest() : mHasBodyId(false) { }
++  SavedRequest() : mHasBodyId(false)
++  {
++    mValue.body() = void_t();
++  }
+   PCacheRequest mValue;
+   bool mHasBodyId;
+   nsID mBodyId;
+   CacheId mCacheId;
+ };
+ 
+ struct SavedResponse
+ {
+-  SavedResponse() : mHasBodyId(false) { }
++  SavedResponse() : mHasBodyId(false)
++  {
++    mValue.body() = void_t();
++  }
+   PCacheResponse mValue;
+   bool mHasBodyId;
+   nsID mBodyId;
+   CacheId mCacheId;
+ };
+ 
+ } // namespace cache
+ } // namespace dom
+diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
+--- a/dom/cache/TypeUtils.cpp
++++ b/dom/cache/TypeUtils.cpp
+@@ -6,17 +6,19 @@
+ 
+ #include "mozilla/dom/cache/TypeUtils.h"
+ 
+ #include "mozilla/dom/CacheBinding.h"
+ #include "mozilla/dom/InternalRequest.h"
+ #include "mozilla/dom/Request.h"
+ #include "mozilla/dom/Response.h"
+ #include "mozilla/dom/cache/PCacheTypes.h"
++#include "mozilla/ipc/InputStreamUtils.h"
+ #include "nsCOMPtr.h"
++#include "nsIIPCSerializableInputStream.h"
+ #include "nsString.h"
+ #include "nsURLParsers.h"
+ 
+ namespace {
+ 
+ // Utility function to remove the query from a URL.  We're not using nsIURL
+ // or URL to do this because they require going to the main thread.
+ static nsresult
+@@ -59,16 +61,17 @@ GetURLWithoutQuery(const nsAString& aUrl
+ 
+ } // anonymous namespace
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ using mozilla::void_t;
++using mozilla::ipc::FileDescriptor;
+ 
+ // static
+ void
+ TypeUtils::ToPCacheRequest(PCacheRequest& aOut, const Request& aIn)
+ {
+   aIn.GetMethod(aOut.method());
+   aIn.GetUrl(aOut.url());
+   if(NS_WARN_IF(NS_FAILED(GetURLWithoutQuery(aOut.url(),
+@@ -79,16 +82,18 @@ TypeUtils::ToPCacheRequest(PCacheRequest
+   }
+   aIn.GetReferrer(aOut.referrer());
+   nsRefPtr<Headers> headers = aIn.Headers_();
+   MOZ_ASSERT(headers);
+   headers->GetPHeaders(aOut.headers());
+   aOut.headersGuard() = headers->Guard();
+   aOut.mode() = aIn.Mode();
+   aOut.credentials() = aIn.Credentials();
++  // don't send the stream by default... not needed for matching, etc.
++  aOut.body() = void_t();
+ }
+ 
+ // static
+ void
+ TypeUtils::ToPCacheRequest(PCacheRequest& aOut,
+                            const RequestOrScalarValueString& aIn)
+ {
+   nsRefPtr<Request> request;
+@@ -128,31 +133,88 @@ TypeUtils::ToPCacheRequest(PCacheRequest
+     MOZ_ASSERT(aIn.IsScalarValueString());
+     MOZ_CRASH("implement me");
+   }
+   ToPCacheRequest(aOut, *request);
+ }
+ 
+ // static
+ void
++TypeUtils::ToPCacheRequestWithStream(PCacheRequest& aOut, const Request& aIn)
++{
++  ToPCacheRequest(aOut, aIn);
++
++  nsRefPtr<InternalRequest> internalRequest = aIn.GetInternalRequest();
++  nsCOMPtr<nsIInputStream> bodyStream;
++  internalRequest->GetBody(getter_AddRefs(bodyStream));
++  nsCOMPtr<nsIIPCSerializableInputStream> serialStream = do_QueryInterface(bodyStream);
++
++  if (!bodyStream) {
++    aOut.body() = void_t();
++  } else if (!serialStream) {
++    NS_WARNING("Unable to serialize request stream - need nsFancyPipe");
++    aOut.body() = void_t();
++  } else {
++    // TODO: send fds across IPC
++    nsTArray<FileDescriptor> fds;
++    SerializeInputStream(bodyStream, aOut.body(), fds);
++    MOZ_ASSERT(fds.Length() < 1);
++  }
++}
++
++// static
++void
++TypeUtils::ToPCacheRequestWithStream(PCacheRequest& aOut,
++                                     const RequestOrScalarValueString& aIn)
++{
++  nsRefPtr<Request> request;
++  if (aIn.IsRequest()) {
++    request = &aIn.GetAsRequest();
++  } else {
++    MOZ_ASSERT(aIn.IsScalarValueString());
++    // TODO: see nsIStandardURL.init() if Request does not provide something...
++    MOZ_CRASH("implement me");
++  }
++  ToPCacheRequestWithStream(aOut, *request);
++}
++
++// static
++void
+ TypeUtils::ToPCacheResponse(PCacheResponse& aOut, const Response& aIn)
+ {
+   aOut.type() = aIn.Type();
+   aIn.GetUrl(aOut.url());
+   aOut.status() = aIn.Status();
+   aIn.GetStatusText(aOut.statusText());
+   nsRefPtr<Headers> headers = aIn.Headers_();
+   MOZ_ASSERT(headers);
+   headers->GetPHeaders(aOut.headers());
+   aOut.headersGuard() = headers->Guard();
++
++  // TODO: nsRefPtr<InternalResponse> internalResponse = aIn.GetInternalResponse();
++  nsCOMPtr<nsIInputStream> bodyStream;
++  // TODO: internalResponse->GetBody(getter_AddRefs(bodyStream));
++  nsCOMPtr<nsIIPCSerializableInputStream> serialStream = do_QueryInterface(bodyStream);
++
++  if (!bodyStream) {
++    aOut.body() = void_t();
++  } else if (!serialStream) {
++    NS_WARNING("Unable to serialize response stream - need nsFancyPipe");
++    aOut.body() = void_t();
++  } else {
++    // TODO: send fds across IPC
++    nsTArray<FileDescriptor> fds;
++    SerializeInputStream(bodyStream, aOut.body(), fds);
++    MOZ_ASSERT(fds.Length() < 1);
++  }
+ }
+ 
+ // static
+ void
+-TypeUtils:: ToPCacheQueryParams(PCacheQueryParams& aOut, const QueryParams& aIn)
++TypeUtils::ToPCacheQueryParams(PCacheQueryParams& aOut, const QueryParams& aIn)
+ {
+   aOut.ignoreSearch() = aIn.mIgnoreSearch.WasPassed() &&
+                         aIn.mIgnoreSearch.Value();
+   aOut.ignoreMethod() = aIn.mIgnoreMethod.WasPassed() &&
+                         aIn.mIgnoreMethod.Value();
+   aOut.ignoreVary() = aIn.mIgnoreVary.WasPassed() &&
+                       aIn.mIgnoreVary.Value();
+   aOut.prefixMatch() = aIn.mPrefixMatch.WasPassed() &&
+@@ -166,27 +228,44 @@ TypeUtils:: ToPCacheQueryParams(PCacheQu
+ }
+ 
+ // static
+ void
+ TypeUtils::ToResponse(Response& aOut, const PCacheResponse& aIn)
+ {
+   // TODO: implement once real Request/Response are available
+   NS_WARNING("Not filling in contents of Response returned from Cache.");
++
++  // TODO: aOut.SetType(aIn.type());
++  // TODO: aOut.SetURL(aIn.url());
++  // TODO: aOut.SetStatus(aIn.status());
++  // TODO: aOut.SetStatusText(aIn.statusText());
++  // TODO: nsRefPtr<Headers> headers = new Headers(aOut.GetClient(), aIn.headers(),
++  // TODO:                                         aIn.headersGuard());
++  // TODO: aOut.SetHeaders(headers);
++
++  nsTArray<FileDescriptor> fds;
++  nsCOMPtr<nsIInputStream> bodyStream = DeserializeInputStream(aIn.body(), fds);
++  // TODO: aOut.SetBody(bodyStream);
+ }
+ 
+ // static
+ void
+ TypeUtils::ToInternalRequest(InternalRequest& aOut, const PCacheRequest& aIn)
+ {
+   aOut.SetMethod(aIn.method());
+   aOut.SetURL(NS_ConvertUTF16toUTF8(aIn.url()));
+   aOut.SetReferrer(NS_ConvertUTF16toUTF8(aIn.referrer()));
+   aOut.SetMode(aIn.mode());
+   aOut.SetCredentialsMode(aIn.credentials());
+   nsRefPtr<Headers> headers = new Headers(aOut.GetClient(), aIn.headers(),
+                                           aIn.headersGuard());
+   aOut.SetHeaders(headers);
++
++  // TODO: pass fds through IPC
++  nsTArray<FileDescriptor> fds;
++  nsCOMPtr<nsIInputStream> bodyStream = DeserializeInputStream(aIn.body(), fds);
++  aOut.SetBody(bodyStream);
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/TypeUtils.h b/dom/cache/TypeUtils.h
+--- a/dom/cache/TypeUtils.h
++++ b/dom/cache/TypeUtils.h
+@@ -40,16 +40,23 @@ public:
+   ToPCacheRequestOrVoid(PCacheRequestOrVoid& aOut,
+                         const Optional<RequestOrScalarValueString>& aIn);
+ 
+   static void
+   ToPCacheRequest(PCacheRequest& aOut,
+                   const OwningRequestOrScalarValueString& aIn);
+ 
+   static void
++  ToPCacheRequestWithStream(PCacheRequest& aOut, const Request& aIn);
++
++  static void
++  ToPCacheRequestWithStream(PCacheRequest& aOut,
++                            const RequestOrScalarValueString& aIn);
++
++  static void
+   ToPCacheResponse(PCacheResponse& aOut, const Response& aIn);
+ 
+   static void
+   ToPCacheQueryParams(PCacheQueryParams& aOut, const QueryParams& aIn);
+ 
+   static void
+   ToResponse(Response& aOut, const PCacheResponse& aIn);
+ 
+diff --git a/dom/fetch/Request.cpp b/dom/fetch/Request.cpp
+--- a/dom/fetch/Request.cpp
++++ b/dom/fetch/Request.cpp
+@@ -45,17 +45,17 @@ Request::Request(nsIGlobalObject* aOwner
+   SetIsDOMBinding();
+ }
+ 
+ Request::~Request()
+ {
+ }
+ 
+ already_AddRefed<InternalRequest>
+-Request::GetInternalRequest()
++Request::GetInternalRequest() const
+ {
+   nsRefPtr<InternalRequest> r = mRequest;
+   return r.forget();
+ }
+ 
+ /*static*/ already_AddRefed<Request>
+ Request::Constructor(const GlobalObject& aGlobal,
+                      const RequestOrScalarValueString& aInput,
+diff --git a/dom/fetch/Request.h b/dom/fetch/Request.h
+--- a/dom/fetch/Request.h
++++ b/dom/fetch/Request.h
+@@ -102,17 +102,17 @@ public:
+ 
+   bool
+   BodyUsed() const
+   {
+     return mBodyUsed;
+   }
+ 
+   already_AddRefed<InternalRequest>
+-  GetInternalRequest();
++  GetInternalRequest() const;
+ private:
+   enum ConsumeType
+   {
+     CONSUME_ARRAYBUFFER,
+     CONSUME_BLOB,
+     // FormData not supported right now,
+     CONSUME_JSON,
+     CONSUME_TEXT,
