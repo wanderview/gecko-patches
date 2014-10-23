@@ -3,12 +3,103 @@
 # User Ben Kelly <ben@wanderview.com>
 Implement clean shutdown for Cache.
 
-
+diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
+--- a/dom/cache/Manager.cpp
++++ b/dom/cache/Manager.cpp
+@@ -86,28 +86,37 @@ public:
+     return *sFactory;
+   }
+ 
+   already_AddRefed<Manager> GetOrCreate(const nsACString& aOrigin,
+                                         const nsACString& aBaseDomain)
+   {
+     mozilla::ipc::AssertIsOnBackgroundThread();
+ 
++    nsRefPtr<Manager> ref = Get(aOrigin);
++    if (!ref) {
++      ref = new Manager(aOrigin, aBaseDomain);
++      mManagerList.AppendElement(ref);
++    }
++
++    return ref.forget();
++  }
++
++  already_AddRefed<Manager> Get(const nsACString& aOrigin)
++  {
++    mozilla::ipc::AssertIsOnBackgroundThread();
++
+     for (uint32_t i = 0; i < mManagerList.Length(); ++i) {
+       if (mManagerList[i]->Origin() == aOrigin) {
+         nsRefPtr<Manager> ref = mManagerList[i];
+         return ref.forget();
+       }
+     }
+ 
+-    nsRefPtr<Manager> ref = new Manager(aOrigin, aBaseDomain);
+-
+-    mManagerList.AppendElement(ref);
+-
+-    return ref.forget();
++    return nullptr;
+   }
+ 
+   void Remove(Manager* aManager)
+   {
+     mozilla::ipc::AssertIsOnBackgroundThread();
+     MOZ_ASSERT(aManager);
+ 
+     for (uint32_t i = 0; i < mManagerList.Length(); ++i) {
+@@ -1144,16 +1153,24 @@ Manager::StreamList::~StreamList()
+ // static
+ already_AddRefed<Manager>
+ Manager::ForOrigin(const nsACString& aOrigin, const nsACString& aBaseDomain)
+ {
+   mozilla::ipc::AssertIsOnBackgroundThread();
+   return Factory::Instance().GetOrCreate(aOrigin, aBaseDomain);
+ }
+ 
++// static
++already_AddRefed<Manager>
++Manager::ForExistingOrigin(const nsACString& aOrigin)
++{
++  mozilla::ipc::AssertIsOnBackgroundThread();
++  return Factory::Instance().Get(aOrigin);
++}
++
+ void
+ Manager::RemoveListener(Listener* aListener)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   mListeners.RemoveElement(aListener);
+ }
+ 
+ void
+diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
+--- a/dom/cache/Manager.h
++++ b/dom/cache/Manager.h
+@@ -114,16 +114,17 @@ public:
+     virtual void OnStorageDelete(RequestId aRequestId, nsresult aRv,
+                                  bool aCacheDeleted) { }
+     virtual void OnStorageKeys(RequestId aRequestId, nsresult aRv,
+                                const nsTArray<nsString>& aKeys) { }
+   };
+ 
+   static already_AddRefed<Manager> ForOrigin(const nsACString& aOrigin,
+                                              const nsACString& aBaseDomain);
++  static already_AddRefed<Manager> ForExistingOrigin(const nsACString& aOrigin);
+ 
+   void RemoveListener(Listener* aListener);
+   void AddRefCacheId(CacheId aCacheId);
+   void ReleaseCacheId(CacheId aCacheId);
+   uint32_t GetCacheIdRefCount(CacheId aCacheId);
+   void Shutdown();
+ 
+   // TODO: consider moving CacheId up in the argument lists below
 diff --git a/dom/cache/ShutdownObserver.cpp b/dom/cache/ShutdownObserver.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/ShutdownObserver.cpp
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,152 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -16,8 +107,16 @@ new file mode 100644
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 +
 +#include "mozilla/dom/cache/ShutdownObserver.h"
++
++#include "mozilla/dom/cache/Manager.h"
 +#include "mozilla/ipc/BackgroundParent.h"
 +#include "nsThreadUtils.h"
++
++namespace {
++
++static nsRefPtr<mozilla::dom::cache::ShutdownObserver> sInstance = nullptr;
++
++} // anonymous namespace
 +
 +namespace mozilla {
 +namespace dom {
@@ -31,19 +130,21 @@ new file mode 100644
 +{
 +  mozilla::ipc::AssertIsOnBackgroundThread();
 +
-+  static ShutdownObserver* instance = nullptr;
-+
-+  if (!instance) {
-+    instance = new ShutdownObserver();
++  if (!sInstance) {
++    sInstance = new ShutdownObserver();
 +  }
 +
-+  return instance;
++  return sInstance;
 +}
 +
-+void
++nsresult
 +ShutdownObserver::AddOrigin(const nsACString& aOrigin)
 +{
 +  mozilla::ipc::AssertIsOnBackgroundThread();
++
++  if (mShuttingDown) {
++    return NS_ERROR_ILLEGAL_DURING_SHUTDOWN;
++  }
 +
 +  nsCOMPtr<nsIRunnable> runnable =
 +    NS_NewRunnableMethodWithArg<nsCString>(this,
@@ -54,6 +155,8 @@ new file mode 100644
 +    NS_DispatchToMainThread(runnable, nsIThread::DISPATCH_NORMAL);
 +
 +  MOZ_ASSERT(NS_SUCCEEDED(rv));
++
++  return NS_OK;
 +}
 +
 +void
@@ -73,25 +176,55 @@ new file mode 100644
 +}
 +
 +ShutdownObserver::ShutdownObserver()
++  : mShuttingDown(false)
 +{
 +  mozilla::ipc::AssertIsOnBackgroundThread();
 +}
 +
 +ShutdownObserver::~ShutdownObserver()
 +{
-+  MOZ_ASSERT_UNREACHABLE("singleton should never be deleted");
++  mozilla::ipc::AssertIsOnBackgroundThread();
 +}
 +
 +void
 +ShutdownObserver::AddOriginOnMainThread(const nsACString& aOrigin)
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
++
++  if (!mOrigins.Contains(aOrigin)) {
++    mOrigins.AppendElement(aOrigin);
++
++    if (mOrigins.Length() == 1) {
++      // TODO: register observer on first origin
++    }
++  }
 +}
 +
 +void
 +ShutdownObserver::RemoveOriginOnMainThread(const nsACString& aOrigin)
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
++
++  mOrigins.RemoveElement(aOrigin);
++
++  if (mOrigins.Length() == 0) {
++    // TODO: de-register observer on last origin
++  }
++}
++
++void
++ShutdownObserver::DoShutdown(const nsTArray<nsCString>& aOrigins)
++{
++  mozilla::ipc::AssertIsOnBackgroundThread();
++
++  mShuttingDown = true;
++
++  for (uint32_t i = 0; i < aOrigins.Length(); ++i) {
++    nsRefPtr<Manager> manager = Manager::ForExistingOrigin(aOrigins[i]);
++    if (manager) {
++      manager->Shutdown();
++    }
++  }
 +}
 +
 +NS_IMETHODIMP
@@ -100,7 +233,19 @@ new file mode 100644
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
 +
-+  // TODO: handle profile-before-change
++  if (!strcmp(aTopic, "profile-before-change")) {
++    // TODO: Send shutdown notification to origins
++
++    while (!mOrigins.IsEmpty()) {
++      if (!NS_ProcessNextEvent()) {
++        NS_WARNING("Something bad happened!");
++        break;
++      }
++    }
++
++    // TODO: schedule runnable to clear singleton ref on background thread
++  }
++
 +  return NS_OK;
 +}
 +
@@ -111,7 +256,7 @@ diff --git a/dom/cache/ShutdownObserver.h b/dom/cache/ShutdownObserver.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/ShutdownObserver.h
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,51 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -123,6 +268,8 @@ new file mode 100644
 +
 +#include "mozilla/Attributes.h"
 +#include "nsIObserver.h"
++#include "nsString.h"
++#include "nsTArray.h"
 +
 +namespace mozilla {
 +namespace dom {
@@ -133,15 +280,23 @@ new file mode 100644
 +public:
 +  static ShutdownObserver* Instance();
 +
-+  void AddOrigin(const nsACString& aOrigin);
++  nsresult AddOrigin(const nsACString& aOrigin);
 +  void RemoveOrigin(const nsACString& aOrigin);
 +
 +private:
 +  void AddOriginOnMainThread(const nsACString& aOrigin);
 +  void RemoveOriginOnMainThread(const nsACString& aOrigin);
 +
++  void DoShutdown(const nsTArray<nsCString>& aOrigins);
++
 +  ShutdownObserver();
 +  virtual ~ShutdownObserver();
++
++  // main thread only
++  nsTArray<nsCString> mOrigins;
++
++  // PBackground thread only
++  bool mShuttingDown;
 +
 +public:
 +  NS_DECL_THREADSAFE_ISUPPORTS
