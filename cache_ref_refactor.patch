@@ -1,0 +1,245 @@
+# HG changeset patch
+# Parent f779576e7e96c54737ff3543536c0a785f538422
+# User Ben Kelly <ben@wanderview.com>
+Refactor how cache deletion on deref works.
+
+
+diff --git a/dom/cache/DBSchema.h b/dom/cache/DBSchema.h
+--- a/dom/cache/DBSchema.h
++++ b/dom/cache/DBSchema.h
+@@ -34,16 +34,17 @@ class DBSchema MOZ_FINAL
+ public:
+   static nsresult CreateSchema(mozIStorageConnection* aConn);
+ 
+   static nsresult CreateCache(mozIStorageConnection* aConn,
+                               CacheId* aCacheIdOut);
+   // TODO: improve naming (confusing with CacheDelete)
+   static nsresult DeleteCache(mozIStorageConnection* aConn, CacheId aCacheId);
+ 
++  // TODO: Consider removing unused IsCacheOrphaned after writing cleanup code.
+   static nsresult IsCacheOrphaned(mozIStorageConnection* aConn,
+                                   CacheId aCacheId, bool* aOrphanedOut);
+ 
+   static nsresult CacheMatch(mozIStorageConnection* aConn, CacheId aCacheId,
+                              const PCacheRequest& aRequest,
+                              const PCacheQueryParams& aParams,
+                              bool* aFoundResponseOut,
+                              SavedResponse* aSavedResponseOut);
+diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
+--- a/dom/cache/Manager.cpp
++++ b/dom/cache/Manager.cpp
+@@ -203,60 +203,16 @@ public:
+   }
+ 
+ private:
+   virtual ~DeleteOrphanedCacheAction() { }
+   nsRefPtr<Manager> mManager;
+   const CacheId mCacheId;
+ };
+ 
+-class Manager::CheckCacheOrphanedAction MOZ_FINAL : public SyncDBAction
+-{
+-public:
+-  CheckCacheOrphanedAction(Manager* aManager, CacheId aCacheId)
+-    : SyncDBAction(DBAction::Existing, aManager->Origin(),
+-                   aManager->BaseDomain())
+-    , mManager(aManager)
+-    , mCacheId(aCacheId)
+-    , mOrphaned(false)
+-  { }
+-
+-  virtual nsresult
+-  RunSyncWithDBOnTarget(nsIFile* aDBDir,
+-                        mozIStorageConnection* aConn) MOZ_OVERRIDE
+-  {
+-    // Note: We need to do the check separately from the delete so we have the
+-    //       opportunity to cancel pending IO actions in
+-    //       CompleteOnInitiatingThread().
+-    return DBSchema::IsCacheOrphaned(aConn, mCacheId, &mOrphaned);
+-  }
+-
+-  virtual void
+-  CompleteOnInitiatingThread(nsresult aRv) MOZ_OVERRIDE
+-  {
+-    if (!mOrphaned) {
+-      mManager = nullptr;
+-      return;
+-    }
+-
+-    mManager->CurrentContext()->CancelForCacheId(mCacheId);
+-
+-    nsRefPtr<Action> action = new DeleteOrphanedCacheAction(mManager, mCacheId);
+-    mManager->CurrentContext()->Dispatch(mManager->mIOThread, action);
+-
+-    mManager = nullptr;
+-  }
+-
+-private:
+-  virtual ~CheckCacheOrphanedAction() { }
+-  nsRefPtr<Manager> mManager;
+-  const CacheId mCacheId;
+-  bool mOrphaned;
+-};
+-
+ class Manager::CacheMatchAction MOZ_FINAL : public Manager::BaseAction
+ {
+ public:
+   CacheMatchAction(Manager* aManager, ListenerId aListenerId,
+                    RequestId aRequestId, CacheId aCacheId,
+                    const PCacheRequest& aRequest,
+                    const PCacheQueryParams& aParams,
+                    StreamList* aStreamList)
+@@ -955,20 +911,21 @@ public:
+     mCacheDeleted = true;
+     return rv;
+   }
+ 
+   virtual void
+   Complete(Listener* aListener, nsresult aRv) MOZ_OVERRIDE
+   {
+     if (mCacheDeleted) {
+-      // If nothing is actively referencing this cache, then delete it
+-      // completely from the database and filesystem.
+-      uint32_t cacheRefCount = mManager->GetCacheIdRefCount(mCacheId);
+-      if (cacheRefCount < 1) {
++      // If content is referencing this cache, mark it orphaned to be
++      // deleted later.
++      if (!mManager->SetCacheIdOrphanedIfRefed(mCacheId)) {
++
++        // no outstanding references, delete immediately
+         mManager->CurrentContext()->CancelForCacheId(mCacheId);
+         nsRefPtr<Action> action =
+           new DeleteOrphanedCacheAction(mManager, mCacheId);
+         mManager->CurrentContext()->Dispatch(mManager->mIOThread, action);
+       }
+     }
+ 
+     aListener->OnStorageDelete(mRequestId, aRv, mCacheDeleted);
+@@ -1153,32 +1110,36 @@ Manager::AddRefCacheId(CacheId aCacheId)
+     if (mCacheIdRefs[i].mCacheId == aCacheId) {
+       mCacheIdRefs[i].mCount += 1;
+       return;
+     }
+   }
+   CacheIdRefCounter* entry = mCacheIdRefs.AppendElement();
+   entry->mCacheId = aCacheId;
+   entry->mCount = 1;
++  entry->mOrphaned = false;
+ }
+ 
+ void
+ Manager::ReleaseCacheId(CacheId aCacheId)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   for (uint32_t i = 0; i < mCacheIdRefs.Length(); ++i) {
+     if (mCacheIdRefs[i].mCacheId == aCacheId) {
+       DebugOnly<uint32_t> oldRef = mCacheIdRefs[i].mCount;
+       mCacheIdRefs[i].mCount -= 1;
+       MOZ_ASSERT(mCacheIdRefs[i].mCount < oldRef);
+       if (mCacheIdRefs[i].mCount < 1) {
++        bool orphaned = mCacheIdRefs[i].mOrphaned;
+         mCacheIdRefs.RemoveElementAt(i);
+         // TODO: note that we need to check this cache for staleness on startup
+-        if (!mShuttingDown) {
+-          nsRefPtr<Action> action = new CheckCacheOrphanedAction(this, aCacheId);
++        if (orphaned && !mShuttingDown) {
++          CurrentContext()->CancelForCacheId(aCacheId);
++          nsRefPtr<Action> action = new DeleteOrphanedCacheAction(this,
++                                                                  aCacheId);
+           CurrentContext()->Dispatch(mIOThread, action);
+         }
+       }
+       return;
+     }
+   }
+   MOZ_ASSERT_UNREACHABLE("Attempt to release CacheId that is not referenced!");
+ }
+@@ -1191,16 +1152,31 @@ Manager::GetCacheIdRefCount(CacheId aCac
+     if (mCacheIdRefs[i].mCacheId == aCacheId) {
+       MOZ_ASSERT(mCacheIdRefs[i].mCount > 0);
+       return mCacheIdRefs[i].mCount;
+     }
+   }
+   return 0;
+ }
+ 
++bool
++Manager::SetCacheIdOrphanedIfRefed(CacheId aCacheId)
++{
++  NS_ASSERT_OWNINGTHREAD(Manager);
++  for (uint32_t i = 0; i < mCacheIdRefs.Length(); ++i) {
++    if (mCacheIdRefs[i].mCacheId == aCacheId) {
++      MOZ_ASSERT(mCacheIdRefs[i].mCount > 0);
++      MOZ_ASSERT(!mCacheIdRefs[i].mOrphaned);
++      mCacheIdRefs[i].mOrphaned = true;
++      return true;
++    }
++  }
++  return false;
++}
++
+ void
+ Manager::Shutdown()
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   mShuttingDown = true;
+   for (uint32_t i = 0; i < mStreamLists.Length(); ++i) {
+     mStreamLists[i]->CloseAll();
+   }
+diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
+--- a/dom/cache/Manager.h
++++ b/dom/cache/Manager.h
+@@ -116,16 +116,17 @@ public:
+   static already_AddRefed<Manager> ForOrigin(const nsACString& aOrigin,
+                                              const nsACString& aBaseDomain);
+   static already_AddRefed<Manager> ForExistingOrigin(const nsACString& aOrigin);
+ 
+   void RemoveListener(Listener* aListener);
+   void AddRefCacheId(CacheId aCacheId);
+   void ReleaseCacheId(CacheId aCacheId);
+   uint32_t GetCacheIdRefCount(CacheId aCacheId);
++  bool SetCacheIdOrphanedIfRefed(CacheId aCacheId);
+   void Shutdown();
+ 
+   // TODO: consider moving CacheId up in the argument lists below
+   void CacheMatch(Listener* aListener, RequestId aRequestId, CacheId aCacheId,
+                   const PCacheRequest& aRequest,
+                   const PCacheQueryParams& aParams);
+   void CacheMatchAll(Listener* aListener, RequestId aRequestId,
+                      CacheId aCacheId, const PCacheRequestOrVoid& aRequestOrVoid,
+@@ -158,17 +159,16 @@ public:
+   const nsCString& BaseDomain() const { return mBaseDomain; }
+ 
+   // Context::Listener methods
+   virtual void RemoveContext(Context* aContext) MOZ_OVERRIDE;
+ 
+ private:
+   class Factory;
+   class BaseAction;
+-  class CheckCacheOrphanedAction;
+   class DeleteOrphanedCacheAction;
+ 
+   class CacheMatchAction;
+   class CacheMatchAllAction;
+   class CachePutAction;
+   class CacheDeleteAction;
+   class CacheKeysAction;
+ 
+@@ -195,16 +195,17 @@ private:
+   nsCOMPtr<nsIThread> mIOThread;
+   nsTArray<Listener*> mListeners;
+   nsTArray<StreamList*> mStreamLists;
+ 
+   struct CacheIdRefCounter
+   {
+     CacheId mCacheId;
+     uint32_t mCount;
++    bool mOrphaned;
+   };
+   nsTArray<CacheIdRefCounter> mCacheIdRefs;
+ 
+   // weak ref as Context destructor clears this pointer
+   Context* mContext;
+ 
+   bool mShuttingDown;
+ 
