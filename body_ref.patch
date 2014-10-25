@@ -1,0 +1,161 @@
+# HG changeset patch
+# Parent dc516b3ed4bd0d94284a2d633db00b7239287c41
+# User Ben Kelly <ben@wanderview.com>
+Track open Cache body streams by reference count.
+
+diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
+--- a/dom/cache/Manager.cpp
++++ b/dom/cache/Manager.cpp
+@@ -1004,16 +1004,20 @@ Manager::StreamList::Activate(CacheId aC
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager::StreamList);
+   MOZ_ASSERT(!mActivated);
+   MOZ_ASSERT(!mCacheId);
+   mActivated = true;
+   mCacheId = aCacheId;
+   mManager->AddRefCacheId(mCacheId);
+   mManager->AddStreamList(this);
++
++  for (uint32_t i = 0; i < mList.Length(); ++i) {
++    mManager->AddRefBodyId(mList[i].mId);
++  }
+ }
+ 
+ void
+ Manager::StreamList::Add(const nsID& aId, nsIInputStream* aStream)
+ {
+   // All streams should be added on IO thread before we set the stream
+   // control on the owning IPC thread.
+   MOZ_ASSERT(!mStreamControl);
+@@ -1037,16 +1041,17 @@ Manager::StreamList::Extract(const nsID&
+ 
+ void
+ Manager::StreamList::NoteClosed(const nsID& aId)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager::StreamList);
+   for (uint32_t i = 0; i < mList.Length(); ++i) {
+     if (mList[i].mId == aId) {
+       mList.RemoveElementAt(i);
++      mManager->ReleaseBodyId(aId);
+       break;
+     }
+   }
+ 
+   if (mList.IsEmpty() && mStreamControl) {
+     mStreamControl->Shutdown();
+   }
+ }
+@@ -1463,11 +1468,67 @@ Manager::AddStreamList(StreamList* aStre
+ void
+ Manager::RemoveStreamList(StreamList* aStreamList)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(aStreamList);
+   mStreamLists.RemoveElement(aStreamList);
+ }
+ 
++void
++Manager::AddRefBodyId(const nsID& aBodyId)
++{
++  NS_ASSERT_OWNINGTHREAD(Manager);
++  for (uint32_t i = 0; i < mBodyIdRefs.Length(); ++i) {
++    if (mBodyIdRefs[i].mBodyId == aBodyId) {
++      mBodyIdRefs[i].mCount += 1;
++      return;
++    }
++  }
++  BodyIdRefCounter* entry = mBodyIdRefs.AppendElement();
++  entry->mBodyId = aBodyId;
++  entry->mCount = 1;
++  entry->mOrphaned = false;
++}
++
++void
++Manager::ReleaseBodyId(const nsID& aBodyId)
++{
++  NS_ASSERT_OWNINGTHREAD(Manager);
++  for (uint32_t i = 0; i < mBodyIdRefs.Length(); ++i) {
++    if (mBodyIdRefs[i].mBodyId == aBodyId) {
++      DebugOnly<uint32_t> oldRef = mBodyIdRefs[i].mCount;
++      mBodyIdRefs[i].mCount -= 1;
++      MOZ_ASSERT(mBodyIdRefs[i].mCount < oldRef);
++      if (mBodyIdRefs[i].mCount < 1) {
++        bool orphaned = mBodyIdRefs[i].mOrphaned;
++        mBodyIdRefs.RemoveElementAt(i);
++        // TODO: note that we need to check this body for staleness on startup
++        if (orphaned && !mShuttingDown) {
++          // TODO: delete body data from file system
++        }
++      }
++      return;
++    }
++  }
++  MOZ_ASSERT_UNREACHABLE("Attempt to release BodyId that is not referenced!");
++}
++
++// TODO: provide way to set body non-orphaned if its added back to a cache
++
++bool
++Manager::SetBodyIdOrphanedIfRefed(const nsID& aBodyId)
++{
++  NS_ASSERT_OWNINGTHREAD(Manager);
++  for (uint32_t i = 0; i < mBodyIdRefs.Length(); ++i) {
++    if (mBodyIdRefs[i].mBodyId == aBodyId) {
++      MOZ_ASSERT(mBodyIdRefs[i].mCount > 0);
++      MOZ_ASSERT(!mBodyIdRefs[i].mOrphaned);
++      mBodyIdRefs[i].mOrphaned = true;
++      return true;
++    }
++  }
++  return false;
++}
++
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
+--- a/dom/cache/Manager.h
++++ b/dom/cache/Manager.h
+@@ -184,30 +184,42 @@ private:
+   Context* CurrentContext();
+ 
+   ListenerId SaveListener(Listener* aListener);
+   Listener* GetListener(ListenerId aListenerId) const;
+ 
+   void AddStreamList(StreamList* aStreamList);
+   void RemoveStreamList(StreamList* aStreamList);
+ 
++  void AddRefBodyId(const nsID& aBodyId);
++  void ReleaseBodyId(const nsID& aBodyId);
++  bool SetBodyIdOrphanedIfRefed(const nsID& aBodyId);
++
+   const nsCString mOrigin;
+   const nsCString mBaseDomain;
+   nsCOMPtr<nsIThread> mIOThread;
+   nsTArray<Listener*> mListeners;
+   nsTArray<StreamList*> mStreamLists;
+ 
+   struct CacheIdRefCounter
+   {
+     CacheId mCacheId;
+     uint32_t mCount;
+     bool mOrphaned;
+   };
+   nsTArray<CacheIdRefCounter> mCacheIdRefs;
+ 
++  struct BodyIdRefCounter
++  {
++    nsID mBodyId;
++    uint32_t mCount;
++    bool mOrphaned;
++  };
++  nsTArray<BodyIdRefCounter> mBodyIdRefs;
++
+   // weak ref as Context destructor clears this pointer
+   Context* mContext;
+ 
+   bool mShuttingDown;
+ 
+ public:
+   NS_INLINE_DECL_REFCOUNTING(mozilla::dom::cache::Manager)
+ };
