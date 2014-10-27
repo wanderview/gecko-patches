@@ -1,12 +1,296 @@
 # HG changeset patch
-# Parent dc516b3ed4bd0d94284a2d633db00b7239287c41
+# Parent 38b736c72c64d1510aa6443ac76c8f1cb0288121
 # User Ben Kelly <ben@wanderview.com>
 Track open Cache body streams by reference count.
 
 diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
 --- a/dom/cache/Manager.cpp
 +++ b/dom/cache/Manager.cpp
-@@ -1004,16 +1004,20 @@ Manager::StreamList::Activate(CacheId aC
+@@ -168,17 +168,16 @@ protected:
+ };
+ 
+ class Manager::DeleteOrphanedCacheAction MOZ_FINAL : public SyncDBAction
+ {
+ public:
+   DeleteOrphanedCacheAction(Manager* aManager, CacheId aCacheId)
+     : SyncDBAction(DBAction::Existing, aManager->Origin(),
+                    aManager->BaseDomain())
+-    , mManager(aManager)
+     , mCacheId(aCacheId)
+   { }
+ 
+   virtual nsresult
+   RunSyncWithDBOnTarget(nsIFile* aDBDir,
+                         mozIStorageConnection* aConn) MOZ_OVERRIDE
+   {
+     mozStorageTransaction trans(aConn, false,
+@@ -191,26 +190,63 @@ public:
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+     rv = trans.Commit();
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+     return rv;
+   }
+ 
++private:
++  virtual ~DeleteOrphanedCacheAction() { }
++  const CacheId mCacheId;
++};
++
++class Manager::DeleteOrphanedBodyAction MOZ_FINAL : public Action
++{
++public:
++  DeleteOrphanedBodyAction(CacheId aCacheId,
++                           const nsTArray<nsID>& aDeletedBodyIdList)
++    : mCacheId(aCacheId)
++    , mDeletedBodyIdList(aDeletedBodyIdList)
++  { }
++
++  DeleteOrphanedBodyAction(CacheId aCacheId, const nsID& aBodyId)
++    : mCacheId(aCacheId)
++  {
++    mDeletedBodyIdList.AppendElement(aBodyId);
++  }
++
+   virtual void
+-  CompleteOnInitiatingThread(nsresult aRv) MOZ_OVERRIDE
++  RunOnTarget(Resolver* aResolver, nsIFile* aQuotaDir) MOZ_OVERRIDE
+   {
+-    mManager = nullptr;
++    MOZ_ASSERT(aResolver);
++    MOZ_ASSERT(aQuotaDir);
++
++    nsresult rv = aQuotaDir->Append(NS_LITERAL_STRING("cache"));
++    if (NS_WARN_IF(NS_FAILED(rv))) {
++      aResolver->Resolve(rv);
++      return;
++    }
++
++    printf_stderr("### ### deleting %lu body files\n", mDeletedBodyIdList.Length());
++
++    rv = FileUtils::BodyDeleteFiles(aQuotaDir, mCacheId, mDeletedBodyIdList);
++    if (NS_WARN_IF(NS_FAILED(rv))) {
++      aResolver->Resolve(rv);
++      return;
++    }
++
++    aResolver->Resolve(rv);
+   }
+ 
+ private:
+-  virtual ~DeleteOrphanedCacheAction() { }
+-  nsRefPtr<Manager> mManager;
++  virtual ~DeleteOrphanedBodyAction() { }
+   const CacheId mCacheId;
++  nsTArray<nsID> mDeletedBodyIdList;
+ };
+ 
+ class Manager::CacheMatchAction MOZ_FINAL : public Manager::BaseAction
+ {
+ public:
+   CacheMatchAction(Manager* aManager, ListenerId aListenerId,
+                    RequestId aRequestId, CacheId aCacheId,
+                    const PCacheRequest& aRequest,
+@@ -341,28 +377,26 @@ protected:
+ class Manager::CachePutAction MOZ_FINAL : public DBAction
+ {
+ public:
+   CachePutAction(Manager* aManager, ListenerId aListenerId,
+                  RequestId aRequestId, CacheId aCacheId,
+                  const PCacheRequest& aRequest,
+                  nsIInputStream* aRequestBodyStream,
+                  const PCacheResponse& aResponse,
+-                 nsIInputStream* aResponseBodyStream,
+-                 StreamList* aStreamList)
++                 nsIInputStream* aResponseBodyStream)
+     : DBAction(DBAction::Existing, aManager->Origin(), aManager->BaseDomain())
+     , mManager(aManager)
+     , mListenerId(aListenerId)
+     , mRequestId(aRequestId)
+     , mCacheId(aCacheId)
+     , mRequest(aRequest)
+     , mRequestBodyStream(aRequestBodyStream)
+     , mResponse(aResponse)
+     , mResponseBodyStream(aResponseBodyStream)
+-    , mStreamList(aStreamList)
+     , mExpectedAsyncCopyCompletions(0)
+   { }
+ 
+   virtual void
+   RunWithDBOnTarget(Resolver* aResolver, nsIFile* aDBDir,
+                     mozIStorageConnection* aConn) MOZ_OVERRIDE
+   {
+     MOZ_ASSERT(aResolver);
+@@ -445,28 +479,21 @@ public:
+         DoResolve(rv);
+         return;
+       }
+     }
+ 
+     mozStorageTransaction trans(mConn, false,
+                                 mozIStorageConnection::TRANSACTION_IMMEDIATE);
+ 
+-    nsTArray<nsID> deletedBodyIdList;
+     rv = DBSchema::CachePut(mConn, mCacheId, mRequest,
+                             mRequestBodyStream ? &mRequestBodyId : nullptr,
+                             mResponse,
+                             mResponseBodyStream ? &mResponseBodyId : nullptr,
+-                            deletedBodyIdList);
+-    if (NS_WARN_IF(NS_FAILED(rv))) {
+-      DoResolve(rv);
+-      return;
+-    }
+-
+-    rv = FileUtils::BodyDeleteFiles(mDBDir, mCacheId, deletedBodyIdList);
++                            mDeletedBodyIdList);
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       DoResolve(rv);
+       return;
+     }
+ 
+     rv = trans.Commit();
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       DoResolve(rv);
+@@ -475,28 +502,42 @@ public:
+ 
+     DoResolve(rv);
+   }
+ 
+   virtual void
+   CompleteOnInitiatingThread(nsresult aRv) MOZ_OVERRIDE
+   {
+     NS_ASSERT_OWNINGTHREAD(Action);
++
++    // Make sure any orphaned bodies are deleted now or after they
++    // are done being referenced
++    nsTArray<nsID> deleteNowList;
++    for (uint32_t i = 0; i < mDeletedBodyIdList.Length(); ++i) {
++      if (!mManager->SetBodyIdOrphanedIfRefed(mDeletedBodyIdList[i])) {
++        deleteNowList.AppendElement(mDeletedBodyIdList[i]);
++      }
++    }
++
++    if (!deleteNowList.IsEmpty()) {
++      nsRefPtr<Action> action = new DeleteOrphanedBodyAction(mCacheId,
++                                                             deleteNowList);
++      mManager->CurrentContext()->Dispatch(mManager->mIOThread, action);
++    }
++
+     Listener* listener = mManager->GetListener(mListenerId);
+     mManager = nullptr;
+     if (!listener) {
+       return;
+     }
+     if (NS_FAILED(aRv)) {
+       listener->OnCachePut(mRequestId, aRv);
+     } else {
+-      mStreamList->Activate(mCacheId);
+       listener->OnCachePut(mRequestId, aRv);
+     }
+-    mStreamList = nullptr;
+   }
+ 
+   virtual void
+   CancelOnTarget() MOZ_OVERRIDE
+   {
+     CancelStreamCopy(mRequestBodyStream, mRequestBodyCopyContext,
+                      mRequestBodyId);
+     mRequestBodyCopyContext = nullptr;
+@@ -586,25 +627,25 @@ private:
+   nsRefPtr<Manager> mManager;
+   const ListenerId mListenerId;
+   const RequestId mRequestId;
+   const CacheId mCacheId;
+   const PCacheRequest mRequest;
+   nsCOMPtr<nsIInputStream> mRequestBodyStream;
+   const PCacheResponse mResponse;
+   nsCOMPtr<nsIInputStream> mResponseBodyStream;
+-  nsRefPtr<StreamList> mStreamList;
+   nsRefPtr<Resolver> mResolver;
+   nsCOMPtr<nsIFile> mDBDir;
+   nsCOMPtr<mozIStorageConnection> mConn;
+   uint32_t mExpectedAsyncCopyCompletions;
+   nsID mRequestBodyId;
+   nsCOMPtr<nsISupports> mRequestBodyCopyContext;
+   nsID mResponseBodyId;
+   nsCOMPtr<nsISupports> mResponseBodyCopyContext;
++  nsTArray<nsID> mDeletedBodyIdList;
+ };
+ 
+ class Manager::CacheDeleteAction MOZ_FINAL : public Manager::BaseAction
+ {
+ public:
+   CacheDeleteAction(Manager* aManager, ListenerId aListenerId,
+                     RequestId aRequestId, CacheId aCacheId,
+                     const PCacheRequest& aRequest,
+@@ -618,50 +659,60 @@ public:
+ 
+   virtual nsresult
+   RunSyncWithDBOnTarget(nsIFile* aDBDir,
+                         mozIStorageConnection* aConn) MOZ_OVERRIDE
+   {
+     mozStorageTransaction trans(aConn, false,
+                                 mozIStorageConnection::TRANSACTION_IMMEDIATE);
+ 
+-    nsTArray<nsID> deletedBodyIdList;
+     nsresult rv = DBSchema::CacheDelete(aConn, mCacheId, mRequest, mParams,
+-                                        deletedBodyIdList, &mSuccess);
+-    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+-
+-    rv = FileUtils::BodyDeleteFiles(aDBDir, mCacheId, deletedBodyIdList);
++                                        mDeletedBodyIdList, &mSuccess);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+     rv = trans.Commit();
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       mSuccess = false;
+       return rv;
+     }
+ 
+     return rv;
+   }
+ 
+   virtual void
+   Complete(Listener* aListener, nsresult aRv) MOZ_OVERRIDE
+   {
++    nsTArray<nsID> deleteNowList;
++    for (uint32_t i = 0; i < mDeletedBodyIdList.Length(); ++i) {
++      if (!mManager->SetBodyIdOrphanedIfRefed(mDeletedBodyIdList[i])) {
++        deleteNowList.AppendElement(mDeletedBodyIdList[i]);
++      }
++    }
++
++    if (!deleteNowList.IsEmpty()) {
++      nsRefPtr<Action> action = new DeleteOrphanedBodyAction(mCacheId,
++                                                             deleteNowList);
++      mManager->CurrentContext()->Dispatch(mManager->mIOThread, action);
++    }
++
+     aListener->OnCacheDelete(mRequestId, aRv, mSuccess);
+   }
+ 
+   virtual bool MatchesCacheId(CacheId aCacheId) MOZ_OVERRIDE
+   {
+     return aCacheId == mCacheId;
+   }
+ 
+ protected:
+   virtual ~CacheDeleteAction() { }
+   const CacheId mCacheId;
+   const PCacheRequest mRequest;
+   const PCacheQueryParams mParams;
+   bool mSuccess;
++  nsTArray<nsID> mDeletedBodyIdList;
+ };
+ 
+ class Manager::CacheKeysAction MOZ_FINAL : public Manager::BaseAction
+ {
+ public:
+   CacheKeysAction(Manager* aManager, ListenerId aListenerId,
+                     RequestId aRequestId, CacheId aCacheId,
+                     const PCacheRequestOrVoid& aRequestOrVoid,
+@@ -1004,16 +1055,20 @@ Manager::StreamList::Activate(CacheId aC
  {
    NS_ASSERT_OWNINGTHREAD(Manager::StreamList);
    MOZ_ASSERT(!mActivated);
@@ -27,7 +311,7 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
    // All streams should be added on IO thread before we set the stream
    // control on the owning IPC thread.
    MOZ_ASSERT(!mStreamControl);
-@@ -1037,16 +1041,17 @@ Manager::StreamList::Extract(const nsID&
+@@ -1037,16 +1092,17 @@ Manager::StreamList::Extract(const nsID&
  
  void
  Manager::StreamList::NoteClosed(const nsID& aId)
@@ -36,7 +320,7 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
    for (uint32_t i = 0; i < mList.Length(); ++i) {
      if (mList[i].mId == aId) {
        mList.RemoveElementAt(i);
-+      mManager->ReleaseBodyId(aId);
++      mManager->ReleaseBodyId(mCacheId, aId);
        break;
      }
    }
@@ -45,7 +329,32 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
      mStreamControl->Shutdown();
    }
  }
-@@ -1463,11 +1468,67 @@ Manager::AddStreamList(StreamList* aStre
+@@ -1229,23 +1285,21 @@ Manager::CachePut(Listener* aListener, R
+                   nsIInputStream* aResponseBodyStream)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(aListener);
+   if (mShuttingDown) {
+     aListener->OnCachePut(aRequestId, NS_ERROR_ILLEGAL_DURING_SHUTDOWN);
+     return;
+   }
+-  nsRefPtr<StreamList> streamList = new StreamList(this, CurrentContext());
+   ListenerId listenerId = SaveListener(aListener);
+   nsRefPtr<Action> action = new CachePutAction(this, listenerId, aRequestId,
+                                                aCacheId,
+                                                aRequest, aRequestBodyStream,
+-                                               aResponse, aResponseBodyStream,
+-                                               streamList);
++                                               aResponse, aResponseBodyStream);
+   CurrentContext()->Dispatch(mIOThread, action);
+ }
+ 
+ void
+ Manager::CacheDelete(Listener* aListener, RequestId aRequestId,
+                      CacheId aCacheId, const PCacheRequest& aRequest,
+                      const PCacheQueryParams& aParams)
+ {
+@@ -1463,11 +1517,70 @@ Manager::AddStreamList(StreamList* aStre
  void
  Manager::RemoveStreamList(StreamList* aStreamList)
  {
@@ -71,7 +380,7 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
 +}
 +
 +void
-+Manager::ReleaseBodyId(const nsID& aBodyId)
++Manager::ReleaseBodyId(CacheId aCacheId, const nsID& aBodyId)
 +{
 +  NS_ASSERT_OWNINGTHREAD(Manager);
 +  for (uint32_t i = 0; i < mBodyIdRefs.Length(); ++i) {
@@ -84,7 +393,9 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
 +        mBodyIdRefs.RemoveElementAt(i);
 +        // TODO: note that we need to check this body for staleness on startup
 +        if (orphaned && !mShuttingDown) {
-+          // TODO: delete body data from file system
++          nsRefPtr<Action> action = new DeleteOrphanedBodyAction(aCacheId,
++                                                                 aBodyId);
++          CurrentContext()->Dispatch(mIOThread, action);
 +        }
 +      }
 +      return;
@@ -94,6 +405,7 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
 +}
 +
 +// TODO: provide way to set body non-orphaned if its added back to a cache
++//       once same-origin de-duplication is implemented
 +
 +bool
 +Manager::SetBodyIdOrphanedIfRefed(const nsID& aBodyId)
@@ -116,7 +428,25 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
 diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
 --- a/dom/cache/Manager.h
 +++ b/dom/cache/Manager.h
-@@ -184,30 +184,42 @@ private:
+@@ -159,16 +159,17 @@ public:
+ 
+   // Context::Listener methods
+   virtual void RemoveContext(Context* aContext) MOZ_OVERRIDE;
+ 
+ private:
+   class Factory;
+   class BaseAction;
+   class DeleteOrphanedCacheAction;
++  class DeleteOrphanedBodyAction;
+ 
+   class CacheMatchAction;
+   class CacheMatchAllAction;
+   class CachePutAction;
+   class CacheDeleteAction;
+   class CacheKeysAction;
+ 
+   class StorageMatchAction;
+@@ -184,30 +185,42 @@ private:
    Context* CurrentContext();
  
    ListenerId SaveListener(Listener* aListener);
@@ -126,7 +456,7 @@ diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
    void RemoveStreamList(StreamList* aStreamList);
  
 +  void AddRefBodyId(const nsID& aBodyId);
-+  void ReleaseBodyId(const nsID& aBodyId);
++  void ReleaseBodyId(CacheId aCacheId, const nsID& aBodyId);
 +  bool SetBodyIdOrphanedIfRefed(const nsID& aBodyId);
 +
    const nsCString mOrigin;
