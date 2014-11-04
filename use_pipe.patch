@@ -1,0 +1,193 @@
+# HG changeset patch
+# Parent e2cb320b3304ec5000a26b5b3babbba362c83d7b
+# User Ben Kelly <ben@wanderview.com>
+Integrate CrossProcessPipe into Cache.
+
+
+diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
+--- a/dom/cache/TypeUtils.cpp
++++ b/dom/cache/TypeUtils.cpp
+@@ -9,34 +9,42 @@
+ #include "mozilla/unused.h"
+ #include "mozilla/dom/CacheBinding.h"
+ #include "mozilla/dom/InternalRequest.h"
+ #include "mozilla/dom/Request.h"
+ #include "mozilla/dom/Response.h"
+ #include "mozilla/dom/cache/PCacheTypes.h"
+ #include "mozilla/dom/cache/ReadStream.h"
+ #include "mozilla/ipc/BackgroundChild.h"
++#include "mozilla/ipc/CrossProcessPipe.h"
+ #include "mozilla/ipc/PBackgroundChild.h"
+ #include "mozilla/ipc/PFileDescriptorSetChild.h"
+ #include "mozilla/ipc/InputStreamUtils.h"
+ #include "nsCOMPtr.h"
++#include "nsIAsyncInputStream.h"
++#include "nsIAsyncOutputStream.h"
++#include "nsNetCID.h"
++#include "nsServiceManagerUtils.h"
++#include "nsStreamUtils.h"
+ #include "nsString.h"
+ #include "nsURLParsers.h"
+ 
+ namespace {
+ 
+ using mozilla::ErrorResult;
+ using mozilla::unused;
+ using mozilla::void_t;
+ using mozilla::dom::cache::PCacheReadStream;
+ using mozilla::dom::cache::PCacheReadStreamOrVoid;
+ using mozilla::ipc::BackgroundChild;
++using mozilla::ipc::CreateCrossProcessPipe;
+ using mozilla::ipc::FileDescriptor;
+ using mozilla::ipc::PFileDescriptorSetChild;
+ using mozilla::ipc::PBackgroundChild;
++using mozilla::ipc::Sending;
+ 
+ // Utility function to remove the fragment from a URL, check its scheme, and optionally
+ // provide a URL without the query.  We're not using nsIURL or URL to do this because
+ // they require going to the main thread.
+ static void
+ ProcessURL(nsAString& aUrl, bool* aSchemeValidOut,
+            nsAString* aUrlWithoutQueryOut, ErrorResult& aRv)
+ {
+@@ -99,30 +107,71 @@ ProcessURL(nsAString& aUrl, bool* aSchem
+   queryPos += pathPos;
+ 
+   // We want everything before the query sine we already removed the trailing
+   // fragment
+   *aUrlWithoutQueryOut = Substring(aUrl, 0, queryPos - 1);
+ }
+ 
+ void
+-SerializeCacheStream(nsIInputStream* aStream, PCacheReadStreamOrVoid* aStreamOut)
++SerializeCacheStream(nsIInputStream* aStream, PCacheReadStreamOrVoid* aStreamOut,
++                     ErrorResult& aRv)
+ {
+   MOZ_ASSERT(aStreamOut);
+   if (!aStream) {
+     *aStreamOut = void_t();
+     return;
+   }
+ 
+-  // TODO: Integrate khuey's nsFancyPipe here if aStream does not provide
+-  //       efficient serialization.  (Or always use pipe.)
++  nsCOMPtr<nsIInputStream> stream;
++
++  // If the provided stream can be serialized, then just send it directly
++  nsCOMPtr<nsIIPCSerializableInputStream> serial = do_QueryInterface(aStream);
++  if (false && serial) {
++    stream = aStream;
++
++  // Otherwise we need to use a cross-process pipe
++  } else {
++    nsCOMPtr<nsICrossProcessPipe> pipe = CreateCrossProcessPipe(Sending);
++
++    nsCOMPtr<nsIAsyncInputStream> asyncStream;
++    nsresult rv = pipe->GetInputStream(getter_AddRefs(asyncStream));
++    if (NS_WARN_IF(NS_FAILED(rv))) {
++      aRv.Throw(rv);
++      return;
++    }
++
++    stream = asyncStream.forget();
++
++    nsCOMPtr<nsIAsyncOutputStream> pipeStream;
++    rv = pipe->GetOutputStream(getter_AddRefs(pipeStream));
++    if (NS_WARN_IF(NS_FAILED(rv))) {
++      aRv.Throw(rv);
++      return;
++    }
++
++    nsCOMPtr<nsIEventTarget> target =
++      do_GetService(NS_STREAMTRANSPORTSERVICE_CONTRACTID, &rv);
++    if (NS_WARN_IF(NS_FAILED(rv))) {
++      aRv.Throw(rv);
++      return;
++    }
++
++    rv = NS_AsyncCopy(aStream, pipeStream, target);
++    if (NS_WARN_IF(NS_FAILED(rv))) {
++      aRv.Throw(rv);
++      return;
++    }
++  }
++
++  MOZ_ASSERT(stream);
+ 
+   PCacheReadStream readStream;
+   nsTArray<FileDescriptor> fds;
+-  SerializeInputStream(aStream, readStream.params(), fds);
++  SerializeInputStream(stream, readStream.params(), fds);
+ 
+   PFileDescriptorSetChild* fdSet = nullptr;
+   if (!fds.IsEmpty()) {
+     // We should not be serializing until we have an actor ready
+     PBackgroundChild* manager = BackgroundChild::GetForCurrentThread();
+     MOZ_ASSERT(manager);
+ 
+     fdSet = manager->SendPFileDescriptorSetConstructor(fds[0]);
+@@ -142,20 +191,16 @@ SerializeCacheStream(nsIInputStream* aSt
+ 
+ } // anonymous namespace
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ using mozilla::void_t;
+-using mozilla::ipc::BackgroundChild;
+-using mozilla::ipc::FileDescriptor;
+-using mozilla::ipc::PFileDescriptorSetChild;
+-using mozilla::ipc::PBackgroundChild;
+ 
+ // static
+ void
+ TypeUtils::ToPCacheRequest(PCacheRequest& aOut, Request& aIn,
+                            bool aReadBody, ErrorResult& aRv)
+ {
+   aIn.GetMethod(aOut.method());
+   aIn.GetUrl(aOut.url());
+@@ -191,17 +236,20 @@ TypeUtils::ToPCacheRequest(PCacheRequest
+ 
+   nsRefPtr<InternalRequest> internalRequest = aIn.GetInternalRequest();
+   MOZ_ASSERT(internalRequest);
+   nsCOMPtr<nsIInputStream> stream;
+ 
+   internalRequest->GetBody(getter_AddRefs(stream));
+   aIn.SetBodyUsed();
+ 
+-  SerializeCacheStream(stream, &aOut.body());
++  SerializeCacheStream(stream, &aOut.body(), aRv);
++  if (NS_WARN_IF(aRv.Failed())) {
++    return;
++  }
+ }
+ 
+ // static
+ void
+ TypeUtils::ToPCacheRequest(const GlobalObject& aGlobal,
+                            PCacheRequest& aOut,
+                            const RequestOrScalarValueString& aIn,
+                            bool aReadBody, ErrorResult& aRv)
+@@ -293,17 +341,20 @@ TypeUtils::ToPCacheResponse(PCacheRespon
+     aRv.ThrowTypeError(MSG_REQUEST_BODY_CONSUMED_ERROR);
+     return;
+   }
+ 
+   nsCOMPtr<nsIInputStream> stream;
+   aIn.GetBody(getter_AddRefs(stream));
+   aIn.SetBodyUsed();
+ 
+-  SerializeCacheStream(stream, &aOut.body());
++  SerializeCacheStream(stream, &aOut.body(), aRv);
++  if (NS_WARN_IF(aRv.Failed())) {
++    return;
++  }
+ }
+ 
+ // static
+ void
+ TypeUtils::ToPCacheQueryParams(PCacheQueryParams& aOut, const QueryParams& aIn)
+ {
+   aOut.ignoreSearch() = aIn.mIgnoreSearch.WasPassed() &&
+                         aIn.mIgnoreSearch.Value();
