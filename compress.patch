@@ -1,0 +1,467 @@
+# HG changeset patch
+# Parent 54d01ded9733a12f49f3a4e1af6faa12b5ca2372
+# User Ben Kelly <ben@wanderview.com>
+Compress Cache body data.
+
+
+diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
+--- a/dom/cache/FileUtils.cpp
++++ b/dom/cache/FileUtils.cpp
+@@ -1,17 +1,19 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/FileUtils.h"
++
++#include "mozilla/unused.h"
++#include "mozilla/dom/cache/SnappyCompressOutputStream.h"
+ #include "mozilla/dom/quota/FileStreams.h"
+-#include "mozilla/unused.h"
+ #include "nsIFile.h"
+ #include "nsIUUIDGenerator.h"
+ #include "nsNetUtil.h"
+ #include "nsServiceManagerUtils.h"
+ #include "nsString.h"
+ #include "nsThreadUtils.h"
+ 
+ namespace mozilla {
+@@ -45,16 +47,20 @@ FileUtils::BodyCreateDir(nsIFile* aBaseD
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+   } else {
+     bool isDir;
+     rv = aBodyDir->IsDirectory(&isDir);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+     if (NS_WARN_IF(!isDir)) { return NS_ERROR_FILE_NOT_DIRECTORY; }
+   }
+ 
++  nsAutoCString path;
++  aBodyDir->GetNativePath(path);
++  printf_stderr("### ### Body dir: %s\n", path.get());
++
+   return rv;
+ }
+ 
+ // static
+ nsresult
+ FileUtils::BodyGetCacheDir(nsIFile* aBaseDir, const nsID& aId,
+                            nsIFile** aCacheDirOut)
+ {
+@@ -177,36 +183,24 @@ FileUtils::BodyStartWriteStream(const ns
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+   if (NS_WARN_IF(exists)) { return NS_ERROR_FILE_ALREADY_EXISTS; }
+ 
+   nsCOMPtr<nsIOutputStream> fileStream =
+     FileOutputStream::Create(PERSISTENCE_TYPE_PERSISTENT,
+                              aBaseDomain, aOrigin, tmpFile);
+   if (NS_WARN_IF(!fileStream)) { return NS_ERROR_UNEXPECTED; }
+ 
+-  // By default we would prefer to just use ReadSegments to copy buffers.
+-  nsAsyncCopyMode mode = NS_ASYNCCOPY_VIA_READSEGMENTS;
+-
+-  // But first we must check to see if the source stream provides ReadSegments.
+-  // If it does not, use a buffered output stream to write to the file.  We don't
+-  // wrap the input because because that can lead to it being closed on the wrong
+-  // thread.
+-  if (!NS_InputStreamIsBuffered(aSource)) {
+-    nsCOMPtr<nsIOutputStream> buffered;
+-    rv = NS_NewBufferedOutputStream(getter_AddRefs(buffered), fileStream, 4096);
+-    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+-
+-    fileStream = buffered.forget();
+-    mode = NS_ASYNCCOPY_VIA_WRITESEGMENTS;
+-  }
++  nsRefPtr<SnappyCompressOutputStream> compressed =
++    new SnappyCompressOutputStream(fileStream);
+ 
+   // Note, we cannot auto-close the source stream here because some of
+   // our source streams must be closed on the PBackground worker thread.
+-  rv = NS_AsyncCopy(aSource, fileStream, NS_GetCurrentThread(), mode,
+-                    4096, // chunk size
++  rv = NS_AsyncCopy(aSource, compressed, NS_GetCurrentThread(),
++                    NS_ASYNCCOPY_VIA_WRITESEGMENTS,
++                    compressed->BlockSize(),
+                     aCallback, aClosure,
+                     false, true, // close streams
+                     aCopyContextOut);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   return rv;
+ }
+ 
+diff --git a/dom/cache/SnappyCompressOutputStream.cpp b/dom/cache/SnappyCompressOutputStream.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/SnappyCompressOutputStream.cpp
+@@ -0,0 +1,168 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "mozilla/dom/cache/SnappyCompressOutputStream.h"
++
++#include "nsAutoPtr.h"
++#include "nsStreamUtils.h"
++#include "snappy/snappy.h"
++
++namespace mozilla {
++namespace dom {
++namespace cache {
++
++NS_IMPL_ISUPPORTS(mozilla::dom::cache::SnappyCompressOutputStream,
++                  nsIOutputStream);
++
++// static
++const size_t
++SnappyCompressOutputStream::kMaxBlockSize = snappy::kBlockSize;
++
++SnappyCompressOutputStream::SnappyCompressOutputStream(nsIOutputStream* aBaseStream,
++                                                       size_t aBlockSize)
++ : mBaseStream(aBaseStream)
++ , mBuffer(std::min(aBlockSize, kMaxBlockSize))
++{
++  MOZ_ASSERT(mBaseStream);
++  MOZ_ASSERT(mBuffer.Capacity());
++  MOZ_ASSERT(mBuffer.Capacity() < kMaxBlockSize);
++}
++
++size_t
++SnappyCompressOutputStream::BlockSize() const
++{
++  return mBuffer.Capacity();
++}
++
++NS_IMETHODIMP
++SnappyCompressOutputStream::Close()
++{
++  if (!mBaseStream) {
++    return NS_OK;
++  }
++
++  nsresult rv = Flush();
++  if (NS_FAILED(rv)) { return rv; }
++
++  mBaseStream->Close();
++  mBaseStream = nullptr;
++
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++SnappyCompressOutputStream::Flush()
++{
++  if (!mBaseStream) {
++    return NS_BASE_STREAM_CLOSED;
++  }
++
++  nsresult rv = FlushToBaseStream();
++  if (NS_FAILED(rv)) { return rv; }
++  mBaseStream->Flush();
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++SnappyCompressOutputStream::Write(const char* aBuf, uint32_t aCount,
++                                  uint32_t* aResultOut)
++{
++  return WriteSegments(NS_CopySegmentToBuffer, const_cast<char*>(aBuf), aCount,
++                       aResultOut);
++}
++
++NS_IMETHODIMP
++SnappyCompressOutputStream::WriteFrom(nsIInputStream*, uint32_t, uint32_t*)
++{
++  return NS_ERROR_NOT_IMPLEMENTED;
++}
++
++NS_IMETHODIMP
++SnappyCompressOutputStream::WriteSegments(nsReadSegmentFun aReader,
++                                          void* aClosure,
++                                          uint32_t aCount,
++                                          uint32_t* aBytesWrittenOut)
++{
++  if (!mBaseStream) {
++    return NS_BASE_STREAM_CLOSED;
++  }
++
++  nsresult rv = NS_OK;
++
++  while (aCount > 0) {
++    uint32_t remaining = mBuffer.Capacity() - mBuffer.Length();
++
++    if (remaining < 1) {
++      rv = FlushToBaseStream();
++      if (NS_FAILED(rv)) { return rv; }
++    }
++
++    uint32_t numToRead = std::min(remaining, aCount);
++    uint32_t numRead = 0;
++
++    uint32_t oldLength = mBuffer.Length();
++    mBuffer.SetLengthAndRetainStorage(oldLength + numToRead);
++
++    rv = aReader(this, aClosure, mBuffer.Elements(), *aBytesWrittenOut,
++                 numToRead, &numRead);
++    if (NS_FAILED(rv) || numRead < 1) {
++      mBuffer.SetLengthAndRetainStorage(oldLength);
++      return NS_OK;
++    }
++
++    mBuffer.SetLengthAndRetainStorage(oldLength + numRead);
++    *aBytesWrittenOut += numRead;
++    aCount -= numRead;
++  }
++
++  return rv;
++}
++
++NS_IMETHODIMP
++SnappyCompressOutputStream::IsNonBlocking(bool* aNonBlockingOut)
++{
++  *aNonBlockingOut = false;
++  return NS_OK;
++}
++
++SnappyCompressOutputStream::~SnappyCompressOutputStream()
++{
++  Close();
++}
++
++nsresult
++SnappyCompressOutputStream::FlushToBaseStream()
++{
++  MOZ_ASSERT(mBaseStream);
++
++  size_t compressedLength = snappy::MaxCompressedLength(mBuffer.Length());
++  nsAutoArrayPtr<char> compressed(new (fallible_t()) char[compressedLength]);
++  if (!compressed) {
++    return NS_ERROR_OUT_OF_MEMORY;
++  }
++
++  snappy::RawCompress(mBuffer.Elements(), mBuffer.Length(), compressed.get(),
++                      &compressedLength);
++
++  mBuffer.ClearAndRetainStorage();
++
++  uint32_t remaining = compressedLength;
++  uint32_t offset = 0;
++  while (remaining > 0) {
++    uint32_t numWritten = 0;
++    nsresult rv = mBaseStream->Write(compressed.get() + offset, remaining,
++                                     &numWritten);
++    if (NS_FAILED(rv)) { return rv; }
++    offset += numWritten;
++    remaining -= numWritten;
++  }
++
++  return NS_OK;
++}
++
++} // namespace cache
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/cache/SnappyCompressOutputStream.h b/dom/cache/SnappyCompressOutputStream.h
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/SnappyCompressOutputStream.h
+@@ -0,0 +1,46 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_cache_SnappyCompressOutputStream_h
++#define mozilla_dom_cache_SnappyCompressOutputStream_h
++
++#include "nsCOMPtr.h"
++#include "nsIOutputStream.h"
++#include "nsISupportsImpl.h"
++#include "nsTArray.h"
++
++namespace mozilla {
++namespace dom {
++namespace cache {
++
++class SnappyCompressOutputStream : public nsIOutputStream
++{
++public:
++  static const size_t kMaxBlockSize;
++
++  SnappyCompressOutputStream(nsIOutputStream* aBaseStream,
++                             size_t aBlockSize = kMaxBlockSize);
++
++  size_t BlockSize() const;
++
++private:
++  virtual ~SnappyCompressOutputStream();
++
++  nsresult FlushToBaseStream();
++
++  nsCOMPtr<nsIOutputStream> mBaseStream;
++  nsTArray<char> mBuffer;
++
++public:
++  NS_DECL_THREADSAFE_ISUPPORTS
++  NS_DECL_NSIOUTPUTSTREAM
++};
++
++} // namespace cache
++} // namespace dom
++} // namespace mozilla
++
++#endif // mozilla_dom_cache_SnappyCompressOutputStream_h
+diff --git a/dom/cache/SnappyUncompressInputStream.cpp b/dom/cache/SnappyUncompressInputStream.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/SnappyUncompressInputStream.cpp
+@@ -0,0 +1,58 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "mozilla/dom/cache/SnappyUncompressInputStream.h"
++
++#include "snappy/snappy.h"
++
++namespace mozilla {
++namespace dom {
++namespace cache {
++
++// static
++const size_t
++SnappyUncompressInputStream::kMaxBlockSize = snappy::kBlockSize;
++
++NS_IMPL_ISUPPORTS(mozilla::dom::cache::SnappyUncompressInputStream,
++                  nsIInputStream);
++
++NS_IMETHODIMP
++SnappyUncompressInputStream::Close()
++{
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++SnappyUncompressInputStream::Available(uint64_t* aLengthOut)
++{
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++SnappyUncompressInputStream::Read(char* aBuf, uint32_t aCount,
++                                  uint32_t* aReadCountOut)
++{
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++SnappyUncompressInputStream::ReadSegments(nsWriteSegmentFun aWriter,
++                                          void* aClosure, uint32_t aCount,
++                                          uint32_t* aResultOut)
++{
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++SnappyUncompressInputStream::IsNonBlocking(bool* aNonBlockingOut)
++{
++  *aNonBlockingOut = false;
++  return NS_OK;
++}
++
++} // namespace cache
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/cache/SnappyUncompressInputStream.h b/dom/cache/SnappyUncompressInputStream.h
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/SnappyUncompressInputStream.h
+@@ -0,0 +1,41 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_cache_SnappyUncompressInputStream_h
++#define mozilla_dom_cache_SnappyUncompressInputStream_h
++
++#include "nsCOMPtr.h"
++#include "nsIInputStream.h"
++#include "nsISupportsImpl.h"
++
++namespace mozilla {
++namespace dom {
++namespace cache {
++
++class SnappyUncompressInputStream : public nsIInputStream
++{
++public:
++  static const size_t kMaxBlockSize;
++
++  SnappyUncompressInputStream(nsIInputStream* aBaseStream,
++                            size_t aBlockSize = kMaxBlockSize);
++
++private:
++  virtual ~SnappyUncompressInputStream();
++
++  nsCOMPtr<nsIInputStream> mBaseStream;
++  const size_t mBlockSize;
++
++public:
++  NS_DECL_THREADSAFE_ISUPPORTS
++  NS_DECL_NSIINPUTSTREAM
++};
++
++} // namespace cache
++} // namespace dom
++} // namespace mozilla
++
++#endif // mozilla_dom_cache_SnappyUncompressInputStream_h
+diff --git a/dom/cache/moz.build b/dom/cache/moz.build
+--- a/dom/cache/moz.build
++++ b/dom/cache/moz.build
+@@ -21,16 +21,18 @@ EXPORTS.mozilla.dom.cache += [
+     'DBAction.h',
+     'DBSchema.h',
+     'FileUtils.h',
+     'IPCUtils.h',
+     'Manager.h',
+     'ReadStream.h',
+     'SavedTypes.h',
+     'ShutdownObserver.h',
++    'SnappyCompressOutputStream.h',
++    'SnappyUncompressInputStream.h',
+     'Types.h',
+     'TypeUtils.h',
+ ]
+ 
+ SOURCES += [
+     'Action.cpp',
+     'Cache.cpp',
+     'CacheChild.cpp',
+@@ -42,16 +44,18 @@ SOURCES += [
+     'CacheStreamControlParent.cpp',
+     'Context.cpp',
+     'DBAction.cpp',
+     'DBSchema.cpp',
+     'FileUtils.cpp',
+     'Manager.cpp',
+     'ReadStream.cpp',
+     'ShutdownObserver.cpp',
++    'SnappyCompressOutputStream.cpp',
++    'SnappyUncompressInputStream.cpp',
+     'TypeUtils.cpp',
+ ]
+ 
+ IPDL_SOURCES += [
+     'PCache.ipdl',
+     'PCacheStorage.ipdl',
+     'PCacheStreamControl.ipdl',
+     'PCacheTypes.ipdlh',
