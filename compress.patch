@@ -1,8 +1,7 @@
 # HG changeset patch
-# Parent 54d01ded9733a12f49f3a4e1af6faa12b5ca2372
+# Parent ba7887ae6ff58d5169b173957232ee9d4746b8da
 # User Ben Kelly <ben@wanderview.com>
 Compress Cache body data.
-
 
 diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
 --- a/dom/cache/FileUtils.cpp
@@ -91,11 +90,223 @@ diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
    return rv;
  }
  
+diff --git a/dom/cache/ReadStream.cpp b/dom/cache/ReadStream.cpp
+--- a/dom/cache/ReadStream.cpp
++++ b/dom/cache/ReadStream.cpp
+@@ -7,26 +7,28 @@
+ #include "mozilla/dom/cache/ReadStream.h"
+ 
+ #include "mozilla/unused.h"
+ #include "mozilla/dom/cache/CacheStreamControlChild.h"
+ #include "mozilla/dom/cache/CacheStreamControlParent.h"
+ #include "mozilla/dom/cache/PCacheStreamControlChild.h"
+ #include "mozilla/dom/cache/PCacheStreamControlParent.h"
+ #include "mozilla/dom/cache/PCacheTypes.h"
++#include "mozilla/dom/cache/SnappyUncompressInputStream.h"
+ #include "mozilla/ipc/FileDescriptor.h"
+ #include "mozilla/ipc/FileDescriptorSetChild.h"
+ #include "mozilla/ipc/FileDescriptorSetParent.h"
+ #include "mozilla/ipc/InputStreamParams.h"
+ #include "mozilla/ipc/InputStreamUtils.h"
+ #include "mozilla/ipc/PBackgroundChild.h"
+ #include "mozilla/ipc/PBackgroundParent.h"
+ #include "mozilla/ipc/PFileDescriptorSetChild.h"
+ #include "mozilla/ipc/PFileDescriptorSetParent.h"
+ #include "nsIAsyncInputStream.h"
++#include "nsNetUtil.h"
+ #include "nsTArray.h"
+ 
+ namespace {
+ 
+ using mozilla::unused;
+ using mozilla::void_t;
+ using mozilla::dom::cache::CacheStreamControlChild;
+ using mozilla::dom::cache::CacheStreamControlParent;
+@@ -50,16 +52,21 @@ public:
+     mControl->AddListener(this);
+   }
+ 
+   virtual ~ReadStreamChild()
+   {
+     NoteClosed();
+   }
+ 
++  virtual void NoteAutoClosed() MOZ_OVERRIDE
++  {
++    NoteClosed();
++  }
++
+   virtual void NoteClosed() MOZ_OVERRIDE
+   {
+     if (mClosed) {
+       return;
+     }
+ 
+     mClosed = true;
+     mControl->RemoveListener(this);
+@@ -118,16 +125,22 @@ public:
+     mControl->AddListener(this);
+   }
+ 
+   virtual ~ReadStreamParent()
+   {
+     NoteClosed();
+   }
+ 
++  virtual void NoteAutoClosed() MOZ_OVERRIDE
++  {
++    // Do not auto-close on parent side since we need to close on a specific
++    // thread.
++  }
++
+   virtual void NoteClosed() MOZ_OVERRIDE
+   {
+     if (mClosed) {
+       return;
+     }
+ 
+     mClosed = true;
+     mControl->RemoveListener(this);
+@@ -319,78 +332,91 @@ ReadStream::MatchId(const nsID& aId)
+ }
+ 
+ ReadStream::ReadStream(const nsID& aId, nsIInputStream* aStream)
+   : mId(aId)
+   , mStream(aStream)
+   , mClosed(false)
+ {
+   MOZ_ASSERT(mStream);
++
++  // TODO: evaluate if this large buffered size is actually useful
++
++  nsCOMPtr<nsIInputStream> buffered;
++  nsresult rv = NS_NewBufferedInputStream(getter_AddRefs(buffered), aStream,
++                                      SnappyUncompressInputStream::BlockSize());
++  if (NS_FAILED(rv)) {
++    mSnappyStream = new SnappyUncompressInputStream(aStream);
++  } else {
++    mSnappyStream = new SnappyUncompressInputStream(buffered);
++  }
+ }
+ 
+ ReadStream::~ReadStream()
+ {
+ }
+ 
+ NS_IMETHODIMP
+ ReadStream::Close()
+ {
+   NoteClosed();
+-  return mStream->Close();
++  return mSnappyStream->Close();
+ }
+ 
+ NS_IMETHODIMP
+ ReadStream::Available(uint64_t* aNumAvailableOut)
+ {
+-  nsresult rv = mStream->Available(aNumAvailableOut);
++  nsresult rv = mSnappyStream->Available(aNumAvailableOut);
+ 
+   if (NS_FAILED(rv)) {
+-    NoteClosed();
++    NoteAutoClosed();
+   }
+ 
+   return rv;
+ }
+ 
+ NS_IMETHODIMP
+ ReadStream::Read(char* aBuf, uint32_t aCount, uint32_t* aNumReadOut)
+ {
+   MOZ_ASSERT(aNumReadOut);
+ 
+-  nsresult rv = mStream->Read(aBuf, aCount, aNumReadOut);
++  nsresult rv = mSnappyStream->Read(aBuf, aCount, aNumReadOut);
+ 
+   // Don't auto-close when end of stream is hit.  We want to close
+   // this stream on a particular thread in the parent case.
+ 
+-  if (NS_FAILED(rv) && rv != NS_BASE_STREAM_WOULD_BLOCK) {
+-    NoteClosed();
++  if ((NS_FAILED(rv) && rv != NS_BASE_STREAM_WOULD_BLOCK) ||
++      *aNumReadOut == 0) {
++    NoteAutoClosed();
+   }
+ 
+   return rv;
+ }
+ 
+ NS_IMETHODIMP
+ ReadStream::ReadSegments(nsWriteSegmentFun aWriter, void* aClosure,
+                          uint32_t aCount, uint32_t* aNumReadOut)
+ {
+   MOZ_ASSERT(aNumReadOut);
+ 
+-  nsresult rv = mStream->ReadSegments(aWriter, aClosure, aCount, aNumReadOut);
++  nsresult rv = mSnappyStream->ReadSegments(aWriter, aClosure, aCount,
++                                            aNumReadOut);
+ 
+   // Don't auto-close when end of stream is hit.  We want to close
+   // this stream on a particular thread in the parent case.
+ 
+-  if (NS_FAILED(rv) && rv != NS_BASE_STREAM_WOULD_BLOCK &&
+-                       rv != NS_ERROR_NOT_IMPLEMENTED) {
+-    NoteClosed();
++  if ((NS_FAILED(rv) && rv != NS_BASE_STREAM_WOULD_BLOCK &&
++                       rv != NS_ERROR_NOT_IMPLEMENTED) || *aNumReadOut == 0) {
++    NoteAutoClosed();
+   }
+ 
+   return rv;
+ }
+ 
+ NS_IMETHODIMP
+ ReadStream::IsNonBlocking(bool* aNonBlockingOut)
+ {
+-  return mStream->IsNonBlocking(aNonBlockingOut);
++  return mSnappyStream->IsNonBlocking(aNonBlockingOut);
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/ReadStream.h b/dom/cache/ReadStream.h
+--- a/dom/cache/ReadStream.h
++++ b/dom/cache/ReadStream.h
+@@ -49,26 +49,28 @@ public:
+   // CacheStreamControlListener methods
+   virtual void CloseStream() MOZ_OVERRIDE;
+   virtual bool MatchId(const nsID& aId) MOZ_OVERRIDE;
+ 
+ protected:
+   ReadStream(const nsID& aId, nsIInputStream* aStream);
+   virtual ~ReadStream();
+ 
++  virtual void NoteAutoClosed()=0;
+   virtual void NoteClosed()=0;
+   virtual void Forget()=0;
+   virtual void SerializeControl(PCacheReadStream* aReadStreamOut)=0;
+ 
+   virtual void
+   SerializeFds(PCacheReadStream* aReadStreamOut,
+                const nsTArray<mozilla::ipc::FileDescriptor>& fds)=0;
+ 
+   const nsID mId;
+   nsCOMPtr<nsIInputStream> mStream;
++  nsCOMPtr<nsIInputStream> mSnappyStream;
+   bool mClosed;
+ 
+ public:
+   NS_DECLARE_STATIC_IID_ACCESSOR(NS_DOM_CACHE_IID);
+ 
+   NS_DECL_THREADSAFE_ISUPPORTS
+   NS_DECL_NSIINPUTSTREAM
+ };
 diff --git a/dom/cache/SnappyCompressOutputStream.cpp b/dom/cache/SnappyCompressOutputStream.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/SnappyCompressOutputStream.cpp
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,211 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -104,7 +315,7 @@ new file mode 100644
 +
 +#include "mozilla/dom/cache/SnappyCompressOutputStream.h"
 +
-+#include "nsAutoPtr.h"
++#include "mozilla/dom/cache/SnappyFrameUtils.h"
 +#include "nsStreamUtils.h"
 +#include "snappy/snappy.h"
 +
@@ -122,17 +333,17 @@ new file mode 100644
 +SnappyCompressOutputStream::SnappyCompressOutputStream(nsIOutputStream* aBaseStream,
 +                                                       size_t aBlockSize)
 + : mBaseStream(aBaseStream)
-+ , mBuffer(std::min(aBlockSize, kMaxBlockSize))
++ , mBlockSize(std::min(aBlockSize, kMaxBlockSize))
++ , mNextByte(0)
++ , mCompressedBufferLength(0)
++ , mFirstFlush(false)
 +{
-+  MOZ_ASSERT(mBaseStream);
-+  MOZ_ASSERT(mBuffer.Capacity());
-+  MOZ_ASSERT(mBuffer.Capacity() < kMaxBlockSize);
 +}
 +
 +size_t
 +SnappyCompressOutputStream::BlockSize() const
 +{
-+  return mBuffer.Capacity();
++  return mBlockSize;
 +}
 +
 +NS_IMETHODIMP
@@ -147,6 +358,9 @@ new file mode 100644
 +
 +  mBaseStream->Close();
 +  mBaseStream = nullptr;
++
++  mBuffer = nullptr;
++  mCompressedBuffer = nullptr;
 +
 +  return NS_OK;
 +}
@@ -188,35 +402,35 @@ new file mode 100644
 +    return NS_BASE_STREAM_CLOSED;
 +  }
 +
-+  nsresult rv = NS_OK;
++  if (!mBuffer) {
++    mBuffer = new (fallible_t()) char[mBlockSize];
++    if (!mBuffer) {
++      return NS_ERROR_OUT_OF_MEMORY;
++    }
++  }
 +
 +  while (aCount > 0) {
-+    uint32_t remaining = mBuffer.Capacity() - mBuffer.Length();
-+
++    uint32_t remaining = mBlockSize - mNextByte;
 +    if (remaining < 1) {
-+      rv = FlushToBaseStream();
++      nsresult rv = FlushToBaseStream();
 +      if (NS_FAILED(rv)) { return rv; }
 +    }
 +
 +    uint32_t numToRead = std::min(remaining, aCount);
 +    uint32_t numRead = 0;
 +
-+    uint32_t oldLength = mBuffer.Length();
-+    mBuffer.SetLengthAndRetainStorage(oldLength + numToRead);
-+
-+    rv = aReader(this, aClosure, mBuffer.Elements(), *aBytesWrittenOut,
-+                 numToRead, &numRead);
++    nsresult rv = aReader(this, aClosure, mBuffer.get() + mNextByte,
++                          *aBytesWrittenOut, numToRead, &numRead);
 +    if (NS_FAILED(rv) || numRead < 1) {
-+      mBuffer.SetLengthAndRetainStorage(oldLength);
 +      return NS_OK;
 +    }
 +
-+    mBuffer.SetLengthAndRetainStorage(oldLength + numRead);
++    mNextByte += numRead;
 +    *aBytesWrittenOut += numRead;
 +    aCount -= numRead;
 +  }
 +
-+  return rv;
++  return NS_OK;
 +}
 +
 +NS_IMETHODIMP
@@ -236,23 +450,63 @@ new file mode 100644
 +{
 +  MOZ_ASSERT(mBaseStream);
 +
-+  size_t compressedLength = snappy::MaxCompressedLength(mBuffer.Length());
-+  nsAutoArrayPtr<char> compressed(new (fallible_t()) char[compressedLength]);
-+  if (!compressed) {
-+    return NS_ERROR_OUT_OF_MEMORY;
++  if (!mCompressedBuffer) {
++    mCompressedBufferLength =
++      SnappyFrameUtils::MaxCompressedBufferLength(mBlockSize);
++    mCompressedBuffer = new (fallible_t()) char[mCompressedBufferLength];
++    if (!mCompressedBuffer) {
++      return NS_ERROR_OUT_OF_MEMORY;
++    }
 +  }
 +
-+  snappy::RawCompress(mBuffer.Elements(), mBuffer.Length(), compressed.get(),
-+                      &compressedLength);
++  nsresult rv = MaybeFlushStreamIdentifier();
++  if (NS_FAILED(rv)) { return rv; }
 +
-+  mBuffer.ClearAndRetainStorage();
++  size_t compressedLength;
++  rv = SnappyFrameUtils::Compress(mCompressedBuffer.get(),
++                                  mCompressedBufferLength, mBuffer.get(),
++                                  mNextByte, &compressedLength);
++  if (NS_FAILED(rv)) { return rv; }
++
++  mNextByte = 0;
 +
 +  uint32_t remaining = compressedLength;
 +  uint32_t offset = 0;
 +  while (remaining > 0) {
 +    uint32_t numWritten = 0;
-+    nsresult rv = mBaseStream->Write(compressed.get() + offset, remaining,
-+                                     &numWritten);
++    rv = mBaseStream->Write(mCompressedBuffer.get() + offset, remaining,
++                            &numWritten);
++    if (NS_FAILED(rv)) { return rv; }
++    offset += numWritten;
++    remaining -= numWritten;
++  }
++
++  return NS_OK;
++}
++
++nsresult
++SnappyCompressOutputStream::MaybeFlushStreamIdentifier()
++{
++  MOZ_ASSERT(mCompressedBuffer);
++
++  if (mFirstFlush) {
++    return NS_OK;
++  }
++
++  mFirstFlush = true;
++
++  size_t compressedLength;
++  nsresult rv = SnappyFrameUtils::WriteStreamIdentifier(mCompressedBuffer.get(),
++                                                        mCompressedBufferLength,
++                                                        &compressedLength);
++  if (NS_FAILED(rv)) { return rv; }
++
++  uint32_t remaining = compressedLength;
++  uint32_t offset = 0;
++  while (remaining > 0) {
++    uint32_t numWritten = 0;
++    rv = mBaseStream->Write(mCompressedBuffer.get() + offset, remaining,
++                            &numWritten);
 +    if (NS_FAILED(rv)) { return rv; }
 +    offset += numWritten;
 +    remaining -= numWritten;
@@ -268,7 +522,7 @@ diff --git a/dom/cache/SnappyCompressOutputStream.h b/dom/cache/SnappyCompressOu
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/SnappyCompressOutputStream.h
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,52 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -278,10 +532,10 @@ new file mode 100644
 +#ifndef mozilla_dom_cache_SnappyCompressOutputStream_h
 +#define mozilla_dom_cache_SnappyCompressOutputStream_h
 +
++#include "nsAutoPtr.h"
 +#include "nsCOMPtr.h"
 +#include "nsIOutputStream.h"
 +#include "nsISupportsImpl.h"
-+#include "nsTArray.h"
 +
 +namespace mozilla {
 +namespace dom {
@@ -301,9 +555,15 @@ new file mode 100644
 +  virtual ~SnappyCompressOutputStream();
 +
 +  nsresult FlushToBaseStream();
++  nsresult MaybeFlushStreamIdentifier();
 +
 +  nsCOMPtr<nsIOutputStream> mBaseStream;
-+  nsTArray<char> mBuffer;
++  const size_t mBlockSize;
++  uint32_t mNextByte;
++  nsAutoArrayPtr<char> mBuffer;
++  nsAutoArrayPtr<char> mCompressedBuffer;
++  size_t mCompressedBufferLength;
++  bool mFirstFlush;
 +
 +public:
 +  NS_DECL_THREADSAFE_ISUPPORTS
@@ -315,11 +575,294 @@ new file mode 100644
 +} // namespace mozilla
 +
 +#endif // mozilla_dom_cache_SnappyCompressOutputStream_h
+diff --git a/dom/cache/SnappyFrameUtils.cpp b/dom/cache/SnappyFrameUtils.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/SnappyFrameUtils.cpp
+@@ -0,0 +1,211 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "SnappyFrameUtils.h"
++#include "snappy/snappy.h"
++
++namespace {
++
++using mozilla::dom::cache::SnappyFrameUtils;
++
++SnappyFrameUtils::ChunkType ReadChunkType(uint8_t aByte)
++{
++  if (aByte == 0xff)  {
++    return SnappyFrameUtils::StreamIdentifier;
++  } else if (aByte == 0x00) {
++    return SnappyFrameUtils::CompressedData;
++  } else if (aByte == 0x01) {
++    return SnappyFrameUtils::UncompressedData;
++  } else if (aByte == 0xfe) {
++    return SnappyFrameUtils::Padding;
++  }
++
++  return SnappyFrameUtils::Reserved;
++}
++
++void WriteChunkType(char* aDest, SnappyFrameUtils::ChunkType aType)
++{
++  if (aType == SnappyFrameUtils::StreamIdentifier) {
++    *aDest = 0xff;
++  } else if (aType == SnappyFrameUtils::CompressedData) {
++    *aDest = 0x00;
++  } else if (aType == SnappyFrameUtils::UncompressedData) {
++    *aDest = 0x01;
++  } else if (aType == SnappyFrameUtils::Padding) {
++    *aDest = 0xfe;
++  } else {
++    *aDest = 0x02;
++  }
++}
++
++} // anonymous namespace
++
++namespace mozilla {
++namespace dom {
++namespace cache {
++
++// static
++nsresult
++SnappyFrameUtils::WriteStreamIdentifier(char* aDest, size_t aDestLength,
++                                        size_t* aBytesWrittenOut)
++{
++  if (aDestLength < 10) {
++    return NS_ERROR_NOT_AVAILABLE;
++  }
++
++  aDest[0] = 0xff;
++  aDest[1] = 0x06;
++  aDest[2] = 0x00;
++  aDest[3] = 0x00;
++  aDest[4] = 0x73;
++  aDest[5] = 0x4e;
++  aDest[6] = 0x61;
++  aDest[7] = 0x50;
++  aDest[8] = 0x70;
++  aDest[9] = 0x59;
++
++  *aBytesWrittenOut = 10;
++
++  return NS_OK;
++}
++
++// static
++nsresult
++SnappyFrameUtils::Compress(char* aDest, size_t aDestLength,
++                           const char* aSource, size_t aSourceLength,
++                           size_t* aBytesWrittenOut)
++{
++  size_t neededLength = MaxCompressedBufferLength(aSourceLength);
++  if (aDestLength < neededLength) {
++    return NS_ERROR_NOT_AVAILABLE;
++  }
++
++  size_t offset = 0;
++
++  WriteChunkType(aDest, CompressedData);
++  offset += 1;
++
++  // skip length
++  size_t lengthOffset = offset;
++  offset += 3;
++
++  // TODO: implement CRC32C (different from zlib) of uncompressed data
++  aDest[offset] = 0;
++  aDest[offset + 1] = 0;
++  aDest[offset + 2] = 0;
++  aDest[offset + 3] = 0;
++  offset += 4;
++
++  size_t compressedLength;
++  snappy::RawCompress(aSource, aSourceLength, aDest + offset, &compressedLength);
++
++  // go back and write data length (compressed length + crc32 bytes)
++  size_t dataLength = compressedLength + 4;
++  aDest[lengthOffset] = dataLength & 0x000000ff;
++  aDest[lengthOffset + 1] = (dataLength & 0x0000ff00) >> 8;
++  aDest[lengthOffset + 2] = (dataLength & 0x00ff0000) >> 16;
++
++  *aBytesWrittenOut = offset + compressedLength;
++
++  return NS_OK;
++}
++
++// static
++nsresult
++SnappyFrameUtils::Uncompress(char* aDest, size_t aDestLength,
++                             const char* aSource, size_t aSourceLength,
++                             size_t* aBytesWrittenOut,
++                             size_t* aBytesReadOut)
++{
++  *aBytesWrittenOut = 0;
++  *aBytesReadOut = 0;
++
++  if (aSourceLength < 4) {
++    return NS_ERROR_NOT_AVAILABLE;
++  }
++
++
++  ChunkType type;
++  size_t dataLength;
++  nsresult rv = ParseHeader(aSource, aSourceLength, &type, &dataLength);
++  if (NS_FAILED(rv)) { return rv; }
++  size_t sourceOffset = kHeaderLength;
++
++  if (type == StreamIdentifier) {
++    if (dataLength != 6) {
++      return NS_ERROR_INVALID_ARG;
++    }
++    *aBytesReadOut = sourceOffset + dataLength;
++    return NS_OK;
++  }
++
++  // TODO: support other types
++  if (type != CompressedData) {
++    return NS_ERROR_NOT_IMPLEMENTED;
++  }
++
++  // skip CRC32 for now since it needs to be compared to uncompressed data
++  sourceOffset += 4;
++
++  // compressed length is chunk data length less the crc size
++  size_t compressedLength = dataLength - 4;
++
++  size_t uncompressedLength;
++  if (!snappy::GetUncompressedLength(aSource + sourceOffset, compressedLength,
++                                     &uncompressedLength)) {
++    return NS_ERROR_INVALID_ARG;
++  }
++
++  if (aDestLength < uncompressedLength) {
++    return NS_ERROR_NOT_AVAILABLE;
++  }
++
++  if (!snappy::RawUncompress(aSource + sourceOffset, compressedLength,
++                             aDest)) {
++    return NS_ERROR_INVALID_ARG;
++  }
++
++  // TODO: check CRC32C (different from zlib) of uncompressed data
++
++  *aBytesWrittenOut = uncompressedLength;
++  *aBytesReadOut = sourceOffset + compressedLength;
++
++  return NS_OK;
++}
++
++// static
++nsresult
++SnappyFrameUtils::ParseHeader(const char* aSource, size_t aSourceLength,
++                              ChunkType* aTypeOut, size_t* aDataLengthOut)
++{
++  if (aSourceLength < kHeaderLength) {
++    return NS_ERROR_NOT_AVAILABLE;
++  }
++
++  *aTypeOut = ReadChunkType(aSource[0]);
++
++  *aDataLengthOut = 0;
++  *aDataLengthOut += aSource[1];
++  *aDataLengthOut += aSource[2] << 8;
++  *aDataLengthOut += aSource[3] << 16;
++
++  return NS_OK;
++}
++
++// static
++size_t
++SnappyFrameUtils::MaxCompressedBufferLength(size_t aSourceLength)
++{
++  size_t neededLength = 1; // chunk type
++  neededLength += 3;         // chunk length
++  neededLength += 4;         // crc32
++  neededLength += snappy::MaxCompressedLength(aSourceLength);
++  return neededLength;
++}
++
++} // namespace cache
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/cache/SnappyFrameUtils.h b/dom/cache/SnappyFrameUtils.h
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/SnappyFrameUtils.h
+@@ -0,0 +1,62 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_cache_SnappyFrameUtils_h
++#define mozilla_dom_cache_SnappyFrameUtils_h
++
++#include "mozilla/Attributes.h"
++#include "nsError.h"
++
++namespace mozilla {
++namespace dom {
++namespace cache {
++
++class SnappyFrameUtils MOZ_FINAL
++{
++public:
++  enum ChunkType
++  {
++    StreamIdentifier,
++    CompressedData,
++    UncompressedData,
++    Padding,
++    Reserved,
++    ChunkTypeCount
++  };
++
++  static const size_t kHeaderLength = 4;
++
++  static nsresult
++  WriteStreamIdentifier(char* aDest, size_t aDestLength,
++                        size_t* aBytesWrittenOut);
++
++  static nsresult
++  Compress(char* aDest, size_t aDestLength,
++           const char* aSource, size_t aSourceLength,
++           size_t* aBytesWrittenOut);
++
++  static nsresult
++  Uncompress(char* aDest, size_t aDestLength,
++             const char* aSource, size_t aSourceLength,
++             size_t* aBytesWrittenOut, size_t* aBytesReadOut);
++
++  static nsresult
++  ParseHeader(const char* aSource, size_t aSourceLength, ChunkType* aTypeOut,
++              size_t* aDataLengthOut);
++
++  static size_t
++  MaxCompressedBufferLength(size_t aSourceLength);
++
++private:
++  SnappyFrameUtils() MOZ_DELETE;
++  ~SnappyFrameUtils() MOZ_DELETE;
++};
++
++} // namespace cache
++} // namespace dom
++} // namespace mozilla
++
++#endif // mozilla_dom_cache_SnappyFrameUtils_h
 diff --git a/dom/cache/SnappyUncompressInputStream.cpp b/dom/cache/SnappyUncompressInputStream.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/SnappyUncompressInputStream.cpp
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,185 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -328,43 +871,142 @@ new file mode 100644
 +
 +#include "mozilla/dom/cache/SnappyUncompressInputStream.h"
 +
++#include "mozilla/dom/cache/SnappyFrameUtils.h"
++#include "nsStreamUtils.h"
 +#include "snappy/snappy.h"
 +
 +namespace mozilla {
 +namespace dom {
 +namespace cache {
 +
++NS_IMPL_ISUPPORTS(mozilla::dom::cache::SnappyUncompressInputStream,
++                  nsIInputStream);
++
 +// static
 +const size_t
 +SnappyUncompressInputStream::kMaxBlockSize = snappy::kBlockSize;
 +
-+NS_IMPL_ISUPPORTS(mozilla::dom::cache::SnappyUncompressInputStream,
-+                  nsIInputStream);
++SnappyUncompressInputStream::SnappyUncompressInputStream(
++                                                    nsIInputStream* aBaseStream)
++  : mBaseStream(aBaseStream)
++  , mBufferFillSize(0)
++  , mNextByte(0)
++  , mCompressedBufferLength(0)
++{
++}
++
++// static
++size_t
++SnappyUncompressInputStream::BlockSize()
++{
++  return SnappyFrameUtils::MaxCompressedBufferLength(kMaxBlockSize);
++}
 +
 +NS_IMETHODIMP
 +SnappyUncompressInputStream::Close()
 +{
++  if (!mBaseStream) {
++    return NS_OK;
++  }
++
++  mBaseStream->Close();
++  mBaseStream = nullptr;
++
++  mBuffer = nullptr;
++  mCompressedBuffer = nullptr;
++
 +  return NS_OK;
 +}
 +
 +NS_IMETHODIMP
 +SnappyUncompressInputStream::Available(uint64_t* aLengthOut)
 +{
++  if (!mBaseStream) {
++    return NS_BASE_STREAM_CLOSED;
++  }
++
++  *aLengthOut = mBufferFillSize - mNextByte;
 +  return NS_OK;
 +}
 +
 +NS_IMETHODIMP
 +SnappyUncompressInputStream::Read(char* aBuf, uint32_t aCount,
-+                                  uint32_t* aReadCountOut)
++                                  uint32_t* aBytesReadOut)
 +{
-+  return NS_OK;
++  return ReadSegments(NS_CopySegmentToBuffer, aBuf, aCount, aBytesReadOut);
 +}
 +
 +NS_IMETHODIMP
 +SnappyUncompressInputStream::ReadSegments(nsWriteSegmentFun aWriter,
 +                                          void* aClosure, uint32_t aCount,
-+                                          uint32_t* aResultOut)
++                                          uint32_t* aBytesReadOut)
 +{
++  if (!mBaseStream) {
++    return NS_BASE_STREAM_CLOSED;
++  }
++
++  if (!mBuffer) {
++    mBuffer = new (fallible_t()) char[kMaxBlockSize];
++    if (!mBuffer) {
++      return NS_ERROR_OUT_OF_MEMORY;
++    }
++  }
++
++  if (!mCompressedBuffer) {
++    mCompressedBufferLength =
++      SnappyFrameUtils::MaxCompressedBufferLength(kMaxBlockSize);
++    mCompressedBuffer = new (fallible_t()) char[mCompressedBufferLength];
++  }
++
++  nsresult rv;
++
++  while (aCount > 0) {
++    if (mBufferFillSize > 0) {
++      uint32_t remaining = mBufferFillSize - mNextByte;
++      uint32_t numToWrite = std::min(aCount, remaining);
++      uint32_t numWritten;
++      rv = aWriter(this, aClosure, mBuffer.get() + mNextByte, *aBytesReadOut,
++                   numToWrite, &numWritten);
++      if (NS_FAILED(rv) || numWritten < 1) {
++        return NS_OK;
++      }
++
++      *aBytesReadOut += numWritten;
++      mNextByte += numWritten;
++      if (mNextByte >= mBufferFillSize) {
++        mBufferFillSize = 0;
++      }
++
++      continue;
++    }
++
++    // TODO: try to use base stream ReadSegments()
++
++    const uint32_t headerLength = SnappyFrameUtils::kHeaderLength;
++    uint32_t bytesRead;
++    rv = ReadAll(mCompressedBuffer.get(), headerLength, &bytesRead);
++    if (NS_FAILED(rv) || bytesRead < 1) { return rv; }
++
++    SnappyFrameUtils::ChunkType type;
++    size_t dataLength;
++    rv = SnappyFrameUtils::ParseHeader(mCompressedBuffer.get(), headerLength,
++                                       &type, &dataLength);
++    if (NS_FAILED(rv)) { return rv; }
++
++    rv = ReadAll(mCompressedBuffer.get() + headerLength, dataLength, &bytesRead);
++    if (NS_FAILED(rv) || bytesRead < 1) { return rv; }
++
++    size_t numRead;
++    size_t numWritten;
++    rv = SnappyFrameUtils::Uncompress(mBuffer, kMaxBlockSize,
++                                      mCompressedBuffer.get(),
++                                      headerLength + dataLength,
++                                      &numWritten, &numRead);
++    if (NS_FAILED(rv)) { return rv; }
++
++    mBufferFillSize = numWritten;
++  }
++
 +  return NS_OK;
 +}
 +
@@ -375,6 +1017,34 @@ new file mode 100644
 +  return NS_OK;
 +}
 +
++SnappyUncompressInputStream::~SnappyUncompressInputStream()
++{
++  Close();
++}
++
++nsresult
++SnappyUncompressInputStream::ReadAll(char* aBuf, uint32_t aCount,
++                                     uint32_t* aBytesReadOut)
++{
++  if (!mBaseStream) {
++    return NS_BASE_STREAM_CLOSED;
++  }
++
++  uint32_t offset = 0;
++  while (aCount > 0) {
++    uint32_t bytesRead = 0;
++    nsresult rv = mBaseStream->Read(aBuf + offset, aCount, &bytesRead);
++    if (NS_FAILED(rv) || bytesRead < 1) {
++      return rv;
++    }
++    *aBytesReadOut += bytesRead;
++    offset += bytesRead;
++    aCount -= bytesRead;
++  }
++
++  return NS_OK;
++}
++
 +} // namespace cache
 +} // namespace dom
 +} // namespace mozilla
@@ -382,7 +1052,7 @@ diff --git a/dom/cache/SnappyUncompressInputStream.h b/dom/cache/SnappyUncompres
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/SnappyUncompressInputStream.h
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,49 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -392,6 +1062,7 @@ new file mode 100644
 +#ifndef mozilla_dom_cache_SnappyUncompressInputStream_h
 +#define mozilla_dom_cache_SnappyUncompressInputStream_h
 +
++#include "nsAutoPtr.h"
 +#include "nsCOMPtr.h"
 +#include "nsIInputStream.h"
 +#include "nsISupportsImpl.h"
@@ -405,14 +1076,21 @@ new file mode 100644
 +public:
 +  static const size_t kMaxBlockSize;
 +
-+  SnappyUncompressInputStream(nsIInputStream* aBaseStream,
-+                            size_t aBlockSize = kMaxBlockSize);
++  SnappyUncompressInputStream(nsIInputStream* aBaseStream);
++
++  static size_t BlockSize();
 +
 +private:
 +  virtual ~SnappyUncompressInputStream();
 +
++  nsresult ReadAll(char* aBuf, uint32_t aCount, uint32_t* aBytesReadOut);
++
 +  nsCOMPtr<nsIInputStream> mBaseStream;
-+  const size_t mBlockSize;
++  nsAutoArrayPtr<char> mBuffer;
++  size_t mBufferFillSize;
++  size_t mNextByte;
++  nsAutoArrayPtr<char> mCompressedBuffer;
++  size_t mCompressedBufferLength;
 +
 +public:
 +  NS_DECL_THREADSAFE_ISUPPORTS
@@ -427,7 +1105,7 @@ new file mode 100644
 diff --git a/dom/cache/moz.build b/dom/cache/moz.build
 --- a/dom/cache/moz.build
 +++ b/dom/cache/moz.build
-@@ -21,16 +21,18 @@ EXPORTS.mozilla.dom.cache += [
+@@ -21,16 +21,19 @@ EXPORTS.mozilla.dom.cache += [
      'DBAction.h',
      'DBSchema.h',
      'FileUtils.h',
@@ -437,6 +1115,7 @@ diff --git a/dom/cache/moz.build b/dom/cache/moz.build
      'SavedTypes.h',
      'ShutdownObserver.h',
 +    'SnappyCompressOutputStream.h',
++    'SnappyFrameUtils.h',
 +    'SnappyUncompressInputStream.h',
      'Types.h',
      'TypeUtils.h',
@@ -446,7 +1125,7 @@ diff --git a/dom/cache/moz.build b/dom/cache/moz.build
      'Action.cpp',
      'Cache.cpp',
      'CacheChild.cpp',
-@@ -42,16 +44,18 @@ SOURCES += [
+@@ -42,16 +45,19 @@ SOURCES += [
      'CacheStreamControlParent.cpp',
      'Context.cpp',
      'DBAction.cpp',
@@ -456,6 +1135,7 @@ diff --git a/dom/cache/moz.build b/dom/cache/moz.build
      'ReadStream.cpp',
      'ShutdownObserver.cpp',
 +    'SnappyCompressOutputStream.cpp',
++    'SnappyFrameUtils.cpp',
 +    'SnappyUncompressInputStream.cpp',
      'TypeUtils.cpp',
  ]
