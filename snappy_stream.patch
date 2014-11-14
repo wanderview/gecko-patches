@@ -851,7 +851,7 @@ diff --git a/xpcom/io/nsSnappyCompressOutputStream.cpp b/xpcom/io/nsSnappyCompre
 new file mode 100644
 --- /dev/null
 +++ b/xpcom/io/nsSnappyCompressOutputStream.cpp
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,228 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -879,6 +879,13 @@ new file mode 100644
 + , mCompressedBufferLength(0)
 + , mFirstFlush(false)
 +{
++  // This implementation does not support async base streams.
++#ifdef DEBUG
++  bool baseNonBlocking;
++  nsresult rv = mBaseStream->IsNonBlocking(&baseNonBlocking);
++  MOZ_ASSERT(NS_SUCCEEDED(rv));
++  MOZ_ASSERT(!baseNonBlocking);
++#endif
 +}
 +
 +size_t
@@ -895,7 +902,7 @@ new file mode 100644
 +  }
 +
 +  nsresult rv = Flush();
-+  if (NS_FAILED(rv)) { return rv; }
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
 +  mBaseStream->Close();
 +  mBaseStream = nullptr;
@@ -914,8 +921,10 @@ new file mode 100644
 +  }
 +
 +  nsresult rv = FlushToBaseStream();
-+  if (NS_FAILED(rv)) { return rv; }
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
 +  mBaseStream->Flush();
++
 +  return NS_OK;
 +}
 +
@@ -947,16 +956,22 @@ new file mode 100644
 +
 +  if (!mBuffer) {
 +    mBuffer = new (fallible_t()) char[mBlockSize];
-+    if (!mBuffer) {
++    if (NS_WARN_IF(!mBuffer)) {
 +      return NS_ERROR_OUT_OF_MEMORY;
 +    }
 +  }
 +
 +  while (aCount > 0) {
++    // Determine how much space is left in our flat, uncompressed buffer
 +    uint32_t remaining = mBlockSize - mNextByte;
++
++    // If its full, then compress and flush the data to the base stream
 +    if (remaining < 1) {
 +      nsresult rv = FlushToBaseStream();
-+      if (NS_FAILED(rv)) { return rv; }
++      if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++      // Now the entire buffer should be available for copying
++      remaining = mBlockSize - mNextByte;
 +    }
 +
 +    uint32_t numToRead = std::min(remaining, aCount);
@@ -964,7 +979,7 @@ new file mode 100644
 +
 +    nsresult rv = aReader(this, aClosure, mBuffer.get() + mNextByte,
 +                          *aBytesWrittenOut, numToRead, &numRead);
-+    if (NS_FAILED(rv) || numRead < 1) {
++    if (NS_WARN_IF(NS_FAILED(rv)) || numRead < 1) {
 +      return NS_OK;
 +    }
 +
@@ -993,35 +1008,34 @@ new file mode 100644
 +{
 +  MOZ_ASSERT(mBaseStream);
 +
++  // Lazily create the compressed buffer on our first flush.  This
++  // allows us to report OOM during stream operation.  This buffer
++  // will then get re-used until the stream is closed.
 +  if (!mCompressedBuffer) {
 +    mCompressedBufferLength = MaxCompressedBufferLength(mBlockSize);
 +    mCompressedBuffer = new (fallible_t()) char[mCompressedBufferLength];
-+    if (!mCompressedBuffer) {
++    if (NS_WARN_IF(!mCompressedBuffer)) {
 +      return NS_ERROR_OUT_OF_MEMORY;
 +    }
 +  }
 +
++  // The first chunk must be a StreamIdentifier chunk.  Write the out
++  // if we have not done so already.
 +  nsresult rv = MaybeFlushStreamIdentifier();
-+  if (NS_FAILED(rv)) { return rv; }
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
++  // Compress the data to our internal compressed buffer
 +  size_t compressedLength;
 +  rv = WriteCompressedData(mCompressedBuffer.get(), mCompressedBufferLength,
 +                           mBuffer.get(), mNextByte, &compressedLength);
-+  if (NS_FAILED(rv)) { return rv; }
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
 +  mNextByte = 0;
 +
-+  // TODO: factor out write loop into separate method
-+  uint32_t remaining = compressedLength;
-+  uint32_t offset = 0;
-+  while (remaining > 0) {
-+    uint32_t numWritten = 0;
-+    rv = mBaseStream->Write(mCompressedBuffer.get() + offset, remaining,
-+                            &numWritten);
-+    if (NS_FAILED(rv)) { return rv; }
-+    offset += numWritten;
-+    remaining -= numWritten;
-+  }
++  // Write the compressed buffer out to the base stream
++  uint32_t numWritten = 0;
++  rv = WriteAll(mCompressedBuffer.get(), compressedLength, &numWritten);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
 +  return NS_OK;
 +}
@@ -1035,33 +1049,42 @@ new file mode 100644
 +    return NS_OK;
 +  }
 +
-+  mFirstFlush = true;
-+
++  // Build the StreamIdentifier in our compressed buffer
 +  size_t compressedLength;
 +  nsresult rv = WriteStreamIdentifier(mCompressedBuffer.get(),
 +                                      mCompressedBufferLength,
 +                                      &compressedLength);
-+  if (NS_FAILED(rv)) { return rv; }
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
-+  // TODO: factor out write loop into separate method
-+  uint32_t remaining = compressedLength;
++  // Write the compressed buffer out to the base stream
++  uint32_t numWritten = 0;
++  rv = WriteAll(mCompressedBuffer.get(), compressedLength, &numWritten);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  mFirstFlush = true;
++
++  return NS_OK;
++}
++
++nsresult
++nsSnappyCompressOutputStream::WriteAll(const char* aBuf, uint32_t aCount,
++                                       uint32_t* aBytesWrittenOut)
++{
 +  uint32_t offset = 0;
-+  while (remaining > 0) {
++  while (aCount > 0) {
 +    uint32_t numWritten = 0;
-+    rv = mBaseStream->Write(mCompressedBuffer.get() + offset, remaining,
-+                            &numWritten);
-+    if (NS_FAILED(rv)) { return rv; }
++    nsresult rv = mBaseStream->Write(aBuf + offset, aCount, &numWritten);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +    offset += numWritten;
-+    remaining -= numWritten;
++    aCount -= numWritten;
 +  }
-+
 +  return NS_OK;
 +}
 diff --git a/xpcom/io/nsSnappyCompressOutputStream.h b/xpcom/io/nsSnappyCompressOutputStream.h
 new file mode 100644
 --- /dev/null
 +++ b/xpcom/io/nsSnappyCompressOutputStream.h
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,65 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1081,11 +1104,18 @@ new file mode 100644
 +                                   , public nsSnappyFrameUtils
 +{
 +public:
++  // Maximum compression block size.
 +  static const size_t kMaxBlockSize;
 +
++  // Construct a new blocking output stream to compress data to
++  // the given base stream.  The base stream must also be blocking.
++  // The compression block size may optionally be set to a value
++  // up to kMaxBlockSize.
 +  nsSnappyCompressOutputStream(nsIOutputStream* aBaseStream,
 +                               size_t aBlockSize = kMaxBlockSize);
 +
++  // The compression block size.  To optimize stream performance
++  // try to write to the stream in segments at least this size.
 +  size_t BlockSize() const;
 +
 +private:
@@ -1093,13 +1123,25 @@ new file mode 100644
 +
 +  nsresult FlushToBaseStream();
 +  nsresult MaybeFlushStreamIdentifier();
++  nsresult WriteAll(const char* aBuf, uint32_t aCount,
++                    uint32_t* aBytesWrittenOut);
 +
 +  nsCOMPtr<nsIOutputStream> mBaseStream;
 +  const size_t mBlockSize;
-+  uint32_t mNextByte;
++
++  // Buffer holding copied uncompressed data.  This must be copied here
++  // so that the compression can be performed on a single flat buffer.
 +  nsAutoArrayPtr<char> mBuffer;
++
++  // The next byte in the uncompressed data to copy incoming data to.
++  uint32_t mNextByte;
++
++  // Buffer holding the resulting compressed data.
 +  nsAutoArrayPtr<char> mCompressedBuffer;
 +  size_t mCompressedBufferLength;
++
++  // Have we flushed any data to the base stream yet?  If not we will
++  // need to write out a StreamIdentifier chunk.
 +  bool mFirstFlush;
 +
 +public:
@@ -1381,7 +1423,7 @@ diff --git a/xpcom/io/nsSnappyFrameUtils.h b/xpcom/io/nsSnappyFrameUtils.h
 new file mode 100644
 --- /dev/null
 +++ b/xpcom/io/nsSnappyFrameUtils.h
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,77 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1394,6 +1436,16 @@ new file mode 100644
 +#include "mozilla/Attributes.h"
 +#include "nsError.h"
 +
++//
++// Utility to class providing primitives necessary to build streams based
++// on the snappy compressor.  This essentially abstracts the framing format
++// defined in:
++//
++//  other-licences/snappy/src/framing_format.txt
++//
++// NOTE: Currently only the StreamIdentifier and CompressedData chunks are
++//       supported.
++//
 +class nsSnappyFrameUtils
 +{
 +public:
@@ -1453,7 +1505,7 @@ diff --git a/xpcom/io/nsSnappyUncompressInputStream.cpp b/xpcom/io/nsSnappyUncom
 new file mode 100644
 --- /dev/null
 +++ b/xpcom/io/nsSnappyUncompressInputStream.cpp
-@@ -0,0 +1,301 @@
+@@ -0,0 +1,317 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1470,27 +1522,25 @@ new file mode 100644
 +NS_IMPL_ISUPPORTS(nsSnappyUncompressInputStream,
 +                  nsIInputStream);
 +
-+// static
-+const size_t
-+nsSnappyUncompressInputStream::kMaxBlockSize = snappy::kBlockSize;
++static size_t kCompressedBufferLength =
++  nsSnappyFrameUtils::MaxCompressedBufferLength(snappy::kBlockSize);
 +
 +nsSnappyUncompressInputStream::nsSnappyUncompressInputStream(
 +                                                    nsIInputStream* aBaseStream)
 +  : mBaseStream(aBaseStream)
 +  , mBufferFillSize(0)
 +  , mNextByte(0)
-+  , mCompressedBufferLength(0)
 +  , mNextChunkType(Unknown)
 +  , mNextChunkDataLength(0)
 +  , mNeedFirstStreamIdentifier(true)
 +{
-+}
-+
-+// static
-+size_t
-+nsSnappyUncompressInputStream::BlockSize()
-+{
-+  return MaxCompressedBufferLength(kMaxBlockSize);
++  // This implementation does not support async base streams.
++#ifdef DEBUG
++  bool baseNonBlocking;
++  nsresult rv = mBaseStream->IsNonBlocking(&baseNonBlocking);
++  MOZ_ASSERT(NS_SUCCEEDED(rv));
++  MOZ_ASSERT(!baseNonBlocking);
++#endif
 +}
 +
 +NS_IMETHODIMP
@@ -1529,8 +1579,8 @@ new file mode 100644
 +  // be StreamIdentifiers, padding, etc with no data.
 +  uint32_t bytesRead;
 +  do {
-+    nsresult rv = UncompressNextChunk(&bytesRead);
-+    if (NS_FAILED(rv)) { return rv; }
++    nsresult rv = ParseNextChunk(&bytesRead);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +    *aLengthOut = mBufferFillSize - mNextByte;
 +  } while(*aLengthOut < 1 && bytesRead);
 +
@@ -1586,10 +1636,17 @@ new file mode 100644
 +      continue;
 +    }
 +
++    // Otherwise uncompress the next chunk and loop.  Any resulting data
++    // will set mBufferFillSize which we check at the top of the loop.
 +    uint32_t bytesRead;
-+    rv = UncompressNextChunk(&bytesRead);
++    rv = ParseNextChunk(&bytesRead);
 +    if (NS_FAILED(rv)) { return rv; }
-+    if (bytesRead < 1 && mBufferFillSize < 1) { return NS_OK; }
++
++    // If we couldn't read anything and there is no more data to provide
++    // to the caller, then this is eof.
++    if (bytesRead < 1 && mBufferFillSize < 1) {
++      return NS_OK;
++    }
 +  }
 +
 +  return NS_OK;
@@ -1608,125 +1665,138 @@ new file mode 100644
 +}
 +
 +nsresult
-+nsSnappyUncompressInputStream::UncompressNextChunk(uint32_t* aBytesReadOut)
++nsSnappyUncompressInputStream::ParseNextChunk(uint32_t* aBytesReadOut)
 +{
++  // There must not be any uncompressed data already in mBuffer.
++  MOZ_ASSERT(mBufferFillSize < 1);
++  MOZ_ASSERT(mNextByte < 1);
++
 +  nsresult rv;
 +  *aBytesReadOut = 0;
 +
-+  uint64_t avail;
-+  rv = mBaseStream->Available(&avail);
-+  if (NS_FAILED(rv)) { return rv; }
-+  if (avail < 1) {
-+    return NS_OK;
-+  }
-+
++  // Lazily create our two buffers so we can report OOM during stream
++  // operation.  These allocations only happens once.  The buffers are reused
++  // until the stream is closed.
 +  if (!mBuffer) {
-+    mBuffer = new (fallible_t()) char[kMaxBlockSize];
-+    if (!mBuffer) {
++    mBuffer = new (fallible_t()) char[snappy::kBlockSize];
++    if (NS_WARN_IF(!mBuffer)) {
 +      return NS_ERROR_OUT_OF_MEMORY;
 +    }
 +  }
 +
 +  if (!mCompressedBuffer) {
-+    mCompressedBufferLength = MaxCompressedBufferLength(kMaxBlockSize);
-+    mCompressedBuffer = new (fallible_t()) char[mCompressedBufferLength];
-+    if (!mCompressedBuffer) {
++    mCompressedBuffer = new (fallible_t()) char[kCompressedBufferLength];
++    if (NS_WARN_IF(!mCompressedBuffer)) {
 +      return NS_ERROR_OUT_OF_MEMORY;
 +    }
 +  }
 +
 +  // We have no decompressed data and we also have not seen the start of stream
-+  // yet.
++  // yet. Read and validate the StreamIdentifier chunk.  Also read the next
++  // header to determine the size of the first real data chunk.
 +  if (mNeedFirstStreamIdentifier) {
 +    const uint32_t firstReadLength = kHeaderLength +
 +                                     kStreamIdentifierDataLength +
 +                                     kHeaderLength;
++    MOZ_ASSERT(firstReadLength <= kCompressedBufferLength);
 +
 +    rv = ReadAll(mCompressedBuffer.get(), firstReadLength, aBytesReadOut);
-+    if (NS_FAILED(rv) || *aBytesReadOut < 1) { return rv; }
-+    if (*aBytesReadOut < firstReadLength) { return NS_ERROR_INVALID_ARG; }
++    if (NS_WARN_IF(NS_FAILED(rv)) || *aBytesReadOut < 1) { return rv; }
++    if (NS_WARN_IF(*aBytesReadOut < firstReadLength)) {
++      return NS_ERROR_CORRUPTED_CONTENT;
++    }
 +
 +    rv = ParseHeader(mCompressedBuffer.get(), kHeaderLength,
 +                     &mNextChunkType, &mNextChunkDataLength);
-+    if (NS_FAILED(rv)) { return rv; }
-+    if (mNextChunkType != StreamIdentifier ||
-+        mNextChunkDataLength != kStreamIdentifierDataLength) {
-+      return NS_ERROR_INVALID_ARG;
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++    if (NS_WARN_IF(mNextChunkType != StreamIdentifier ||
++                   mNextChunkDataLength != kStreamIdentifierDataLength)) {
++      return NS_ERROR_CORRUPTED_CONTENT;
 +    }
 +    size_t offset = kHeaderLength;
 +
++    mNeedFirstStreamIdentifier = false;
++
 +    size_t numRead;
 +    size_t numWritten;
-+    rv = ParseData(mBuffer, kMaxBlockSize, mNextChunkType,
++    rv = ParseData(mBuffer, snappy::kBlockSize, mNextChunkType,
 +                   mCompressedBuffer.get() + offset,
 +                   mNextChunkDataLength, &numWritten, &numRead);
-+    if (NS_FAILED(rv)) { return rv; }
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +    MOZ_ASSERT(numWritten == 0);
 +    MOZ_ASSERT(numRead == mNextChunkDataLength);
 +    offset += numRead;
 +
 +    rv = ParseHeader(mCompressedBuffer.get() + offset, *aBytesReadOut - offset,
 +                     &mNextChunkType, &mNextChunkDataLength);
-+    if (NS_FAILED(rv)) { return rv; }
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
 +    return NS_OK;
 +  }
 +
-+  // We have no compressed data and we have no header length.  This happens
-+  // when we get an EOF pause in the middle of a stream and at the end of
-+  // the stream.
++  // We have no compressed data and we don't know how big the next chunk is.
++  // This happens when we get an EOF pause in the middle of a stream and also
++  // at the end of the stream.  Simply read the next header and return.  The
++  // chunk body will be read on the next entry into this method.
 +  if (mNextChunkType == Unknown) {
 +    rv = ReadAll(mCompressedBuffer.get(), kHeaderLength, aBytesReadOut);
-+    if (NS_FAILED(rv) || *aBytesReadOut < 1) { return rv; }
-+    if (*aBytesReadOut < kHeaderLength) { return NS_ERROR_INVALID_ARG; }
++    if (NS_WARN_IF(NS_FAILED(rv)) || *aBytesReadOut < 1) { return rv; }
++    if (NS_WARN_IF(*aBytesReadOut < kHeaderLength)) {
++      return NS_ERROR_CORRUPTED_CONTENT;
++    }
 +
 +    rv = ParseHeader(mCompressedBuffer.get(), kHeaderLength,
 +                     &mNextChunkType, &mNextChunkDataLength);
-+    if (NS_FAILED(rv)) { return rv; }
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
 +    return NS_OK;
 +  }
 +
-+  // We have no decompressed data, but we do know we are in the middle of
-+  // reading a compressed data chunk.  Try to read both the current compressed
-+  // data and the next chunk header at the same time.  This avoids excess small
-+  // reads for the headers.
++  // We have no decompressed data, but we do know the size of the next chunk.
++  // Read at least that much from the base stream.
 +  uint32_t readLength = mNextChunkDataLength;
++  MOZ_ASSERT(readLength <= kCompressedBufferLength);
 +
-+  // But only read the next header if the underlying stream has enough data
-+  // available.  This avoids blocking the current chunk potentially long
-+  // periods.
++  // However, if there is enough data in the base stream, also read the next
++  // chunk header.  This helps optimize the stream by avoiding many small reads.
++  uint64_t avail;
++  rv = mBaseStream->Available(&avail);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +  if (avail >= (readLength + kHeaderLength)) {
 +    readLength += kHeaderLength;
++    MOZ_ASSERT(readLength <= kCompressedBufferLength);
 +  }
 +
 +  rv = ReadAll(mCompressedBuffer.get(), readLength, aBytesReadOut);
-+  if (NS_FAILED(rv) || *aBytesReadOut < 1) { return rv; }
-+  if (*aBytesReadOut < mNextChunkDataLength) { return NS_ERROR_INVALID_ARG; }
++  if (NS_WARN_IF(NS_FAILED(rv)) || *aBytesReadOut < 1) { return rv; }
++  if (NS_WARN_IF(*aBytesReadOut < mNextChunkDataLength)) {
++    return NS_ERROR_CORRUPTED_CONTENT;
++  }
 +
 +  size_t numRead;
 +  size_t numWritten;
-+  rv = ParseData(mBuffer, kMaxBlockSize, mNextChunkType,
++  rv = ParseData(mBuffer, snappy::kBlockSize, mNextChunkType,
 +                 mCompressedBuffer.get(), mNextChunkDataLength,
 +                 &numWritten, &numRead);
-+  if (NS_FAILED(rv)) { return rv; }
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +  MOZ_ASSERT(numRead == mNextChunkDataLength);
 +
 +  mBufferFillSize = numWritten;
 +
-+  // This is the end of the stream.  Mark the chunk type unknown to trigger
-+  // one last read which will in turn return 0 bytes and cause an exit.
++  // If we were unable to directly read the next chunk header, then clear
++  // our internal state.  We will have to perform a small read to get the
++  // header the next time we enter this method.
 +  if (*aBytesReadOut <= mNextChunkDataLength) {
 +    mNextChunkType = Unknown;
 +    mNextChunkDataLength = 0;
 +    return NS_OK;
 +  }
 +
-+  // Parse the next chunk header so that we are ready to decompress the data
-+  // once the current batch has been consumed.
++  // We got the next chunk header.  Parse it so that we are ready to for the
++  // next call into this method.
 +  rv = ParseHeader(mCompressedBuffer.get() + numRead, *aBytesReadOut - numRead,
 +                   &mNextChunkType, &mNextChunkDataLength);
-+  if (NS_FAILED(rv)) { return rv; }
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
 +  return NS_OK;
 +}
@@ -1745,9 +1815,7 @@ new file mode 100644
 +  while (aCount > 0) {
 +    uint32_t bytesRead = 0;
 +    nsresult rv = mBaseStream->Read(aBuf + offset, aCount, &bytesRead);
-+    if (NS_FAILED(rv) || bytesRead < 1) {
-+      return rv;
-+    }
++    if (NS_WARN_IF(NS_FAILED(rv)) || bytesRead < 1) { return rv; }
 +    *aBytesReadOut += bytesRead;
 +    offset += bytesRead;
 +    aCount -= bytesRead;
@@ -1759,7 +1827,7 @@ diff --git a/xpcom/io/nsSnappyUncompressInputStream.h b/xpcom/io/nsSnappyUncompr
 new file mode 100644
 --- /dev/null
 +++ b/xpcom/io/nsSnappyUncompressInputStream.h
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,71 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1779,27 +1847,50 @@ new file mode 100644
 +                                    , public nsSnappyFrameUtils
 +{
 +public:
-+  static const size_t kMaxBlockSize;
-+
++  // Construct a new blocking stream to uncompress the given base stream.  The
++  // base stream must also be blocking.  The base stream does not have to be
++  // buffered.
 +  nsSnappyUncompressInputStream(nsIInputStream* aBaseStream);
-+
-+  // TODO: remove block size
-+  static size_t BlockSize();
 +
 +private:
 +  virtual ~nsSnappyUncompressInputStream();
 +
-+  nsresult UncompressNextChunk(uint32_t* aBytesReadOut);
++  // Parse the next chunk of data.  This may populate mBuffer and set
++  // mBufferFillSize.  This should not be called when mBuffer already
++  // contains data.
++  nsresult ParseNextChunk(uint32_t* aBytesReadOut);
++
++  // Convenience routine to Read() from the base stream until we get
++  // the given number of bytes or reach EOF.
 +  nsresult ReadAll(char* aBuf, uint32_t aCount, uint32_t* aBytesReadOut);
 +
 +  nsCOMPtr<nsIInputStream> mBaseStream;
-+  nsAutoArrayPtr<char> mBuffer;
-+  size_t mBufferFillSize;
-+  size_t mNextByte;
++
++  // Buffer to hold compressed data.  Must copy here since we need a large
++  // flat buffer to run the uncompress process on. Always the same length
++  // of nsSnappyFrameUtils::MaxCompressedBufferLength(snappy::kBlockSize)
++  // bytes long.
 +  nsAutoArrayPtr<char> mCompressedBuffer;
-+  size_t mCompressedBufferLength;
++
++  // Buffer storing the resulting uncompressed data.  Exactly snappy::kBlockSize
++  // bytes long.
++  nsAutoArrayPtr<char> mBuffer;
++
++  // Number of bytes of uncompressed data in mBuffer.
++  size_t mBufferFillSize;
++
++  // Next byte of mBuffer to return in ReadSegments().  Must be less than
++  // mBufferFillSize
++  size_t mNextByte;
++
++  // Next chunk in the stream that has been parsed during read-ahead.
 +  ChunkType mNextChunkType;
++
++  // Length of next chunk's length that has been determined during read-ahead.
 +  size_t mNextChunkDataLength;
++
++  // The stream must begin with a StreamIdentifier chunk.  Are we still
++  // expecting it?
 +  bool mNeedFirstStreamIdentifier;
 +
 +public:
@@ -1808,6 +1899,216 @@ new file mode 100644
 +};
 +
 +#endif // nsSnappyUncompressInputStream_h__
+diff --git a/xpcom/tests/gtest/TestSnappyStreams.cpp b/xpcom/tests/gtest/TestSnappyStreams.cpp
+new file mode 100644
+--- /dev/null
++++ b/xpcom/tests/gtest/TestSnappyStreams.cpp
+@@ -0,0 +1,187 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "gtest/gtest.h"
++#include "nsIPipe.h"
++#include "nsSnappyCompressOutputStream.h"
++#include "nsSnappyUncompressInputStream.h"
++#include "nsStreamUtils.h"
++#include "nsString.h"
++#include "nsTArray.h"
++#include "prrng.h"
++
++namespace {
++
++static void CreateData(uint32_t aNumBytes, nsTArray<char>& aDataOut)
++{
++  static const char* dataSets[] =
++  {
++    "foobar",
++    "snafu",
++    "hello world",
++    "beep beep boop",
++    "0123456789",
++    "9876543210"
++  };
++  static const uint32_t numDataSets = sizeof(dataSets) / sizeof(const char*);
++
++  aDataOut.SetLength(aNumBytes);
++
++  uint32_t offset = 0;
++  while (aNumBytes > 0) {
++    uint8_t setIndex;
++    size_t randomSize = PR_GetRandomNoise(&setIndex, sizeof(setIndex));
++    ASSERT_EQ(sizeof(setIndex), randomSize);
++    setIndex %= numDataSets;
++
++    const char* dataSet = dataSets[setIndex];
++    uint32_t dataSetLength = strlen(dataSet);
++
++    for (uint32_t i = 0; i < dataSetLength && aNumBytes > 0; ++i) {
++      aDataOut[offset] = dataSet[i];
++      offset += 1;
++      aNumBytes -= 1;
++    }
++  }
++}
++
++static void
++WriteAllAndClose(nsIOutputStream* aStream, const nsTArray<char>& aData)
++{
++  uint32_t offset = 0;
++  uint32_t remaining = aData.Length();
++  while (remaining > 0) {
++    uint32_t numWritten;
++    nsresult rv = aStream->Write(aData.Elements() + offset, remaining,
++                                 &numWritten);
++    ASSERT_TRUE(NS_SUCCEEDED(rv));
++    if (numWritten < 1) {
++      break;
++    }
++    offset += numWritten;
++    remaining -= numWritten;
++  }
++  aStream->Close();
++}
++
++static already_AddRefed<nsIOutputStream>
++CompressPipe(nsIInputStream** aReaderOut)
++{
++  nsCOMPtr<nsIOutputStream> pipeWriter;
++
++  nsresult rv = NS_NewPipe(aReaderOut, getter_AddRefs(pipeWriter));
++  if (NS_FAILED(rv)) { return nullptr; }
++
++  nsCOMPtr<nsIOutputStream> compress =
++    new nsSnappyCompressOutputStream(pipeWriter);
++  return compress.forget();
++}
++
++// Verify the given number of bytes compresses to a smaller number of bytes.
++static void TestCompress(uint32_t aNumBytes)
++{
++  // Don't permit this test on small data sizes as snappy can slightly
++  // bloat very small content.
++  ASSERT_GT(aNumBytes, 1024u);
++
++  nsCOMPtr<nsIInputStream> pipeReader;
++  nsCOMPtr<nsIOutputStream> compress = CompressPipe(getter_AddRefs(pipeReader));
++  ASSERT_TRUE(compress);
++
++  nsTArray<char> inputData;
++  CreateData(aNumBytes, inputData);
++
++  WriteAllAndClose(compress, inputData);
++
++  nsAutoCString outputData;
++  nsresult rv = NS_ConsumeStream(pipeReader, UINT32_MAX, outputData);
++  ASSERT_TRUE(NS_SUCCEEDED(rv));
++
++  ASSERT_LT(outputData.Length(), inputData.Length());
++}
++
++// Verify that the given number of bytes can be compressed and uncompressed
++// successfully.
++static void TestCompressUncompress(uint32_t aNumBytes)
++{
++  nsCOMPtr<nsIInputStream> pipeReader;
++  nsCOMPtr<nsIOutputStream> compress = CompressPipe(getter_AddRefs(pipeReader));
++  ASSERT_TRUE(compress);
++
++  nsCOMPtr<nsIInputStream> uncompress =
++    new nsSnappyUncompressInputStream(pipeReader);
++
++  nsTArray<char> inputData;
++  CreateData(aNumBytes, inputData);
++
++  WriteAllAndClose(compress, inputData);
++
++  nsAutoCString outputData;
++  nsresult rv = NS_ConsumeStream(uncompress, UINT32_MAX, outputData);
++  ASSERT_TRUE(NS_SUCCEEDED(rv));
++
++  ASSERT_EQ(inputData.Length(), outputData.Length());
++  for (uint32_t i = 0; i < inputData.Length(); ++i) {
++    EXPECT_EQ(inputData[i], outputData.get()[i]) << "Byte " << i;
++  }
++}
++
++} // anonymous namespace
++
++TEST(SnappyStream, Compress_32k)
++{
++  TestCompress(32 * 1024);
++}
++
++TEST(SnappyStream, Compress_64k)
++{
++  TestCompress(64 * 1024);
++}
++
++TEST(SnappyStream, Compress_128k)
++{
++  TestCompress(128 * 1024);
++}
++
++TEST(SnappyStream, CompressUncompress_0)
++{
++  TestCompressUncompress(0);
++}
++
++TEST(SnappyStream, CompressUncompress_1)
++{
++  TestCompressUncompress(1);
++}
++
++TEST(SnappyStream, CompressUncompress_32)
++{
++  TestCompressUncompress(32);
++}
++
++TEST(SnappyStream, CompressUncompress_1k)
++{
++  TestCompressUncompress(1024);
++}
++
++TEST(SnappyStream, CompressUncompress_32k)
++{
++  TestCompressUncompress(32 * 1024);
++}
++
++TEST(SnappyStream, CompressUncompress_64k)
++{
++  TestCompressUncompress(64 * 1024);
++}
++
++TEST(SnappyStream, CompressUncompress_128k)
++{
++  TestCompressUncompress(128 * 1024);
++}
++
++TEST(SnappyStream, CompressUncompress_256k)
++{
++  TestCompressUncompress(256 * 1024);
++}
+diff --git a/xpcom/tests/gtest/moz.build b/xpcom/tests/gtest/moz.build
+new file mode 100644
+--- /dev/null
++++ b/xpcom/tests/gtest/moz.build
+@@ -0,0 +1,13 @@
++# -*- Mode: python; c-basic-offset: 4; indent-tabs-mode: nil; tab-width: 40 -*-
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++UNIFIED_SOURCES += [
++    'TestSnappyStreams.cpp',
++]
++
++FINAL_LIBRARY = 'xul-gtest'
++
++FAIL_ON_WARNINGS = True
 diff --git a/xpcom/tests/moz.build b/xpcom/tests/moz.build
 --- a/xpcom/tests/moz.build
 +++ b/xpcom/tests/moz.build
