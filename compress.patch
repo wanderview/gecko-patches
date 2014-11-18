@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent 9d38d76a1f8674888a87a86c53bb60830bcd4e79
+# Parent 976fcc3db8c37bed2a609de5063b3956924837f8
 # User Ben Kelly <ben@wanderview.com>
 Compress Cache body data.
 
@@ -31,28 +31,7 @@ diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
  namespace cache {
  
  using mozilla::dom::quota::FileInputStream;
-@@ -45,16 +47,20 @@ FileUtils::BodyCreateDir(nsIFile* aBaseD
-     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
-   } else {
-     bool isDir;
-     rv = aBodyDir->IsDirectory(&isDir);
-     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
-     if (NS_WARN_IF(!isDir)) { return NS_ERROR_FILE_NOT_DIRECTORY; }
-   }
- 
-+  nsAutoCString path;
-+  aBodyDir->GetNativePath(path);
-+  printf_stderr("### ### Body dir: %s\n", path.get());
-+
-   return rv;
- }
- 
- // static
- nsresult
- FileUtils::BodyGetCacheDir(nsIFile* aBaseDir, const nsID& aId,
-                            nsIFile** aCacheDirOut)
- {
-@@ -177,36 +183,24 @@ FileUtils::BodyStartWriteStream(const ns
+@@ -177,38 +179,24 @@ FileUtils::BodyStartWriteStream(const ns
    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
    if (NS_WARN_IF(exists)) { return NS_ERROR_FILE_ALREADY_EXISTS; }
  
@@ -63,7 +42,9 @@ diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
  
 -  // By default we would prefer to just use ReadSegments to copy buffers.
 -  nsAsyncCopyMode mode = NS_ASYNCCOPY_VIA_READSEGMENTS;
--
++  nsRefPtr<nsSnappyCompressOutputStream> compressed =
++    new nsSnappyCompressOutputStream(fileStream);
+ 
 -  // But first we must check to see if the source stream provides ReadSegments.
 -  // If it does not, use a buffered output stream to write to the file.  We don't
 -  // wrap the input because because that can lead to it being closed on the wrong
@@ -76,24 +57,25 @@ diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
 -    fileStream = buffered.forget();
 -    mode = NS_ASYNCCOPY_VIA_WRITESEGMENTS;
 -  }
-+  nsRefPtr<nsSnappyCompressOutputStream> compressed =
-+    new nsSnappyCompressOutputStream(fileStream);
- 
-   // Note, we cannot auto-close the source stream here because some of
-   // our source streams must be closed on the PBackground worker thread.
+-
+-  // Note, we cannot auto-close the source stream here because some of
+-  // our source streams must be closed on the PBackground worker thread.
 -  rv = NS_AsyncCopy(aSource, fileStream, NS_GetCurrentThread(), mode,
 -                    4096, // chunk size
 +  rv = NS_AsyncCopy(aSource, compressed, NS_GetCurrentThread(),
 +                    NS_ASYNCCOPY_VIA_WRITESEGMENTS,
 +                    compressed->BlockSize(),
                      aCallback, aClosure,
-                     false, true, // close streams
+-                    false, true, // close streams
++                    true, true, // close streams
                      aCopyContextOut);
    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
  
    return rv;
  }
  
+ // static
+ void
 diff --git a/dom/cache/ReadStream.cpp b/dom/cache/ReadStream.cpp
 --- a/dom/cache/ReadStream.cpp
 +++ b/dom/cache/ReadStream.cpp
@@ -115,52 +97,7 @@ diff --git a/dom/cache/ReadStream.cpp b/dom/cache/ReadStream.cpp
  using mozilla::void_t;
  using mozilla::dom::cache::CacheStreamControlChild;
  using mozilla::dom::cache::CacheStreamControlParent;
-@@ -50,16 +51,21 @@ public:
-     mControl->AddListener(this);
-   }
- 
-   virtual ~ReadStreamChild()
-   {
-     NoteClosed();
-   }
- 
-+  virtual void NoteAutoClosed() MOZ_OVERRIDE
-+  {
-+    NoteClosed();
-+  }
-+
-   virtual void NoteClosed() MOZ_OVERRIDE
-   {
-     if (mClosed) {
-       return;
-     }
- 
-     mClosed = true;
-     mControl->RemoveListener(this);
-@@ -118,16 +124,22 @@ public:
-     mControl->AddListener(this);
-   }
- 
-   virtual ~ReadStreamParent()
-   {
-     NoteClosed();
-   }
- 
-+  virtual void NoteAutoClosed() MOZ_OVERRIDE
-+  {
-+    // Do not auto-close on parent side since we need to close on a specific
-+    // thread.
-+  }
-+
-   virtual void NoteClosed() MOZ_OVERRIDE
-   {
-     if (mClosed) {
-       return;
-     }
- 
-     mClosed = true;
-     mControl->RemoveListener(this);
-@@ -316,81 +328,85 @@ bool
+@@ -352,16 +353,17 @@ bool
  ReadStream::MatchId(const nsID& aId)
  {
    return mId.Equals(aId);
@@ -170,22 +107,18 @@ diff --git a/dom/cache/ReadStream.cpp b/dom/cache/ReadStream.cpp
    : mId(aId)
    , mStream(aStream)
 +  , mSnappyStream(new nsSnappyUncompressInputStream(aStream))
+   , mThread(NS_GetCurrentThread())
    , mClosed(false)
  {
    MOZ_ASSERT(mStream);
-+
  }
  
  ReadStream::~ReadStream()
  {
- }
- 
- NS_IMETHODIMP
- ReadStream::Close()
+@@ -410,62 +412,64 @@ ReadStream::Close()
  {
    NoteClosed();
--  return mStream->Close();
-+  return mSnappyStream->Close();
+   return mStream->Close();
  }
  
  NS_IMETHODIMP
@@ -195,8 +128,7 @@ diff --git a/dom/cache/ReadStream.cpp b/dom/cache/ReadStream.cpp
 +  nsresult rv = mSnappyStream->Available(aNumAvailableOut);
  
    if (NS_FAILED(rv)) {
--    NoteClosed();
-+    NoteAutoClosed();
+     NoteClosed();
    }
  
    return rv;
@@ -214,10 +146,9 @@ diff --git a/dom/cache/ReadStream.cpp b/dom/cache/ReadStream.cpp
    // this stream on a particular thread in the parent case.
  
 -  if (NS_FAILED(rv) && rv != NS_BASE_STREAM_WOULD_BLOCK) {
--    NoteClosed();
 +  if ((NS_FAILED(rv) && rv != NS_BASE_STREAM_WOULD_BLOCK) ||
 +      *aNumReadOut == 0) {
-+    NoteAutoClosed();
+     NoteClosed();
    }
  
    return rv;
@@ -238,10 +169,9 @@ diff --git a/dom/cache/ReadStream.cpp b/dom/cache/ReadStream.cpp
  
 -  if (NS_FAILED(rv) && rv != NS_BASE_STREAM_WOULD_BLOCK &&
 -                       rv != NS_ERROR_NOT_IMPLEMENTED) {
--    NoteClosed();
 +  if ((NS_FAILED(rv) && rv != NS_BASE_STREAM_WOULD_BLOCK &&
-+                       rv != NS_ERROR_NOT_IMPLEMENTED) || *aNumReadOut == 0) {
-+    NoteAutoClosed();
++                        rv != NS_ERROR_NOT_IMPLEMENTED) || *aNumReadOut == 0) {
+     NoteClosed();
    }
  
    return rv;
@@ -260,18 +190,7 @@ diff --git a/dom/cache/ReadStream.cpp b/dom/cache/ReadStream.cpp
 diff --git a/dom/cache/ReadStream.h b/dom/cache/ReadStream.h
 --- a/dom/cache/ReadStream.h
 +++ b/dom/cache/ReadStream.h
-@@ -49,26 +49,28 @@ public:
-   // CacheStreamControlListener methods
-   virtual void CloseStream() MOZ_OVERRIDE;
-   virtual bool MatchId(const nsID& aId) MOZ_OVERRIDE;
- 
- protected:
-   ReadStream(const nsID& aId, nsIInputStream* aStream);
-   virtual ~ReadStream();
- 
-+  virtual void NoteAutoClosed()=0;
-   virtual void NoteClosed()=0;
-   virtual void Forget()=0;
+@@ -63,16 +63,17 @@ protected:
    virtual void SerializeControl(PCacheReadStream* aReadStreamOut)=0;
  
    virtual void
@@ -281,11 +200,11 @@ diff --git a/dom/cache/ReadStream.h b/dom/cache/ReadStream.h
    const nsID mId;
    nsCOMPtr<nsIInputStream> mStream;
 +  nsCOMPtr<nsIInputStream> mSnappyStream;
+   nsCOMPtr<nsIThread> mThread;
    bool mClosed;
  
  public:
-   NS_DECLARE_STATIC_IID_ACCESSOR(NS_DOM_CACHE_IID);
+   class NoteClosedRunnable;
+   class ForgetRunnable;
  
-   NS_DECL_THREADSAFE_ISUPPORTS
-   NS_DECL_NSIINPUTSTREAM
- };
+   NS_DECLARE_STATIC_IID_ACCESSOR(NS_DOM_CACHE_IID);
