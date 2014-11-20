@@ -1,0 +1,312 @@
+# HG changeset patch
+# Parent 25519f7f4fb91b26498a53548f3d681b4138a60d
+# User Ben Kelly <ben@wanderview.com>
+Implement Cache Add()/AddAll().
+
+
+diff --git a/dom/cache/FetchPut.cpp b/dom/cache/FetchPut.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/FetchPut.cpp
+@@ -0,0 +1,168 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "mozilla/dom/cache/FetchPut.h"
++
++#include "mozilla/dom/Fetch.h"
++#include "mozilla/dom/Promise.h"
++#include "mozilla/dom/PromiseNativeHandler.h"
++#include "mozilla/dom/Request.h"
++#include "mozilla/dom/ResponseBinding.h"
++#include "mozilla/dom/UnionTypes.h"
++
++namespace mozilla {
++namespace dom {
++namespace cache {
++
++class FetchPut::PromiseHandler MOZ_FINAL : public PromiseNativeHandler
++{
++public:
++  PromiseHandler(FetchPut* aFetchPut, Promise* aPromise)
++    : mFetchPut(aFetchPut)
++    , mPromise(aPromise)
++  {
++    MOZ_ASSERT(mFetchPut);
++    MOZ_ASSERT(mPromise);
++  }
++
++  virtual void ResolvedCallback(JSContext* aCx,
++                                JS::Handle<JS::Value> aValue) MOZ_OVERRIDE {
++    JS::Rooted<JSObject*> obj(aCx, &aValue.toObject());
++    if (!obj) {
++      mFetchPut->FetchRejected(mPromise);
++      return;
++    }
++    Response* response;
++    UNWRAP_OBJECT(Response, obj, response);
++    if (!response) {
++      mFetchPut->FetchRejected(mPromise);
++      return;
++    }
++
++    mFetchPut->FetchResolved(mPromise, response);
++  }
++
++  virtual void RejectedCallback(JSContext* aCx,
++                                JS::Handle<JS::Value> aValue) MOZ_OVERRIDE {
++    // TODO: pass on rejected error code
++    mFetchPut->FetchRejected(mPromise);
++  }
++
++private:
++  virtual ~PromiseHandler() { }
++
++  nsRefPtr<FetchPut> mFetchPut;
++  nsRefPtr<Promise> mPromise;
++
++public:
++  NS_DECL_ISUPPORTS_INHERITED
++};
++
++NS_IMPL_ISUPPORTS_INHERITED0(mozilla::dom::cache::FetchPut::PromiseHandler,
++                             PromiseNativeHandler);
++
++// static
++already_AddRefed<FetchPut>
++FetchPut::Create(Owner* aOwner, RequestId aRequestId,
++                        const RequestOrScalarValueString& aRequest,
++                        ErrorResult& aRv)
++{
++  Sequence<OwningRequestOrScalarValueString> seq;
++  OwningRequestOrScalarValueString* elem = seq.AppendElement();
++  if (aRequest.IsRequest()) {
++    elem->SetAsRequest() = aRequest.GetAsRequest();
++  } else {
++    MOZ_ASSERT(aRequest.IsScalarValueString());
++    elem->SetAsScalarValueString() = aRequest.GetAsScalarValueString();
++  }
++  return Create(aOwner, aRequestId, seq, aRv);
++}
++
++// static
++already_AddRefed<FetchPut>
++FetchPut::Create(Owner* aOwner, RequestId aRequestId,
++                        const Sequence<OwningRequestOrScalarValueString>& aRequests,
++                        ErrorResult& aRv)
++{
++  MOZ_ASSERT(aOwner);
++
++  AutoJSAPI jsapi;
++  jsapi.Init(aOwner->GetGlobalObject());
++  JSContext* cx = jsapi.cx();
++  JS::Rooted<JSObject*> jsGlobal(cx, aOwner->GetGlobalObject()->GetGlobalJSObject());
++  JSAutoCompartment ac(cx, jsGlobal);
++  GlobalObject global(cx, jsGlobal);
++
++  nsTArray<State> stateList(aRequests.Length());
++  for (uint32_t i = 0; i < aRequests.Length(); ++i) {
++    nsRefPtr<Request> request;
++    if (aRequests[i].IsRequest()) {
++      request = aRequests[i].GetAsRequest();
++    } else {
++      RequestInit init;
++
++      RequestOrScalarValueString requestOrSvs;
++      requestOrSvs.SetAsScalarValueString().Rebind(
++        aRequests[i].GetAsScalarValueString().Data(),
++        aRequests[i].GetAsScalarValueString().Length());
++
++      request = Request::Constructor(global, requestOrSvs, init, aRv);
++      if (aRv.Failed()) {
++        return nullptr;
++      }
++    }
++
++    RequestOrScalarValueString requestOrSvs;
++    requestOrSvs.SetAsRequest() = request;
++
++    RequestInit init;
++    nsRefPtr<Promise> promise = FetchRequest(aOwner->GetGlobalObject(),
++                                             requestOrSvs, init, aRv);
++    if (aRv.Failed()) {
++      return nullptr;
++    }
++
++    State* state = stateList.AppendElement();
++    state->mRequest = request.forget();
++    state->mPromise = promise.forget();
++  }
++
++  nsRefPtr<FetchPut> ref = new FetchPut(aOwner, aRequestId, stateList);
++  return ref.forget();
++}
++
++FetchPut::FetchPut(Owner* aOwner, RequestId aRequestId,
++                   const nsTArray<State>& aStateList)
++  : mOwner(aOwner)
++  , mRequestId(aRequestId)
++  , mStateList(aStateList)
++{
++  // TODO: handle zero length state list
++
++  for (uint32_t i = 0; i < aStateList.Length(); ++i) {
++    nsRefPtr<PromiseHandler> handler =
++      new PromiseHandler(this, aStateList[i].mPromise);
++    aStateList[i].mPromise->AppendNativeHandler(handler);
++  }
++}
++
++FetchPut::~FetchPut()
++{
++}
++
++void
++FetchPut::FetchResolved(Promise* aPromise, Response* aResponse)
++{
++}
++
++void
++FetchPut::FetchRejected(Promise* aPromise)
++{
++}
++
++} // namespace cache
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/cache/FetchPut.h b/dom/cache/FetchPut.h
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/FetchPut.h
+@@ -0,0 +1,89 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_cache_FetchPut_h
++#define mozilla_dom_cache_FetchPut_h
++
++#include "AlreadyAddRefed.h"
++#include "mozilla/Attributes.h"
++#include "mozilla/dom/cache/Types.h"
++#include "nsRefPtr.h"
++#include "nsTArray.h"
++
++class nsIGlobalObject;
++
++namespace mozilla {
++
++class ErrorResult;
++
++namespace dom {
++
++class OwningRequestOrScalarValueString;
++class Promise;
++class Request;
++class RequestOrScalarValueString;
++class Response;
++template<typename T> class Sequence;
++
++namespace cache {
++
++class FetchPut MOZ_FINAL
++{
++public:
++  class Owner : public nsISupports
++  {
++  public:
++    virtual ~Owner() { }
++
++    virtual nsIGlobalObject*
++    GetGlobalObject() const=0;
++
++    virtual already_AddRefed<Promise>
++    Put(const RequestOrScalarValueString& aRequest, Response& aResponse,
++        ErrorResult& aRv)=0;
++
++    virtual void
++    FetchPutComplete(FetchPut* aContext, RequestId aRequestId,
++                     nsresult aRv)=0;
++  };
++
++  static already_AddRefed<FetchPut>
++  Create(Owner* aOwner, RequestId aRequestId,
++         const RequestOrScalarValueString& aRequest, ErrorResult& aRv);
++
++  static already_AddRefed<FetchPut>
++  Create(Owner* aOwner, RequestId aRequestId,
++         const Sequence<OwningRequestOrScalarValueString>& aRequests,
++         ErrorResult& aRv);
++
++private:
++  class PromiseHandler;
++  struct State
++  {
++    nsRefPtr<Request> mRequest;
++    nsRefPtr<Promise> mPromise;
++  };
++
++  FetchPut(Owner* aOwner, RequestId aRequestId,
++           const nsTArray<State>& aStateList);
++  ~FetchPut();
++
++  void FetchResolved(Promise* aPromise, Response* aResponse);
++  void FetchRejected(Promise* aPromise);
++
++  nsRefPtr<Owner> mOwner;
++  const RequestId mRequestId;
++  nsTArray<State> mStateList;
++
++public:
++  NS_INLINE_DECL_REFCOUNTING(mozilla::dom::cache::FetchPut);
++};
++
++} // namespace cache
++} // namespace dom
++} // namespace mozilla
++
++#endif // mozilla_dom_cache_FetchPut_h
+diff --git a/dom/cache/moz.build b/dom/cache/moz.build
+--- a/dom/cache/moz.build
++++ b/dom/cache/moz.build
+@@ -15,16 +15,17 @@ EXPORTS.mozilla.dom.cache += [
+     'CacheStorageChildListener.h',
+     'CacheStorageParent.h',
+     'CacheStreamControlChild.h',
+     'CacheStreamControlListener.h',
+     'CacheStreamControlParent.h',
+     'Context.h',
+     'DBAction.h',
+     'DBSchema.h',
++    'FetchPut.h',
+     'FileUtils.h',
+     'IPCUtils.h',
+     'Manager.h',
+     'ReadStream.h',
+     'SavedTypes.h',
+     'ShutdownObserver.h',
+     'Types.h',
+     'TypeUtils.h',
+@@ -38,16 +39,17 @@ SOURCES += [
+     'CacheStorage.cpp',
+     'CacheStorageChild.cpp',
+     'CacheStorageParent.cpp',
+     'CacheStreamControlChild.cpp',
+     'CacheStreamControlParent.cpp',
+     'Context.cpp',
+     'DBAction.cpp',
+     'DBSchema.cpp',
++    'FetchPut.cpp',
+     'FileUtils.cpp',
+     'Manager.cpp',
+     'ReadStream.cpp',
+     'ShutdownObserver.cpp',
+     'TypeUtils.cpp',
+ ]
+ 
+ IPDL_SOURCES += [
