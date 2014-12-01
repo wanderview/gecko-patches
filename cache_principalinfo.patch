@@ -94,6 +94,28 @@ diff --git a/dom/base/nsGlobalWindow.h b/dom/base/nsGlobalWindow.h
                nsAString& aReturn, mozilla::ErrorResult& aError);
    void Print(mozilla::ErrorResult& aError);
    void ShowModalDialog(JSContext* aCx, const nsAString& aUrl,
+diff --git a/dom/cache/Action.h b/dom/cache/Action.h
+--- a/dom/cache/Action.h
++++ b/dom/cache/Action.h
+@@ -34,17 +34,17 @@ public:
+     virtual void Resolve(nsresult aRv)=0;
+ 
+     NS_DECL_THREADSAFE_ISUPPORTS
+   };
+ 
+   // Execute operations on target thread. Once complete call
+   // Resolver::Resolve().  This can be done sync or async.
+   // Note: Action should hold Resolver ref until its ready to call Resolve().
+-  virtual void RunOnTarget(Resolver* aResolver, nsIFile* aQuotaDir)=0;
++  virtual void RunOnTarget(Resolver* aResolver, const QuotaInfo& aQuotaInfo)=0;
+ 
+   // Called on target thread if the Action is being canceled.  Simply
+   // clean up and do not call Resolver::Resolve() in this case.
+   // Note: Action must drop Resolver ref if CancelOnTarget() is called!
+   virtual void CancelOnTarget() { }
+ 
+   // Executed on the initiating thread and is passed the nsresult given to
+   // Resolver::Resolve().
 diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
 --- a/dom/cache/Cache.cpp
 +++ b/dom/cache/Cache.cpp
@@ -226,17 +248,22 @@ diff --git a/dom/cache/CacheInitData.ipdlh b/dom/cache/CacheInitData.ipdlh
 diff --git a/dom/cache/CacheParent.cpp b/dom/cache/CacheParent.cpp
 --- a/dom/cache/CacheParent.cpp
 +++ b/dom/cache/CacheParent.cpp
-@@ -24,17 +24,17 @@ namespace cache {
+@@ -21,20 +21,19 @@ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
  using mozilla::unused;
  using mozilla::void_t;
  using mozilla::ipc::FileDescriptorSetParent;
  using mozilla::ipc::PFileDescriptorSetParent;
  
- CacheParent::CacheParent(const CacheInitData& aInitData,
-                          CacheId aCacheId)
-   : mCacheId(aCacheId)
+-CacheParent::CacheParent(const CacheInitData& aInitData,
+-                         CacheId aCacheId)
+-  : mCacheId(aCacheId)
 -  , mManager(Manager::ForOrigin(aInitData))
-+  , mManager(Manager::GetOrCreate(nullptr /* TODO aInitData*/))
++CacheParent::CacheParent(cache::Manager* aManager, CacheId aCacheId)
++  : mManager(aManager)
++  , mCacheId(aCacheId)
  {
    MOZ_ASSERT(mManager);
    mManager->AddRefCacheId(mCacheId);
@@ -245,6 +272,58 @@ diff --git a/dom/cache/CacheParent.cpp b/dom/cache/CacheParent.cpp
  CacheParent::~CacheParent()
  {
    MOZ_ASSERT(!mManager);
+diff --git a/dom/cache/CacheParent.h b/dom/cache/CacheParent.h
+--- a/dom/cache/CacheParent.h
++++ b/dom/cache/CacheParent.h
+@@ -14,27 +14,26 @@
+ 
+ struct nsID;
+ template <class T> class nsRefPtr;
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+-class CacheInitData;
+ class CacheDBConnection;
+ struct SavedResponse;
+ struct StreamHolder;
+ 
+ class CacheParent MOZ_FINAL : public PCacheParent
+                             , public Manager::Listener
+                             , public FetchPut::Listener
+ {
+ public:
+-  CacheParent(const CacheInitData& aInitData, CacheId aCacheId);
++  CacheParent(cache::Manager* aManager, CacheId aCacheId);
+   virtual ~CacheParent();
+   virtual void ActorDestroy(ActorDestroyReason aReason) MOZ_OVERRIDE;
+ 
+   // PCacheParent method
+   virtual bool
+   RecvMatch(const RequestId& aRequestId, const PCacheRequest& aRequest,
+             const PCacheQueryParams& aParams) MOZ_OVERRIDE;
+   virtual bool
+@@ -74,18 +73,18 @@ private:
+   Manager::StreamControl*
+   SerializeReadStream(Manager::StreamControl *aStreamControl, const nsID& aId,
+                       Manager::StreamList* aStreamList,
+                       PCacheReadStream* aReadStreamOut);
+ 
+   already_AddRefed<nsIInputStream>
+   DeserializeCacheStream(const PCacheReadStreamOrVoid& aStreamOrVoid);
+ 
++  nsRefPtr<cache::Manager> mManager;
+   const CacheId mCacheId;
+-  nsRefPtr<mozilla::dom::cache::Manager> mManager;
+   nsTArray<nsRefPtr<FetchPut>> mFetchPutList;
+ };
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_cache_CacheParent_h
 diff --git a/dom/cache/CacheStorage.cpp b/dom/cache/CacheStorage.cpp
 --- a/dom/cache/CacheStorage.cpp
 +++ b/dom/cache/CacheStorage.cpp
@@ -429,7 +508,28 @@ diff --git a/dom/cache/CacheStorage.cpp b/dom/cache/CacheStorage.cpp
      return;
    }
  
-@@ -426,17 +488,17 @@ CacheStorage::RecvOpenResponse(RequestId
+@@ -356,16 +418,20 @@ CacheStorage::ActorFailed()
+ void
+ CacheStorage::ActorDestroy(IProtocol& aActor)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorage);
+   MOZ_ASSERT(mActor);
+   MOZ_ASSERT(mActor == &aActor);
+   mActor->ClearListener();
+   mActor = nullptr;
++
++  // Note that we will never get an actor again in case another request is
++  // made before this object is destructed.
++  ActorFailed();
+ }
+ 
+ void
+ CacheStorage::RecvMatchResponse(RequestId aRequestId, nsresult aRv,
+                                 const PCacheResponseOrVoid& aResponse)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorage);
+ 
+@@ -426,17 +492,17 @@ CacheStorage::RecvOpenResponse(RequestId
      return;
    }
  
@@ -556,114 +656,795 @@ diff --git a/dom/cache/CacheStorage.h b/dom/cache/CacheStorage.h
 diff --git a/dom/cache/CacheStorageParent.cpp b/dom/cache/CacheStorageParent.cpp
 --- a/dom/cache/CacheStorageParent.cpp
 +++ b/dom/cache/CacheStorageParent.cpp
-@@ -23,17 +23,17 @@ namespace dom {
- namespace cache {
- 
- using mozilla::unused;
- using mozilla::void_t;
- using mozilla::ipc::PFileDescriptorSetParent;
- 
- CacheStorageParent::CacheStorageParent(const CacheInitData& aInitData)
-   : mInitData(aInitData)
--  , mManager(Manager::ForOrigin(aInitData))
-+  , mManager(Manager::GetOrCreate(nullptr /* TODO aInitData */))
- {
-   MOZ_ASSERT(mManager);
- }
- 
- CacheStorageParent::~CacheStorageParent()
- {
-   MOZ_ASSERT(!mManager);
- }
-diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
---- a/dom/cache/Context.cpp
-+++ b/dom/cache/Context.cpp
-@@ -170,19 +170,21 @@ Context::QuotaInitRunnable::Run()
-     case STATE_CALL_WAIT_FOR_OPEN_ALLOWED:
-       MOZ_ASSERT(NS_IsMainThread());
-       qm = QuotaManager::GetOrCreate();
-       if (!qm) {
-         Resolve(NS_ERROR_FAILURE);
-         return NS_OK;
-       }
-       mState = STATE_WAIT_FOR_OPEN_ALLOWED;
-+      /* TODO
-       rv = qm->WaitForOpenAllowed(OriginOrPatternString::FromOrigin(mInitData.origin()),
-                                   Nullable<PersistenceType>(PERSISTENCE_TYPE_PERSISTENT),
-                                   mQuotaId, this);
-+      */
-       if (NS_FAILED(rv)) {
-         Resolve(rv);
-         return NS_OK;
-       }
-       break;
-     case STATE_WAIT_FOR_OPEN_ALLOWED:
-       MOZ_ASSERT(NS_IsMainThread());
-       qm = QuotaManager::Get();
-@@ -193,22 +195,24 @@ Context::QuotaInitRunnable::Run()
-         Resolve(rv);
-         return NS_OK;
-       }
-       break;
-     case STATE_ENSURE_ORIGIN_INITIALIZED:
-       // TODO: MOZ_ASSERT(NS_GetCurrentThread() == QuotaManager::Get()->IOThread());
-       qm = QuotaManager::Get();
-       MOZ_ASSERT(qm);
-+      /* TODO
-       rv = qm->EnsureOriginIsInitialized(PERSISTENCE_TYPE_PERSISTENT,
-                                          mInitData.quotaGroup(),
-                                          mInitData.origin(),
-                                          mInitData.isApp(),
-                                          mInitData.hasUnlimStoragePerm(),
-                                          getter_AddRefs(mQuotaDir));
-+      */
-       if (NS_FAILED(rv)) {
-         Resolve(rv);
-         return NS_OK;
-       }
-       mState = STATE_RUNNING;
-       if (mQuotaIOThreadAction) {
-         nsCOMPtr<nsIFile> quotaDir;
-         rv = mQuotaDir->Clone(getter_AddRefs(quotaDir));
-@@ -417,17 +421,17 @@ Context::ActionRunnable::Run()
-       break;
-   }
-   return NS_OK;
- }
- 
- Context::Context(Listener* aListener, const CacheInitData& aInitData,
-                  Action* aQuotaIOThreadAction)
-   : mListener(aListener)
--  , mOrigin(aInitData.origin())
-+  /*TODO, mOrigin(aInitData.origin())*/
-   , mState(STATE_CONTEXT_INIT)
- {
-   MOZ_ASSERT(mListener);
- 
-   nsRefPtr<QuotaInitRunnable> runnable =
-     new QuotaInitRunnable(this, aInitData, NS_LITERAL_CSTRING("Cache"),
-                           aQuotaIOThreadAction);
-   nsresult rv = runnable->Dispatch();
-diff --git a/dom/cache/DBAction.cpp b/dom/cache/DBAction.cpp
---- a/dom/cache/DBAction.cpp
-+++ b/dom/cache/DBAction.cpp
-@@ -1,34 +1,40 @@
+@@ -1,97 +1,164 @@
  /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
  /* vim: set ts=8 sts=2 et sw=2 tw=80: */
  /* This Source Code Form is subject to the terms of the Mozilla Public
   * License, v. 2.0. If a copy of the MPL was not distributed with this
   * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
  
- #include "mozilla/dom/cache/DBAction.h"
+ #include "mozilla/dom/cache/CacheStorageParent.h"
  
++#include "mozilla/dom/ContentParent.h"
+ #include "mozilla/dom/cache/CacheParent.h"
+ #include "mozilla/dom/cache/CacheStreamControlParent.h"
+ #include "mozilla/dom/cache/Manager.h"
 +#include "mozilla/dom/cache/ManagerId.h"
- #include "mozilla/dom/quota/PersistenceType.h"
- #include "mozIStorageConnection.h"
- #include "mozIStorageService.h"
- #include "mozStorageCID.h"
+ #include "mozilla/dom/cache/ReadStream.h"
+ #include "mozilla/dom/cache/SavedTypes.h"
++#include "mozilla/ipc/BackgroundParent.h"
+ #include "mozilla/ipc/InputStreamUtils.h"
+ #include "mozilla/ipc/PBackgroundParent.h"
+ #include "mozilla/ipc/PFileDescriptorSetParent.h"
+ #include "mozilla/DebugOnly.h"
+ #include "mozilla/unused.h"
+ #include "nsCOMPtr.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ using mozilla::unused;
+ using mozilla::void_t;
++using mozilla::ipc::BackgroundParent;
+ using mozilla::ipc::PFileDescriptorSetParent;
+ 
+ CacheStorageParent::CacheStorageParent(const CacheInitData& aInitData)
+-  : mInitData(aInitData)
+-  , mManager(Manager::ForOrigin(aInitData))
++  : mNamespace(aInitData.namespaceEnum())
+ {
+-  MOZ_ASSERT(mManager);
++  nsRefPtr<ContentParent> actor = BackgroundParent::GetContentParent(Manager());
++  nsresult rv = PrincipalVerifier::Create(this, actor, aInitData.principalInfo(),
++                                          getter_AddRefs(mVerifier));
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    unused << Send__delete__(this);
++  }
+ }
+ 
+ CacheStorageParent::~CacheStorageParent()
+ {
+   MOZ_ASSERT(!mManager);
+ }
+ 
+ void
+ CacheStorageParent::ActorDestroy(ActorDestroyReason aReason)
+ {
++  // TODO
+   MOZ_ASSERT(mManager);
+   mManager->RemoveListener(this);
+   mManager = nullptr;
+ }
+ 
+ bool
+ CacheStorageParent::RecvMatch(const RequestId& aRequestId,
+                               const PCacheRequest& aRequest,
+                               const PCacheQueryParams& aParams)
+ {
+-  mManager->StorageMatch(this, aRequestId, mInitData.namespaceEnum(), aRequest,
++  if (mManager) {
++    Entry* entry = mPendingRequests.AppendElement();
++    entry->mOp = OP_MATCH;
++    entry->mRequestId = aRequestId;
++    entry->mRequest = aRequest;
++    entry->mParams = aParams;
++    return true;
++  }
++
++  mManager->StorageMatch(this, aRequestId, mNamespace, aRequest,
+                          aParams);
+   return true;
+ }
+ 
+ bool
+ CacheStorageParent::RecvHas(const RequestId& aRequestId, const nsString& aKey)
+ {
+-  mManager->StorageHas(this, aRequestId, mInitData.namespaceEnum(), aKey);
++  if (mManager) {
++    Entry* entry = mPendingRequests.AppendElement();
++    entry->mOp = OP_HAS;
++    entry->mRequestId = aRequestId;
++    entry->mKey = aKey;
++    return true;
++  }
++
++  mManager->StorageHas(this, aRequestId, mNamespace, aKey);
+   return true;
+ }
+ 
+ bool
+-CacheStorageParent::RecvOpen(const RequestId& aRequestId,
+-                               const nsString& aKey)
++CacheStorageParent::RecvOpen(const RequestId& aRequestId, const nsString& aKey)
+ {
+-  mManager->StorageOpen(this, aRequestId, mInitData.namespaceEnum(), aKey);
++  if (mManager) {
++    Entry* entry = mPendingRequests.AppendElement();
++    entry->mOp = OP_OPEN;
++    entry->mRequestId = aRequestId;
++    entry->mKey = aKey;
++    return true;
++  }
++
++  mManager->StorageOpen(this, aRequestId, mNamespace, aKey);
+   return true;
+ }
+ 
+ bool
+ CacheStorageParent::RecvDelete(const RequestId& aRequestId,
+                                const nsString& aKey)
+ {
+-  mManager->StorageDelete(this, aRequestId, mInitData.namespaceEnum(), aKey);
++  if (mManager) {
++    Entry* entry = mPendingRequests.AppendElement();
++    entry->mOp = OP_DELETE;
++    entry->mRequestId = aRequestId;
++    entry->mKey = aKey;
++    return true;
++  }
++
++  mManager->StorageDelete(this, aRequestId, mNamespace, aKey);
+   return true;
+ }
+ 
+ bool
+ CacheStorageParent::RecvKeys(const RequestId& aRequestId)
+ {
+-  mManager->StorageKeys(this, aRequestId, mInitData.namespaceEnum());
++  if (mManager) {
++    Entry* entry = mPendingRequests.AppendElement();
++    entry->mOp = OP_DELETE;
++    entry->mRequestId = aRequestId;
++    return true;
++  }
++
++  mManager->StorageKeys(this, aRequestId, mNamespace);
+   return true;
+ }
+ 
+ void
++CacheStorageParent::OnPrincipalVerified(nsresult aRv, ManagerId* aManagerId)
++{
++  if (NS_WARN_IF(NS_FAILED(aRv))) {
++    unused << Send__delete__(this);
++    return;
++  }
++
++  MOZ_ASSERT(mVerifier);
++  MOZ_ASSERT(!mManagerId);
++
++  mManagerId = aManagerId;
++  mVerifier = nullptr;
++
++  // TODO: process pending requests
++  for (uint32_t i = 0; i < mPendingRequests.Length(); ++i) {
++  }
++}
++
++void
+ CacheStorageParent::OnStorageMatch(RequestId aRequestId, nsresult aRv,
+                                    const SavedResponse* aSavedResponse,
+                                    Manager::StreamList* aStreamList)
+ {
+   PCacheResponseOrVoid responseOrVoid;
+ 
+   // no match
+   if (NS_FAILED(aRv) || !aSavedResponse) {
+@@ -128,17 +195,19 @@ void
+ CacheStorageParent::OnStorageOpen(RequestId aRequestId, nsresult aRv,
+                                   CacheId aCacheId)
+ {
+   if (NS_FAILED(aRv)) {
+     unused << SendOpenResponse(aRequestId, aRv, nullptr);
+     return;
+   }
+ 
+-  CacheParent* actor = new CacheParent(mInitData, aCacheId);
++  MOZ_ASSERT(mManager);
++  CacheParent* actor = new CacheParent(mManager, aCacheId);
++
+   PCacheParent* base = Manager()->SendPCacheConstructor(actor);
+   actor = static_cast<CacheParent*>(base);
+   unused << SendOpenResponse(aRequestId, aRv, actor);
+ }
+ 
+ void
+ CacheStorageParent::OnStorageDelete(RequestId aRequestId, nsresult aRv,
+                                     bool aCacheDeleted)
+diff --git a/dom/cache/CacheStorageParent.h b/dom/cache/CacheStorageParent.h
+--- a/dom/cache/CacheStorageParent.h
++++ b/dom/cache/CacheStorageParent.h
+@@ -5,25 +5,29 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_cache_CacheStorageParent_h
+ #define mozilla_dom_cache_CacheStorageParent_h
+ 
+ #include "mozilla/dom/cache/CacheInitData.h"
+ #include "mozilla/dom/cache/PCacheStorageParent.h"
+ #include "mozilla/dom/cache/Manager.h"
++#include "mozilla/dom/cache/PrincipalVerifier.h"
+ #include "mozilla/dom/cache/Types.h"
+ 
+ template <class T> class nsRefPtr;
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
++class ManagerId;
++
+ class CacheStorageParent MOZ_FINAL : public PCacheStorageParent
++                                   , public PrincipalVerifier::Listener
+                                    , public Manager::Listener
+ {
+ public:
+   CacheStorageParent(const CacheInitData& aInitData);
+   virtual ~CacheStorageParent();
+ 
+   // PCacheStorageParent methods
+   virtual void ActorDestroy(ActorDestroyReason aReason) MOZ_OVERRIDE;
+@@ -33,16 +37,20 @@ public:
+   virtual bool RecvHas(const RequestId& aRequestId,
+                        const nsString& aKey) MOZ_OVERRIDE;
+   virtual bool RecvOpen(const RequestId& aRequestId,
+                         const nsString& aKey) MOZ_OVERRIDE;
+   virtual bool RecvDelete(const RequestId& aRequestId,
+                           const nsString& aKey) MOZ_OVERRIDE;
+   virtual bool RecvKeys(const RequestId& aRequestId) MOZ_OVERRIDE;
+ 
++  // PrincipalVerifier::Listener methods
++  virtual void OnPrincipalVerified(nsresult aRv,
++                                   ManagerId* aManagerId) MOZ_OVERRIDE;
++
+   // Manager::Listener methods
+   virtual void OnStorageMatch(RequestId aRequestId, nsresult aRv,
+                               const SavedResponse* aResponse,
+                               Manager::StreamList* aStreamList) MOZ_OVERRIDE;
+   virtual void OnStorageHas(RequestId aRequestId, nsresult aRv,
+                             bool aCacheFound) MOZ_OVERRIDE;
+   virtual void OnStorageOpen(RequestId aRequestId, nsresult aRv,
+                              CacheId aCacheId) MOZ_OVERRIDE;
+@@ -52,17 +60,39 @@ public:
+                              const nsTArray<nsString>& aKeys) MOZ_OVERRIDE;
+ 
+ private:
+   Manager::StreamControl*
+   SerializeReadStream(Manager::StreamControl *aStreamControl, const nsID& aId,
+                       Manager::StreamList* aStreamList,
+                       PCacheReadStream* aReadStreamOut);
+ 
+-  const CacheInitData mInitData;
+-  nsRefPtr<mozilla::dom::cache::Manager> mManager;
++  const Namespace mNamespace;
++  nsRefPtr<PrincipalVerifier> mVerifier;
++  nsRefPtr<ManagerId> mManagerId;
++  nsRefPtr<cache::Manager> mManager;
++
++  enum Op
++  {
++    OP_MATCH,
++    OP_HAS,
++    OP_OPEN,
++    OP_DELETE,
++    OP_KEYS
++  };
++
++  struct Entry
++  {
++    RequestId mRequestId;
++    Op mOp;
++    nsString mKey;
++    PCacheRequest mRequest;
++    PCacheQueryParams mParams;
++  };
++
++  nsTArray<Entry> mPendingRequests;
+ };
+ 
+ } // namesapce cache
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_cache_CacheStorageParent_h
+diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
+--- a/dom/cache/Context.cpp
++++ b/dom/cache/Context.cpp
+@@ -3,61 +3,61 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/Context.h"
+ 
+ #include "mozilla/DebugOnly.h"
+ #include "mozilla/dom/cache/Action.h"
+-#include "mozilla/dom/cache/CacheInitData.h"
++#include "mozilla/dom/cache/ManagerId.h"
+ #include "mozilla/dom/quota/OriginOrPatternString.h"
+ #include "mozilla/dom/quota/QuotaManager.h"
  #include "nsIFile.h"
- #include "nsIURI.h"
- #include "nsNetUtil.h"
++#include "nsIPrincipal.h"
+ #include "nsIRunnable.h"
+ #include "nsThreadUtils.h"
+ 
+ namespace {
+ 
+ using mozilla::dom::Nullable;
++using mozilla::dom::cache::QuotaInfo;
+ using mozilla::dom::quota::OriginOrPatternString;
+ using mozilla::dom::quota::QuotaManager;
+ using mozilla::dom::quota::PERSISTENCE_TYPE_PERSISTENT;
+ using mozilla::dom::quota::PersistenceType;
+ 
+ class QuotaReleaseRunnable MOZ_FINAL : public nsIRunnable
+ {
+ public:
+-  QuotaReleaseRunnable(const nsACString& aOrigin, const nsACString& aQuotaId)
+-    : mOrigin(aOrigin)
++  QuotaReleaseRunnable(const QuotaInfo& aQuotaInfo, const nsACString& aQuotaId)
++    : mQuotaInfo(aQuotaInfo)
+     , mQuotaId(aQuotaId)
+-  {
+-  }
++  { }
+ 
+ private:
+-  ~QuotaReleaseRunnable()
+-  {}
++  ~QuotaReleaseRunnable() { }
+ 
+-  const nsCString mOrigin;
++  const QuotaInfo mQuotaInfo;
+   const nsCString mQuotaId;
+ 
+ public:
+   NS_DECL_THREADSAFE_ISUPPORTS
+   NS_DECL_NSIRUNNABLE
+ };
+ 
+ NS_IMPL_ISUPPORTS(QuotaReleaseRunnable, nsIRunnable);
+ 
+ NS_IMETHODIMP
+ QuotaReleaseRunnable::Run()
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+   QuotaManager* qm = QuotaManager::Get();
+   MOZ_ASSERT(qm);
+-  qm->AllowNextSynchronizedOp(OriginOrPatternString::FromOrigin(mOrigin),
++  qm->AllowNextSynchronizedOp(OriginOrPatternString::FromOrigin(mQuotaInfo.mOrigin),
+                               Nullable<PersistenceType>(PERSISTENCE_TYPE_PERSISTENT),
+                               mQuotaId);
+   return NS_OK;
+ }
+ 
+ } // anonymous namespace
+ 
+ namespace mozilla {
+@@ -70,28 +70,29 @@ using mozilla::dom::quota::QuotaManager;
+ using mozilla::dom::quota::PERSISTENCE_TYPE_PERSISTENT;
+ using mozilla::dom::quota::PersistenceType;
+ 
+ class Context::QuotaInitRunnable MOZ_FINAL : public nsIRunnable
+                                            , public Action::Resolver
+ {
+ public:
+   QuotaInitRunnable(Context* aContext,
+-                    const CacheInitData& aInitData,
++                    ManagerId* aManagerId,
+                     const nsACString& aQuotaId,
+                     Action* aQuotaIOThreadAction)
+     : mContext(aContext)
+-    , mInitData(aInitData)
++    , mManagerId(aManagerId)
+     , mQuotaId(aQuotaId)
+     , mQuotaIOThreadAction(aQuotaIOThreadAction)
+     , mInitiatingThread(NS_GetCurrentThread())
+     , mState(STATE_INIT)
+     , mResult(NS_OK)
+   {
+     MOZ_ASSERT(mContext);
++    MOZ_ASSERT(mManagerId);
+     MOZ_ASSERT(mInitiatingThread);
+   }
+ 
+   nsresult Dispatch()
+   {
+     NS_ASSERT_OWNINGTHREAD(Action::Resolver);
+     MOZ_ASSERT(mState == STATE_INIT);
+ 
+@@ -139,131 +140,151 @@ private:
+   {
+     NS_ASSERT_OWNINGTHREAD(Action::Resolver);
+     MOZ_ASSERT(mContext);
+     mContext = nullptr;
+     mQuotaIOThreadAction = nullptr;
+   }
+ 
+   nsRefPtr<Context> mContext;
+-  const CacheInitData mInitData;
++  nsRefPtr<ManagerId> mManagerId;
+   const nsCString mQuotaId;
+   nsRefPtr<Action> mQuotaIOThreadAction;
+   nsCOMPtr<nsIThread> mInitiatingThread;
+   State mState;
+   nsresult mResult;
+-  nsCOMPtr<nsIFile> mQuotaDir;
++  QuotaInfo mQuotaInfo;
+ 
+ public:
+   NS_DECL_ISUPPORTS_INHERITED
+   NS_DECL_NSIRUNNABLE
+ };
+ 
+ NS_IMPL_ISUPPORTS_INHERITED(mozilla::dom::cache::Context::QuotaInitRunnable,
+                             Action::Resolver, nsIRunnable);
+ 
+ NS_IMETHODIMP
+ Context::QuotaInitRunnable::Run()
+ {
+-  QuotaManager* qm;
+-  nsresult rv;
+-
+   switch(mState) {
+     case STATE_CALL_WAIT_FOR_OPEN_ALLOWED:
++    {
+       MOZ_ASSERT(NS_IsMainThread());
+-      qm = QuotaManager::GetOrCreate();
++      QuotaManager* qm = QuotaManager::GetOrCreate();
+       if (!qm) {
+         Resolve(NS_ERROR_FAILURE);
+         return NS_OK;
+       }
++
++      nsCOMPtr<nsIPrincipal> principal = mManagerId->Principal();
++      nsresult rv = qm->GetInfoFromPrincipal(principal,
++                                             PERSISTENCE_TYPE_PERSISTENT,
++                                             &mQuotaInfo.mGroup,
++                                             &mQuotaInfo.mOrigin,
++                                             &mQuotaInfo.mIsApp,
++                                             &mQuotaInfo.mHasUnlimStoragePerm);
++      if (NS_WARN_IF(NS_FAILED(rv))) {
++        Resolve(rv);
++        return NS_OK;
++      }
++
+       mState = STATE_WAIT_FOR_OPEN_ALLOWED;
+-      rv = qm->WaitForOpenAllowed(OriginOrPatternString::FromOrigin(mInitData.origin()),
++      // TODO: use default storage instead of persistent
++      rv = qm->WaitForOpenAllowed(OriginOrPatternString::FromOrigin(mQuotaInfo.mOrigin),
+                                   Nullable<PersistenceType>(PERSISTENCE_TYPE_PERSISTENT),
+                                   mQuotaId, this);
+       if (NS_FAILED(rv)) {
+         Resolve(rv);
+         return NS_OK;
+       }
+       break;
++    }
+     case STATE_WAIT_FOR_OPEN_ALLOWED:
++    {
+       MOZ_ASSERT(NS_IsMainThread());
+-      qm = QuotaManager::Get();
++      QuotaManager* qm = QuotaManager::Get();
+       MOZ_ASSERT(qm);
+       mState = STATE_ENSURE_ORIGIN_INITIALIZED;
+-      rv = qm->IOThread()->Dispatch(this, nsIThread::DISPATCH_NORMAL);
++      nsresult rv = qm->IOThread()->Dispatch(this, nsIThread::DISPATCH_NORMAL);
+       if (NS_WARN_IF(NS_FAILED(rv))) {
+         Resolve(rv);
+         return NS_OK;
+       }
+       break;
++    }
+     case STATE_ENSURE_ORIGIN_INITIALIZED:
+-      // TODO: MOZ_ASSERT(NS_GetCurrentThread() == QuotaManager::Get()->IOThread());
+-      qm = QuotaManager::Get();
++    {
++      // Can't assert quota IO thread because its an idle thread that can get
++      // recreated.
++      QuotaManager* qm = QuotaManager::Get();
+       MOZ_ASSERT(qm);
+-      rv = qm->EnsureOriginIsInitialized(PERSISTENCE_TYPE_PERSISTENT,
+-                                         mInitData.quotaGroup(),
+-                                         mInitData.origin(),
+-                                         mInitData.isApp(),
+-                                         mInitData.hasUnlimStoragePerm(),
+-                                         getter_AddRefs(mQuotaDir));
++      nsresult rv = qm->EnsureOriginIsInitialized(PERSISTENCE_TYPE_PERSISTENT,
++                                                  mQuotaInfo.mGroup,
++                                                  mQuotaInfo.mOrigin,
++                                                  mQuotaInfo.mIsApp,
++                                                  mQuotaInfo.mHasUnlimStoragePerm,
++                                                  getter_AddRefs(mQuotaInfo.mDir));
+       if (NS_FAILED(rv)) {
+         Resolve(rv);
+         return NS_OK;
+       }
++
+       mState = STATE_RUNNING;
+-      if (mQuotaIOThreadAction) {
+-        nsCOMPtr<nsIFile> quotaDir;
+-        rv = mQuotaDir->Clone(getter_AddRefs(quotaDir));
+-        if (NS_FAILED(rv)) {
+-          Resolve(rv);
+-          return NS_OK;
+-        }
+-        mQuotaIOThreadAction->RunOnTarget(this, quotaDir);
+-      } else {
++
++      if (!mQuotaIOThreadAction) {
+         Resolve(NS_OK);
++        return NS_OK;
+       }
++
++      mQuotaIOThreadAction->RunOnTarget(this, mQuotaInfo);
++
+       break;
++    }
+     case STATE_COMPLETING:
++    {
+       NS_ASSERT_OWNINGTHREAD(Action::Resolver);
+       if (mQuotaIOThreadAction) {
+         mQuotaIOThreadAction->CompleteOnInitiatingThread(mResult);
+       }
+-      mContext->OnQuotaInit(mResult, mQuotaDir);
++      mContext->OnQuotaInit(mResult, mQuotaInfo);
+       mState = STATE_COMPLETE;
+       // Explicitly cleanup here as the destructor could fire on any of
+       // the threads we have bounced through.
+       Clear();
+       break;
++    }
+     default:
++    {
+       MOZ_CRASH("unexpected state in QuotaInitRunnable");
+       break;
++    }
+   }
+ 
+   return NS_OK;
+ }
+ 
+ class Context::ActionRunnable MOZ_FINAL : public nsIRunnable
+                                         , public Action::Resolver
+ {
+ public:
+   ActionRunnable(Context* aContext, nsIEventTarget* aTarget, Action* aAction,
+-                 nsIFile* aQuotaDir)
++                 const QuotaInfo& aQuotaInfo)
+     : mContext(aContext)
+     , mTarget(aTarget)
+     , mAction(aAction)
+-    , mQuotaDir(aQuotaDir)
++    , mQuotaInfo(aQuotaInfo)
+     , mInitiatingThread(NS_GetCurrentThread())
+     , mState(STATE_INIT)
+     , mCanceled(false)
+     , mResult(NS_OK)
+   {
+     MOZ_ASSERT(mContext);
+     MOZ_ASSERT(mTarget);
+     MOZ_ASSERT(mAction);
+-    MOZ_ASSERT(mQuotaDir);
++    MOZ_ASSERT(mQuotaInfo.mDir);
+     MOZ_ASSERT(mInitiatingThread);
+   }
+ 
+   nsresult Dispatch()
+   {
+     NS_ASSERT_OWNINGTHREAD(Action::Resolver);
+     MOZ_ASSERT(mState == STATE_INIT);
+ 
+@@ -348,17 +369,17 @@ private:
+     STATE_RUNNING,
+     STATE_COMPLETING,
+     STATE_COMPLETE
+   };
+ 
+   nsRefPtr<Context> mContext;
+   nsCOMPtr<nsIEventTarget> mTarget;
+   nsRefPtr<Action> mAction;
+-  nsCOMPtr<nsIFile> mQuotaDir;
++  const QuotaInfo mQuotaInfo;
+   nsCOMPtr<nsIThread> mInitiatingThread;
+   State mState;
+   bool mCanceled;
+   nsresult mResult;
+ 
+ public:
+   NS_DECL_ISUPPORTS_INHERITED
+   NS_DECL_NSIRUNNABLE
+@@ -378,17 +399,17 @@ Context::ActionRunnable::Run()
+         mState = STATE_COMPLETING;
+         rv = mInitiatingThread->Dispatch(this, nsIThread::DISPATCH_NORMAL);
+         if (NS_FAILED(rv)) {
+           MOZ_CRASH("Failed to dispatch ActionRunnable to initiating thread.");
+         }
+         break;
+       }
+       mState = STATE_RUNNING;
+-      mAction->RunOnTarget(this, mQuotaDir);
++      mAction->RunOnTarget(this, mQuotaInfo);
+       break;
+     case STATE_RUNNING:
+       MOZ_ASSERT(NS_GetCurrentThread() == mTarget);
+       // We only re-enter the RUNNING state if we are canceling.  Normally we
+       // should transition out of RUNNING via Resolve() instead.
+       MOZ_ASSERT(mCanceled);
+       mState = STATE_COMPLETING;
+       mAction->CancelOnTarget();
+@@ -414,26 +435,27 @@ Context::ActionRunnable::Run()
+       break;
+     default:
+       MOZ_CRASH("unexpected state in ActionRunnable");
+       break;
+   }
+   return NS_OK;
+ }
+ 
+-Context::Context(Listener* aListener, const CacheInitData& aInitData,
++Context::Context(Listener* aListener, ManagerId* aManagerId,
+                  Action* aQuotaIOThreadAction)
+   : mListener(aListener)
+-  , mOrigin(aInitData.origin())
++  , mManagerId(aManagerId)
+   , mState(STATE_CONTEXT_INIT)
+ {
+   MOZ_ASSERT(mListener);
++  MOZ_ASSERT(mManagerId);
+ 
+   nsRefPtr<QuotaInitRunnable> runnable =
+-    new QuotaInitRunnable(this, aInitData, NS_LITERAL_CSTRING("Cache"),
++    new QuotaInitRunnable(this, mManagerId, NS_LITERAL_CSTRING("Cache"),
+                           aQuotaIOThreadAction);
+   nsresult rv = runnable->Dispatch();
+   if (NS_FAILED(rv)) {
+     MOZ_CRASH("Failed to dispatch QuotaInitRunnable.");
+   }
+ }
+ 
+ void
+@@ -485,63 +507,55 @@ Context::CancelForCacheId(CacheId aCache
+ 
+ Context::~Context()
+ {
+   NS_ASSERT_OWNINGTHREAD(Context);
+   MOZ_ASSERT(mListener);
+ 
+   // Unlock the quota dir as we go out of scope.
+   nsCOMPtr<nsIRunnable> runnable =
+-    new QuotaReleaseRunnable(mOrigin, NS_LITERAL_CSTRING("Cache"));
++    new QuotaReleaseRunnable(mQuotaInfo, NS_LITERAL_CSTRING("Cache"));
+   nsresult rv = NS_DispatchToMainThread(runnable, nsIThread::DISPATCH_NORMAL);
+   if (NS_FAILED(rv)) {
+     MOZ_CRASH("Failed to dispatch QuotaReleaseRunnable to main thread.");
+   }
+ 
+   mListener->RemoveContext(this);
+ }
+ 
+ void
+ Context::DispatchAction(nsIEventTarget* aTarget, Action* aAction)
+ {
+   NS_ASSERT_OWNINGTHREAD(Context);
+ 
+-  nsCOMPtr<nsIFile> quotaDir;
+-  nsresult rv = mQuotaDir->Clone(getter_AddRefs(quotaDir));
+-  if (NS_WARN_IF(NS_FAILED(rv))) {
+-    aAction->CompleteOnInitiatingThread(rv);
+-    return;
+-  }
+-
+   nsRefPtr<ActionRunnable> runnable =
+-    new ActionRunnable(this, aTarget, aAction, quotaDir);
++    new ActionRunnable(this, aTarget, aAction, mQuotaInfo);
+   mActionRunnables.AppendElement(runnable);
+-  rv = runnable->Dispatch();
++  nsresult rv = runnable->Dispatch();
+   if (NS_FAILED(rv)) {
+     MOZ_CRASH("Failed to dispatch ActionRunnable to target thread.");
+   }
+ }
+ 
+ void
+-Context::OnQuotaInit(nsresult aRv, nsIFile* aQuotaDir)
++Context::OnQuotaInit(nsresult aRv, const QuotaInfo& aQuotaInfo)
+ {
+   NS_ASSERT_OWNINGTHREAD(Context);
+   MOZ_ASSERT(mState == STATE_CONTEXT_INIT);
+ 
+   if (NS_FAILED(aRv)) {
+     for (uint32_t i = 0; i < mPendingActions.Length(); ++i) {
+       mPendingActions[i].mAction->CompleteOnInitiatingThread(aRv);
+     }
+     mPendingActions.Clear();
+     // Context will destruct after return here and last ref is released.
+     return;
+   }
+ 
+-  mQuotaDir = aQuotaDir;
+-  MOZ_ASSERT(mQuotaDir);
++  mQuotaInfo = mQuotaInfo;
+   mState = STATE_CONTEXT_READY;
+ 
+   for (uint32_t i = 0; i < mPendingActions.Length(); ++i) {
+     DispatchAction(mPendingActions[i].mTarget, mPendingActions[i].mAction);
+   }
+   mPendingActions.Clear();
+ }
+ 
+diff --git a/dom/cache/Context.h b/dom/cache/Context.h
+--- a/dom/cache/Context.h
++++ b/dom/cache/Context.h
+@@ -17,34 +17,34 @@
+ class nsIEventTarget;
+ class nsIFile;
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ class Action;
+-class CacheInitData;
++class ManagerId;
+ 
+ class Context MOZ_FINAL
+ {
+ public:
+   class Listener
+   {
+   protected:
+     virtual ~Listener() { }
+   public:
+     // Called from the Context destructor on the thread that originally
+     // created the Context.
+     virtual void RemoveContext(Context* aContext)=0;
+ 
+     NS_INLINE_DECL_REFCOUNTING(mozilla::dom::cache::Context::Listener)
+   };
+ 
+-  Context(Listener* aListener, const CacheInitData& aInitData,
++  Context(Listener* aListener, ManagerId* aManagerId,
+           Action* aQuotaIOThreadAction);
+ 
+   // Execute given action on the target once the quota manager has been
+   // initialized.
+   //
+   // Only callable from the thread that created the Context.
+   void Dispatch(nsIEventTarget* aTarget, Action* aAction);
+ 
+@@ -75,23 +75,23 @@ private:
+   struct PendingAction
+   {
+     nsCOMPtr<nsIEventTarget> mTarget;
+     nsRefPtr<Action> mAction;
+   };
+ 
+   ~Context();
+   void DispatchAction(nsIEventTarget* aTarget, Action* aAction);
+-  void OnQuotaInit(nsresult aRv, nsIFile* aQuotaDir);
++  void OnQuotaInit(nsresult aRv, const QuotaInfo& aQuotaInfo);
+   void OnActionRunnableComplete(ActionRunnable* const aAction);
+ 
+   nsRefPtr<Listener> mListener;
+-  const nsCString mOrigin;
++  nsRefPtr<ManagerId> mManagerId;
+   State mState;
+-  nsCOMPtr<nsIFile> mQuotaDir;
++  QuotaInfo mQuotaInfo;
+   nsTArray<PendingAction> mPendingActions;
+ 
+   // weak refs since ~ActionRunnable() removes itself from this list
+   nsTArray<ActionRunnable*> mActionRunnables;
+ 
+ public:
+   NS_INLINE_DECL_REFCOUNTING(mozilla::dom::cache::Context)
+ };
+diff --git a/dom/cache/DBAction.cpp b/dom/cache/DBAction.cpp
+--- a/dom/cache/DBAction.cpp
++++ b/dom/cache/DBAction.cpp
+@@ -16,47 +16,58 @@
  
  namespace mozilla {
  namespace dom {
@@ -673,37 +1454,90 @@ diff --git a/dom/cache/DBAction.cpp b/dom/cache/DBAction.cpp
  using mozilla::dom::quota::PersistenceType;
  
 -DBAction::DBAction(Mode aMode, const CacheInitData& aInitData)
-+DBAction::DBAction(Mode aMode, ManagerId* aManagerId)
++DBAction::DBAction(Mode aMode)
    : mMode(aMode)
 -  , mInitData(aInitData)
-+  , mManagerId(aManagerId)
 +{
-+  MOZ_ASSERT(mManagerId);
 +}
 +
-+DBActin::~DBAction()
++DBAction::~DBAction()
  {
  }
  
  void
- DBAction::RunOnTarget(Resolver* aResolver, nsIFile* aQuotaDir)
+-DBAction::RunOnTarget(Resolver* aResolver, nsIFile* aQuotaDir)
++DBAction::RunOnTarget(Resolver* aResolver, const QuotaInfo& aQuotaInfo)
  {
    MOZ_ASSERT(aResolver);
-   MOZ_ASSERT(aQuotaDir);
-@@ -92,19 +98,19 @@ DBAction::OpenConnection(nsIFile* aDBDir
+-  MOZ_ASSERT(aQuotaDir);
++  MOZ_ASSERT(aQuotaInfo.mDir);
+ 
+-  nsresult rv = aQuotaDir->Append(NS_LITERAL_STRING("cache"));
++  nsCOMPtr<nsIFile> dbDir;
++  nsresult rv = aQuotaInfo.mDir->Clone(getter_AddRefs(dbDir));
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    aResolver->Resolve(rv);
++    return;
++  }
++
++  rv = dbDir->Append(NS_LITERAL_STRING("cache"));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     aResolver->Resolve(rv);
+     return;
+   }
+ 
+   nsCOMPtr<mozIStorageConnection> conn;
+-  rv = OpenConnection(aQuotaDir, getter_AddRefs(conn));
++  rv = OpenConnection(aQuotaInfo, dbDir, getter_AddRefs(conn));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     aResolver->Resolve(rv);
+     return;
+   }
+   MOZ_ASSERT(conn);
+ 
+-  RunWithDBOnTarget(aResolver, aQuotaDir, conn);
++  RunWithDBOnTarget(aResolver, aQuotaInfo, dbDir, conn);
+ }
+ 
+ nsresult
+-DBAction::OpenConnection(nsIFile* aDBDir, mozIStorageConnection** aConnOut)
++DBAction::OpenConnection(const QuotaInfo& aQuotaInfo, nsIFile* aDBDir,
++                         mozIStorageConnection** aConnOut)
+ {
+   MOZ_ASSERT(aDBDir);
+   MOZ_ASSERT(aConnOut);
+ 
+   bool exists;
+   nsresult rv = aDBDir->Exists(&exists);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+@@ -81,30 +92,32 @@ DBAction::OpenConnection(nsIFile* aDBDir
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   rv = dbTmpDir->Append(NS_LITERAL_STRING("db"));
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   // XXX: Jonas tells me nsIFileURL usage off-main-thread is dangerous,
+   //      but this is what IDB does to access mozIStorageConnection so
+   //      it seems at least this corner case mostly works.
++  // TODO: move this to main thread where GetInfoFromPrincipal() is executed
+   nsCOMPtr<nsIURI> uri;
+   rv = NS_NewFileURI(getter_AddRefs(uri), dbFile);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
  
    nsCOMPtr<nsIFileURL> dbFileUrl = do_QueryInterface(uri);
    if (NS_WARN_IF(!dbFileUrl)) { return NS_ERROR_UNEXPECTED; }
  
++  // TODO: use default storage
    nsAutoCString type;
    PersistenceTypeToText(PERSISTENCE_TYPE_PERSISTENT, type);
  
    rv = dbFileUrl->SetQuery(
--    NS_LITERAL_CSTRING("persistenceType=") + type +
-+    NS_LITERAL_CSTRING("persistenceType=") /* TODO + type +
-     NS_LITERAL_CSTRING("&group=") + mInitData.quotaGroup() +
+     NS_LITERAL_CSTRING("persistenceType=") + type +
+-    NS_LITERAL_CSTRING("&group=") + mInitData.quotaGroup() +
 -    NS_LITERAL_CSTRING("&origin=") + mInitData.origin());
-+    NS_LITERAL_CSTRING("&origin=") + mInitData.origin()*/);
++    NS_LITERAL_CSTRING("&group=") + aQuotaInfo.mGroup +
++    NS_LITERAL_CSTRING("&origin=") + aQuotaInfo.mOrigin);
    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
  
    nsCOMPtr<mozIStorageService> ss =
@@ -712,7 +1546,7 @@ diff --git a/dom/cache/DBAction.cpp b/dom/cache/DBAction.cpp
  
    rv = ss->OpenDatabaseWithFileURL(dbFileUrl, aConnOut);
    if (rv == NS_ERROR_FILE_CORRUPTED) {
-@@ -125,18 +131,22 @@ DBAction::OpenConnection(nsIFile* aDBDir
+@@ -125,28 +138,33 @@ DBAction::OpenConnection(nsIFile* aDBDir
  
      rv = ss->OpenDatabaseWithFileURL(dbFileUrl, aConnOut);
    }
@@ -723,8 +1557,8 @@ diff --git a/dom/cache/DBAction.cpp b/dom/cache/DBAction.cpp
  
 -SyncDBAction::SyncDBAction(Mode aMode, const CacheInitData& aInitData)
 -  : DBAction(aMode, aInitData)
-+SyncDBAction::SyncDBAction(Mode aMode, ManagerId* mManagerId)
-+  : DBAction(aMode, aManagerId)
++SyncDBAction::SyncDBAction(Mode aMode)
++  : DBAction(aMode)
 +{
 +}
 +
@@ -733,14 +1567,28 @@ diff --git a/dom/cache/DBAction.cpp b/dom/cache/DBAction.cpp
  }
  
  void
- SyncDBAction::RunWithDBOnTarget(Resolver* aResolver, nsIFile* aQuotaDir,
+-SyncDBAction::RunWithDBOnTarget(Resolver* aResolver, nsIFile* aQuotaDir,
++SyncDBAction::RunWithDBOnTarget(Resolver* aResolver,
++                                const QuotaInfo& aQuotaInfo, nsIFile* aDBDir,
                                  mozIStorageConnection* aConn)
  {
    MOZ_ASSERT(aResolver);
+-  MOZ_ASSERT(aQuotaDir);
++  MOZ_ASSERT(aDBDir);
+   MOZ_ASSERT(aConn);
+ 
+-  nsresult rv = RunSyncWithDBOnTarget(aQuotaDir, aConn);
++  nsresult rv = RunSyncWithDBOnTarget(aQuotaInfo, aDBDir, aConn);
+   aResolver->Resolve(rv);
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
 diff --git a/dom/cache/DBAction.h b/dom/cache/DBAction.h
 --- a/dom/cache/DBAction.h
 +++ b/dom/cache/DBAction.h
-@@ -4,60 +4,61 @@
+@@ -4,16 +4,17 @@
   * License, v. 2.0. If a copy of the MPL was not distributed with this
   * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
  
@@ -758,10 +1606,7 @@ diff --git a/dom/cache/DBAction.h b/dom/cache/DBAction.h
  namespace mozilla {
  namespace dom {
  namespace cache {
- 
-+class ManagerId;
-+
- class DBAction : public Action
+@@ -22,47 +23,48 @@ class DBAction : public Action
  {
  protected:
    enum Mode
@@ -771,59 +1616,277 @@ diff --git a/dom/cache/DBAction.h b/dom/cache/DBAction.h
    };
  
 -  DBAction(Mode aMode, const CacheInitData& aInitData);
-+  DBAction(Mode aMode, ManagerId* aManagerId);
++  DBAction(Mode aMode);
 +  virtual ~DBAction();
  
    // Just as the resolver must be ref'd until cancel or resolve, you may also
    // ref the DB connection.  The connection can only be referenced from the
    // target thread and must be released upon cancel or resolve.
-   virtual void RunWithDBOnTarget(Resolver* aResolver, nsIFile* aDBDir,
-                                  mozIStorageConnection* aConn)=0;
+-  virtual void RunWithDBOnTarget(Resolver* aResolver, nsIFile* aDBDir,
+-                                 mozIStorageConnection* aConn)=0;
++  virtual void
++  RunWithDBOnTarget(Resolver* aResolver, const QuotaInfo& aQuotaInfo,
++                    nsIFile* aDBDir, mozIStorageConnection* aConn)=0;
  
-   virtual
-   void RunOnTarget(Resolver* aResolver, nsIFile* aQuotaDir) MOZ_OVERRIDE;
- 
--  virtual ~DBAction() { }
+-  virtual
+-  void RunOnTarget(Resolver* aResolver, nsIFile* aQuotaDir) MOZ_OVERRIDE;
 -
+-  virtual ~DBAction() { }
++  virtual void
++  RunOnTarget(Resolver* aResolver, const QuotaInfo& aQuotaInfo) MOZ_OVERRIDE;
+ 
  private:
-   nsresult OpenConnection(nsIFile* aQuotaDir, mozIStorageConnection** aConnOut);
+-  nsresult OpenConnection(nsIFile* aQuotaDir, mozIStorageConnection** aConnOut);
++  nsresult OpenConnection(const QuotaInfo& aQuotaInfo, nsIFile* aQuotaDir,
++                          mozIStorageConnection** aConnOut);
  
    const Mode mMode;
 -  const CacheInitData mInitData;
-+  nsRefPtr<ManagerId> mManagerId;
  };
  
  class SyncDBAction : public DBAction
  {
  protected:
 -  SyncDBAction(Mode aMode, const CacheInitData& aInitData);
--
--  virtual ~SyncDBAction() { }
-+  SyncDBAction(Mode aMode, ManagerId* aManagerId);
++  SyncDBAction(Mode aMode);
 +  virtual ~SyncDBAction();
  
-   virtual nsresult RunSyncWithDBOnTarget(nsIFile* aDBDir,
-                                          mozIStorageConnection* aConn)=0;
+-  virtual ~SyncDBAction() { }
++  virtual nsresult
++  RunSyncWithDBOnTarget(const QuotaInfo& aQuotaInfo, nsIFile* aDBDir,
++                        mozIStorageConnection* aConn)=0;
  
-   virtual void RunWithDBOnTarget(Resolver* aResolver, nsIFile* aDBDir,
-                                  mozIStorageConnection* aConn) MOZ_OVERRIDE;
+-  virtual nsresult RunSyncWithDBOnTarget(nsIFile* aDBDir,
+-                                         mozIStorageConnection* aConn)=0;
+-
+-  virtual void RunWithDBOnTarget(Resolver* aResolver, nsIFile* aDBDir,
+-                                 mozIStorageConnection* aConn) MOZ_OVERRIDE;
++  virtual void
++  RunWithDBOnTarget(Resolver* aResolver, const QuotaInfo& aQuotaInfo,
++                    nsIFile* aDBDir, mozIStorageConnection* aConn) MOZ_OVERRIDE;
  };
  
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_cache_DBAction_h
+diff --git a/dom/cache/FetchPut.cpp b/dom/cache/FetchPut.cpp
+--- a/dom/cache/FetchPut.cpp
++++ b/dom/cache/FetchPut.cpp
+@@ -10,16 +10,17 @@
+ #include "mozilla/dom/FetchDriver.h"
+ #include "mozilla/dom/Headers.h"
+ #include "mozilla/dom/Promise.h"
+ #include "mozilla/dom/PromiseNativeHandler.h"
+ #include "mozilla/dom/Request.h"
+ #include "mozilla/dom/Response.h"
+ #include "mozilla/dom/ResponseBinding.h"
+ #include "mozilla/dom/UnionTypes.h"
++#include "mozilla/dom/cache/ManagerId.h"
+ #include "mozilla/dom/cache/PCacheTypes.h"
+ #include "nsContentUtils.h"
+ #include "nsNetUtil.h"
+ #include "nsThreadUtils.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+@@ -131,16 +132,17 @@ FetchPut::FetchPut(Listener* aListener, 
+   , mRequestId(aRequestId)
+   , mCacheId(aCacheId)
+   , mInitiatingThread(NS_GetCurrentThread())
+   , mStateList(aRequests.Length())
+   , mPendingCount(0)
+   , mResult(NS_OK)
+ {
+   MOZ_ASSERT(mListener);
++  MOZ_ASSERT(mManager);
+   MOZ_ASSERT(aRequests.Length() == aRequestStreams.Length());
+ 
+   for (uint32_t i = 0; i < aRequests.Length(); ++i) {
+     State* s = mStateList.AppendElement();
+     s->mPCacheRequest = aRequests[i];
+     s->mRequestStream = aRequestStreams[i];
+   }
+ 
+@@ -187,39 +189,18 @@ FetchPut::DispatchToInitiatingThread()
+   mRunnable = nullptr;
+ }
+ 
+ void
+ FetchPut::DoFetchOnMainThread()
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+ 
+-  nsCOMPtr<nsIURI> uri;
+-  nsresult rv = NS_NewURI(getter_AddRefs(uri), mManager->Origin());
+-  if (NS_WARN_IF(NS_FAILED(rv))) {
+-    MaybeSetError(rv);
+-    MaybeCompleteOnMainThread();
+-    return;
+-  }
+-
+-  nsCOMPtr<nsIScriptSecurityManager> ssm = nsContentUtils::GetSecurityManager();
+-  if (!ssm) {
+-    MaybeSetError(NS_ERROR_UNEXPECTED);
+-    MaybeCompleteOnMainThread();
+-    return;
+-  }
+-
+-  nsCOMPtr<nsIPrincipal> principal;
+-  rv = ssm->GetSimpleCodebasePrincipal(uri, getter_AddRefs(principal));
+-  if (NS_WARN_IF(NS_FAILED(rv))) {
+-    MaybeSetError(rv);
+-    MaybeCompleteOnMainThread();
+-    return;
+-  }
+-
++  nsRefPtr<ManagerId> managerId = mManager->GetManagerId();
++  nsCOMPtr<nsIPrincipal> principal = managerId->Principal();
+   mPendingCount = mStateList.Length();
+ 
+   for (uint32_t i = 0; i < mStateList.Length(); ++i) {
+     nsRefPtr<InternalRequest> internalRequest =
+       ToInternalRequest(mStateList[i].mPCacheRequest);
+ 
+     // If there is a stream we must clone it so that its still available
+     // to store in the cache later;
+@@ -233,17 +214,17 @@ FetchPut::DoFetchOnMainThread()
+ 
+       internalRequest = clone;
+     }
+ 
+     nsRefPtr<FetchDriver> fetchDriver = new FetchDriver(internalRequest,
+                                                         principal);
+ 
+     mStateList[i].mFetchObserver = new FetchObserver(this);
+-    rv = fetchDriver->Fetch(mStateList[i].mFetchObserver);
++    nsresult rv = fetchDriver->Fetch(mStateList[i].mFetchObserver);
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       MaybeSetError(rv);
+       mStateList[i].mFetchObserver = nullptr;
+       mPendingCount -= 1;
+       continue;
+     }
+   }
+ 
+@@ -432,17 +413,18 @@ nsIGlobalObject*
+ FetchPut::GetGlobalObject() const
+ {
+   MOZ_CRASH("No global object in parent-size FetchPut operation!");
+ }
+ 
+ const nsACString&
+ FetchPut::Origin() const
+ {
+-  return mManager->Origin();
++  nsRefPtr<ManagerId> managerId = mManager->GetManagerId();
++  return managerId->Origin();
+ }
+ 
+ #ifdef DEBUG
+ void
+ FetchPut::AssertOwningThread() const
+ {
+   MOZ_ASSERT(mInitiatingThread == NS_GetCurrentThread());
+ }
+diff --git a/dom/cache/FetchPut.h b/dom/cache/FetchPut.h
+--- a/dom/cache/FetchPut.h
++++ b/dom/cache/FetchPut.h
+@@ -45,17 +45,17 @@ public:
+   class Listener
+   {
+   public:
+     virtual void
+     OnFetchPut(FetchPut* aFetchPut, RequestId aRequestId, nsresult aRv)=0;
+   };
+ 
+   static nsresult
+-  Create(Listener* aListener, Manager* mManager,
++  Create(Listener* aListener, Manager* aManager,
+          RequestId aRequestId, CacheId aCacheId,
+          const nsTArray<PCacheRequest>& aRequests,
+          const nsTArray<nsCOMPtr<nsIInputStream>>& aRequestStreams,
+          FetchPut** aFetchPutOut);
+ 
+   void ClearListener();
+ 
+ private:
+@@ -97,17 +97,16 @@ private:
+ 
+   // TypeUtils methods
+   virtual nsIGlobalObject* GetGlobalObject() const MOZ_OVERRIDE;
+   virtual const nsACString& Origin() const MOZ_OVERRIDE;
+ #ifdef DEBUG
+   virtual void AssertOwningThread() const MOZ_OVERRIDE;
+ #endif
+ 
+-  // TODO remove ref counting on owner since its an actor
+   Listener* mListener;
+   nsRefPtr<Manager> mManager;
+   const RequestId mRequestId;
+   const CacheId mCacheId;
+   nsCOMPtr<nsIThread> mInitiatingThread;
+   nsTArray<State> mStateList;
+   uint32_t mPendingCount;
+   nsresult mResult;
 diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
 --- a/dom/cache/FileUtils.cpp
 +++ b/dom/cache/FileUtils.cpp
-@@ -175,17 +175,17 @@ FileUtils::BodyStartWriteStream(const Ca
+@@ -1,17 +1,16 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/FileUtils.h"
+ 
+-#include "mozilla/dom/cache/CacheInitData.h"
+ #include "mozilla/dom/quota/FileStreams.h"
+ #include "mozilla/unused.h"
+ #include "nsIFile.h"
+ #include "nsIUUIDGenerator.h"
+ #include "nsNetUtil.h"
+ #include "nsServiceManagerUtils.h"
+ #include "nsString.h"
+ #include "nsThreadUtils.h"
+@@ -134,17 +133,17 @@ FileUtils::BodyIdToFile(nsIFile* aBaseDi
+   rv = (*aBodyFileOut)->Append(fileName);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   return rv;
+ }
+ 
+ // static
+ nsresult
+-FileUtils::BodyStartWriteStream(const CacheInitData& aInitData,
++FileUtils::BodyStartWriteStream(const QuotaInfo& aQuotaInfo,
+                                 nsIFile* aBaseDir, nsIInputStream* aSource,
+                                 void* aClosure,
+                                 nsAsyncCopyCallbackFun aCallback, nsID* aIdOut,
+                                 nsISupports** aCopyContextOut)
+ {
+   MOZ_ASSERT(aBaseDir);
+   MOZ_ASSERT(aSource);
+   MOZ_ASSERT(aClosure);
+@@ -173,20 +172,20 @@ FileUtils::BodyStartWriteStream(const Ca
+   nsCOMPtr<nsIFile> tmpFile;
+   rv = BodyIdToFile(aBaseDir, *aIdOut, BODY_FILE_TMP, getter_AddRefs(tmpFile));
    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
  
    rv = tmpFile->Exists(&exists);
    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
    if (NS_WARN_IF(exists)) { return NS_ERROR_FILE_ALREADY_EXISTS; }
  
++  // TODO: use default storage
    nsCOMPtr<nsIOutputStream> fileStream =
-     FileOutputStream::Create(PERSISTENCE_TYPE_PERSISTENT,
+-    FileOutputStream::Create(PERSISTENCE_TYPE_PERSISTENT,
 -                             aInitData.quotaGroup(), aInitData.origin(),
-+                             EmptyCString(), EmptyCString() /*TODO aInitData.quotaGroup(), aInitData.origin()*/,
-                              tmpFile);
+-                             tmpFile);
++    FileOutputStream::Create(PERSISTENCE_TYPE_PERSISTENT, aQuotaInfo.mGroup,
++                             aQuotaInfo.mOrigin, tmpFile);
    if (NS_WARN_IF(!fileStream)) { return NS_ERROR_UNEXPECTED; }
  
    // By default we would prefer to just use ReadSegments to copy buffers.
@@ -831,7 +1894,45 @@ diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
  
    // But first we must check to see if the source stream provides ReadSegments.
    // If it does not, use a buffered output stream to write to the file.  We don't
-@@ -282,18 +282,18 @@ FileUtils::BodyOpen(const CacheInitData&
+   // wrap the input because because that can lead to it being closed on the wrong
+@@ -195,16 +194,18 @@ FileUtils::BodyStartWriteStream(const Ca
+     nsCOMPtr<nsIOutputStream> buffered;
+     rv = NS_NewBufferedOutputStream(getter_AddRefs(buffered), fileStream, 4096);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+     fileStream = buffered.forget();
+     mode = NS_ASYNCCOPY_VIA_WRITESEGMENTS;
+   }
+ 
++  // TODO: we should be able to auto-close now...
++
+   // Note, we cannot auto-close the source stream here because some of
+   // our source streams must be closed on the PBackground worker thread.
+   rv = NS_AsyncCopy(aSource, fileStream, NS_GetCurrentThread(), mode,
+                     4096, // chunk size
+                     aCallback, aClosure,
+                     false, true, // close streams
+                     aCopyContextOut);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+@@ -265,97 +266,45 @@ FileUtils::BodyFinalizeWrite(nsIFile* aB
+   rv = tmpFile->RenameTo(finalDir, finalFileName);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   return rv;
+ }
+ 
+ // static
+ nsresult
+-FileUtils::BodyOpen(const CacheInitData& aInitData, nsIFile* aBaseDir,
++FileUtils::BodyOpen(const QuotaInfo& aQuotaInfo, nsIFile* aBaseDir,
+                     const nsID& aId, nsIInputStream** aStreamOut)
+ {
+   MOZ_ASSERT(aBaseDir);
+   MOZ_ASSERT(aStreamOut);
+ 
+   nsCOMPtr<nsIFile> finalFile;
+   nsresult rv = BodyIdToFile(aBaseDir, aId, BODY_FILE_FINAL,
+                              getter_AddRefs(finalFile));
    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
  
    bool exists;
@@ -839,11 +1940,12 @@ diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
    if (NS_WARN_IF(!exists)) { return NS_ERROR_FILE_NOT_FOUND; }
  
++  // TODO: use default storage
    nsCOMPtr<nsIInputStream> fileStream =
 -    FileInputStream::Create(PERSISTENCE_TYPE_PERSISTENT, aInitData.quotaGroup(),
 -                            aInitData.origin(), finalFile);
-+    FileInputStream::Create(PERSISTENCE_TYPE_PERSISTENT, EmptyCString(), EmptyCString() /*TODO aInitData.quotaGroup(),
-+                            aInitData.origin()*/, finalFile);
++    FileInputStream::Create(PERSISTENCE_TYPE_PERSISTENT, aQuotaInfo.mGroup,
++                            aQuotaInfo.mOrigin, finalFile);
    if (NS_WARN_IF(!fileStream)) { return NS_ERROR_UNEXPECTED; }
  
    fileStream.forget(aStreamOut);
@@ -852,31 +1954,138 @@ diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
  }
  
  // static
-@@ -317,18 +317,18 @@ FileUtils::BodyStartReadStream(const Cac
-   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
- 
-   bool exists;
-   rv = finalFile->Exists(&exists);
-   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
-   if (NS_WARN_IF(!exists)) { return NS_ERROR_FILE_NOT_FOUND; }
- 
-   nsCOMPtr<nsIInputStream> fileStream =
+ nsresult
+-FileUtils::BodyStartReadStream(const CacheInitData& aInitData,
+-                               nsIFile* aBaseDir,
+-                               const nsID& aId, nsIOutputStream* aDest,
+-                               void* aClosure,
+-                               nsAsyncCopyCallbackFun aCallback,
+-                               nsISupports** aCopyContextOut)
+-{
+-  MOZ_ASSERT(aBaseDir);
+-  MOZ_ASSERT(aDest);
+-  MOZ_ASSERT(aClosure);
+-  MOZ_ASSERT(aCallback);
+-  MOZ_ASSERT(aCopyContextOut);
+-
+-  nsCOMPtr<nsIFile> finalFile;
+-  nsresult rv = BodyIdToFile(aBaseDir, aId, BODY_FILE_FINAL,
+-                             getter_AddRefs(finalFile));
+-  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+-
+-  bool exists;
+-  rv = finalFile->Exists(&exists);
+-  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+-  if (NS_WARN_IF(!exists)) { return NS_ERROR_FILE_NOT_FOUND; }
+-
+-  nsCOMPtr<nsIInputStream> fileStream =
 -    FileInputStream::Create(PERSISTENCE_TYPE_PERSISTENT, aInitData.quotaGroup(),
 -                            aInitData.origin(), finalFile);
-+    FileInputStream::Create(PERSISTENCE_TYPE_PERSISTENT, EmptyCString(), EmptyCString() /*aInitData.quotaGroup(),
-+                            aInitData.origin()*/, finalFile);
-   if (NS_WARN_IF(!fileStream)) { return NS_ERROR_UNEXPECTED; }
+-  if (NS_WARN_IF(!fileStream)) { return NS_ERROR_UNEXPECTED; }
+-
+-  rv = NS_AsyncCopy(fileStream, aDest, NS_GetCurrentThread(),
+-                    NS_ASYNCCOPY_VIA_READSEGMENTS,
+-                    4096, // chunk size
+-                    aCallback, aClosure,
+-                    true, true, // close streams
+-                    aCopyContextOut);
+-  if (NS_WARN_IF(NS_FAILED(rv))) {
+-    fileStream->Close();
+-    return rv;
+-  }
+-
+-  return rv;
+-}
+-
+-// static
+-void
+-FileUtils::BodyCancelRead(nsISupports* aCopyContext)
+-{
+-  MOZ_ASSERT(aCopyContext);
+-  nsresult rv = NS_CancelAsyncCopy(aCopyContext, NS_ERROR_ABORT);
+-  unused << NS_WARN_IF(NS_FAILED(rv));
+-}
+-
+-// static
+-nsresult
+ FileUtils::BodyDeleteFiles(nsIFile* aBaseDir, const nsTArray<nsID>& aIdList)
+ {
+   nsresult rv = NS_OK;
  
-   rv = NS_AsyncCopy(fileStream, aDest, NS_GetCurrentThread(),
-                     NS_ASYNCCOPY_VIA_READSEGMENTS,
-                     4096, // chunk size
-                     aCallback, aClosure,
-                     true, true, // close streams
-                     aCopyContextOut);
+   for (uint32_t i = 0; i < aIdList.Length(); ++i) {
+     nsCOMPtr<nsIFile> finalFile;
+     rv = BodyIdToFile(aBaseDir, aIdList[i], BODY_FILE_FINAL,
+                       getter_AddRefs(finalFile));
+diff --git a/dom/cache/FileUtils.h b/dom/cache/FileUtils.h
+--- a/dom/cache/FileUtils.h
++++ b/dom/cache/FileUtils.h
+@@ -14,18 +14,16 @@
+ struct nsID;
+ class nsIFile;
+ template<class T> class nsTArray;
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+-class CacheInitData;
+-
+ class FileUtils MOZ_FINAL
+ {
+ public:
+   enum BodyFileType
+   {
+     BODY_FILE_FINAL,
+     BODY_FILE_TMP
+   };
+@@ -34,41 +32,33 @@ public:
+   static nsresult BodyGetCacheDir(nsIFile* aBaseDir, const nsID& aId,
+                                   nsIFile** aCacheDirOut);
+ 
+   static nsresult
+   BodyIdToFile(nsIFile* aBaseDir, const nsID& aId, BodyFileType aType,
+                nsIFile** aBodyFileOut);
+ 
+   static nsresult
+-  BodyStartWriteStream(const CacheInitData& aInitData, nsIFile* aBaseDir,
++  BodyStartWriteStream(const QuotaInfo& aQuotaInfo, nsIFile* aBaseDir,
+                        nsIInputStream* aSource, void* aClosure,
+                        nsAsyncCopyCallbackFun aCallback, nsID* aIdOut,
+                        nsISupports** aCopyContextOut);
+ 
+   static void
+   BodyCancelWrite(nsIFile* aBaseDir, const nsID& aId,
+                   nsISupports* aCopyContext);
+ 
+   static nsresult
+   BodyFinalizeWrite(nsIFile* aBaseDir, const nsID& aId);
+ 
+   static nsresult
+-  BodyOpen(const CacheInitData& aInitData, nsIFile* aBaseDir, const nsID& aId,
++  BodyOpen(const QuotaInfo& aQuotaInfo, nsIFile* aBaseDir, const nsID& aId,
+            nsIInputStream** aStreamOut);
+ 
+   static nsresult
+-  BodyStartReadStream(const CacheInitData& aInitData, nsIFile* aBaseDir,
+-                      const nsID& aId, nsIOutputStream* aDest, void* aClosure,
+-                      nsAsyncCopyCallbackFun aCallback,
+-                      nsISupports** aCopyContextOut);
+-
+-  static void BodyCancelRead(nsISupports* aCopyContext);
+-
+-  static nsresult
+   BodyDeleteFiles(nsIFile* aBaseDir, const nsTArray<nsID>& aIdList);
+ 
+ private:
+   FileUtils() MOZ_DELETE;
+   ~FileUtils() MOZ_DELETE;
+ };
+ 
+ } // namespace cache
 diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
 --- a/dom/cache/Manager.cpp
 +++ b/dom/cache/Manager.cpp
-@@ -4,16 +4,17 @@
+@@ -4,44 +4,45 @@
   * License, v. 2.0. If a copy of the MPL was not distributed with this
   * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
  
@@ -894,6 +2103,38 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
  #include "mozStorageHelper.h"
  #include "nsAutoPtr.h"
  #include "nsIInputStream.h"
+ #include "nsID.h"
+ #include "nsIFile.h"
+ #include "nsIThread.h"
+ 
+ namespace {
+ 
+-using mozilla::dom::cache::CacheInitData;
+ using mozilla::dom::cache::DBSchema;
+ using mozilla::dom::cache::FileUtils;
++using mozilla::dom::cache::QuotaInfo;
+ using mozilla::dom::cache::SyncDBAction;
+ 
+ class SetupAction MOZ_FINAL : public SyncDBAction
+ {
+ public:
+-  SetupAction(const CacheInitData& aInitData)
+-    : SyncDBAction(DBAction::Create, aInitData)
++  SetupAction()
++    : SyncDBAction(DBAction::Create)
+   { }
+ 
+   virtual nsresult
+-  RunSyncWithDBOnTarget(nsIFile* aDBDir,
++  RunSyncWithDBOnTarget(const QuotaInfo& aQuotaInfo, nsIFile* aDBDir,
+                         mozIStorageConnection* aConn) MOZ_OVERRIDE
+   {
+     // TODO: init maintainance marker
+     // TODO: perform maintainance if necessary
+     // TODO: find orphaned caches in database
+     // TODO: have Context create/delete marker files in constructor/destructor
+     //       and only do expensive maintenance if that marker is present
+ 
 @@ -82,35 +83,35 @@ public:
      mozilla::ipc::AssertIsOnBackgroundThread();
  
@@ -935,7 +2176,428 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
      return nullptr;
    }
  
-@@ -1138,28 +1139,28 @@ Manager::StreamList::~StreamList()
+@@ -135,17 +136,17 @@ public:
+ 
+ // static
+ Manager::Factory* Manager::Factory::sFactory = nullptr;
+ 
+ class Manager::BaseAction : public SyncDBAction
+ {
+ protected:
+   BaseAction(Manager* aManager, ListenerId aListenerId, RequestId aRequestId)
+-    : SyncDBAction(DBAction::Existing, aManager->mInitData)
++    : SyncDBAction(DBAction::Existing)
+     , mManager(aManager)
+     , mListenerId(aListenerId)
+     , mRequestId (aRequestId)
+   { }
+ 
+   virtual void
+   Complete(Listener* aListener, nsresult aRv)=0;
+ 
+@@ -174,28 +175,35 @@ public:
+   { }
+ 
+   DeleteOrphanedBodyAction(const nsID& aBodyId)
+   {
+     mDeletedBodyIdList.AppendElement(aBodyId);
+   }
+ 
+   virtual void
+-  RunOnTarget(Resolver* aResolver, nsIFile* aQuotaDir) MOZ_OVERRIDE
++  RunOnTarget(Resolver* aResolver, const QuotaInfo& aQuotaInfo) MOZ_OVERRIDE
+   {
+     MOZ_ASSERT(aResolver);
+-    MOZ_ASSERT(aQuotaDir);
++    MOZ_ASSERT(aQuotaInfo.mDir);
+ 
+-    nsresult rv = aQuotaDir->Append(NS_LITERAL_STRING("cache"));
++    nsCOMPtr<nsIFile> dbDir;
++    nsresult rv = aQuotaInfo.mDir->Clone(getter_AddRefs(dbDir));
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       aResolver->Resolve(rv);
+       return;
+     }
+ 
+-    rv = FileUtils::BodyDeleteFiles(aQuotaDir, mDeletedBodyIdList);
++    rv = dbDir->Append(NS_LITERAL_STRING("cache"));
++    if (NS_WARN_IF(NS_FAILED(rv))) {
++      aResolver->Resolve(rv);
++      return;
++    }
++
++    rv = FileUtils::BodyDeleteFiles(dbDir, mDeletedBodyIdList);
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       aResolver->Resolve(rv);
+       return;
+     }
+ 
+     aResolver->Resolve(rv);
+   }
+ 
+@@ -203,23 +211,23 @@ private:
+   virtual ~DeleteOrphanedBodyAction() { }
+   nsTArray<nsID> mDeletedBodyIdList;
+ };
+ 
+ class Manager::DeleteOrphanedCacheAction MOZ_FINAL : public SyncDBAction
+ {
+ public:
+   DeleteOrphanedCacheAction(Manager* aManager, CacheId aCacheId)
+-    : SyncDBAction(DBAction::Existing, aManager->mInitData)
++    : SyncDBAction(DBAction::Existing)
+     , mManager(aManager)
+     , mCacheId(aCacheId)
+   { }
+ 
+   virtual nsresult
+-  RunSyncWithDBOnTarget(nsIFile* aDBDir,
++  RunSyncWithDBOnTarget(const QuotaInfo& aQuotaInfo, nsIFile* aDBDir,
+                         mozIStorageConnection* aConn) MOZ_OVERRIDE
+   {
+     mozStorageTransaction trans(aConn, false,
+                                 mozIStorageConnection::TRANSACTION_IMMEDIATE);
+ 
+     nsresult rv = DBSchema::DeleteCache(aConn, mCacheId, mDeletedBodyIdList);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+@@ -255,29 +263,29 @@ public:
+     , mCacheId(aCacheId)
+     , mRequest(aRequest)
+     , mParams(aParams)
+     , mStreamList(aStreamList)
+     , mFoundResponse(false)
+   { }
+ 
+   virtual nsresult
+-  RunSyncWithDBOnTarget(nsIFile* aDBDir,
++  RunSyncWithDBOnTarget(const QuotaInfo& aQuotaInfo, nsIFile* aDBDir,
+                         mozIStorageConnection* aConn) MOZ_OVERRIDE
+   {
+     nsresult rv = DBSchema::CacheMatch(aConn, mCacheId, mRequest, mParams,
+                                        &mFoundResponse, &mResponse);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+     if (!mFoundResponse || !mResponse.mHasBodyId) {
+       return rv;
+     }
+ 
+     nsCOMPtr<nsIInputStream> stream;
+-    rv = FileUtils::BodyOpen(mManager->mInitData, aDBDir, mResponse.mBodyId,
++    rv = FileUtils::BodyOpen(aQuotaInfo, aDBDir, mResponse.mBodyId,
+                              getter_AddRefs(stream));
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+     if (NS_WARN_IF(!stream)) { return NS_ERROR_FILE_NOT_FOUND; }
+ 
+     mStreamList->Add(mResponse.mBodyId, stream);
+ 
+     return rv;
+   }
+@@ -320,30 +328,30 @@ public:
+     : BaseAction(aManager, aListenerId, aRequestId)
+     , mCacheId(aCacheId)
+     , mRequestOrVoid(aRequestOrVoid)
+     , mParams(aParams)
+     , mStreamList(aStreamList)
+   { }
+ 
+   virtual nsresult
+-  RunSyncWithDBOnTarget(nsIFile* aDBDir,
++  RunSyncWithDBOnTarget(const QuotaInfo& aQuotaInfo, nsIFile* aDBDir,
+                         mozIStorageConnection* aConn) MOZ_OVERRIDE
+   {
+     nsresult rv = DBSchema::CacheMatchAll(aConn, mCacheId, mRequestOrVoid,
+                                           mParams, mSavedResponses);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+     for (uint32_t i = 0; i < mSavedResponses.Length(); ++i) {
+       if (!mSavedResponses[i].mHasBodyId) {
+         continue;
+       }
+ 
+       nsCOMPtr<nsIInputStream> stream;
+-      rv = FileUtils::BodyOpen(mManager->mInitData, aDBDir,
++      rv = FileUtils::BodyOpen(aQuotaInfo, aDBDir,
+                                mSavedResponses[i].mBodyId,
+                                getter_AddRefs(stream));
+       if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+       if (NS_WARN_IF(!stream)) { return NS_ERROR_FILE_NOT_FOUND; }
+ 
+       mStreamList->Add(mSavedResponses[i].mBodyId, stream);
+     }
+ 
+@@ -375,17 +383,17 @@ protected:
+ class Manager::CachePutAllAction MOZ_FINAL : public DBAction
+ {
+ public:
+   CachePutAllAction(Manager* aManager, ListenerId aListenerId,
+                     RequestId aRequestId, CacheId aCacheId,
+                     const nsTArray<CacheRequestResponse>& aPutList,
+                     const nsTArray<nsCOMPtr<nsIInputStream>>& aRequestStreamList,
+                     const nsTArray<nsCOMPtr<nsIInputStream>>& aResponseStreamList)
+-    : DBAction(DBAction::Existing, aManager->mInitData)
++    : DBAction(DBAction::Existing)
+     , mManager(aManager)
+     , mListenerId(aListenerId)
+     , mRequestId(aRequestId)
+     , mCacheId(aCacheId)
+     , mList(aPutList.Length())
+     , mExpectedAsyncCopyCompletions(0)
+   {
+     MOZ_ASSERT(aPutList.Length() == aRequestStreamList.Length());
+@@ -399,18 +407,18 @@ public:
+       entry->mResponseStream = aResponseStreamList[i];
+ 
+       mExpectedAsyncCopyCompletions += entry->mRequestStream ? 1 : 0;
+       mExpectedAsyncCopyCompletions += entry->mResponseStream ? 1 : 0;
+     }
+   }
+ 
+   virtual void
+-  RunWithDBOnTarget(Resolver* aResolver, nsIFile* aDBDir,
+-                    mozIStorageConnection* aConn) MOZ_OVERRIDE
++  RunWithDBOnTarget(Resolver* aResolver, const QuotaInfo& aQuotaInfo,
++                    nsIFile* aDBDir, mozIStorageConnection* aConn) MOZ_OVERRIDE
+   {
+     MOZ_ASSERT(aResolver);
+     MOZ_ASSERT(aDBDir);
+     MOZ_ASSERT(aConn);
+     MOZ_ASSERT(!mResolver);
+     MOZ_ASSERT(!mDBDir);
+     MOZ_ASSERT(!mConn);
+ 
+@@ -421,26 +429,26 @@ public:
+     if (mExpectedAsyncCopyCompletions < 1) {
+       mExpectedAsyncCopyCompletions = 1;
+       OnAsyncCopyComplete(NS_OK);
+       return;
+     }
+ 
+     nsresult rv = NS_OK;
+     for (uint32_t i = 0; i < mList.Length(); ++i) {
+-      rv = StartStreamCopy(mList[i].mRequestStream,
++      rv = StartStreamCopy(aQuotaInfo, mList[i].mRequestStream,
+                            &mList[i].mRequestBodyId,
+                            getter_AddRefs(mList[i].mRequestCopyContext));
+       if (NS_WARN_IF(NS_FAILED(rv))) {
+         CancelAllStreamCopying();
+         DoResolve(rv);
+         return;
+       }
+ 
+-      rv = StartStreamCopy(mList[i].mResponseStream,
++      rv = StartStreamCopy(aQuotaInfo, mList[i].mResponseStream,
+                            &mList[i].mResponseBodyId,
+                            getter_AddRefs(mList[i].mResponseCopyContext));
+       if (NS_WARN_IF(NS_FAILED(rv))) {
+         CancelAllStreamCopying();
+         DoResolve(rv);
+         return;
+       }
+     }
+@@ -543,34 +551,30 @@ public:
+   {
+     return aCacheId == mCacheId;
+   }
+ 
+ private:
+   virtual ~CachePutAllAction() { }
+ 
+   nsresult
+-  StartStreamCopy(nsIInputStream* aSource, nsID* aIdOut,
+-                  nsISupports** aCopyContextOut)
++  StartStreamCopy(const QuotaInfo& aQuotaInfo, nsIInputStream* aSource,
++                  nsID* aIdOut, nsISupports** aCopyContextOut)
+   {
+     MOZ_ASSERT(aIdOut);
+     MOZ_ASSERT(aCopyContextOut);
+     MOZ_ASSERT(mDBDir);
+ 
+     if (!aSource) {
+       return NS_OK;
+     }
+ 
+-    nsresult rv = FileUtils::BodyStartWriteStream(mManager->mInitData,
+-                                                  mDBDir,
+-                                                  aSource,
+-                                                  this,
+-                                                  AsyncCopyCompleteFunc,
+-                                                  aIdOut,
+-                                                  aCopyContextOut);
++    nsresult rv = FileUtils::BodyStartWriteStream(aQuotaInfo, mDBDir, aSource,
++                                                  this, AsyncCopyCompleteFunc,
++                                                  aIdOut, aCopyContextOut);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+     return rv;
+   }
+ 
+   void
+   CancelAllStreamCopying()
+   {
+@@ -661,17 +665,17 @@ public:
+     : BaseAction(aManager, aListenerId, aRequestId)
+     , mCacheId(aCacheId)
+     , mRequest(aRequest)
+     , mParams(aParams)
+     , mSuccess(false)
+   { }
+ 
+   virtual nsresult
+-  RunSyncWithDBOnTarget(nsIFile* aDBDir,
++  RunSyncWithDBOnTarget(const QuotaInfo& aQuotaInfo, nsIFile* aDBDir,
+                         mozIStorageConnection* aConn) MOZ_OVERRIDE
+   {
+     mozStorageTransaction trans(aConn, false,
+                                 mozIStorageConnection::TRANSACTION_IMMEDIATE);
+ 
+     nsresult rv = DBSchema::CacheDelete(aConn, mCacheId, mRequest, mParams,
+                                         mDeletedBodyIdList, &mSuccess);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+@@ -717,30 +721,30 @@ public:
+     : BaseAction(aManager, aListenerId, aRequestId)
+     , mCacheId(aCacheId)
+     , mRequestOrVoid(aRequestOrVoid)
+     , mParams(aParams)
+     , mStreamList(aStreamList)
+   { }
+ 
+   virtual nsresult
+-  RunSyncWithDBOnTarget(nsIFile* aDBDir,
++  RunSyncWithDBOnTarget(const QuotaInfo& aQuotaInfo, nsIFile* aDBDir,
+                         mozIStorageConnection* aConn) MOZ_OVERRIDE
+   {
+     nsresult rv = DBSchema::CacheKeys(aConn, mCacheId, mRequestOrVoid, mParams,
+                                       mSavedRequests);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+     for (uint32_t i = 0; i < mSavedRequests.Length(); ++i) {
+       if (!mSavedRequests[i].mHasBodyId) {
+         continue;
+       }
+ 
+       nsCOMPtr<nsIInputStream> stream;
+-      rv = FileUtils::BodyOpen(mManager->mInitData, aDBDir,
++      rv = FileUtils::BodyOpen(aQuotaInfo, aDBDir,
+                                mSavedRequests[i].mBodyId,
+                                getter_AddRefs(stream));
+       if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+       if (NS_WARN_IF(!stream)) { return NS_ERROR_FILE_NOT_FOUND; }
+ 
+       mStreamList->Add(mSavedRequests[i].mBodyId, stream);
+     }
+ 
+@@ -781,30 +785,30 @@ public:
+     , mNamespace(aNamespace)
+     , mRequest(aRequest)
+     , mParams(aParams)
+     , mStreamList(aStreamList)
+     , mFoundResponse(false)
+   { }
+ 
+   virtual nsresult
+-  RunSyncWithDBOnTarget(nsIFile* aDBDir,
++  RunSyncWithDBOnTarget(const QuotaInfo& aQuotaInfo, nsIFile* aDBDir,
+                         mozIStorageConnection* aConn) MOZ_OVERRIDE
+   {
+     nsresult rv = DBSchema::StorageMatch(aConn, mNamespace, mRequest, mParams,
+                                          &mFoundResponse, &mSavedResponse);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+     if (!mFoundResponse || !mSavedResponse.mHasBodyId) {
+       return rv;
+     }
+ 
+     nsCOMPtr<nsIInputStream> stream;
+-    rv = FileUtils::BodyOpen(mManager->mInitData, aDBDir,
+-                             mSavedResponse.mBodyId, getter_AddRefs(stream));
++    rv = FileUtils::BodyOpen(aQuotaInfo, aDBDir, mSavedResponse.mBodyId,
++                             getter_AddRefs(stream));
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+     if (NS_WARN_IF(!stream)) { return NS_ERROR_FILE_NOT_FOUND; }
+ 
+     mStreamList->Add(mSavedResponse.mBodyId, stream);
+ 
+     return rv;
+   }
+ 
+@@ -838,17 +842,17 @@ public:
+                    const nsAString& aKey)
+     : BaseAction(aManager, aListenerId, aRequestId)
+     , mNamespace(aNamespace)
+     , mKey(aKey)
+     , mCacheFound(false)
+   { }
+ 
+   virtual nsresult
+-  RunSyncWithDBOnTarget(nsIFile* aDBDir,
++  RunSyncWithDBOnTarget(const QuotaInfo& aQuotaInfo, nsIFile* aDBDir,
+                         mozIStorageConnection* aConn) MOZ_OVERRIDE
+   {
+     CacheId cacheId;
+     return DBSchema::StorageGetCacheId(aConn, mNamespace, mKey,
+                                        &mCacheFound, &cacheId);
+   }
+ 
+   virtual void
+@@ -872,17 +876,17 @@ public:
+                     const nsAString& aKey)
+     : BaseAction(aManager, aListenerId, aRequestId)
+     , mNamespace(aNamespace)
+     , mKey(aKey)
+     , mCacheId(0)
+   { }
+ 
+   virtual nsresult
+-  RunSyncWithDBOnTarget(nsIFile* aDBDir,
++  RunSyncWithDBOnTarget(const QuotaInfo& aQuotaInfo, nsIFile* aDBDir,
+                         mozIStorageConnection* aConn) MOZ_OVERRIDE
+   {
+     // Look for existing cache
+     bool cacheFound;
+     nsresult rv = DBSchema::StorageGetCacheId(aConn, mNamespace, mKey,
+                                               &cacheFound, &mCacheId);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+     if (cacheFound) {
+@@ -927,17 +931,17 @@ public:
+     : BaseAction(aManager, aListenerId, aRequestId)
+     , mNamespace(aNamespace)
+     , mKey(aKey)
+     , mCacheDeleted(false)
+     , mCacheId(0)
+   { }
+ 
+   virtual nsresult
+-  RunSyncWithDBOnTarget(nsIFile* aDBDir,
++  RunSyncWithDBOnTarget(const QuotaInfo& aQuotaInfo, nsIFile* aDBDir,
+                         mozIStorageConnection* aConn) MOZ_OVERRIDE
+   {
+     mozStorageTransaction trans(aConn, false,
+                                 mozIStorageConnection::TRANSACTION_IMMEDIATE);
+ 
+     bool exists;
+     nsresult rv = DBSchema::StorageGetCacheId(aConn, mNamespace, mKey, &exists,
+                                               &mCacheId);
+@@ -990,17 +994,17 @@ class Manager::StorageKeysAction MOZ_FIN
+ public:
+   StorageKeysAction(Manager* aManager, ListenerId aListenerId,
+                       RequestId aRequestId, Namespace aNamespace)
+     : BaseAction(aManager, aListenerId, aRequestId)
+     , mNamespace(aNamespace)
+   { }
+ 
+   virtual nsresult
+-  RunSyncWithDBOnTarget(nsIFile* aDBDir,
++  RunSyncWithDBOnTarget(const QuotaInfo& aQuotaInfo, nsIFile* aDBDir,
+                         mozIStorageConnection* aConn) MOZ_OVERRIDE
+   {
+     return DBSchema::StorageGetKeys(aConn, mNamespace, mKeys);
+   }
+ 
+   virtual void
+   Complete(Listener* aListener, nsresult aRv) MOZ_OVERRIDE
+   {
+@@ -1138,28 +1142,28 @@ Manager::StreamList::~StreamList()
        mManager->ReleaseBodyId(mList[i].mId);
      }
      mManager->ReleaseCacheId(mCacheId);
@@ -968,7 +2630,7 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
    NS_ASSERT_OWNINGTHREAD(Context::Listener);
    mListeners.RemoveElement(aListener);
  }
-@@ -1229,17 +1230,17 @@ Manager::Shutdown()
+@@ -1229,25 +1233,32 @@ Manager::Shutdown()
    for (uint32_t i = 0; i < mStreamLists.Length(); ++i) {
      mStreamLists[i]->CloseAll();
    }
@@ -987,7 +2649,22 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
    }
  }
  
-@@ -1433,35 +1434,37 @@ Manager::RemoveContext(Context* aContext
++already_AddRefed<ManagerId>
++Manager::GetManagerId() const
++{
++  nsRefPtr<ManagerId> ref = mManagerId;
++  return ref.forget();
++}
++
+ void
+ Manager::CacheMatch(Listener* aListener, RequestId aRequestId, CacheId aCacheId,
+                     const PCacheRequest& aRequest,
+                     const PCacheQueryParams& aParams)
+ {
+   NS_ASSERT_OWNINGTHREAD(Context::Listener);
+   MOZ_ASSERT(aListener);
+   if (mShuttingDown) {
+@@ -1433,35 +1444,37 @@ Manager::RemoveContext(Context* aContext
    NS_ASSERT_OWNINGTHREAD(Context::Listener);
    MOZ_ASSERT(mContext);
    MOZ_ASSERT(mContext == aContext);
@@ -1029,6 +2706,27 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
  Manager::~Manager()
  {
    NS_ASSERT_OWNINGTHREAD(Context::Listener);
+@@ -1471,18 +1484,18 @@ Manager::~Manager()
+ }
+ 
+ Context*
+ Manager::CurrentContext()
+ {
+   NS_ASSERT_OWNINGTHREAD(Context::Listener);
+   if (!mContext) {
+     MOZ_ASSERT(!mShuttingDown);
+-    nsRefPtr<Action> setupAction = new SetupAction(mInitData);
+-    mContext = new Context(this, mInitData, setupAction);
++    nsRefPtr<Action> setupAction = new SetupAction();
++    mContext = new Context(this, mManagerId, setupAction);
+   }
+   return mContext;
+ }
+ 
+ Manager::ListenerId
+ Manager::SaveListener(Listener* aListener)
+ {
+   NS_ASSERT_OWNINGTHREAD(Context::Listener);
 diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
 --- a/dom/cache/Manager.h
 +++ b/dom/cache/Manager.h
@@ -1050,7 +2748,7 @@ diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
  struct SavedResponse;
  
  class Manager MOZ_FINAL : public Context::Listener
-@@ -110,18 +111,18 @@ public:
+@@ -110,24 +111,25 @@ public:
      virtual void OnStorageOpen(RequestId aRequestId, nsresult aRv,
                                 CacheId aCacheId) { }
      virtual void OnStorageDelete(RequestId aRequestId, nsresult aRv,
@@ -1069,9 +2767,16 @@ diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
    void ReleaseCacheId(CacheId aCacheId);
    bool SetCacheIdOrphanedIfRefed(CacheId aCacheId);
    void Shutdown();
++  already_AddRefed<ManagerId> GetManagerId() const;
  
    // TODO: consider moving CacheId up in the argument lists below
-@@ -149,17 +150,17 @@ public:
+   void CacheMatch(Listener* aListener, RequestId aRequestId, CacheId aCacheId,
+                   const PCacheRequest& aRequest,
+                   const PCacheQueryParams& aParams);
+   void CacheMatchAll(Listener* aListener, RequestId aRequestId,
+                      CacheId aCacheId, const PCacheRequestOrVoid& aRequestOrVoid,
+                      const PCacheQueryParams& aParams);
+@@ -149,18 +151,16 @@ public:
                    Namespace aNamespace, const nsAString& aKey);
    void StorageOpen(Listener* aListener, RequestId aRequestId,
                     Namespace aNamespace, const nsAString& aKey);
@@ -1081,8 +2786,7 @@ diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
                     Namespace aNamespace);
  
 -  const nsCString& Origin() const { return mInitData.origin(); }
-+  const nsCString& Origin() const { return EmptyCString(); /* TODO mInitData.origin(); */ }
- 
+-
    // Context::Listener methods
    virtual void RemoveContext(Context* aContext) MOZ_OVERRIDE;
  
@@ -1090,7 +2794,8 @@ diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
    class Factory;
    class BaseAction;
    class DeleteOrphanedBodyAction;
-@@ -174,31 +175,32 @@ private:
+   class DeleteOrphanedCacheAction;
+@@ -174,32 +174,32 @@ private:
    class StorageMatchAction;
    class StorageHasAction;
    class StorageOpenAction;
@@ -1115,8 +2820,8 @@ diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
    bool SetBodyIdOrphanedIfRefed(const nsID& aBodyId);
    void NoteOrphanedBodyIdList(const nsTArray<nsID>& aDeletedBodyIdList);
  
+-  const CacheInitData mInitData;
 +  nsRefPtr<ManagerId> mManagerId;
-   const CacheInitData mInitData;
    nsCOMPtr<nsIThread> mIOThread;
    nsTArray<Listener*> mListeners;
    nsTArray<StreamList*> mStreamLists;
@@ -1124,11 +2829,12 @@ diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
    struct CacheIdRefCounter
    {
      CacheId mCacheId;
+     uint32_t mCount;
 diff --git a/dom/cache/ManagerId.cpp b/dom/cache/ManagerId.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/ManagerId.cpp
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,70 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1146,10 +2852,15 @@ new file mode 100644
 +
 +// static
 +nsresult
-+ManagerId::Create(Namespace aNamespace, nsIPrincipal* aPrincipal,
-+                  ManagerId** aManagerIdOut)
++ManagerId::Create(nsIPrincipal* aPrincipal, ManagerId** aManagerIdOut)
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
++
++  // The QuotaManager::GetInfoFromPrincipal() has special logic for system
++  // and about: principals.  We currently don't need the system principal logic
++  // because ManagerId only uses the origin for in memory comparisons.  We
++  // also don't do any special logic to host the same Cache for different about:
++  // pages, so we don't need those checks either.
 +
 +  nsAutoCString origin;
 +  nsresult rv = aPrincipal->GetOrigin(getter_Copies(origin));
@@ -1163,7 +2874,7 @@ new file mode 100644
 +  rv = aPrincipal->GetIsInBrowserElement(&inBrowserElement);
 +  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
-+  nsRefPtr<ManagerId> ref = new ManagerId(aNamespace, aPrincipal, origin, appId,
++  nsRefPtr<ManagerId> ref = new ManagerId(aPrincipal, origin, appId,
 +                                          inBrowserElement);
 +  ref.forget(aManagerIdOut);
 +
@@ -1178,11 +2889,9 @@ new file mode 100644
 +  return ref.forget();
 +}
 +
-+ManagerId::ManagerId(Namespace aNamespace, nsIPrincipal* aPrincipal,
-+                     const nsACString& aOrigin, uint32_t aAppId,
-+                     bool aInBrowserElement)
-+    : mNamespace(aNamespace)
-+    , mPrincipal(aPrincipal)
++ManagerId::ManagerId(nsIPrincipal* aPrincipal, const nsACString& aOrigin,
++                     uint32_t aAppId, bool aInBrowserElement)
++    : mPrincipal(aPrincipal)
 +    , mOrigin(aOrigin)
 +    , mAppId(aAppId)
 +    , mInBrowserElement(aInBrowserElement)
@@ -1200,7 +2909,7 @@ diff --git a/dom/cache/ManagerId.h b/dom/cache/ManagerId.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/ManagerId.h
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,65 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1226,31 +2935,33 @@ new file mode 100644
 +class ManagerId MOZ_FINAL
 +{
 +public:
-+  static nsresult Create(Namespace aNamespace, nsIPrincipal* aPrincipal,
-+                         ManagerId** aManagerIdOut);
++  // Main thread only
++  static nsresult Create(nsIPrincipal* aPrincipal, ManagerId** aManagerIdOut);
 +
-+  Namespace GetNamespace() const { return mNamespace; }
++  // Main thread only
 +  already_AddRefed<nsIPrincipal> Principal() const;
++
 +  const nsACString& Origin() const { return mOrigin; }
 +
 +  bool operator==(const ManagerId& aOther) const
 +  {
-+    return mNamespace == aOther.mNamespace &&
-+           mOrigin == aOther.mOrigin &&
++    return mOrigin == aOther.mOrigin &&
 +           mAppId == aOther.mAppId &&
 +           mInBrowserElement == aOther.mInBrowserElement;
 +  }
 +
 +private:
-+  ManagerId(Namespace aNamespace, nsIPrincipal* aPrincipal,
-+            const nsACString& aOrigin, uint32_t aAppId, bool aInBrowserElement);
++  ManagerId(nsIPrincipal* aPrincipal, const nsACString& aOrigin,
++            uint32_t aAppId, bool aInBrowserElement);
 +  ~ManagerId();
 +
 +  ManagerId(const ManagerId&) MOZ_DELETE;
 +  ManagerId& operator=(const ManagerId&) MOZ_DELETE;
 +
-+  const Namespace mNamespace;
++  // only accessible on main thread
 +  nsCOMPtr<nsIPrincipal> mPrincipal;
++
++  // immutable to allow threadsfe access
 +  const nsCString mOrigin;
 +  const uint32_t mAppId;
 +  const bool mInBrowserElement;
@@ -1264,6 +2975,208 @@ new file mode 100644
 +} // namespace mozilla
 +
 +#endif // mozilla_dom_cache_ManagerId_h
+diff --git a/dom/cache/PrincipalVerifier.cpp b/dom/cache/PrincipalVerifier.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/PrincipalVerifier.cpp
+@@ -0,0 +1,127 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "mozilla/dom/cache/PrincipalVerifier.h"
++
++#include "mozilla/AppProcessChecker.h"
++#include "mozilla/dom/ContentParent.h"
++#include "mozilla/dom/cache/ManagerId.h"
++#include "mozilla/ipc/BackgroundUtils.h"
++#include "nsIPrincipal.h"
++
++namespace mozilla {
++namespace dom {
++namespace cache {
++
++using mozilla::ipc::PrincipalInfo;
++using mozilla::ipc::PrincipalInfoToPrincipal;
++
++// static
++nsresult
++PrincipalVerifier::Create(Listener* aListener, ContentParent* aActor,
++                          const PrincipalInfo& aPrincipalInfo,
++                          PrincipalVerifier** aVerifierOut)
++{
++  nsRefPtr<PrincipalVerifier> verifier = new PrincipalVerifier(aListener,
++                                                               aActor,
++                                                               aPrincipalInfo);
++
++  nsresult rv = NS_DispatchToMainThread(verifier, nsIThread::DISPATCH_NORMAL);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  verifier.forget(aVerifierOut);
++
++  return NS_OK;
++}
++
++void
++PrincipalVerifier::ClearListener()
++{
++  MOZ_ASSERT(NS_GetCurrentThread() == mInitiatingThread);
++  MOZ_ASSERT(mListener);
++  mListener = nullptr;
++}
++
++PrincipalVerifier::PrincipalVerifier(Listener* aListener,
++                                     ContentParent* aActor,
++                                     const PrincipalInfo& aPrincipalInfo)
++  : mListener(aListener)
++  , mActor(aActor)
++  , mPrincipalInfo(aPrincipalInfo)
++  , mInitiatingThread(NS_GetCurrentThread())
++  , mResult(NS_OK)
++{
++  MOZ_ASSERT(mListener);
++  MOZ_ASSERT(mInitiatingThread);
++}
++
++PrincipalVerifier::~PrincipalVerifier()
++{
++  MOZ_ASSERT(!mListener);
++}
++
++NS_IMETHODIMP
++PrincipalVerifier::Run()
++{
++  if (NS_IsMainThread()) {
++    VerifyOnMainThread();
++    return NS_OK;
++  }
++  CompleteOnInitiatingThread();
++  return NS_OK;
++}
++
++void
++PrincipalVerifier::VerifyOnMainThread()
++{
++  MOZ_ASSERT(NS_IsMainThread());
++
++  nsresult rv;
++  nsRefPtr<nsIPrincipal> principal = PrincipalInfoToPrincipal(mPrincipalInfo,
++                                                              &rv);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    DispatchToInitiatingThread(rv);
++    return;
++  }
++
++  if (NS_WARN_IF(mActor && !AssertAppPrincipal(mActor, principal))) {
++    DispatchToInitiatingThread(NS_ERROR_FAILURE);
++    return;
++  }
++  mActor = nullptr;
++
++  rv = ManagerId::Create(principal, getter_AddRefs(mManagerId));
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    DispatchToInitiatingThread(rv);
++    return;
++  }
++
++  DispatchToInitiatingThread(NS_OK);
++}
++
++void
++PrincipalVerifier::CompleteOnInitiatingThread()
++{
++  MOZ_ASSERT(NS_GetCurrentThread() == mInitiatingThread);
++  if (!mListener) {
++    return;
++  }
++  mListener->OnPrincipalVerified(mResult, mManagerId);
++}
++
++void
++PrincipalVerifier::DispatchToInitiatingThread(nsresult aRv)
++{
++  mResult = aRv;
++  nsresult rv = mInitiatingThread->Dispatch(this, nsIThread::DISPATCH_NORMAL);
++  if (NS_FAILED(rv)) {
++    MOZ_CRASH("Failed to dispatch PrincipalVerifier to initiating thread.");
++  }
++}
++
++} // namesapce cache
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/cache/PrincipalVerifier.h b/dom/cache/PrincipalVerifier.h
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/PrincipalVerifier.h
+@@ -0,0 +1,65 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_cache_PrincipalVerifier_h
++#define mozilla_dom_cache_PrincipalVerifier_h
++
++#include "mozilla/ipc/PBackgroundSharedTypes.h"
++#include "nsThreadUtils.h"
++
++namespace mozilla {
++namespace dom {
++
++class ContentParent;
++
++namespace cache {
++
++class ManagerId;
++
++class PrincipalVerifier MOZ_FINAL : public nsRunnable
++{
++public:
++  class Listener
++  {
++  public:
++    virtual ~Listener() { }
++
++    virtual void OnPrincipalVerified(nsresult aRv, ManagerId* aManagerId)=0;
++  };
++
++  static nsresult
++  Create(Listener* aListener, ContentParent* aActor,
++         const ipc::PrincipalInfo& aPrincipalInfo,
++         PrincipalVerifier** aVerifierOut);
++
++  void ClearListener();
++
++private:
++  PrincipalVerifier(Listener* aListener, ContentParent* aActor,
++                    const ipc::PrincipalInfo& aPrincipalInfo);
++  virtual ~PrincipalVerifier();
++
++  void VerifyOnMainThread();
++  void CompleteOnInitiatingThread();
++
++  void DispatchToInitiatingThread(nsresult aRv);
++
++  Listener* mListener;
++  nsRefPtr<ContentParent> mActor;
++  const ipc::PrincipalInfo mPrincipalInfo;
++  nsCOMPtr<nsIThread> mInitiatingThread;
++  nsresult mResult;
++  nsRefPtr<ManagerId> mManagerId;
++
++public:
++  NS_DECL_NSIRUNNABLE
++};
++
++} // namesapce cache
++} // namespace dom
++} // namespace mozilla
++
++#endif // mozilla_dom_cache_PrincipalVerifier_h
 diff --git a/dom/cache/ShutdownObserver.cpp b/dom/cache/ShutdownObserver.cpp
 --- a/dom/cache/ShutdownObserver.cpp
 +++ b/dom/cache/ShutdownObserver.cpp
@@ -1510,10 +3423,57 @@ diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
    internalRequest->SetContext(aIn.context());
  
    nsRefPtr<InternalHeaders> internalHeaders =
+diff --git a/dom/cache/Types.h b/dom/cache/Types.h
+--- a/dom/cache/Types.h
++++ b/dom/cache/Types.h
+@@ -3,16 +3,19 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_cache_Types_h
+ #define mozilla_dom_cache_Types_h
+ 
+ #include <stdint.h>
++#include "nsCOMPtr.h"
++#include "nsIFile.h"
++#include "nsString.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ enum Namespace
+ {
+   DEFAULT_NAMESPACE,
+@@ -20,13 +23,23 @@ enum Namespace
+   NUMBER_OF_NAMESPACES
+ };
+ 
+ typedef uintptr_t RequestId;
+ static const RequestId INVALID_REQUEST_ID = 0;
+ 
+ typedef int32_t CacheId;
+ 
++struct QuotaInfo
++{
++  QuotaInfo() : mIsApp(false), mHasUnlimStoragePerm(false) { }
++  nsCOMPtr<nsIFile> mDir;
++  nsCString mGroup;
++  nsCString mOrigin;
++  bool mIsApp;
++  bool mHasUnlimStoragePerm;
++};
++
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_cache_Types_h
 diff --git a/dom/cache/moz.build b/dom/cache/moz.build
 --- a/dom/cache/moz.build
 +++ b/dom/cache/moz.build
-@@ -19,16 +19,17 @@ EXPORTS.mozilla.dom.cache += [
+@@ -19,16 +19,18 @@ EXPORTS.mozilla.dom.cache += [
      'CacheStreamControlParent.h',
      'Context.h',
      'DBAction.h',
@@ -1523,6 +3483,7 @@ diff --git a/dom/cache/moz.build b/dom/cache/moz.build
      'IPCUtils.h',
      'Manager.h',
 +    'ManagerId.h',
++    'PrincipalVerifier.h',
      'ReadStream.h',
      'SavedTypes.h',
      'ShutdownObserver.h',
@@ -1531,7 +3492,7 @@ diff --git a/dom/cache/moz.build b/dom/cache/moz.build
  ]
  
  SOURCES += [
-@@ -42,16 +43,17 @@ SOURCES += [
+@@ -42,16 +44,18 @@ SOURCES += [
      'CacheStreamControlChild.cpp',
      'CacheStreamControlParent.cpp',
      'Context.cpp',
@@ -1541,6 +3502,7 @@ diff --git a/dom/cache/moz.build b/dom/cache/moz.build
      'FileUtils.cpp',
      'Manager.cpp',
 +    'ManagerId.cpp',
++    'PrincipalVerifier.cpp',
      'ReadStream.cpp',
      'ShutdownObserver.cpp',
      'TypeUtils.cpp',
