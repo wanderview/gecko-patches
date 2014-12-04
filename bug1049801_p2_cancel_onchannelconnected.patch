@@ -1,22 +1,22 @@
 # HG changeset patch
-# Parent e66e1130da318dd06853572df55373a3196f9d10
+# Parent 215842d463605cdb60d1126c2ec90a6e35600a48
 # User Ben Kelly <ben@wanderview.com>
-Bug 1049801 Cancel the DispatchOnChannelConnected runnable when destructing the MessageChannel.
+Bug 1049801 P2 Cancel the DispatchOnChannelConnected runnable when destructing the MessageChannel.
 
 diff --git a/ipc/glue/MessageChannel.cpp b/ipc/glue/MessageChannel.cpp
 --- a/ipc/glue/MessageChannel.cpp
 +++ b/ipc/glue/MessageChannel.cpp
-@@ -200,29 +200,35 @@ MessageChannel::MessageChannel(MessageLi
-     mPendingSyncReplies(0),
-     mPendingUrgentReplies(0),
+@@ -230,29 +230,35 @@ MessageChannel::MessageChannel(MessageLi
      mPendingRPCReplies(0),
      mCurrentRPCTransaction(0),
      mDispatchingSyncMessage(false),
      mDispatchingUrgentMessageCount(0),
      mRemoteStackDepthGuess(false),
      mSawInterruptOutMsg(false),
--    mAbortOnError(false)
-+    mAbortOnError(false),
+     mAbortOnError(false),
+     mBlockScripts(false),
+-    mFlags(REQUIRE_DEFAULT)
++    mFlags(REQUIRE_DEFAULT),
 +    mPeerPidSet(false),
 +    mPeerPid(-1)
  {
@@ -43,7 +43,7 @@ diff --git a/ipc/glue/MessageChannel.cpp b/ipc/glue/MessageChannel.cpp
  
  MessageChannel::~MessageChannel()
  {
-@@ -275,16 +281,18 @@ MessageChannel::Clear()
+@@ -305,16 +311,18 @@ MessageChannel::Clear()
      // before mListener.  But just to be safe, mListener is a weak pointer.
  
      mDequeueOneTask->Cancel();
@@ -62,7 +62,7 @@ diff --git a/ipc/glue/MessageChannel.cpp b/ipc/glue/MessageChannel.cpp
      // Free up any memory used by pending messages.
      mPending.clear();
      mPendingUrgentRequest = nullptr;
-@@ -1415,29 +1423,40 @@ MessageChannel::SetReplyTimeoutMs(int32_
+@@ -1486,29 +1494,29 @@ MessageChannel::SetReplyTimeoutMs(int32_
      mTimeoutMs = (aTimeoutMs <= 0)
                   ? kNoTimeout
                   : (int32_t)ceil((double)aTimeoutMs / 2.0);
@@ -76,12 +76,9 @@ diff --git a/ipc/glue/MessageChannel.cpp b/ipc/glue/MessageChannel.cpp
 -        NewRunnableMethod(this,
 -                          &MessageChannel::DispatchOnChannelConnected,
 -                          peer_id));
-+    {
-+      MonitorAutoLock lock(*mMonitor);
-+      MOZ_ASSERT(!mPeerPidSet);
-+      mPeerPid = peer_id;
-+      mPeerPidSet = true;
-+    }
++    MOZ_ASSERT(!mPeerPidSet);
++    mPeerPidSet = true;
++    mPeerPid = peer_id;
 +    mWorkerLoop->PostTask(FROM_HERE, new DequeueTask(mOnChannelConnectedTask));
  }
  
@@ -90,19 +87,10 @@ diff --git a/ipc/glue/MessageChannel.cpp b/ipc/glue/MessageChannel.cpp
 +MessageChannel::DispatchOnChannelConnected()
  {
      AssertWorkerThread();
--    if (mListener)
++    MOZ_ASSERT(mPeerPidSet);
+     if (mListener)
 -        mListener->OnChannelConnected(peer_pid);
-+    if (!mListener) {
-+      return;
-+    }
-+
-+    int32_t peerPid;
-+    {
-+      MonitorAutoLock lock(*mMonitor);
-+      MOZ_ASSERT(mPeerPidSet);
-+      peerPid = mPeerPid;
-+    }
-+    mListener->OnChannelConnected(peerPid);
++        mListener->OnChannelConnected(mPeerPid);
  }
  
  void
@@ -132,7 +120,7 @@ diff --git a/ipc/glue/MessageChannel.h b/ipc/glue/MessageChannel.h
  #include "nsAutoPtr.h"
  
  #include <deque>
-@@ -184,17 +185,17 @@ class MessageChannel : HasResultCodes
+@@ -204,17 +205,17 @@ class MessageChannel : HasResultCodes
      void OnNotifyMaybeChannelError();
      void ReportConnectionError(const char* aChannelName) const;
      void ReportMessageRouteError(const char* channelName) const;
@@ -151,47 +139,69 @@ diff --git a/ipc/glue/MessageChannel.h b/ipc/glue/MessageChannel.h
      //  urgent, which can only initiate messages from parent to child.
      //
      // SendAndWait() expects that the worker thread owns the monitor, and that
-@@ -634,14 +635,18 @@ class MessageChannel : HasResultCodes
- 
- #ifdef OS_WIN
-     HANDLE mEvent;
- #endif
- 
-     // Should the channel abort the process from the I/O thread when
+@@ -660,16 +661,23 @@ class MessageChannel : HasResultCodes
      // a channel error occurs?
      bool mAbortOnError;
+ 
+     // Should we prevent scripts from running while dispatching urgent messages?
+     bool mBlockScripts;
+ 
+     // See SetChannelFlags
+     ChannelFlags mFlags;
 +
++    // Task and state used to asynchronously notify channel has been connected
++    // safely.  This is necessary to be able to cancel notification if we are
++    // closed at the same time.
 +    nsRefPtr<RefCountedTask> mOnChannelConnectedTask;
 +    DebugOnly<bool> mPeerPidSet;
 +    int32_t mPeerPid;
  };
  
+ bool
+ ProcessingUrgentMessages();
+ 
  } // namespace ipc
  } // namespace mozilla
  
- #endif  // ifndef ipc_glue_MessageChannel_h
 diff --git a/ipc/glue/MessageLink.cpp b/ipc/glue/MessageLink.cpp
 --- a/ipc/glue/MessageLink.cpp
 +++ b/ipc/glue/MessageLink.cpp
-@@ -337,16 +337,21 @@ ProcessLink::OnTakeConnectedChannel()
+@@ -339,26 +339,35 @@ ProcessLink::OnTakeConnectedChannel()
+     }
+ }
  
  void
  ProcessLink::OnChannelConnected(int32_t peer_pid)
  {
      AssertIOThread();
  
++    bool notifyChannel = false;
++
      {
          MonitorAutoLock lock(*mChan->mMonitor);
-+        // If the channel has errored out for some reason, do not force
-+        // it back into the connected state.
-+        if (NS_WARN_IF(mChan->mChannelState != ChannelOpening)) {
-+          return;
+-        mChan->mChannelState = ChannelConnected;
+-        mChan->mMonitor->Notify();
++        // Only update channel state if its still thinks its opening.  Do not
++        // force it into connected if it has errored out, started closing, etc.
++        if (mChan->mChannelState == ChannelOpening) {
++          mChan->mChannelState = ChannelConnected;
++          mChan->mMonitor->Notify();
++          notifyChannel = true;
 +        }
-         mChan->mChannelState = ChannelConnected;
-         mChan->mMonitor->Notify();
      }
  
      if (mExistingListener)
          mExistingListener->OnChannelConnected(peer_pid);
  
-     mChan->OnChannelConnected(peer_pid);
+-    mChan->OnChannelConnected(peer_pid);
++    if (notifyChannel) {
++      mChan->OnChannelConnected(peer_pid);
++    }
+ }
+ 
+ void
+ ProcessLink::OnChannelError()
+ {
+     AssertIOThread();
+ 
+     MonitorAutoLock lock(*mChan->mMonitor);

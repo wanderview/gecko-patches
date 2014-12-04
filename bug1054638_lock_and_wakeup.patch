@@ -1,0 +1,190 @@
+Bug 1054638 Wake up worker thread on Dispatch().
+
+diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
+--- a/dom/workers/RuntimeService.cpp
++++ b/dom/workers/RuntimeService.cpp
+@@ -1047,16 +1047,17 @@ class RuntimeService::WorkerThread MOZ_F
+     ~Observer()
+     {
+       mWorkerPrivate->AssertIsOnWorkerThread();
+     }
+ 
+     NS_DECL_NSITHREADOBSERVER
+   };
+ 
++  mozilla::Mutex mWorkerPrivateLock;
+   WorkerPrivate* mWorkerPrivate;
+   nsRefPtr<Observer> mObserver;
+ 
+ #ifdef DEBUG
+   // Protected by nsThread::mLock.
+   bool mAcceptingNonWorkerRunnables;
+ #endif
+ 
+@@ -1130,16 +1131,17 @@ public:
+       MOZ_RELEASE_ASSERT(ok);
+     }
+   }
+ #endif // #ENABLE_TESTS
+ 
+ private:
+   WorkerThread()
+   : nsThread(nsThread::NOT_MAIN_THREAD, WORKER_STACK_SIZE),
++    mWorkerPrivateLock("RuntimeService::WorkerThread::mWorkerPrivateLock"),
+     mWorkerPrivate(nullptr)
+ #ifdef DEBUG
+     , mAcceptingNonWorkerRunnables(true)
+ #endif
+   { }
+ 
+   ~WorkerThread()
+   { }
+@@ -2565,28 +2567,34 @@ RuntimeService::WorkerThread::Create()
+ 
+ void
+ RuntimeService::WorkerThread::SetWorker(WorkerPrivate* aWorkerPrivate)
+ {
+   MOZ_ASSERT(PR_GetCurrentThread() == mThread);
+   MOZ_ASSERT_IF(aWorkerPrivate, !mWorkerPrivate);
+   MOZ_ASSERT_IF(!aWorkerPrivate, mWorkerPrivate);
+ 
+-  // No need to lock here because mWorkerPrivate is only modified on mThread.
++  // No need to lock here for these checks because mWorkerPrivate is only
++  // modified on mThread.
+ 
+   if (mWorkerPrivate) {
+     MOZ_ASSERT(mObserver);
+ 
+     MOZ_ALWAYS_TRUE(NS_SUCCEEDED(RemoveObserver(mObserver)));
+ 
+     mObserver = nullptr;
+     mWorkerPrivate->SetThread(nullptr);
+   }
+ 
+-  mWorkerPrivate = aWorkerPrivate;
++  // Lock when writing to mWorkerPrivate because WorkerThread::Dispatch()
++  // needs to check it from any thread.
++  {
++    MutexAutoLock lock(mWorkerPrivateLock);
++    mWorkerPrivate = aWorkerPrivate;
++  }
+ 
+   if (mWorkerPrivate) {
+     mWorkerPrivate->SetThread(this);
+ 
+     nsRefPtr<Observer> observer = new Observer(mWorkerPrivate);
+ 
+     MOZ_ALWAYS_TRUE(NS_SUCCEEDED(AddObserver(observer)));
+ 
+@@ -2631,16 +2639,25 @@ RuntimeService::WorkerThread::Dispatch(n
+     runnableToDispatch = aRunnable;
+   }
+ 
+   nsresult rv = nsThread::Dispatch(runnableToDispatch, NS_DISPATCH_NORMAL);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return rv;
+   }
+ 
++  if (PR_GetCurrentThread() != mThread) {
++    // We must lock here because we're checking mWorkerPrivate from a different
++    // thread.
++    MutexAutoLock lock(mWorkerPrivateLock);
++    if (mWorkerPrivate) {
++      mWorkerPrivate->WakeUpEventLoop();
++    }
++  }
++
+   return NS_OK;
+ }
+ 
+ NS_IMPL_ISUPPORTS(RuntimeService::WorkerThread::Observer, nsIThreadObserver)
+ 
+ NS_IMETHODIMP
+ RuntimeService::WorkerThread::Observer::OnDispatchedEvent(
+                                                 nsIThreadInternal* /*aThread */)
+diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
+--- a/dom/workers/WorkerPrivate.cpp
++++ b/dom/workers/WorkerPrivate.cpp
+@@ -2196,22 +2196,30 @@ WorkerPrivateParent<Derived>::DispatchPr
+     nsCOMPtr<nsIEventTarget> target;
+     if (aSyncLoopTarget) {
+       target = aSyncLoopTarget;
+     }
+     else {
+       target = self->mThread;
+     }
+ 
+-    nsresult rv = target->Dispatch(aRunnable, NS_DISPATCH_NORMAL);
+-    if (NS_WARN_IF(NS_FAILED(rv))) {
+-      return rv;
+-    }
+-
+-    mCondVar.Notify();
++    // Temporarily unlock while we Dispatch since WorkerThread::Dispatch needs
++    // to call our WakeUpEventLoop() method.
++    {
++      MutexAutoUnlock unlock(mMutex);
++      nsresult rv = target->Dispatch(aRunnable, NS_DISPATCH_NORMAL);
++      if (NS_WARN_IF(NS_FAILED(rv))) {
++        return rv;
++      }
++    }
++
++    // WorkerThread::Dispatch() will call WakeUpEventLoop()
++    if (aSyncLoopTarget) {
++      mCondVar.Notify();
++    }
+   }
+ 
+   return NS_OK;
+ }
+ 
+ template <class Derived>
+ nsresult
+ WorkerPrivateParent<Derived>::DispatchControlRunnable(
+@@ -4064,16 +4072,23 @@ WorkerPrivate::OnProcessNextEvent(uint32
+ void
+ WorkerPrivate::AfterProcessNextEvent(uint32_t aRecursionDepth)
+ {
+   AssertIsOnWorkerThread();
+   MOZ_ASSERT(aRecursionDepth);
+ }
+ 
+ void
++WorkerPrivate::WakeUpEventLoop()
++{
++  MutexAutoLock lock(mMutex);
++  mCondVar.Notify();
++}
++
++void
+ WorkerPrivate::InitializeGCTimers()
+ {
+   AssertIsOnWorkerThread();
+ 
+   // We need a timer for GC. The basic plan is to run a non-shrinking GC
+   // periodically (PERIODIC_GC_TIMER_DELAY_SEC) while the worker is running.
+   // Once the worker goes idle we set a short (IDLE_GC_TIMER_DELAY_SEC) timer to
+   // run a shrinking GC. If the worker receives more messages then the short
+diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
+--- a/dom/workers/WorkerPrivate.h
++++ b/dom/workers/WorkerPrivate.h
+@@ -1084,16 +1084,18 @@ public:
+   // Only valid after CompileScriptRunnable has finished running!
+   bool
+   WorkerScriptExecutedSuccessfully() const
+   {
+     AssertIsOnWorkerThread();
+     return mWorkerScriptExecutedSuccessfully;
+   }
+ 
++  void WakeUpEventLoop();
++
+ private:
+   WorkerPrivate(JSContext* aCx, WorkerPrivate* aParent,
+                 const nsAString& aScriptURL, bool aIsChromeWorker,
+                 WorkerType aWorkerType, const nsACString& aSharedWorkerName,
+                 LoadInfo& aLoadInfo);
+ 
+   void
+   ClearMainEventQueue(WorkerRanOrNot aRanOrNot);
