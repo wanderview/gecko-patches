@@ -1,0 +1,568 @@
+Bug 1107516 P3 Make sure all workers have an nsILoadGroup when loading scripts.
+
+diff --git a/dom/workers/ScriptLoader.cpp b/dom/workers/ScriptLoader.cpp
+--- a/dom/workers/ScriptLoader.cpp
++++ b/dom/workers/ScriptLoader.cpp
+@@ -24,16 +24,18 @@
+ #include "nsNetUtil.h"
+ #include "nsScriptLoader.h"
+ #include "nsString.h"
+ #include "nsTArray.h"
+ #include "nsThreadUtils.h"
+ #include "nsXPCOM.h"
+ #include "xpcpublic.h"
+ 
++#include "mozilla/Assertions.h"
++#include "mozilla/LoadContext.h"
+ #include "mozilla/dom/Exceptions.h"
+ #include "Principal.h"
+ #include "WorkerFeature.h"
+ #include "WorkerPrivate.h"
+ #include "WorkerRunnable.h"
+ 
+ #define MAX_CONCURRENT_SCRIPTS 1000
+ 
+@@ -112,25 +114,24 @@ ChannelFromScriptURL(nsIPrincipal* princ
+                        parentDoc,
+                        nsILoadInfo::SEC_NORMAL,
+                        nsIContentPolicy::TYPE_SCRIPT,
+                        loadGroup,
+                        nullptr, // aCallbacks
+                        flags,
+                        ios);
+   } else {
+-    // we should use 'principal' here; needs to be fixed before
+-    // we move security checks to AsyncOpen. We use nullPrincipal
+-    // for now, because the loadGroup is null and hence causes
+-    // GetChannelUriPrincipal to return the wrong principal.
+-    nsCOMPtr<nsIPrincipal> nullPrincipal =
+-      do_CreateInstance("@mozilla.org/nullprincipal;1", &rv);
++    // We must have a loadGroup with a load context for the principal to
++    // traverse the channel correctly.
++    MOZ_ASSERT(loadGroup);
++    MOZ_ASSERT(NS_LoadGroupMatchesPrincipal(loadGroup, principal));
++
+     rv = NS_NewChannel(getter_AddRefs(channel),
+                        uri,
+-                       nullPrincipal,
++                       principal,
+                        nsILoadInfo::SEC_NORMAL,
+                        nsIContentPolicy::TYPE_SCRIPT,
+                        loadGroup,
+                        nullptr, // aCallbacks
+                        flags,
+                        ios);
+   }
+ 
+@@ -329,21 +330,23 @@ private:
+   RunInternal()
+   {
+     AssertIsOnMainThread();
+ 
+     WorkerPrivate* parentWorker = mWorkerPrivate->GetParent();
+ 
+     // Figure out which principal to use.
+     nsIPrincipal* principal = mWorkerPrivate->GetPrincipal();
++    nsCOMPtr<nsILoadGroup> loadGroup = mWorkerPrivate->GetLoadGroup();
+     if (!principal) {
+       NS_ASSERTION(parentWorker, "Must have a principal!");
+       NS_ASSERTION(mIsWorkerScript, "Must have a principal for importScripts!");
+ 
+       principal = parentWorker->GetPrincipal();
++      loadGroup = parentWorker->GetLoadGroup();
+     }
+     NS_ASSERTION(principal, "This should never be null here!");
+ 
+     // Figure out our base URI.
+     nsCOMPtr<nsIURI> baseURI;
+     if (mIsWorkerScript) {
+       if (parentWorker) {
+         baseURI = parentWorker->GetBaseURI();
+@@ -363,23 +366,16 @@ private:
+     nsCOMPtr<nsIDocument> parentDoc = mWorkerPrivate->GetDocument();
+ 
+     nsCOMPtr<nsIChannel> channel;
+     if (mIsWorkerScript) {
+       // May be null.
+       channel = mWorkerPrivate->ForgetWorkerChannel();
+     }
+ 
+-    // All of these can potentially be null, but that should be ok. We'll either
+-    // succeed without them or fail below.
+-    nsCOMPtr<nsILoadGroup> loadGroup;
+-    if (parentDoc) {
+-      loadGroup = parentDoc->GetDocumentLoadGroup();
+-    }
+-
+     nsCOMPtr<nsIIOService> ios(do_GetIOService());
+ 
+     nsIScriptSecurityManager* secMan = nsContentUtils::GetSecurityManager();
+     NS_ASSERTION(secMan, "This should never be null!");
+ 
+     for (uint32_t index = 0; index < mLoadInfos.Length(); index++) {
+       ScriptLoadInfo& loadInfo = mLoadInfos[index];
+       nsresult& rv = loadInfo.mLoadResult;
+@@ -508,16 +504,21 @@ private:
+ 
+       nsIScriptSecurityManager* ssm = nsContentUtils::GetSecurityManager();
+       NS_ASSERTION(ssm, "Should never be null!");
+ 
+       nsCOMPtr<nsIPrincipal> channelPrincipal;
+       rv = ssm->GetChannelResultPrincipal(channel, getter_AddRefs(channelPrincipal));
+       NS_ENSURE_SUCCESS(rv, rv);
+ 
++      nsCOMPtr<nsILoadGroup> channelLoadGroup;
++      rv = channel->GetLoadGroup(getter_AddRefs(channelLoadGroup));
++      NS_ENSURE_SUCCESS(rv, rv);
++      MOZ_ASSERT(channelLoadGroup);
++
+       // See if this is a resource URI. Since JSMs usually come from resource://
+       // URIs we're currently considering all URIs with the URI_IS_UI_RESOURCE
+       // flag as valid for creating privileged workers.
+       if (!nsContentUtils::IsSystemPrincipal(channelPrincipal)) {
+         bool isResource;
+         rv = NS_URIChainHasFlags(finalURI,
+                                  nsIProtocolHandler::URI_IS_UI_RESOURCE,
+                                  &isResource);
+@@ -546,17 +547,23 @@ private:
+ 
+         // We exempt data urls and other URI's that inherit their
+         // principal again.
+         if (NS_FAILED(loadPrincipal->CheckMayLoad(finalURI, false, true))) {
+           return NS_ERROR_DOM_BAD_URI;
+         }
+       }
+ 
+-      mWorkerPrivate->SetPrincipal(channelPrincipal);
++      if (!NS_LoadGroupMatchesPrincipal(channelLoadGroup, channelPrincipal)) {
++        rv = NS_NewLoadGroup(getter_AddRefs(channelLoadGroup),
++                             channelPrincipal);
++        NS_ENSURE_SUCCESS(rv, rv);
++      }
++
++      mWorkerPrivate->SetPrincipal(channelPrincipal, channelLoadGroup);
+ 
+       if (parent) {
+         // XHR Params Allowed
+         mWorkerPrivate->SetXHRParamsAllowed(parent->XHRParamsAllowed());
+ 
+         // Set Eval and ContentSecurityPolicy
+         mWorkerPrivate->SetCSP(parent->GetCSP());
+         mWorkerPrivate->SetEvalAllowed(parent->IsEvalAllowed());
+@@ -628,16 +635,17 @@ class ChannelGetterRunnable MOZ_FINAL : 
+ public:
+   ChannelGetterRunnable(WorkerPrivate* aParentWorker,
+                         nsIEventTarget* aSyncLoopTarget,
+                         const nsAString& aScriptURL,
+                         nsIChannel** aChannel)
+   : mParentWorker(aParentWorker), mSyncLoopTarget(aSyncLoopTarget),
+     mScriptURL(aScriptURL), mChannel(aChannel), mResult(NS_ERROR_FAILURE)
+   {
++    MOZ_ASSERT(mParentWorker);
+     aParentWorker->AssertIsOnWorkerThread();
+     MOZ_ASSERT(aSyncLoopTarget);
+   }
+ 
+   NS_IMETHOD
+   Run() MOZ_OVERRIDE
+   {
+     AssertIsOnMainThread();
+@@ -647,20 +655,23 @@ public:
+ 
+     // Figure out our base URI.
+     nsCOMPtr<nsIURI> baseURI = mParentWorker->GetBaseURI();
+     NS_ASSERTION(baseURI, "Should have been set already!");
+ 
+     // May be null.
+     nsCOMPtr<nsIDocument> parentDoc = mParentWorker->GetDocument();
+ 
++    nsCOMPtr<nsILoadGroup> loadGroup = mParentWorker->GetLoadGroup();
++
+     nsCOMPtr<nsIChannel> channel;
+     mResult =
+       scriptloader::ChannelFromScriptURLMainThread(principal, baseURI,
+-                                                   parentDoc, mScriptURL,
++                                                   parentDoc, loadGroup,
++                                                   mScriptURL,
+                                                    getter_AddRefs(channel));
+     if (NS_SUCCEEDED(mResult)) {
+       channel.forget(mChannel);
+     }
+ 
+     nsRefPtr<MainThreadStopSyncLoopRunnable> runnable =
+       new MainThreadStopSyncLoopRunnable(mParentWorker,
+                                          mSyncLoopTarget.forget(), true);
+@@ -840,32 +851,28 @@ LoadAllScripts(JSContext* aCx, WorkerPri
+ BEGIN_WORKERS_NAMESPACE
+ 
+ namespace scriptloader {
+ 
+ nsresult
+ ChannelFromScriptURLMainThread(nsIPrincipal* aPrincipal,
+                                nsIURI* aBaseURI,
+                                nsIDocument* aParentDoc,
++                               nsILoadGroup* aLoadGroup,
+                                const nsAString& aScriptURL,
+                                nsIChannel** aChannel)
+ {
+   AssertIsOnMainThread();
+ 
+-  nsCOMPtr<nsILoadGroup> loadGroup;
+-  if (aParentDoc) {
+-    loadGroup = aParentDoc->GetDocumentLoadGroup();
+-  }
+-
+   nsCOMPtr<nsIIOService> ios(do_GetIOService());
+ 
+   nsIScriptSecurityManager* secMan = nsContentUtils::GetSecurityManager();
+   NS_ASSERTION(secMan, "This should never be null!");
+ 
+-  return ChannelFromScriptURL(aPrincipal, aBaseURI, aParentDoc, loadGroup,
++  return ChannelFromScriptURL(aPrincipal, aBaseURI, aParentDoc, aLoadGroup,
+                               ios, secMan, aScriptURL, true, aChannel);
+ }
+ 
+ nsresult
+ ChannelFromScriptURLWorkerThread(JSContext* aCx,
+                                  WorkerPrivate* aParent,
+                                  const nsAString& aScriptURL,
+                                  nsIChannel** aChannel)
+diff --git a/dom/workers/ScriptLoader.h b/dom/workers/ScriptLoader.h
+--- a/dom/workers/ScriptLoader.h
++++ b/dom/workers/ScriptLoader.h
+@@ -6,16 +6,17 @@
+ #ifndef mozilla_dom_workers_scriptloader_h__
+ #define mozilla_dom_workers_scriptloader_h__
+ 
+ #include "Workers.h"
+ 
+ class nsIPrincipal;
+ class nsIURI;
+ class nsIDocument;
++class nsILoadGroup;
+ class nsString;
+ class nsIChannel;
+ 
+ namespace mozilla {
+ 
+ class ErrorResult;
+ 
+ namespace dom {
+@@ -29,16 +30,17 @@ class Sequence;
+ BEGIN_WORKERS_NAMESPACE
+ 
+ namespace scriptloader {
+ 
+ nsresult
+ ChannelFromScriptURLMainThread(nsIPrincipal* aPrincipal,
+                                nsIURI* aBaseURI,
+                                nsIDocument* aParentDoc,
++                               nsILoadGroup* aLoadGroup,
+                                const nsAString& aScriptURL,
+                                nsIChannel** aChannel);
+ 
+ nsresult
+ ChannelFromScriptURLWorkerThread(JSContext* aCx,
+                                  WorkerPrivate* aParent,
+                                  const nsAString& aScriptURL,
+                                  nsIChannel** aChannel);
+diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
+--- a/dom/workers/ServiceWorkerManager.cpp
++++ b/dom/workers/ServiceWorkerManager.cpp
+@@ -11,16 +11,17 @@
+ #include "nsIScriptSecurityManager.h"
+ #include "nsIStreamLoader.h"
+ #include "nsPIDOMWindow.h"
+ #include "nsDebug.h"
+ 
+ #include "jsapi.h"
+ 
+ #include "mozilla/DebugOnly.h"
++#include "mozilla/LoadContext.h"
+ #include "mozilla/dom/BindingUtils.h"
+ #include "mozilla/dom/DOMError.h"
+ #include "mozilla/dom/ErrorEvent.h"
+ #include "mozilla/dom/Headers.h"
+ #include "mozilla/dom/InstallEventBinding.h"
+ #include "mozilla/dom/Navigator.h"
+ #include "mozilla/dom/PromiseNativeHandler.h"
+ #include "mozilla/dom/Request.h"
+@@ -37,16 +38,20 @@
+ #include "ServiceWorkerContainer.h"
+ #include "ServiceWorkerRegistration.h"
+ #include "ServiceWorkerEvents.h"
+ #include "WorkerInlines.h"
+ #include "WorkerPrivate.h"
+ #include "WorkerRunnable.h"
+ #include "WorkerScope.h"
+ 
++#ifdef PostMessage
++#undef PostMessage
++#endif
++
+ using namespace mozilla;
+ using namespace mozilla::dom;
+ 
+ BEGIN_WORKERS_NAMESPACE
+ 
+ NS_IMPL_ISUPPORTS0(ServiceWorkerJob)
+ NS_IMPL_ISUPPORTS0(ServiceWorkerRegistrationInfo)
+ 
+@@ -2377,16 +2382,27 @@ ServiceWorkerManager::CreateServiceWorke
+ 
+   rv = info.mBaseURI->GetHost(info.mDomain);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return rv;
+   }
+ 
+   info.mPrincipal = aPrincipal;
+ 
++  info.mLoadGroup = do_CreateInstance(NS_LOADGROUP_CONTRACTID, &rv);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return rv;
++  }
++
++  nsRefPtr<LoadContext> loadContext = new LoadContext(info.mPrincipal);
++  rv = info.mLoadGroup->SetNotificationCallbacks(loadContext);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return rv;
++  }
++
+   AutoSafeJSContext cx;
+ 
+   nsRefPtr<ServiceWorker> serviceWorker;
+   RuntimeService* rs = RuntimeService::GetOrCreateService();
+   if (!rs) {
+     return NS_ERROR_FAILURE;
+   }
+ 
+diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
+--- a/dom/workers/WorkerPrivate.cpp
++++ b/dom/workers/WorkerPrivate.cpp
+@@ -34,16 +34,17 @@
+ #include <algorithm>
+ #include "jsfriendapi.h"
+ #include "js/MemoryMetrics.h"
+ #include "mozilla/Assertions.h"
+ #include "mozilla/Attributes.h"
+ #include "mozilla/ContentEvents.h"
+ #include "mozilla/EventDispatcher.h"
+ #include "mozilla/Likely.h"
++#include "mozilla/LoadContext.h"
+ #include "mozilla/dom/BindingUtils.h"
+ #include "mozilla/dom/BlobBinding.h"
+ #include "mozilla/dom/ErrorEvent.h"
+ #include "mozilla/dom/ErrorEventBinding.h"
+ #include "mozilla/dom/Exceptions.h"
+ #include "mozilla/dom/FunctionBinding.h"
+ #include "mozilla/dom/ImageData.h"
+ #include "mozilla/dom/ImageDataBinding.h"
+@@ -2842,27 +2843,28 @@ WorkerPrivateParent<Derived>::ModifyBusy
+ template <class Derived>
+ void
+ WorkerPrivateParent<Derived>::ForgetMainThreadObjects(
+                                       nsTArray<nsCOMPtr<nsISupports> >& aDoomed)
+ {
+   AssertIsOnParentThread();
+   MOZ_ASSERT(!mMainThreadObjectsForgotten);
+ 
+-  static const uint32_t kDoomedCount = 7;
++  static const uint32_t kDoomedCount = 8;
+ 
+   aDoomed.SetCapacity(kDoomedCount);
+ 
+   SwapToISupportsArray(mLoadInfo.mWindow, aDoomed);
+   SwapToISupportsArray(mLoadInfo.mScriptContext, aDoomed);
+   SwapToISupportsArray(mLoadInfo.mBaseURI, aDoomed);
+   SwapToISupportsArray(mLoadInfo.mResolvedScriptURI, aDoomed);
+   SwapToISupportsArray(mLoadInfo.mPrincipal, aDoomed);
+   SwapToISupportsArray(mLoadInfo.mChannel, aDoomed);
+   SwapToISupportsArray(mLoadInfo.mCSP, aDoomed);
++  SwapToISupportsArray(mLoadInfo.mLoadGroup, aDoomed);
+   // Before adding anything here update kDoomedCount above!
+ 
+   MOZ_ASSERT(aDoomed.Length() == kDoomedCount);
+ 
+   mMainThreadObjectsForgotten = true;
+ }
+ 
+ template <class Derived>
+@@ -3579,29 +3581,32 @@ WorkerPrivateParent<Derived>::SetBaseURI
+     mLocationInfo.mHost.Assign(mLocationInfo.mHostname);
+   }
+ 
+   nsContentUtils::GetUTFOrigin(aBaseURI, mLocationInfo.mOrigin);
+ }
+ 
+ template <class Derived>
+ void
+-WorkerPrivateParent<Derived>::SetPrincipal(nsIPrincipal* aPrincipal)
++WorkerPrivateParent<Derived>::SetPrincipal(nsIPrincipal* aPrincipal,
++                                           nsILoadGroup* aLoadGroup)
+ {
+   AssertIsOnMainThread();
+   MOZ_ASSERT(!mLoadInfo.mPrincipalInfo);
+ 
+   mLoadInfo.mPrincipal = aPrincipal;
+   mLoadInfo.mPrincipalIsSystem = nsContentUtils::IsSystemPrincipal(aPrincipal);
+   uint16_t appStatus = aPrincipal->GetAppStatus();
+   mLoadInfo.mIsInPrivilegedApp =
+     (appStatus == nsIPrincipal::APP_STATUS_CERTIFIED ||
+      appStatus == nsIPrincipal::APP_STATUS_PRIVILEGED);
+   mLoadInfo.mIsInCertifiedApp = (appStatus == nsIPrincipal::APP_STATUS_CERTIFIED);
+ 
++  mLoadInfo.mLoadGroup = aLoadGroup;
++
+   mLoadInfo.mPrincipalInfo = new PrincipalInfo();
+ 
+   MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
+     PrincipalToPrincipalInfo(aPrincipal, mLoadInfo.mPrincipalInfo)));
+ }
+ 
+ template <class Derived>
+ JSContext*
+@@ -4232,16 +4237,17 @@ WorkerPrivate::GetLoadInfo(JSContext* aC
+       NS_ENSURE_TRUE(loadInfo.mScriptContext, NS_ERROR_FAILURE);
+ 
+       // If we're called from a window then we can dig out the principal and URI
+       // from the document.
+       document = loadInfo.mWindow->GetExtantDoc();
+       NS_ENSURE_TRUE(document, NS_ERROR_FAILURE);
+ 
+       loadInfo.mBaseURI = document->GetDocBaseURI();
++      loadInfo.mLoadGroup = document->GetDocumentLoadGroup();
+ 
+       // Use the document's NodePrincipal as our principal if we're not being
+       // called from chrome.
+       if (!loadInfo.mPrincipal) {
+         loadInfo.mPrincipal = document->NodePrincipal();
+         NS_ENSURE_TRUE(loadInfo.mPrincipal, NS_ERROR_FAILURE);
+ 
+         // We use the document's base domain to limit the number of workers
+@@ -4340,18 +4346,30 @@ WorkerPrivate::GetLoadInfo(JSContext* aC
+       rv = loadInfo.mCSP->GetAllowsEval(&loadInfo.mReportCSPViolations,
+                                         &loadInfo.mEvalAllowed);
+       NS_ENSURE_SUCCESS(rv, rv);
+     } else {
+       loadInfo.mEvalAllowed = true;
+       loadInfo.mReportCSPViolations = false;
+     }
+ 
++    if (!loadInfo.mLoadGroup) {
++      rv = NS_NewLoadGroup(getter_AddRefs(loadInfo.mLoadGroup),
++                           loadInfo.mPrincipal);
++      NS_ENSURE_SUCCESS(rv, rv);
++    }
++
++    // We should either be creating the channel with a document or
++    // with a load group and matching principal.
++    MOZ_ASSERT(document || NS_LoadGroupMatchesPrincipal(loadInfo.mLoadGroup,
++                                                        loadInfo.mPrincipal));
++
+     rv = ChannelFromScriptURLMainThread(loadInfo.mPrincipal, loadInfo.mBaseURI,
+-                                        document, aScriptURL,
++                                        document, loadInfo.mLoadGroup,
++                                        aScriptURL,
+                                         getter_AddRefs(loadInfo.mChannel));
+     NS_ENSURE_SUCCESS(rv, rv);
+ 
+     rv = NS_GetFinalChannelURI(loadInfo.mChannel,
+                                getter_AddRefs(loadInfo.mResolvedScriptURI));
+     NS_ENSURE_SUCCESS(rv, rv);
+   }
+ 
+diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
+--- a/dom/workers/WorkerPrivate.h
++++ b/dom/workers/WorkerPrivate.h
+@@ -4,16 +4,17 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_workers_workerprivate_h__
+ #define mozilla_dom_workers_workerprivate_h__
+ 
+ #include "Workers.h"
+ 
+ #include "nsIContentSecurityPolicy.h"
++#include "nsILoadGroup.h"
+ #include "nsIWorkerDebugger.h"
+ #include "nsPIDOMWindow.h"
+ 
+ #include "mozilla/CondVar.h"
+ #include "mozilla/DOMEventTargetHelper.h"
+ #include "mozilla/TimeStamp.h"
+ #include "mozilla/dom/BindingDeclarations.h"
+ #include "nsAutoPtr.h"
+@@ -157,16 +158,17 @@ public:
+     // All of these should be released in ForgetMainThreadObjects.
+     nsCOMPtr<nsIURI> mBaseURI;
+     nsCOMPtr<nsIURI> mResolvedScriptURI;
+     nsCOMPtr<nsIPrincipal> mPrincipal;
+     nsCOMPtr<nsIScriptContext> mScriptContext;
+     nsCOMPtr<nsPIDOMWindow> mWindow;
+     nsCOMPtr<nsIContentSecurityPolicy> mCSP;
+     nsCOMPtr<nsIChannel> mChannel;
++    nsCOMPtr<nsILoadGroup> mLoadGroup;
+ 
+     nsAutoPtr<PrincipalInfo> mPrincipalInfo;
+     nsCString mDomain;
+ 
+     bool mEvalAllowed;
+     bool mReportCSPViolations;
+     bool mXHRParamsAllowed;
+     bool mPrincipalIsSystem;
+@@ -195,16 +197,19 @@ public:
+       aOther.mWindow.swap(mWindow);
+ 
+       MOZ_ASSERT(!mCSP);
+       aOther.mCSP.swap(mCSP);
+ 
+       MOZ_ASSERT(!mChannel);
+       aOther.mChannel.swap(mChannel);
+ 
++      MOZ_ASSERT(!mLoadGroup);
++      aOther.mLoadGroup.swap(mLoadGroup);
++
+       MOZ_ASSERT(!mPrincipalInfo);
+       mPrincipalInfo = aOther.mPrincipalInfo.forget();
+ 
+       mDomain = aOther.mDomain;
+       mEvalAllowed = aOther.mEvalAllowed;
+       mReportCSPViolations = aOther.mReportCSPViolations;
+       mXHRParamsAllowed = aOther.mXHRParamsAllowed;
+       mPrincipalIsSystem = aOther.mPrincipalIsSystem;
+@@ -551,27 +556,34 @@ public:
+ 
+   nsIPrincipal*
+   GetPrincipal() const
+   {
+     AssertIsOnMainThread();
+     return mLoadInfo.mPrincipal;
+   }
+ 
++  nsILoadGroup*
++  GetLoadGroup() const
++  {
++    AssertIsOnMainThread();
++    return mLoadInfo.mLoadGroup;
++  }
++
+   // This method allows the principal to be retrieved off the main thread.
+   // Principals are main-thread objects so the caller must ensure that all
+   // access occurs on the main thread.
+   nsIPrincipal*
+   GetPrincipalDontAssertMainThread() const
+   {
+       return mLoadInfo.mPrincipal;
+   }
+ 
+   void
+-  SetPrincipal(nsIPrincipal* aPrincipal);
++  SetPrincipal(nsIPrincipal* aPrincipal, nsILoadGroup* aLoadGroup);
+ 
+   bool
+   UsesSystemPrincipal() const
+   {
+     return mLoadInfo.mPrincipalIsSystem;
+   }
+ 
+   bool
