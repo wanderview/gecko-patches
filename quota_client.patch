@@ -1,0 +1,204 @@
+# HG changeset patch
+# Parent ba71ba81175fda5a6f9513b3d66f562d87e1879c
+# User Ben Kelly <ben@wanderview.com>
+Implement a basic QuotaManager Client for Cache.
+
+
+diff --git a/dom/cache/moz.build b/dom/cache/moz.build
+--- a/dom/cache/moz.build
++++ b/dom/cache/moz.build
+@@ -21,16 +21,17 @@ EXPORTS.mozilla.dom.cache += [
+     'DBAction.h',
+     'DBSchema.h',
+     'FetchPut.h',
+     'FileUtils.h',
+     'IPCUtils.h',
+     'Manager.h',
+     'ManagerId.h',
+     'PrincipalVerifier.h',
++    'QuotaClient.h',
+     'ReadStream.h',
+     'SavedTypes.h',
+     'ShutdownObserver.h',
+     'Types.h',
+     'TypeUtils.h',
+ ]
+ 
+ SOURCES += [
+@@ -46,16 +47,17 @@ SOURCES += [
+     'Context.cpp',
+     'DBAction.cpp',
+     'DBSchema.cpp',
+     'FetchPut.cpp',
+     'FileUtils.cpp',
+     'Manager.cpp',
+     'ManagerId.cpp',
+     'PrincipalVerifier.cpp',
++    'QuotaClient.cpp',
+     'ReadStream.cpp',
+     'ShutdownObserver.cpp',
+     'TypeUtils.cpp',
+ ]
+ 
+ IPDL_SOURCES += [
+     'CacheInitData.ipdlh',
+     'PCache.ipdl',
+diff --git a/dom/quota/Client.h b/dom/quota/Client.h
+--- a/dom/quota/Client.h
++++ b/dom/quota/Client.h
+@@ -11,16 +11,17 @@
+ 
+ #include "PersistenceType.h"
+ 
+ class nsIOfflineStorage;
+ class nsIRunnable;
+ 
+ #define IDB_DIRECTORY_NAME "idb"
+ #define ASMJSCACHE_DIRECTORY_NAME "asmjs"
++#define DOMCACHE_DIRECTORY_NAME "cache"
+ 
+ BEGIN_QUOTA_NAMESPACE
+ 
+ class OriginOrPatternString;
+ class UsageInfo;
+ 
+ // An abstract interface for quota manager clients.
+ // Each storage API must provide an implementation of this interface in order
+@@ -34,16 +35,17 @@ public:
+   NS_IMETHOD_(MozExternalRefCountType)
+   Release() = 0;
+ 
+   enum Type {
+     IDB = 0,
+     //LS,
+     //APPCACHE,
+     ASMJS,
++    DOMCACHE,
+     TYPE_MAX
+   };
+ 
+   virtual Type
+   GetType() = 0;
+ 
+   static nsresult
+   TypeToText(Type aType, nsAString& aText)
+@@ -52,16 +54,20 @@ public:
+       case IDB:
+         aText.AssignLiteral(IDB_DIRECTORY_NAME);
+         break;
+ 
+       case ASMJS:
+         aText.AssignLiteral(ASMJSCACHE_DIRECTORY_NAME);
+         break;
+ 
++      case DOMCACHE:
++        aText.AssignLiteral(DOMCACHE_DIRECTORY_NAME);
++        break;
++
+       case TYPE_MAX:
+       default:
+         NS_NOTREACHED("Bad id value!");
+         return NS_ERROR_UNEXPECTED;
+     }
+ 
+     return NS_OK;
+   }
+@@ -70,16 +76,19 @@ public:
+   TypeFromText(const nsAString& aText, Type& aType)
+   {
+     if (aText.EqualsLiteral(IDB_DIRECTORY_NAME)) {
+       aType = IDB;
+     }
+     else if (aText.EqualsLiteral(ASMJSCACHE_DIRECTORY_NAME)) {
+       aType = ASMJS;
+     }
++    else if (aText.EqualsLiteral(DOMCACHE_DIRECTORY_NAME)) {
++      aType = DOMCACHE;
++    }
+     else {
+       return NS_ERROR_FAILURE;
+     }
+ 
+     return NS_OK;
+   }
+ 
+   // Methods which are called on the IO thred.
+diff --git a/dom/quota/QuotaManager.cpp b/dom/quota/QuotaManager.cpp
+--- a/dom/quota/QuotaManager.cpp
++++ b/dom/quota/QuotaManager.cpp
+@@ -25,16 +25,17 @@
+ #include "nsPIDOMWindow.h"
+ 
+ #include <algorithm>
+ #include "GeckoProfiler.h"
+ #include "mozilla/Atomics.h"
+ #include "mozilla/CondVar.h"
+ #include "mozilla/dom/asmjscache/AsmJSCache.h"
+ #include "mozilla/dom/FileService.h"
++#include "mozilla/dom/cache/QuotaClient.h"
+ #include "mozilla/dom/indexedDB/ActorsParent.h"
+ #include "mozilla/Mutex.h"
+ #include "mozilla/LazyIdleThread.h"
+ #include "mozilla/Preferences.h"
+ #include "mozilla/Services.h"
+ #include "nsAppDirectoryServiceDefs.h"
+ #include "nsComponentManagerUtils.h"
+ #include "nsAboutProtocolUtils.h"
+@@ -1404,27 +1405,28 @@ QuotaManager::Init()
+     NS_WARNING("Unable to respond to temp storage pref changes!");
+   }
+ 
+   if (NS_FAILED(Preferences::AddBoolVarCache(&gTestingEnabled,
+                                              PREF_TESTING_FEATURES, false))) {
+     NS_WARNING("Unable to respond to testing pref changes!");
+   }
+ 
+-  static_assert(Client::IDB == 0 && Client::ASMJS == 1 && Client::TYPE_MAX == 2,
+-                "Fix the registration!");
++  static_assert(Client::IDB == 0 && Client::ASMJS == 1 && Client::DOMCACHE == 2 &&
++                Client::TYPE_MAX == 3, "Fix the registration!");
+ 
+   NS_ASSERTION(mClients.Capacity() == Client::TYPE_MAX,
+                "Should be using an auto array with correct capacity!");
+ 
+   nsRefPtr<Client> idbClient = indexedDB::CreateQuotaClient();
+ 
+   // Register clients.
+   mClients.AppendElement(idbClient);
+   mClients.AppendElement(asmjscache::CreateClient());
++  mClients.AppendElement(cache::QuotaClient::Create());
+ 
+   return NS_OK;
+ }
+ 
+ void
+ QuotaManager::InitQuotaForOrigin(PersistenceType aPersistenceType,
+                                  const nsACString& aGroup,
+                                  const nsACString& aOrigin,
+@@ -2033,21 +2035,21 @@ QuotaManager::InitializeOrigin(Persisten
+ 
+     if (!isDirectory) {
+       NS_WARNING("Unknown file found!");
+       return NS_ERROR_UNEXPECTED;
+     }
+ 
+     Client::Type clientType;
+     rv = Client::TypeFromText(leafName, clientType);
+-    if (NS_SUCCEEDED(rv)) {
+-      rv = mClients[clientType]->InitOrigin(aPersistenceType, aGroup, aOrigin,
+-                                            usageInfo);
+-      NS_ENSURE_SUCCESS(rv, rv);
+-    }
++    NS_ENSURE_SUCCESS(rv, rv);
++
++    rv = mClients[clientType]->InitOrigin(aPersistenceType, aGroup, aOrigin,
++                                          usageInfo);
++    NS_ENSURE_SUCCESS(rv, rv);
+   }
+ 
+   if (trackQuota) {
+     uint64_t quotaMaxBytes;
+     uint64_t totalUsageBytes = usageInfo->TotalUsage();
+ 
+     if (IsTreatedAsTemporary(aPersistenceType, aIsApp)) {
+       // Temporary storage has no limit for origin usage (there's a group and
