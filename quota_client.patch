@@ -3,11 +3,67 @@
 # User Ben Kelly <ben@wanderview.com>
 Implement a basic QuotaManager Client for Cache.
 
+diff --git a/dom/cache/DBAction.cpp b/dom/cache/DBAction.cpp
+--- a/dom/cache/DBAction.cpp
++++ b/dom/cache/DBAction.cpp
+@@ -82,23 +82,16 @@ DBAction::OpenConnection(const QuotaInfo
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   rv = dbFile->Append(NS_LITERAL_STRING("db.sqlite"));
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   rv = dbFile->Exists(&exists);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+-  nsCOMPtr<nsIFile> dbTmpDir;
+-  rv = aDBDir->Clone(getter_AddRefs(dbTmpDir));
+-  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+-
+-  rv = dbTmpDir->Append(NS_LITERAL_STRING("db"));
+-  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+-
+   // XXX: Jonas tells me nsIFileURL usage off-main-thread is dangerous,
+   //      but this is what IDB does to access mozIStorageConnection so
+   //      it seems at least this corner case mostly works.
+   // TODO: move this to main thread where GetInfoFromPrincipal() is executed
+   nsCOMPtr<nsIURI> uri;
+   rv = NS_NewFileURI(getter_AddRefs(uri), dbFile);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+@@ -119,28 +112,16 @@ DBAction::OpenConnection(const QuotaInfo
+     do_GetService(MOZ_STORAGE_SERVICE_CONTRACTID);
+   if (NS_WARN_IF(!ss)) { return NS_ERROR_UNEXPECTED; }
+ 
+   rv = ss->OpenDatabaseWithFileURL(dbFileUrl, aConnOut);
+   if (rv == NS_ERROR_FILE_CORRUPTED) {
+     dbFile->Remove(false);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+-    rv = dbTmpDir->Exists(&exists);
+-    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+-
+-    if (exists) {
+-      bool isDir;
+-      rv = dbTmpDir->IsDirectory(&isDir);
+-      if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+-      if (NS_WARN_IF(!isDir)) { return NS_ERROR_UNEXPECTED; }
+-      rv = dbTmpDir->Remove(true);
+-      if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+-    }
+-
+     rv = ss->OpenDatabaseWithFileURL(dbFileUrl, aConnOut);
+   }
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+   MOZ_ASSERT(*aConnOut);
+   return rv;
+ }
+ 
+ SyncDBAction::SyncDBAction(Mode aMode)
 diff --git a/dom/cache/QuotaClient.cpp b/dom/cache/QuotaClient.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/QuotaClient.cpp
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,211 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -16,12 +72,63 @@ new file mode 100644
 +
 +#include "mozilla/dom/cache/QuotaClient.h"
 +
++#include "mozilla/DebugOnly.h"
++#include "mozilla/dom/quota/QuotaManager.h"
++#include "mozilla/dom/quota/UsageInfo.h"
++#include "nsIFile.h"
++#include "nsISimpleEnumerator.h"
++
++namespace {
++
++using mozilla::dom::quota::UsageInfo;
++
++static nsresult
++GetBodyUsage(nsIFile* aDir, UsageInfo* aUsageInfo)
++{
++  nsCOMPtr<nsISimpleEnumerator> entries;
++  nsresult rv = aDir->GetDirectoryEntries(getter_AddRefs(entries));
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  bool hasMore;
++  while (NS_SUCCEEDED(rv = entries->HasMoreElements(&hasMore)) && hasMore &&
++         !aUsageInfo->Canceled()) {
++    nsCOMPtr<nsISupports> entry;
++    rv = entries->GetNext(getter_AddRefs(entry));
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    nsCOMPtr<nsIFile> file = do_QueryInterface(entry);
++    if (!file) { return NS_NOINTERFACE; }
++
++    bool isDir;
++    rv = file->IsDirectory(&isDir);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    if (isDir) {
++      rv = GetBodyUsage(file, aUsageInfo);
++      if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++      continue;
++    }
++
++    int64_t fileSize;
++    rv = file->GetFileSize(&fileSize);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++    MOZ_ASSERT(fileSize >= 0);
++
++    aUsageInfo->AppendToFileUsage(fileSize);
++  }
++
++  return NS_OK;
++}
++
++} // anonymous namespace;
++
 +namespace mozilla {
 +namespace dom {
 +namespace cache {
 +
 +using mozilla::dom::quota::Client;
 +using mozilla::dom::quota::PersistenceType;
++using mozilla::dom::quota::QuotaManager;
 +using mozilla::dom::quota::UsageInfo;
 +
 +Client*
@@ -49,7 +156,73 @@ new file mode 100644
 +                               const nsACString& aGroup,
 +                               const nsACString& aOrigin, UsageInfo* aUsageInfo)
 +{
-+  // TODO
++  QuotaManager* qm = QuotaManager::Get();
++  MOZ_ASSERT(qm);
++
++  nsCOMPtr<nsIFile> dir;
++  nsresult rv = qm->GetDirectoryForOrigin(aPersistenceType, aOrigin,
++                                          getter_AddRefs(dir));
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  rv = dir->Append(NS_LITERAL_STRING(DOMCACHE_DIRECTORY_NAME));
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  DebugOnly<bool> exists;
++  MOZ_ASSERT(NS_SUCCEEDED(dir->Exists(&exists)) && exists);
++
++  nsCOMPtr<nsISimpleEnumerator> entries;
++  rv = dir->GetDirectoryEntries(getter_AddRefs(entries));
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  bool hasMore;
++  while (NS_SUCCEEDED(rv = entries->HasMoreElements(&hasMore)) && hasMore &&
++         !aUsageInfo->Canceled()) {
++    nsCOMPtr<nsISupports> entry;
++    rv = entries->GetNext(getter_AddRefs(entry));
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    nsCOMPtr<nsIFile> file = do_QueryInterface(entry);
++    if (!file) { return NS_NOINTERFACE; }
++
++    nsAutoString leafName;
++    rv = file->GetLeafName(leafName);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    bool isDir;
++    rv = file->IsDirectory(&isDir);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    if (isDir) {
++      if (leafName.EqualsLiteral("morgue")) {
++        rv = GetBodyUsage(file, aUsageInfo);
++      } else {
++        NS_WARNING("Unknown Cache directory found!");
++      }
++
++      continue;
++    }
++
++    // Ignore transient sqlite files
++    if (leafName.EqualsLiteral("db.sqlite-journal") ||
++        leafName.EqualsLiteral("db.sqlite-shm") ||
++        leafName.Find(NS_LITERAL_CSTRING("db.sqlite-mj"), false, 0, 0) == 0) {
++      continue;
++    }
++
++    if (leafName.EqualsLiteral("db.sqlite") ||
++        leafName.EqualsLiteral("db.sqlite-wal")) {
++      int64_t fileSize;
++      rv = file->GetFileSize(&fileSize);
++      if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++      MOZ_ASSERT(fileSize >= 0);
++
++      aUsageInfo->AppendToDatabaseUsage(fileSize);
++      continue;
++    }
++
++    NS_WARNING("Unknown Cache file found!");
++  }
++
 +  return NS_OK;
 +}
 +
