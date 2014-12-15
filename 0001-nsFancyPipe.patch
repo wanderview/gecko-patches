@@ -1,13 +1,284 @@
 # HG changeset patch
-# Parent 3b40951bf9cd45107965bc1e77ba56de3d9ee9b9
+# Parent 217342aa5d11687fdd4e15298bae210b6afd1039
 # User Kyle Huey <khuey@kylehuey.com>
 
 nsFancyPipe
 
+diff --git a/dom/ipc/ContentChild.cpp b/dom/ipc/ContentChild.cpp
+--- a/dom/ipc/ContentChild.cpp
++++ b/dom/ipc/ContentChild.cpp
+@@ -537,16 +537,17 @@ ReinitTaskTracer(void* /*aUnused*/)
+ 
+ ContentChild::ContentChild()
+  : mID(uint64_t(-1))
+ #ifdef ANDROID
+    ,mScreenSize(0, 0)
+ #endif
+    , mCanOverrideProcessName(true)
+    , mIsAlive(true)
++   , mIsCurrentlyProcessingMessages(false)
+ {
+     // This process is a content process, so it's clearly running in
+     // multiprocess mode!
+     nsDebugImpl::SetMultiprocessMode("Child");
+ }
+ 
+ ContentChild::~ContentChild()
+ {
+@@ -745,16 +746,28 @@ ContentChild::InitXPCOM()
+     // This object is held alive by the observer service.
+     nsRefPtr<SystemMessageHandledObserver> sysMsgObserver =
+         new SystemMessageHandledObserver();
+     sysMsgObserver->Init();
+ 
+     InitOnContentProcessCreated();
+ }
+ 
++/* static */ ContentChild*
++ContentChild::GetCurrentlyProcessingMessages()
++{
++    ContentChild* self = GetSingleton();
++
++    if (self->mIsCurrentlyProcessingMessages) {
++        return self;
++    }
++
++    return nullptr;
++}
++
+ a11y::PDocAccessibleChild*
+ ContentChild::AllocPDocAccessibleChild(PDocAccessibleChild*, const uint64_t&)
+ {
+   MOZ_ASSERT(false, "should never call this!");
+   return nullptr;
+ }
+ 
+ bool
+@@ -1811,16 +1824,32 @@ ContentChild::ProcessingError(Result wha
+     case MsgValueError:
+         NS_RUNTIMEABORT("aborting because of MsgValueError");
+ 
+     default:
+         NS_RUNTIMEABORT("not reached");
+     }
+ }
+ 
++auto
++ContentChild::OnMessageReceived(const Message& __msg) -> Result
++{
++    AutoRestore<bool> autoRestore(mIsCurrentlyProcessingMessages);
++    mIsCurrentlyProcessingMessages = true;
++    return PContentChild::OnMessageReceived(__msg);
++}
++
++auto
++ContentChild::OnMessageReceived(const Message& __msg, Message*& __reply) -> Result
++{
++    AutoRestore<bool> autoRestore(mIsCurrentlyProcessingMessages);
++    mIsCurrentlyProcessingMessages = true;
++    return PContentChild::OnMessageReceived(__msg);
++}
++
+ void
+ ContentChild::QuickExit()
+ {
+     NS_WARNING("content process _exit()ing");
+     _exit(0);
+ }
+ 
+ nsresult
+diff --git a/dom/ipc/ContentChild.h b/dom/ipc/ContentChild.h
+--- a/dom/ipc/ContentChild.h
++++ b/dom/ipc/ContentChild.h
+@@ -81,16 +81,18 @@ public:
+               IPC::Channel* aChannel);
+     void InitProcessAttributes();
+     void InitXPCOM();
+ 
+     static ContentChild* GetSingleton() {
+         return sSingleton;
+     }
+ 
++    static ContentChild* GetCurrentlyProcessingMessages();
++
+     const AppInfo& GetAppInfo() {
+         return mAppInfo;
+     }
+     void SetProcessName(const nsAString& aName, bool aDontOverride = false);
+     void GetProcessName(nsAString& aName);
+     void GetProcessName(nsACString& aName);
+     bool IsAlive();
+     static void AppendProcessId(nsACString& aName);
+@@ -419,16 +421,22 @@ public:
+     virtual bool
+     DeallocPOfflineCacheUpdateChild(POfflineCacheUpdateChild* offlineCacheUpdate) MOZ_OVERRIDE;
+ 
+ private:
+     virtual void ActorDestroy(ActorDestroyReason why) MOZ_OVERRIDE;
+ 
+     virtual void ProcessingError(Result what) MOZ_OVERRIDE;
+ 
++    virtual Result
++    OnMessageReceived(const Message& __msg) MOZ_OVERRIDE;
++
++    virtual Result
++    OnMessageReceived(const Message& __msg, Message*& __reply) MOZ_OVERRIDE;
++
+     /**
+      * Exit *now*.  Do not shut down XPCOM, do not pass Go, do not run
+      * static destructors, do not collect $200.
+      */
+     MOZ_NORETURN void QuickExit();
+ 
+     InfallibleTArray<nsAutoPtr<AlertObserver> > mAlertObservers;
+     nsRefPtr<ConsoleListener> mConsoleListener;
+@@ -453,16 +461,18 @@ private:
+ #endif
+ 
+     bool mIsForApp;
+     bool mIsForBrowser;
+     bool mCanOverrideProcessName;
+     bool mIsAlive;
+     nsString mProcessName;
+ 
++    bool mIsCurrentlyProcessingMessages;
++
+     static ContentChild* sSingleton;
+ 
+     DISALLOW_EVIL_CONSTRUCTORS(ContentChild);
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+diff --git a/dom/ipc/ContentParent.cpp b/dom/ipc/ContentParent.cpp
+--- a/dom/ipc/ContentParent.cpp
++++ b/dom/ipc/ContentParent.cpp
+@@ -359,16 +359,17 @@ template<>
+ struct nsIConsoleService::COMTypeInfo<nsConsoleService, void> {
+   static const nsIID kIID;
+ };
+ const nsIID nsIConsoleService::COMTypeInfo<nsConsoleService, void>::kIID = NS_ICONSOLESERVICE_IID;
+ 
+ namespace mozilla {
+ namespace dom {
+ 
++ContentParent* ContentParent::sCurrentlyProcessingMessagesContentParent;
+ #ifdef MOZ_NUWA_PROCESS
+ int32_t ContentParent::sNuwaPid = 0;
+ bool ContentParent::sNuwaReady = false;
+ #endif
+ 
+ #define NS_IPC_IOSERVICE_SET_OFFLINE_TOPIC "ipc:network:set-offline"
+ 
+ class MemoryReportRequestParent : public PMemoryReportRequestParent
+@@ -1254,16 +1255,22 @@ ContentParent::GetAllEvenIfDead(nsTArray
+     }
+ 
+     for (ContentParent* cp = sContentParents->getFirst(); cp;
+          cp = cp->LinkedListElement<ContentParent>::getNext()) {
+         aArray.AppendElement(cp);
+     }
+ }
+ 
++/* static */ ContentParent*
++ContentParent::GetCurrentlyProcessingMessages() {
++    MOZ_ASSERT(NS_IsMainThread());
++    return sCurrentlyProcessingMessagesContentParent;
++}
++
+ void
+ ContentParent::Init()
+ {
+     nsCOMPtr<nsIObserverService> obs = mozilla::services::GetObserverService();
+     if (obs) {
+         size_t length = ArrayLength(sObserverTopics);
+         for (size_t i = 0; i < length; ++i) {
+             obs->AddObserver(this, sObserverTopics[i], false);
+@@ -2865,16 +2872,32 @@ ContentParent::RecvPDocAccessibleConstru
+   } else {
+     MOZ_ASSERT(!aParentID);
+     GetAccService()->RemoteDocAdded(doc);
+   }
+ #endif
+   return true;
+ }
+ 
++auto
++ContentParent::OnMessageReceived(const Message& __msg) -> Result
++{
++    AutoRestore<ContentParent*> autoRestore(sCurrentlyProcessingMessagesContentParent);
++    sCurrentlyProcessingMessagesContentParent = this;
++    return PContentParent::OnMessageReceived(__msg);
++}
++
++auto
++ContentParent::OnMessageReceived(const Message& __msg, Message*& __reply) -> Result
++{
++    AutoRestore<ContentParent*> autoRestore(sCurrentlyProcessingMessagesContentParent);
++    sCurrentlyProcessingMessagesContentParent = this;
++    return PContentParent::OnMessageReceived(__msg, __reply);
++}
++
+ PCompositorParent*
+ ContentParent::AllocPCompositorParent(mozilla::ipc::Transport* aTransport,
+                                       base::ProcessId aOtherProcess)
+ {
+     return CompositorParent::Create(aTransport, aOtherProcess);
+ }
+ 
+ PImageBridgeParent*
+diff --git a/dom/ipc/ContentParent.h b/dom/ipc/ContentParent.h
+--- a/dom/ipc/ContentParent.h
++++ b/dom/ipc/ContentParent.h
+@@ -134,16 +134,18 @@ public:
+     static TabParent*
+     CreateBrowserOrApp(const TabContext& aContext,
+                        Element* aFrameElement,
+                        ContentParent* aOpenerContentParent);
+ 
+     static void GetAll(nsTArray<ContentParent*>& aArray);
+     static void GetAllEvenIfDead(nsTArray<ContentParent*>& aArray);
+ 
++    static ContentParent* GetCurrentlyProcessingMessages();
++
+     static bool IgnoreIPCPrincipal();
+ 
+     static void NotifyUpdatedDictionaries();
+ 
+     virtual bool RecvCreateChildProcess(const IPCTabContext& aContext,
+                                         const hal::ProcessPriority& aPriority,
+                                         const TabId& aOpenerTabId,
+                                         ContentParentId* aCpId,
+@@ -740,16 +742,24 @@ private:
+                           int32_t* aSliceRefCnt,
+                           bool* aResult) MOZ_OVERRIDE;
+ 
+     virtual PDocAccessibleParent* AllocPDocAccessibleParent(PDocAccessibleParent*, const uint64_t&) MOZ_OVERRIDE;
+     virtual bool DeallocPDocAccessibleParent(PDocAccessibleParent*) MOZ_OVERRIDE;
+     virtual bool RecvPDocAccessibleConstructor(PDocAccessibleParent* aDoc,
+                                                PDocAccessibleParent* aParentDoc, const uint64_t& aParentID) MOZ_OVERRIDE;
+ 
++    virtual Result
++    OnMessageReceived(const Message& __msg) MOZ_OVERRIDE;
++
++    virtual Result
++    OnMessageReceived(const Message& __msg, Message*& __reply) MOZ_OVERRIDE;
++
++    static ContentParent* sCurrentlyProcessingMessagesContentParent;
++
+     // If you add strong pointers to cycle collected objects here, be sure to
+     // release these objects in ShutDownProcess.  See the comment there for more
+     // details.
+ 
+     GeckoChildProcessHost* mSubprocess;
+     ContentParent* mOpener;
+ 
+     ContentParentId mChildID;
 diff --git a/dom/ipc/PContent.ipdl b/dom/ipc/PContent.ipdl
 --- a/dom/ipc/PContent.ipdl
 +++ b/dom/ipc/PContent.ipdl
-@@ -43,16 +43,17 @@ include URIParams;
+@@ -47,16 +47,17 @@ include PluginTypes;
  include ProtocolTypes;
  
  // Workaround to prevent error if PContentChild.cpp & PContentBridgeParent.cpp
@@ -25,11 +296,45 @@ diff --git a/dom/ipc/PContent.ipdl b/dom/ipc/PContent.ipdl
  using struct OverrideMapping from "mozilla/chrome/RegistryMessageUtils.h";
  using base::ChildPrivileges from "base/process_util.h";
  using struct IPC::Permission from "mozilla/net/NeckoMessageUtils.h";
+diff --git a/ipc/glue/BackgroundChild.h b/ipc/glue/BackgroundChild.h
+--- a/ipc/glue/BackgroundChild.h
++++ b/ipc/glue/BackgroundChild.h
+@@ -66,16 +66,22 @@ public:
+   static mozilla::dom::PBlobChild*
+   GetOrCreateActorForBlob(PBackgroundChild* aBackgroundActor,
+                           nsIDOMBlob* aBlob);
+ 
+   // See above.
+   static void
+   CloseForCurrentThread();
+ 
++  // Returns the PBackgroundChild that is currently processing messages. This
++  // function may only be called on a thread with an existing PBackgroundChild,
++  // and only when a message is being processed.
++  static PBackgroundChild*
++  GetCurrentlyProcessingMessages();
++
+ private:
+   // Only called by ContentChild or ContentParent.
+   static void
+   Startup();
+ 
+   // Only called by ContentChild.
+   static PBackgroundChild*
+   Alloc(Transport* aTransport, ProcessId aOtherProcess);
 diff --git a/ipc/glue/BackgroundChildImpl.cpp b/ipc/glue/BackgroundChildImpl.cpp
 --- a/ipc/glue/BackgroundChildImpl.cpp
 +++ b/ipc/glue/BackgroundChildImpl.cpp
-@@ -7,16 +7,17 @@
+@@ -1,23 +1,25 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+  * You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "BackgroundChildImpl.h"
+ 
  #include "FileDescriptorSetChild.h"
+ #include "mozilla/Assertions.h"
++#include "mozilla/AutoRestore.h"
  #include "mozilla/dom/PBlobChild.h"
  #include "mozilla/dom/indexedDB/PBackgroundIDBFactoryChild.h"
  #include "mozilla/dom/ipc/BlobChild.h"
@@ -46,7 +351,36 @@ diff --git a/ipc/glue/BackgroundChildImpl.cpp b/ipc/glue/BackgroundChildImpl.cpp
  using mozilla::dom::cache::PCacheChild;
  using mozilla::dom::cache::PCacheStreamControlChild;
  using mozilla::dom::cache::CacheStreamControlChild;
-@@ -124,16 +125,29 @@ BackgroundChildImpl::DeallocPBackgroundI
+@@ -75,23 +77,28 @@ ThreadLocal::~ThreadLocal()
+   MOZ_COUNT_DTOR(mozilla::ipc::BackgroundChildImpl::ThreadLocal);
+ }
+ 
+ // -----------------------------------------------------------------------------
+ // BackgroundChildImpl
+ // -----------------------------------------------------------------------------
+ 
+ BackgroundChildImpl::BackgroundChildImpl()
++#ifdef DEBUG
++  : mCurrentlyProcessingMessages(false)
++#endif
+ {
+   // May happen on any thread!
+   MOZ_COUNT_CTOR(mozilla::ipc::BackgroundChildImpl);
+ }
+ 
+ BackgroundChildImpl::~BackgroundChildImpl()
+ {
++  MOZ_ASSERT(!mCurrentlyProcessingMessages);
++
+   // May happen on any thread!
+   MOZ_COUNT_DTOR(mozilla::ipc::BackgroundChildImpl);
+ }
+ 
+ void
+ BackgroundChildImpl::ProcessingError(Result aWhat)
+ {
+   // May happen on any thread!
+@@ -157,16 +164,29 @@ BackgroundChildImpl::DeallocPBackgroundI
                                               PBackgroundIDBFactoryChild* aActor)
  {
    MOZ_ASSERT(aActor);
@@ -76,13 +410,49 @@ diff --git a/ipc/glue/BackgroundChildImpl.cpp b/ipc/glue/BackgroundChildImpl.cpp
  
    return mozilla::dom::BlobChild::Create(this, aParams);
  }
+@@ -257,16 +277,35 @@ bool
+ BackgroundChildImpl::DeallocPMessagePortChild(PMessagePortChild* aActor)
+ {
+   nsRefPtr<dom::MessagePortChild> child =
+     dont_AddRef(static_cast<dom::MessagePortChild*>(aActor));
+   MOZ_ASSERT(child);
+   return true;
+ }
+ 
++#ifdef DEBUG
++auto
++BackgroundChildImpl::OnMessageReceived(const Message& __msg) -> Result
++{
++  AutoRestore<bool> autoRestore(mCurrentlyProcessingMessages);
++  mCurrentlyProcessingMessages = true;
++  return PBackgroundChild::OnMessageReceived(__msg);
++}
++
++auto
++BackgroundChildImpl::OnMessageReceived(const Message& __msg,
++                                       Message*& __reply) -> Result
++{
++  AutoRestore<bool> autoRestore(mCurrentlyProcessingMessages);
++  mCurrentlyProcessingMessages = true;
++  return PBackgroundChild::OnMessageReceived(__msg, __reply);
++}
++#endif
++
+ } // namespace ipc
+ } // namespace mozilla
+ 
+ bool
+ TestChild::Recv__delete__(const nsCString& aTestArg)
+ {
+   MOZ_RELEASE_ASSERT(aTestArg == mTestArg,
+                      "BackgroundTest message was corrupted!");
 diff --git a/ipc/glue/BackgroundChildImpl.h b/ipc/glue/BackgroundChildImpl.h
 --- a/ipc/glue/BackgroundChildImpl.h
 +++ b/ipc/glue/BackgroundChildImpl.h
-@@ -59,16 +59,22 @@ protected:
+@@ -61,16 +61,22 @@ protected:
+ 
    virtual PBackgroundIDBFactoryChild*
-   AllocPBackgroundIDBFactoryChild(const OptionalWindowId& aOptionalWindowId)
-                                   MOZ_OVERRIDE;
+   AllocPBackgroundIDBFactoryChild() MOZ_OVERRIDE;
  
    virtual bool
    DeallocPBackgroundIDBFactoryChild(PBackgroundIDBFactoryChild* aActor)
@@ -102,10 +472,225 @@ diff --git a/ipc/glue/BackgroundChildImpl.h b/ipc/glue/BackgroundChildImpl.h
  
    virtual PFileDescriptorSetChild*
    AllocPFileDescriptorSetChild(const FileDescriptor& aFileDescriptor)
+@@ -97,16 +103,27 @@ protected:
+   virtual bool
+   DeallocPCacheStreamControlChild(mozilla::dom::cache::PCacheStreamControlChild* aActor);
+ 
+   virtual PMessagePortChild*
+   AllocPMessagePortChild() MOZ_OVERRIDE;
+ 
+   virtual bool
+   DeallocPMessagePortChild(PMessagePortChild* aActor) MOZ_OVERRIDE;
++
++#ifdef DEBUG
++  virtual Result
++  OnMessageReceived(const Message& __msg) MOZ_OVERRIDE;
++
++  virtual Result
++  OnMessageReceived(const Message& __msg,
++                    Message*& __reply) MOZ_OVERRIDE;
++
++  bool mCurrentlyProcessingMessages;
++#endif
+ };
+ 
+ class BackgroundChildImpl::ThreadLocal MOZ_FINAL
+ {
+   friend class nsAutoPtr<ThreadLocal>;
+ 
+ public:
+   mozilla::dom::indexedDB::IDBTransaction* mCurrentTransaction;
+diff --git a/ipc/glue/BackgroundImpl.cpp b/ipc/glue/BackgroundImpl.cpp
+--- a/ipc/glue/BackgroundImpl.cpp
++++ b/ipc/glue/BackgroundImpl.cpp
+@@ -232,16 +232,20 @@ private:
+   GetContentParent(PBackgroundParent* aBackgroundActor);
+ 
+   // Forwarded from BackgroundParent.
+   static intptr_t
+   GetRawContentParentForComparison(PBackgroundParent* aBackgroundActor);
+ 
+   // Forwarded from BackgroundParent.
+   static PBackgroundParent*
++  GetCurrentlyProcessingMessages();
++
++  // Forwarded from BackgroundParent.
++  static PBackgroundParent*
+   Alloc(ContentParent* aContent,
+         Transport* aTransport,
+         ProcessId aOtherProcess);
+ 
+   static bool
+   CreateBackgroundThread();
+ 
+   static void
+@@ -416,16 +420,20 @@ private:
+   // Forwarded from BackgroundChild.
+   static bool
+   GetOrCreateForCurrentThread(nsIIPCBackgroundChildCreateCallback* aCallback);
+ 
+   // Forwarded from BackgroundChild.
+   static void
+   CloseForCurrentThread();
+ 
++  // Forwarded from BackgroundChild.
++  static PBackgroundChild*
++  GetCurrentlyProcessingMessages();
++
+   // Forwarded from BackgroundChildImpl.
+   static BackgroundChildImpl::ThreadLocal*
+   GetThreadLocalForCurrentThread();
+ 
+   static void
+   ThreadLocalDestructor(void* aThreadLocal)
+   {
+     auto threadLocalInfo = static_cast<ThreadLocalInfo*>(aThreadLocal);
+@@ -865,16 +873,23 @@ intptr_t
+ BackgroundParent::GetRawContentParentForComparison(
+                                             PBackgroundParent* aBackgroundActor)
+ {
+   return ParentImpl::GetRawContentParentForComparison(aBackgroundActor);
+ }
+ 
+ // static
+ PBackgroundParent*
++BackgroundParent::GetCurrentlyProcessingMessages()
++{
++  return ParentImpl::GetCurrentlyProcessingMessages();
++}
++
++// static
++PBackgroundParent*
+ BackgroundParent::Alloc(ContentParent* aContent,
+                         Transport* aTransport,
+                         ProcessId aOtherProcess)
+ {
+   return ParentImpl::Alloc(aContent, aTransport, aOtherProcess);
+ }
+ 
+ // -----------------------------------------------------------------------------
+@@ -935,16 +950,23 @@ BackgroundChild::GetOrCreateActorForBlob
+ 
+ // static
+ void
+ BackgroundChild::CloseForCurrentThread()
+ {
+   ChildImpl::CloseForCurrentThread();
+ }
+ 
++// static
++PBackgroundChild*
++BackgroundChild::GetCurrentlyProcessingMessages()
++{
++  return ChildImpl::GetCurrentlyProcessingMessages();
++}
++
+ // -----------------------------------------------------------------------------
+ // BackgroundChildImpl Public Methods
+ // -----------------------------------------------------------------------------
+ 
+ // static
+ BackgroundChildImpl::ThreadLocal*
+ BackgroundChildImpl::GetThreadLocalForCurrentThread()
+ {
+@@ -1051,16 +1073,28 @@ ParentImpl::GetRawContentParentForCompar
+     return intptr_t(-1);
+   }
+ 
+   return intptr_t(static_cast<nsIContentParent*>(actor->mContent.get()));
+ }
+ 
+ // static
+ PBackgroundParent*
++ParentImpl::GetCurrentlyProcessingMessages()
++{
++  AssertIsOnBackgroundThread();
++
++  PBackgroundParent* actor = sCurrentlyProcessingMessagesBackgroundParent;
++  MOZ_ASSERT(actor);
++
++  return actor;
++}
++
++// static
++PBackgroundParent*
+ ParentImpl::Alloc(ContentParent* aContent,
+                   Transport* aTransport,
+                   ProcessId aOtherProcess)
+ {
+   AssertIsInMainProcess();
+   AssertIsOnMainThread();
+   MOZ_ASSERT(aTransport);
+ 
+@@ -1780,16 +1814,29 @@ ChildImpl::CloseForCurrentThread()
+   }
+ 
+   // Clearing the thread local will synchronously close the actor.
+   DebugOnly<PRStatus> status = PR_SetThreadPrivate(sThreadLocalIndex, nullptr);
+   MOZ_ASSERT(status == PR_SUCCESS);
+ }
+ 
+ // static
++PBackgroundChild*
++ChildImpl::GetCurrentlyProcessingMessages()
++{
++  auto actor = static_cast<ChildImpl*>(ChildImpl::GetForCurrentThread());
++
++  if (!actor || !actor->mCurrentlyProcessingMessages) {
++    return nullptr;
++  }
++
++  return actor;
++}
++
++// static
+ BackgroundChildImpl::ThreadLocal*
+ ChildImpl::GetThreadLocalForCurrentThread()
+ {
+   MOZ_ASSERT(sThreadLocalIndex != kBadThreadLocalIndex,
+              "BackgroundChild::Startup() was never called!");
+ 
+   auto threadLocalInfo =
+     static_cast<ThreadLocalInfo*>(PR_GetThreadPrivate(sThreadLocalIndex));
+diff --git a/ipc/glue/BackgroundParent.h b/ipc/glue/BackgroundParent.h
+--- a/ipc/glue/BackgroundParent.h
++++ b/ipc/glue/BackgroundParent.h
+@@ -60,16 +60,22 @@ public:
+ 
+   // Get a value that represents the ContentParent associated with the parent
+   // actor for comparison. The value is not guaranteed to uniquely identify the
+   // ContentParent after the ContentParent has died. This function may only be
+   // called on the background thread.
+   static intptr_t
+   GetRawContentParentForComparison(PBackgroundParent* aBackgroundActor);
+ 
++  // Returns the PBackgroundParent that is currently processing messages. This
++  // function may only be called on the background thread, and only when a
++  // message is being processed.
++  static PBackgroundParent*
++  GetCurrentlyProcessingMessages();
++
+ private:
+   // Only called by ContentParent for cross-process actors.
+   static PBackgroundParent*
+   Alloc(ContentParent* aContent,
+         Transport* aTransport,
+         ProcessId aOtherProcess);
+ };
+ 
 diff --git a/ipc/glue/BackgroundParentImpl.cpp b/ipc/glue/BackgroundParentImpl.cpp
 --- a/ipc/glue/BackgroundParentImpl.cpp
 +++ b/ipc/glue/BackgroundParentImpl.cpp
-@@ -9,16 +9,17 @@
+@@ -1,24 +1,26 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+  * You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "BackgroundParentImpl.h"
+ 
+ #include "FileDescriptorSetParent.h"
+ #include "mozilla/Assertions.h"
++#include "mozilla/AutoRestore.h"
  #include "mozilla/dom/PBlobParent.h"
  #include "mozilla/dom/indexedDB/ActorsParent.h"
  #include "mozilla/dom/ipc/BlobParent.h"
@@ -123,7 +708,27 @@ diff --git a/ipc/glue/BackgroundParentImpl.cpp b/ipc/glue/BackgroundParentImpl.c
  #ifdef DISABLE_ASSERTS_FOR_FUZZING
  #define ASSERT_UNLESS_FUZZING(...) do { } while (0)
  #else
-@@ -161,16 +162,37 @@ BackgroundParentImpl::DeallocPBackground
+@@ -67,16 +69,19 @@ public:
+   ActorDestroy(ActorDestroyReason aWhy) MOZ_OVERRIDE;
+ };
+ 
+ } // anonymous namespace
+ 
+ namespace mozilla {
+ namespace ipc {
+ 
++/* static */
++BackgroundParentImpl* BackgroundParentImpl::sCurrentlyProcessingMessagesBackgroundParent;
++
+ BackgroundParentImpl::BackgroundParentImpl()
+ {
+   AssertIsInMainProcess();
+   AssertIsOnMainThread();
+ 
+   MOZ_COUNT_CTOR(mozilla::ipc::BackgroundParentImpl);
+ }
+ 
+@@ -159,16 +164,46 @@ BackgroundParentImpl::DeallocPBackground
  {
    AssertIsInMainProcess();
    AssertIsOnBackgroundThread();
@@ -136,7 +741,12 @@ diff --git a/ipc/glue/BackgroundParentImpl.cpp b/ipc/glue/BackgroundParentImpl.c
 +PBackgroundPipeTransportParent*
 +BackgroundParentImpl::AllocPBackgroundPipeTransportParent(const intptr_t& aCookie)
 +{
-+  return detail::AllocPBackgroundPipeTransportParent(aCookie);
++  AssertIsInMainProcess();
++  AssertIsOnBackgroundThread();
++
++  intptr_t contentParentId = BackgroundParent::GetRawContentParentForComparison(this);
++
++  return detail::AllocPBackgroundPipeTransportParent(contentParentId, aCookie);
 +}
 +
 +bool
@@ -150,6 +760,10 @@ diff --git a/ipc/glue/BackgroundParentImpl.cpp b/ipc/glue/BackgroundParentImpl.c
 +bool
 +BackgroundParentImpl::DeallocPBackgroundPipeTransportParent(PBackgroundPipeTransportParent* aActor)
 +{
++  AssertIsInMainProcess();
++  AssertIsOnBackgroundThread();
++  MOZ_ASSERT(aActor);
++
 +  return detail::DeallocPBackgroundPipeTransportParent(aActor);
 +}
 +
@@ -161,13 +775,47 @@ diff --git a/ipc/glue/BackgroundParentImpl.cpp b/ipc/glue/BackgroundParentImpl.c
    AssertIsOnBackgroundThread();
  
    if (NS_WARN_IF(aParams.type() !=
+@@ -274,16 +309,33 @@ BackgroundParentImpl::DeallocPMessagePor
+   AssertIsInMainProcess();
+   AssertIsOnBackgroundThread();
+   MOZ_ASSERT(aActor);
+ 
+   delete static_cast<MessagePortParent*>(aActor);
+   return true;
+ }
+ 
++auto
++BackgroundParentImpl::OnMessageReceived(const Message& __msg) -> Result
++{
++  AutoRestore<BackgroundParentImpl*> autoRestore(sCurrentlyProcessingMessagesBackgroundParent);
++  sCurrentlyProcessingMessagesBackgroundParent = this;
++  return PBackgroundParent::OnMessageReceived(__msg);
++}
++
++auto
++BackgroundParentImpl::OnMessageReceived(const Message& __msg,
++                                        Message*& __reply) -> Result
++{
++  AutoRestore<BackgroundParentImpl*> autoRestore(sCurrentlyProcessingMessagesBackgroundParent);
++  sCurrentlyProcessingMessagesBackgroundParent = this;
++  return PBackgroundParent::OnMessageReceived(__msg, __reply);
++}
++
+ } // namespace ipc
+ } // namespace mozilla
+ 
+ void
+ TestParent::ActorDestroy(ActorDestroyReason aWhy)
+ {
+   AssertIsInMainProcess();
+   AssertIsOnBackgroundThread();
 diff --git a/ipc/glue/BackgroundParentImpl.h b/ipc/glue/BackgroundParentImpl.h
 --- a/ipc/glue/BackgroundParentImpl.h
 +++ b/ipc/glue/BackgroundParentImpl.h
-@@ -48,16 +48,26 @@ protected:
-                                       PBackgroundIDBFactoryParent* aActor,
-                                       const OptionalWindowId& aOptionalWindowId)
-                                       MOZ_OVERRIDE;
+@@ -45,16 +45,26 @@ protected:
+   virtual bool
+   RecvPBackgroundIDBFactoryConstructor(PBackgroundIDBFactoryParent* aActor)
+                                        MOZ_OVERRIDE;
  
    virtual bool
    DeallocPBackgroundIDBFactoryParent(PBackgroundIDBFactoryParent* aActor)
@@ -191,11 +839,35 @@ diff --git a/ipc/glue/BackgroundParentImpl.h b/ipc/glue/BackgroundParentImpl.h
  
    virtual PFileDescriptorSetParent*
    AllocPFileDescriptorSetParent(const FileDescriptor& aFileDescriptor)
+@@ -82,14 +92,23 @@ protected:
+   virtual bool
+   DeallocPCacheStreamControlParent(mozilla::dom::cache::PCacheStreamControlParent* aActor);
+ 
+   virtual PMessagePortParent*
+   AllocPMessagePortParent() MOZ_OVERRIDE;
+ 
+   virtual bool
+   DeallocPMessagePortParent(PMessagePortParent* aActor) MOZ_OVERRIDE;
++
++  virtual Result
++  OnMessageReceived(const Message& __msg) MOZ_OVERRIDE;
++
++  virtual Result
++  OnMessageReceived(const Message& __msg,
++                    Message*& __reply) MOZ_OVERRIDE;
++
++  static BackgroundParentImpl* sCurrentlyProcessingMessagesBackgroundParent;
+ };
+ 
+ } // namespace ipc
+ } // namespace mozilla
+ 
+ #endif // mozilla_ipc_backgroundparentimpl_h__
 diff --git a/ipc/glue/CrossProcessPipe.cpp b/ipc/glue/CrossProcessPipe.cpp
 new file mode 100644
 --- /dev/null
 +++ b/ipc/glue/CrossProcessPipe.cpp
-@@ -0,0 +1,1034 @@
+@@ -0,0 +1,1078 @@
 +/* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*-
 + * This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -204,13 +876,13 @@ new file mode 100644
 +/**
 + * A CrossProcessPipe is a pipe between the main process and a child process.
 + * The pipe can flow in either direction, but it is not duplex (meaning that
-+ * a given pipe can only flow in one direction).  nsIPipe is the external
-+ * facing interface we provide.
-+ * 
++ * a given pipe can only flow in one direction).  nsICrossProcessPipe is the
++ * external facing interface we provide.
 + */
 +
 +#include "mozilla/ipc/CrossProcessPipe.h"
 +
++#include "mozilla/dom/ContentParent.h"
 +#include "mozilla/ipc/BackgroundChild.h"
 +#include "mozilla/ipc/BackgroundParent.h"
 +#include "mozilla/ipc/InputStreamUtils.h"
@@ -245,7 +917,7 @@ new file mode 100644
 +  CrossProcessPipe() {}
 +
 +  void
-+  InitializeStreams(PipeDirection aDirection);
++  InitializeStreams(intptr_t aContentParentId, PipeDirection aDirection);
 +
 +  NS_DECL_THREADSAFE_ISUPPORTS
 +  NS_DECL_NSICROSSPROCESSPIPE
@@ -367,6 +1039,7 @@ new file mode 100644
 +
 +  // If true, we're the parent actor, otherwise, we're the child actor.
 +  const bool mInMainProcess;
++  const intptr_t mContentParentId;
 +  const intptr_t mPipeId;
 +  // Are we the sending or receiving side?
 +  const PipeDirection mDirection;
@@ -394,16 +1067,7 @@ new file mode 100644
 +
 +  mozilla::Mutex mLock;
 +
-+  struct XPPStreamListComparator {
-+    static bool Equals(const nsRefPtr<XPPActiveStream>& aA, const intptr_t& aB) {
-+      return aA->PipeId() == aB;
-+    }
-+  };
-+
-+  static nsTArray<nsRefPtr<XPPActiveStream>>* sInFlightList;
-+  static mozilla::StaticMutex sInFlightMutex;
-+
-+  ~XPPActiveStream() { }
++  ~XPPActiveStream();
 +
 +  virtual bool
 +  Recv__delete__(const nsresult& aResult) MOZ_OVERRIDE;
@@ -421,6 +1085,9 @@ new file mode 100644
 +  FlushTransport();
 +
 +public:
++  static mozilla::StaticMutex sInFlightTableLock;
++  static nsAutoPtr<InfallibleTArray<nsRefPtr<XPPActiveStream>>> sInFlightTable;
++
 +  PBackgroundPipeTransportParent*
 +  AsParent() const {
 +    MOZ_ASSERT(mInMainProcess);
@@ -434,8 +1101,9 @@ new file mode 100644
 +    return self;
 +  }
 +
-+  XPPActiveStream(intptr_t aPipeId, PipeDirection aDirection)
++  XPPActiveStream(intptr_t aContentParentId, intptr_t aPipeId, PipeDirection aDirection)
 +    : mInMainProcess(XRE_GetProcessType() == GeckoProcessType_Default)
++    , mContentParentId(aContentParentId)
 +    , mPipeId(aPipeId)
 +    , mDirection(aDirection)
 +    , mBackgroundChild(nullptr)
@@ -445,9 +1113,11 @@ new file mode 100644
 +    , mRequestedAsyncWaitCount(0)
 +    , mLock("XPPActiveStream lock")
 +  {
-+    if (!sInFlightList) {
-+      sInFlightList = new nsTArray<nsRefPtr<XPPActiveStream>>;
-+    }
++  }
++
++  intptr_t
++  ContentParentId() const {
++    return mContentParentId;
 +  }
 +
 +  intptr_t
@@ -572,13 +1242,21 @@ new file mode 100644
 +
 +  void
 +  MaybeFireCallbacks();
-+
-+  static already_AddRefed<XPPActiveStream>
-+  GetOrCreateById(intptr_t aId, mozilla::ipc::PipeDirection aDirection);
 +};
 +
-+nsTArray<nsRefPtr<XPPActiveStream>>* XPPActiveStream::sInFlightList;
-+mozilla::StaticMutex XPPActiveStream::sInFlightMutex;
++/*static*/
++mozilla::StaticMutex XPPActiveStream::sInFlightTableLock;
++/*static*/
++nsAutoPtr<InfallibleTArray<nsRefPtr<XPPActiveStream>>> XPPActiveStream::sInFlightTable;
++
++XPPActiveStream::~XPPActiveStream() {
++  if (XRE_GetProcessType() == GeckoProcessType_Default) {
++    mozilla::StaticMutexAutoLock autoLock(sInFlightTableLock);
++    if (sInFlightTable->Length() == 0) {
++      sInFlightTable = nullptr;
++    }
++  }
++}
 +
 +NS_IMPL_ADDREF(XPPActiveStream)
 +NS_IMPL_RELEASE(XPPActiveStream)
@@ -704,13 +1382,17 @@ new file mode 100644
 +      mResultCode = aRv;
 +    }
 +
-+    if (IsOnTransportThread()) {
-+      CloseTransport(aRv);
-+    }
-+    else {
-+      nsCOMPtr<nsIRunnable> event =
-+        NS_NewRunnableMethodWithArg<nsresult>(this, &XPPActiveStream::CloseTransport, aRv);
-+      mTransportThread->Dispatch(event, 0);
++    if (mIsTransportActive) {
++      if (IsOnTransportThread()) {
++        CloseTransport(aRv);
++      }
++      else {
++        nsCOMPtr<nsIRunnable> event =
++          NS_NewRunnableMethodWithArg<nsresult>(this,
++                                                &XPPActiveStream::CloseTransport,
++                                                aRv);
++        mTransportThread->Dispatch(event, 0);
++      }
 +    }
 +
 +    return NS_OK;
@@ -778,6 +1460,8 @@ new file mode 100644
 +                              uint32_t aCount, uint32_t* aBytesRead)
 +{
 +  MOZ_ASSERT(IsReceiving());
++
++  *aBytesRead = 0;
 +
 +  {
 +    mozilla::MutexAutoLock lock(mLock);
@@ -907,6 +1591,7 @@ new file mode 100644
 +XPPActiveStream::AsyncWait(nsIInputStreamCallback* aCallback, uint32_t aFlags,
 +                           uint32_t aRequestedCount, nsIEventTarget* aEventTarget)
 +{
++  NS_WARNING("AsyncWait");
 +  MOZ_ASSERT(IsReceiving());
 +
 +  nsCOMPtr<nsIEventTarget> currentThread = do_GetCurrentThread();
@@ -1016,6 +1701,7 @@ new file mode 100644
 +nsresult
 +XPPActiveStream::InitializeTransport()
 +{
++  NS_WARNING("Init transport");
 +  // The transport is always initialized in the child.
 +  // XXXkhuey guard against one call while another is in flight!
 +  MOZ_ASSERT(!mInMainProcess);
@@ -1023,6 +1709,8 @@ new file mode 100644
 +
 +  NoteTransportThread();
 +
++  // XXXkhuey we should short circuit this if the BackgroundChild already exists
++  // but we have to be careful not to deadlock.
 +  if (!mozilla::ipc::BackgroundChild::GetOrCreateForCurrentThread(this)) {
 +    CloseWithStatus(NS_ERROR_FAILURE);
 +    return NS_ERROR_FAILURE;
@@ -1055,12 +1743,14 @@ new file mode 100644
 +void
 +XPPActiveStream::MaybeFireCallbacks()
 +{
++  NS_WARNING("Maybe fire callbacks");
 +  mLock.AssertCurrentThreadOwns();
 +
 +  if (IsReceiving()) {
 +    MOZ_ASSERT(!mOutputAsyncWaitCallback);
 +    if (mInputAsyncWaitCallback && (mData.Length() >= mRequestedAsyncWaitCount ||
 +                                    mClosed)) {
++      NS_WARNING("Firing callback");
 +      mInputAsyncWaitCallback->OnInputStreamReady(this);
 +      mRequestedAsyncWaitCount = 0;
 +      mInputAsyncWaitCallback = nullptr;
@@ -1071,6 +1761,7 @@ new file mode 100644
 +                                     mIsTransportActive)) {
 +      // The requested count is pointless for writing, since once the transport
 +      // layer is active we can write as much as we want.
++      NS_WARNING("Firing callback");
 +      mOutputAsyncWaitCallback->OnOutputStreamReady(this);
 +      mRequestedAsyncWaitCount = 0;
 +      mOutputAsyncWaitCallback = nullptr;
@@ -1080,34 +1771,49 @@ new file mode 100644
 +  }
 +}
 +
-+/* static */
++NS_IMPL_ISUPPORTS(CrossProcessPipe, nsICrossProcessPipe)
++
 +already_AddRefed<XPPActiveStream>
-+XPPActiveStream::GetOrCreateById(intptr_t aId, mozilla::ipc::PipeDirection aDirection)
++GetOrCreatePipeStreamForId(intptr_t aContentParentId, intptr_t aPipeId, mozilla::ipc::PipeDirection aDirection)
 +{
-+  nsRefPtr<XPPActiveStream> stream;
-+
-+  mozilla::StaticMutexAutoLock lock(sInFlightMutex);
-+
-+  XPPStreamListComparator comparator;
-+  // XXXkhuey dereferencing a null pointer here is crazy. fix before landing
-+  size_t index = sInFlightList ? sInFlightList->IndexOf(aId, 0, comparator) : sInFlightList->NoIndex;
-+  if (index == sInFlightList->NoIndex) {
-+    // We didn't find it.  Go ahead and create it.
-+    stream = new XPPActiveStream(aId, aDirection);
-+    // The ctor will have created sInFlightList.
-+    sInFlightList->AppendElement(stream);
++  if (XRE_GetProcessType() != GeckoProcessType_Default) {
++    NS_WARNING("Created new stream in non-default process");
++    MOZ_ASSERT(!aContentParentId);
++    nsRefPtr<XPPActiveStream> stream =
++      new XPPActiveStream(aContentParentId, aPipeId, aDirection);
 +    return stream.forget();
 +  }
 +
-+  stream = sInFlightList->ElementAt(index).forget();
-+  sInFlightList->RemoveElementAt(index);
-+  return stream.forget(); // XXXkhuey assert direction matches
++  // Otherwise we must consult the table.
++  mozilla::StaticMutexAutoLock autoLock(XPPActiveStream::sInFlightTableLock);
++  if (XPPActiveStream::sInFlightTable) {
++    for (uint32_t length = XPPActiveStream::sInFlightTable->Length(), i = 0; i < length; ++i) {
++      nsRefPtr<XPPActiveStream>& stream = XPPActiveStream::sInFlightTable->ElementAt(i);
++      if (stream->PipeId() == aPipeId) {
++        if (stream->ContentParentId() == aContentParentId) {
++          NS_WARNING("Found existing stream in default process");
++          nsRefPtr<XPPActiveStream> addRefedStream = stream;
++          return addRefedStream.forget();
++        } else {
++          NS_WARNING("Matched pipe id but not ContentParent id, something might be wrong");
++        }
++      }
++    }
++  } else {
++    XPPActiveStream::sInFlightTable = new InfallibleTArray<nsRefPtr<XPPActiveStream>>();
++  }
++
++  NS_WARNING("Created new stream in default process");
++  // Not in the table, create a new one.
++  nsRefPtr<XPPActiveStream> stream =
++    new XPPActiveStream(aContentParentId, aPipeId, aDirection);
++  XPPActiveStream::sInFlightTable->AppendElement(stream);
++  return stream.forget();
 +}
 +
-+NS_IMPL_ISUPPORTS(CrossProcessPipe, nsICrossProcessPipe)
-+
 +void
-+CrossProcessPipe::InitializeStreams(PipeDirection aDirection)
++CrossProcessPipe::InitializeStreams(intptr_t aContentParentId,
++                                    PipeDirection aDirection)
 +{
 +  MOZ_ASSERT(!mInputStream && !mOutputStream);
 +
@@ -1116,8 +1822,8 @@ new file mode 100644
 +    // just a serialization placeholder
 +    mInputStream = new SerializationPlaceholderStream(this);
 +    intptr_t id = reinterpret_cast<intptr_t>(this);
-+    // XXXkhuey assert created
-+    mOutputStream = XPPActiveStream::GetOrCreateById(id, aDirection).downcast<nsIAsyncOutputStream>();
++    mOutputStream = GetOrCreatePipeStreamForId(aContentParentId, id, aDirection);
++    // XXX assert created?
 +  }
 +  else {
 +    MOZ_CRASH("Implement me!");
@@ -1125,13 +1831,19 @@ new file mode 100644
 +}
 +
 +NS_IMETHODIMP
-+CrossProcessPipe::Init(bool aIsSending)
++CrossProcessPipe::Init(nsISupports* aContentParent, bool aIsSending)
 +{
 +  if (mInputStream || mOutputStream) {
 +    return NS_ERROR_UNEXPECTED;
 +  }
 +
-+  InitializeStreams(aIsSending ? mozilla::ipc::Sending
++  nsCOMPtr<mozilla::dom::nsIContentParent> contentParent = do_QueryInterface(aContentParent);
++  if (aContentParent && !contentParent) {
++    return NS_ERROR_UNEXPECTED;
++  }
++
++  InitializeStreams(reinterpret_cast<intptr_t>(contentParent.get()),
++                    aIsSending ? mozilla::ipc::Sending
 +                               : mozilla::ipc::Receiving);
 +  return NS_OK;
 +}
@@ -1171,7 +1883,6 @@ new file mode 100644
 +CreateCrossProcessPipe(PipeDirection aDirection)
 +{
 +  nsRefPtr<CrossProcessPipe> xpp = new CrossProcessPipe();
-+  xpp->InitializeStreams(aDirection);
 +  return xpp.forget();
 +}
 +
@@ -1191,11 +1902,12 @@ new file mode 100644
 +}
 +
 +PBackgroundPipeTransportParent*
-+AllocPBackgroundPipeTransportParent(const intptr_t& aCookie)
++AllocPBackgroundPipeTransportParent(const intptr_t& aContentParentId, const intptr_t& aPipeId)
 +{
-+  nsRefPtr<XPPActiveStream> stream = XPPActiveStream::GetOrCreateById(aCookie, mozilla::ipc::Receiving);
++  NS_WARNING("AllocPBackgroundPipeTransportParent");
++  nsRefPtr<XPPActiveStream> stream = GetOrCreatePipeStreamForId(aContentParentId, aPipeId, mozilla::ipc::Receiving);
 +
-+  MOZ_ASSERT(stream->PipeId() == aCookie);
++  MOZ_ASSERT(stream->ContentParentId() == aContentParentId && stream->PipeId() == aPipeId);
 +  if (!stream->RecvIPDLConstructor()) {
 +    return nullptr;
 +  }
@@ -1208,6 +1920,9 @@ new file mode 100644
 +{
 +  nsRefPtr<XPPActiveStream> stream =
 +    dont_AddRef(XPPActiveStream::FromParent(aActor));
++
++  // XXXkhuey should we check the table to see if the stream is still in it?
++  // That could happen if the stream is never serialized.
 +
 +  return true;
 +}
@@ -1222,9 +1937,10 @@ new file mode 100644
 +}
 +
 +already_AddRefed<nsIInputStream>
-+PipeInputStreamForId(intptr_t aPipeId)
++GetOrCreatePipeInputStreamForId(intptr_t aContentParentId, intptr_t aPipeId)
 +{
-+  return XPPActiveStream::GetOrCreateById(aPipeId, mozilla::ipc::Receiving).downcast<nsIInputStream>();
++  return GetOrCreatePipeStreamForId(aContentParentId, aPipeId,
++                                    mozilla::ipc::Receiving).downcast<nsIInputStream>();
 +}
 +
 +} // namespace detail
@@ -1234,7 +1950,7 @@ diff --git a/ipc/glue/CrossProcessPipe.h b/ipc/glue/CrossProcessPipe.h
 new file mode 100644
 --- /dev/null
 +++ b/ipc/glue/CrossProcessPipe.h
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,64 @@
 +/* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*-
 + * This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -1255,8 +1971,8 @@ new file mode 100644
 +
 +/**
 + * Create a new CrossProcessPipe.  This pipe provides input and output streams,
-+ * and the input stream can be serialized across IPDL.  The init method should
-+ * not be called (it is only for use when creating pipes via XPCOM).
++ * and the input stream can be serialized across IPDL.
++ * The init method must be called before using it.
 + */
 +already_AddRefed<nsICrossProcessPipe>
 +CreateCrossProcessPipe(PipeDirection aDirection);
@@ -1281,7 +1997,8 @@ new file mode 100644
 +                            void** aResult);
 +
 +PBackgroundPipeTransportParent*
-+AllocPBackgroundPipeTransportParent(const intptr_t& aCookie);
++AllocPBackgroundPipeTransportParent(const intptr_t& aContentParentId,
++                                    const intptr_t& aPipeId);
 +
 +bool
 +DeallocPBackgroundPipeTransportParent(PBackgroundPipeTransportParent* aActor);
@@ -1293,7 +2010,7 @@ new file mode 100644
 +DeallocPBackgroundPipeTransportChild(PBackgroundPipeTransportChild* aActor);
 +
 +already_AddRefed<nsIInputStream>
-+PipeInputStreamForId(intptr_t aPipeId);
++GetOrCreatePipeInputStreamForId(intptr_t aContentParent, intptr_t aPipeId);
 +
 +} // namespace detail
 +} // namespace ipc
@@ -1357,7 +2074,7 @@ diff --git a/ipc/glue/InputStreamUtils.cpp b/ipc/glue/InputStreamUtils.cpp
  #include "nsMultiplexInputStream.h"
  #include "nsNetCID.h"
  #include "nsStringStream.h"
-@@ -134,16 +135,29 @@ DeserializeInputStream(const InputStream
+@@ -134,16 +135,52 @@ DeserializeInputStream(const InputStream
  
        stream = dont_AddRef(
          reinterpret_cast<nsIInputStream*>(params.addRefedInputStream()));
@@ -1367,13 +2084,36 @@ diff --git a/ipc/glue/InputStreamUtils.cpp b/ipc/glue/InputStreamUtils.cpp
      }
  
 +    case InputStreamParams::TPipeInputStreamParams: {
++      NS_WARNING("Got stuff, deserializing");
 +      MOZ_ASSERT(aFileDescriptors.IsEmpty());
 +
 +      const PipeInputStreamParams& params =
 +	aParams.get_PipeInputStreamParams();
 +
++      // The tricky part about pipes is that we have to connect the transport
++      // actor to the serialized pipe.  This isn't a problem if we're on the
++      // child side though, since the transport actor is always created from
++      // the child.
++      intptr_t contentParentId = 0;
++      if (XRE_GetProcessType() == GeckoProcessType_Default) {
++	// If we're on the background thread, we must have a PBackgroundParent.
++	if (IsOnBackgroundThread()) {
++	  NS_WARNING("Got PBackground contentParent");
++          contentParentId = BackgroundParent::GetRawContentParentForComparison(BackgroundParent::GetCurrentlyProcessingMessages());
++	} else if (NS_IsMainThread()) {
++	  auto contentParent = ContentParent::GetCurrentlyProcessingMessages();
++	  contentParentId = (intptr_t)static_cast<nsIContentParent*>(contentParent);
++	  NS_WARNING("Got ContentParent contentParent");
++	}
++	if (!contentParentId) {
++	  // Else we must be on a BackgroundChild.
++	  // XXXkhuey assert that.
++	  NS_WARNING("Got nothing");
++	}
++      }
++
 +      nsCOMPtr<nsIInputStream> stream =
-+        detail::PipeInputStreamForId(params.pipeId());
++	detail::GetOrCreatePipeInputStreamForId(contentParentId, params.pipeId());
 +      MOZ_ASSERT(stream);
 +
 +      return stream.forget();
@@ -1405,10 +2145,10 @@ diff --git a/ipc/glue/PBackground.ipdl b/ipc/glue/PBackground.ipdl
  include protocol PCacheStreamControl;
  include protocol PMessagePort;
  
-@@ -30,30 +31,35 @@ union OptionalWindowId
- } // namespace indexedDB
- } // namespace dom
+@@ -17,16 +18,17 @@ include PBackgroundSharedTypes;
+ using mozilla::dom::cache::Namespace from "mozilla/dom/cache/IPCUtils.h";
  
+ namespace mozilla {
  namespace ipc {
  
  sync protocol PBackground
@@ -1423,24 +2163,27 @@ diff --git a/ipc/glue/PBackground.ipdl b/ipc/glue/PBackground.ipdl
    manages PCacheStreamControl;
    manages PMessagePort;
  
- parent:
-   // Only called at startup during mochitests to check the basic infrastructure.
+@@ -35,16 +37,20 @@ parent:
    PBackgroundTest(nsCString testArg);
  
-   PBackgroundIDBFactory(OptionalWindowId optionalWindowId);
+   PBackgroundIDBFactory();
+ 
+   PCacheStorage(Namespace aNamespace, PrincipalInfo aPrincipalInfo);
+ 
+   PMessagePort();
  
 +  // The cookie is used to match up the transport on the background thread and
 +  // the serialized stream that might come over on the main thread.
 +  PBackgroundPipeTransport(intptr_t aCookie);
 +
-   PCacheStorage(Namespace namespaceEnum, nsCString origin, nsCString baseDomain);
- 
-   PMessagePort();
- 
  both:
    PBlob(BlobConstructorParams params);
  
    PFileDescriptorSet(FileDescriptor fd);
+ 
+ child:
+   PCache();
+   PCacheStreamControl();
 diff --git a/ipc/glue/PBackgroundPipeTransport.ipdl b/ipc/glue/PBackgroundPipeTransport.ipdl
 new file mode 100644
 --- /dev/null
@@ -1547,7 +2290,7 @@ diff --git a/ipc/glue/nsICrossProcessPipe.idl b/ipc/glue/nsICrossProcessPipe.idl
 new file mode 100644
 --- /dev/null
 +++ b/ipc/glue/nsICrossProcessPipe.idl
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,40 @@
 +/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -1567,12 +2310,14 @@ new file mode 100644
 +    /**
 +     * initialize this pipe
 +     *
++     * @param contentParent
++     *        the ContentParent the pipe belongs to.
 +     * @param sending
 +     *        true if the pipe is sending (that is, the output stream will be
 +     *        used in the this process and the input stream will be serialized),
 +     *        false if the pipe is receiving.
 +     */
-+    void init(in boolean sending);
++    void init(in nsISupports contentParent, in boolean sending);
 +
 +    /**
 +     * The pipe's input end.  If the pipe is sending this is only useful for
@@ -1590,7 +2335,7 @@ diff --git a/ipc/glue/unit/test_crossProcessPipe.js b/ipc/glue/unit/test_crossPr
 new file mode 100644
 --- /dev/null
 +++ b/ipc/glue/unit/test_crossProcessPipe.js
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,250 @@
 +const { 'classes': Cc, 'interfaces': Ci, 'results': Cr, 'utils': Cu } = Components;
 +
 +Cu.import("resource://gre/modules/NetUtil.jsm");
@@ -1679,7 +2424,7 @@ new file mode 100644
 +  Assert.throws(function() { XPP.outputStream; }, "NS_ERROR_NOT_INITIALIZED");
 +  Assert.notEqual(XPP.init, undefined);
 +
-+  XPP.init(true);
++  XPP.init(ipc.contentParent, true);
 +  Assert.ok(XPP.inputStream instanceof Ci.nsIAsyncInputStream);
 +  Assert.ok(XPP.outputStream instanceof Ci.nsIAsyncOutputStream);
 +
@@ -1699,9 +2444,10 @@ new file mode 100644
 +// Test sending data
 +function* test1() {
 +  const data = "ohai";
++  let ipc = ipcTest();
 +
 +  let XPP = newXPP();
-+  XPP.init(true);
++  XPP.init(ipc.contentParent, true);
 +
 +  let inputStream = XPP.inputStream;
 +  let outputStream = XPP.outputStream;
@@ -1710,7 +2456,6 @@ new file mode 100644
 +
 +  outputStream.asyncWait(getStreamAndContinue(test), 0, 0, null);
 +
-+  let ipc = ipcTest();
 +  ipc.sendInputStream(inputStream);
 +
 +  let readyStream = yield;
@@ -1742,15 +2487,15 @@ new file mode 100644
 +
 +// Test the result code
 +function* test2() {
++  let ipc = ipcTest();
 +  let XPP = newXPP();
-+  XPP.init(true);
++  XPP.init(ipc.contentParent, true);
 +
 +  let inputStream = XPP.inputStream;
 +  let outputStream = XPP.outputStream;
 +
 +  outputStream.asyncWait(getStreamAndContinue(test), 0, 0, null);
 +
-+  let ipc = ipcTest();
 +  ipc.sendInputStream(inputStream);
 +
 +  yield;
@@ -1760,6 +2505,9 @@ new file mode 100644
 +
 +  let statusReceived = yield;
 +  Assert.equal(statusReceived, Cr.NS_ERROR_FILE_TOO_BIG);
++
++  // Close the pipe again to make sure nothing breaks.
++  outputStream.close();
 +
 +  continueTest();
 +};
@@ -1778,10 +2526,24 @@ new file mode 100644
 +  sendMessage(exception);
 +}
 +
++function* test3() {
++  let ipc = ipcTest();
++
++  let XPP = newXPP();
++  XPP.init(ipc.contentParent, true);
++  let outputStream = XPP.outputStream;
++  outputStream.close();
++  continueTest();
++}
++
++function* recv3() {
++}
++
 +const tests = [
 +  [test0, recv0],
 +  [test1, recv1],
 +  [test2, recv2],
++  [test3, recv3],
 +];
 +
 +function* run_all_tests() {
@@ -2142,8 +2904,9 @@ diff --git a/ipc/testshell/TestShellTest.cpp b/ipc/testshell/TestShellTest.cpp
 new file mode 100644
 --- /dev/null
 +++ b/ipc/testshell/TestShellTest.cpp
-@@ -0,0 +1,220 @@
+@@ -0,0 +1,239 @@
 +#include "nsITestShellTest.h"
++#include "mozilla/dom/ContentParent.h"
 +#include "mozilla/ipc/PTestShellTestParent.h"
 +#include "mozilla/ipc/PTestShellTestChild.h"
 +#include "TestShellParent.h"
@@ -2298,6 +3061,24 @@ new file mode 100644
 +    return Base::RecvInputStream(aParams, aFds);
 +  }
 +};
++
++template <>
++NS_IMETHODIMP
++TestShellTest<TestShellTestChild>::GetContentParent(nsISupports** aContentParent)
++{
++  *aContentParent = nullptr;
++  return NS_OK;
++}
++
++template <>
++NS_IMETHODIMP
++TestShellTest<TestShellTestParent>::GetContentParent(nsISupports** aContentParent)
++{
++  NS_ADDREF(*aContentParent =
++	      static_cast<mozilla::dom::nsIContentParent*>(
++	        static_cast<mozilla::dom::ContentParent*>(AsDerived()->Manager()->Manager())));
++  return NS_OK;
++}
 +
 +template class TestShellTest<TestShellTestParent>;
 +template class TestShellTest<TestShellTestChild>;
@@ -2496,7 +3277,7 @@ diff --git a/ipc/testshell/nsITestShellTest.idl b/ipc/testshell/nsITestShellTest
 new file mode 100644
 --- /dev/null
 +++ b/ipc/testshell/nsITestShellTest.idl
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,22 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -2511,6 +3292,8 @@ new file mode 100644
 +[scriptable, builtinclass, uuid(ef3342e4-7f63-4403-bed4-0b4a95bc0a2a)]
 +interface nsITestShellTest : nsISupports
 +{
++  readonly attribute nsISupports contentParent;
++
 +  attribute nsIInputStreamCallback onInputStreamReceived;
 +  attribute nsIOutputStreamCallback onOutputStreamReceived;
 +
@@ -2600,7 +3383,7 @@ diff --git a/js/xpconnect/src/XPCShellImpl.cpp b/js/xpconnect/src/XPCShellImpl.c
      NS_DECL_ISUPPORTS_INHERITED
      NS_DECL_NSIDIRECTORYSERVICEPROVIDER
      NS_DECL_NSIDIRECTORYSERVICEPROVIDER2
-@@ -462,16 +466,47 @@ SendCommand(JSContext *cx, unsigned argc
+@@ -467,16 +471,47 @@ SendCommand(JSContext *cx, unsigned argc
          return false;
      }
  
@@ -2648,7 +3431,7 @@ diff --git a/js/xpconnect/src/XPCShellImpl.cpp b/js/xpconnect/src/XPCShellImpl.c
      for (unsigned i = 0; i < args.length(); ++i) {
          JSString *str = ToString(cx, args[i]);
          if (!str)
-@@ -644,16 +679,17 @@ static const JSFunctionSpec glob_functio
+@@ -649,16 +684,17 @@ static const JSFunctionSpec glob_functio
      JS_FS("dump",            Dump,           1,0),
      JS_FS("gc",              GC,             0,0),
  #ifdef JS_GC_ZEAL
