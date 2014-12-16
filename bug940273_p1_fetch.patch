@@ -1,0 +1,544 @@
+# HG changeset patch
+# Parent dd15bfb3e7f5ae0fb4be624bad7c5f625fe1aac1
+# User Ben Kelly <ben@wanderview.com>
+Bug 940273 P1 Fetch changes from maple twig to support Service Worker Cache.
+
+diff --git a/dom/fetch/Fetch.h b/dom/fetch/Fetch.h
+--- a/dom/fetch/Fetch.h
++++ b/dom/fetch/Fetch.h
+@@ -96,16 +96,22 @@ template <class Derived> class FetchBody
+  * The pump is always released on the main thread.
+  */
+ template <class Derived>
+ class FetchBody {
+ public:
+   bool
+   BodyUsed() { return mBodyUsed; }
+ 
++  void
++  SetBodyUsed()
++  {
++    mBodyUsed = true;
++  }
++
+   already_AddRefed<Promise>
+   ArrayBuffer(ErrorResult& aRv)
+   {
+     return ConsumeBody(CONSUME_ARRAYBUFFER, aRv);
+   }
+ 
+   already_AddRefed<Promise>
+   Blob(ErrorResult& aRv)
+@@ -145,22 +151,16 @@ public:
+ protected:
+   FetchBody();
+ 
+   virtual ~FetchBody()
+   {
+   }
+ 
+   void
+-  SetBodyUsed()
+-  {
+-    mBodyUsed = true;
+-  }
+-
+-  void
+   SetMimeType(ErrorResult& aRv);
+ private:
+   enum ConsumeType
+   {
+     CONSUME_ARRAYBUFFER,
+     CONSUME_BLOB,
+     // FormData not supported right now,
+     CONSUME_JSON,
+diff --git a/dom/fetch/FetchDriver.h b/dom/fetch/FetchDriver.h
+--- a/dom/fetch/FetchDriver.h
++++ b/dom/fetch/FetchDriver.h
+@@ -5,16 +5,17 @@
+ 
+ #ifndef mozilla_dom_FetchDriver_h
+ #define mozilla_dom_FetchDriver_h
+ 
+ #include "nsAutoPtr.h"
+ #include "nsIStreamListener.h"
+ #include "nsRefPtr.h"
+ 
++class nsIAsyncOutputStream;
+ class nsIPrincipal;
+ class nsPIDOMWindow;
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ class BlobSet;
+ class InternalRequest;
+diff --git a/dom/fetch/FetchIPCUtils.h b/dom/fetch/FetchIPCUtils.h
+new file mode 100644
+--- /dev/null
++++ b/dom/fetch/FetchIPCUtils.h
+@@ -0,0 +1,37 @@
++/* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_FetchIPCUtils_h
++#define mozilla_dom_FetchIPCUtils_h
++
++#include "ipc/IPCMessageUtils.h"
++#include "mozilla/dom/HeadersBinding.h"
++#include "mozilla/dom/Request.h"
++#include "mozilla/dom/Response.h"
++
++namespace IPC {
++  template<>
++  struct ParamTraits<mozilla::dom::HeadersGuardEnum> :
++    public ContiguousTypedEnumSerializer<mozilla::dom::HeadersGuardEnum,
++                                         mozilla::dom::HeadersGuardEnum::MozNone,
++                                         mozilla::dom::HeadersGuardEnum::EndGuard_> {};
++  template<>
++  struct ParamTraits<mozilla::dom::RequestMode> :
++    public ContiguousTypedEnumSerializer<mozilla::dom::RequestMode,
++                                         mozilla::dom::RequestMode::Same_origin,
++                                         mozilla::dom::RequestMode::EndGuard_> {};
++  template<>
++  struct ParamTraits<mozilla::dom::RequestCredentials> :
++    public ContiguousTypedEnumSerializer<mozilla::dom::RequestCredentials,
++                                         mozilla::dom::RequestCredentials::Omit,
++                                         mozilla::dom::RequestCredentials::EndGuard_> {};
++  template<>
++  struct ParamTraits<mozilla::dom::ResponseType> :
++    public ContiguousTypedEnumSerializer<mozilla::dom::ResponseType,
++                                         mozilla::dom::ResponseType::Basic,
++                                         mozilla::dom::ResponseType::EndGuard_> {};
++}
++
++#endif // mozilla_dom_FetchIPCUtils_h
+diff --git a/dom/fetch/InternalHeaders.cpp b/dom/fetch/InternalHeaders.cpp
+--- a/dom/fetch/InternalHeaders.cpp
++++ b/dom/fetch/InternalHeaders.cpp
+@@ -2,25 +2,43 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/InternalHeaders.h"
+ 
+ #include "mozilla/ErrorResult.h"
++#include "mozilla/dom/PHeaders.h"
+ 
+ #include "nsCharSeparatedTokenizer.h"
+ #include "nsContentUtils.h"
+ #include "nsNetUtil.h"
+ #include "nsReadableUtils.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
++InternalHeaders::InternalHeaders(const nsTArray<PHeadersEntry>& aHeaders,
++                                 HeadersGuardEnum aGuard)
++  : mGuard(aGuard)
++{
++  for (uint32_t i = 0; i < aHeaders.Length(); ++i) {
++    mList.AppendElement(Entry(aHeaders[i].name(), aHeaders[i].value()));
++  }
++}
++
++void
++InternalHeaders::GetPHeaders(nsTArray<PHeadersEntry>& aPHeadersOut) const
++{
++  for (uint32_t i = 0; i < mList.Length(); ++i) {
++    aPHeadersOut.AppendElement(PHeadersEntry(mList[i].mName, mList[i].mValue));
++  }
++}
++
+ void
+ InternalHeaders::Append(const nsACString& aName, const nsACString& aValue,
+                         ErrorResult& aRv)
+ {
+   nsAutoCString lowerName;
+   ToLowerCase(aName, lowerName);
+ 
+   if (IsInvalidMutableHeader(lowerName, aValue, aRv)) {
+diff --git a/dom/fetch/InternalHeaders.h b/dom/fetch/InternalHeaders.h
+--- a/dom/fetch/InternalHeaders.h
++++ b/dom/fetch/InternalHeaders.h
+@@ -19,16 +19,17 @@ class nsPIDOMWindow;
+ namespace mozilla {
+ 
+ class ErrorResult;
+ 
+ namespace dom {
+ 
+ template<typename T> class MozMap;
+ class HeadersOrByteStringSequenceSequenceOrByteStringMozMap;
++class PHeadersEntry;
+ 
+ class InternalHeaders MOZ_FINAL
+ {
+   NS_INLINE_DECL_THREADSAFE_REFCOUNTING(InternalHeaders)
+ 
+ private:
+   struct Entry
+   {
+@@ -42,29 +43,32 @@ private:
+     nsCString mName;
+     nsCString mValue;
+   };
+ 
+   HeadersGuardEnum mGuard;
+   nsTArray<Entry> mList;
+ 
+ public:
+-  explicit InternalHeaders(HeadersGuardEnum aGuard = HeadersGuardEnum::None)
++  explicit InternalHeaders(HeadersGuardEnum aGuard = HeadersGuardEnum::MozNone)
+     : mGuard(aGuard)
+   {
+   }
+ 
+   explicit InternalHeaders(const InternalHeaders& aOther)
+     : mGuard(aOther.mGuard)
+   {
+     ErrorResult result;
+     Fill(aOther, result);
+     MOZ_ASSERT(!result.Failed());
+   }
+ 
++  InternalHeaders(const nsTArray<PHeadersEntry>& aHeaders,
++                  HeadersGuardEnum aGuard = HeadersGuardEnum::MozNone);
++
+   void Append(const nsACString& aName, const nsACString& aValue,
+               ErrorResult& aRv);
+   void Delete(const nsACString& aName, ErrorResult& aRv);
+   void Get(const nsACString& aName, nsCString& aValue, ErrorResult& aRv) const;
+   void GetAll(const nsACString& aName, nsTArray<nsCString>& aResults,
+               ErrorResult& aRv) const;
+   bool Has(const nsACString& aName, ErrorResult& aRv) const;
+   void Set(const nsACString& aName, const nsACString& aValue, ErrorResult& aRv);
+@@ -80,16 +84,20 @@ public:
+ 
+   bool HasOnlySimpleHeaders() const;
+ 
+   static already_AddRefed<InternalHeaders>
+   BasicHeaders(InternalHeaders* aHeaders);
+ 
+   static already_AddRefed<InternalHeaders>
+   CORSHeaders(InternalHeaders* aHeaders);
++
++  void
++  GetPHeaders(nsTArray<PHeadersEntry>& aPHeadersOut) const;
++
+ private:
+   virtual ~InternalHeaders();
+ 
+   static bool IsSimpleHeader(const nsACString& aName,
+                              const nsACString& aValue);
+   static bool IsInvalidName(const nsACString& aName, ErrorResult& aRv);
+   static bool IsInvalidValue(const nsACString& aValue, ErrorResult& aRv);
+   bool IsImmutable(ErrorResult& aRv) const;
+diff --git a/dom/fetch/InternalRequest.h b/dom/fetch/InternalRequest.h
+--- a/dom/fetch/InternalRequest.h
++++ b/dom/fetch/InternalRequest.h
+@@ -50,17 +50,17 @@ public:
+   {
+     RESPONSETAINT_BASIC,
+     RESPONSETAINT_CORS,
+     RESPONSETAINT_OPAQUE,
+   };
+ 
+   explicit InternalRequest()
+     : mMethod("GET")
+-    , mHeaders(new InternalHeaders(HeadersGuardEnum::None))
++    , mHeaders(new InternalHeaders(HeadersGuardEnum::MozNone))
+     , mContextFrameType(FRAMETYPE_NONE)
+     , mReferrerType(REFERRER_CLIENT)
+     , mMode(RequestMode::No_cors)
+     , mCredentialsMode(RequestCredentials::Omit)
+     , mResponseTainting(RESPONSETAINT_BASIC)
+     , mRedirectCount(0)
+     , mAuthenticationFlag(false)
+     , mForceOriginHeader(false)
+@@ -126,16 +126,22 @@ public:
+   }
+ 
+   void
+   GetURL(nsCString& aURL) const
+   {
+     aURL.Assign(mURL);
+   }
+ 
++  void
++  SetURL(const nsACString& aURL)
++  {
++    mURL.Assign(aURL);
++  }
++
+   bool
+   ReferrerIsNone() const
+   {
+     return mReferrerType == REFERRER_NONE;
+   }
+ 
+   bool
+   ReferrerIsURL() const
+@@ -202,16 +208,22 @@ public:
+   }
+ 
+   nsContentPolicyType
+   GetContext() const
+   {
+     return mContext;
+   }
+ 
++  void
++  SetContext(nsContentPolicyType aContext)
++  {
++    mContext = aContext;
++  }
++
+   bool
+   UnsafeRequest() const
+   {
+     return mUnsafeRequest;
+   }
+ 
+   InternalHeaders*
+   Headers()
+@@ -226,16 +238,22 @@ public:
+   }
+ 
+   void
+   GetOrigin(nsCString& aOrigin) const
+   {
+     aOrigin.Assign(mOrigin);
+   }
+ 
++  void
++  SetOrigin(const nsACString& aOrigin)
++  {
++    mOrigin = aOrigin;
++  }
++
+   bool
+   SameOriginDataURL() const
+   {
+     return mSameOriginDataURL;
+   }
+ 
+   void
+   SetBody(nsIInputStream* aStream)
+@@ -256,22 +274,16 @@ public:
+ 
+   // The global is used as the client for the new object.
+   already_AddRefed<InternalRequest>
+   GetRequestConstructorCopy(nsIGlobalObject* aGlobal, ErrorResult& aRv) const;
+ 
+ private:
+   ~InternalRequest();
+ 
+-  void
+-  SetURL(const nsACString& aURL)
+-  {
+-    mURL.Assign(aURL);
+-  }
+-
+   nsCString mMethod;
+   nsCString mURL;
+   nsRefPtr<InternalHeaders> mHeaders;
+   nsCOMPtr<nsIInputStream> mBodyStream;
+ 
+   // nsContentPolicyType does not cover the complete set defined in the spec,
+   // but it is a good start.
+   nsContentPolicyType mContext;
+diff --git a/dom/fetch/PHeaders.ipdlh b/dom/fetch/PHeaders.ipdlh
+new file mode 100644
+--- /dev/null
++++ b/dom/fetch/PHeaders.ipdlh
+@@ -0,0 +1,15 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++namespace mozilla {
++namespace dom {
++
++struct PHeadersEntry
++{
++  nsCString name;
++  nsCString value;
++};
++
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/fetch/Request.h b/dom/fetch/Request.h
+--- a/dom/fetch/Request.h
++++ b/dom/fetch/Request.h
+@@ -37,19 +37,19 @@ public:
+ 
+   JSObject*
+   WrapObject(JSContext* aCx)
+   {
+     return RequestBinding::Wrap(aCx, this);
+   }
+ 
+   void
+-  GetUrl(DOMString& aUrl) const
++  GetUrl(nsAString& aUrl) const
+   {
+-    aUrl.AsAString() = NS_ConvertUTF8toUTF16(mRequest->mURL);
++    aUrl = NS_ConvertUTF8toUTF16(mRequest->mURL);
+   }
+ 
+   void
+   GetMethod(nsCString& aMethod) const
+   {
+     aMethod = mRequest->mMethod;
+   }
+ 
+@@ -61,25 +61,25 @@ public:
+ 
+   RequestCredentials
+   Credentials() const
+   {
+     return mRequest->mCredentialsMode;
+   }
+ 
+   void
+-  GetReferrer(DOMString& aReferrer) const
++  GetReferrer(nsAString& aReferrer) const
+   {
+     if (mRequest->ReferrerIsNone()) {
+-      aReferrer.AsAString() = EmptyString();
++      aReferrer = EmptyString();
+       return;
+     }
+ 
+     // FIXME(nsm): Spec doesn't say what to do if referrer is client.
+-    aReferrer.AsAString() = NS_ConvertUTF8toUTF16(mRequest->mReferrerURL);
++    aReferrer = NS_ConvertUTF8toUTF16(mRequest->mReferrerURL);
+   }
+ 
+   InternalHeaders*
+   GetInternalHeaders() const
+   {
+     return mRequest->Headers();
+   }
+ 
+diff --git a/dom/fetch/Response.cpp b/dom/fetch/Response.cpp
+--- a/dom/fetch/Response.cpp
++++ b/dom/fetch/Response.cpp
+@@ -146,16 +146,23 @@ Response::Clone()
+ 
+ void
+ Response::SetBody(nsIInputStream* aBody)
+ {
+   // FIXME(nsm): Do we flip bodyUsed here?
+   mInternalResponse->SetBody(aBody);
+ }
+ 
++already_AddRefed<InternalResponse>
++Response::GetInternalResponse()
++{
++  nsRefPtr<InternalResponse> ref = mInternalResponse;
++  return ref.forget();
++}
++
+ Headers*
+ Response::Headers_()
+ {
+   if (!mHeaders) {
+     mHeaders = new Headers(mOwner, mInternalResponse->Headers());
+   }
+ 
+   return mHeaders;
+diff --git a/dom/fetch/Response.h b/dom/fetch/Response.h
+--- a/dom/fetch/Response.h
++++ b/dom/fetch/Response.h
+@@ -95,16 +95,19 @@ public:
+     return mOwner;
+   }
+ 
+   already_AddRefed<Response>
+   Clone();
+ 
+   void
+   SetBody(nsIInputStream* aBody);
++
++  already_AddRefed<InternalResponse>
++  GetInternalResponse();
+ private:
+   ~Response();
+ 
+   nsCOMPtr<nsIGlobalObject> mOwner;
+   nsRefPtr<InternalResponse> mInternalResponse;
+   // Lazily created
+   nsRefPtr<Headers> mHeaders;
+ };
+diff --git a/dom/fetch/moz.build b/dom/fetch/moz.build
+--- a/dom/fetch/moz.build
++++ b/dom/fetch/moz.build
+@@ -2,16 +2,17 @@
+ # vim: set filetype=python:
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ EXPORTS.mozilla.dom += [
+     'Fetch.h',
+     'FetchDriver.h',
++    'FetchIPCUtils.h',
+     'Headers.h',
+     'InternalHeaders.h',
+     'InternalRequest.h',
+     'InternalResponse.h',
+     'Request.h',
+     'Response.h',
+ ]
+ 
+@@ -21,16 +22,22 @@ UNIFIED_SOURCES += [
+     'Headers.cpp',
+     'InternalHeaders.cpp',
+     'InternalRequest.cpp',
+     'InternalResponse.cpp',
+     'Request.cpp',
+     'Response.cpp',
+ ]
+ 
++IPDL_SOURCES += [
++    'PHeaders.ipdlh',
++]
++
++include('/ipc/chromium/chromium-config.mozbuild')
++
+ LOCAL_INCLUDES += [
+     '../workers',
+     # For nsDataHandler.h
+     '/netwerk/protocol/data',
+ ]
+ 
+ FAIL_ON_WARNINGS = True
+ MSVC_ENABLE_PGO = True
+diff --git a/dom/webidl/Headers.webidl b/dom/webidl/Headers.webidl
+--- a/dom/webidl/Headers.webidl
++++ b/dom/webidl/Headers.webidl
+@@ -6,17 +6,17 @@
+  *
+  * The origin of this IDL file is
+  * http://fetch.spec.whatwg.org/#headers-class
+  */
+ 
+ typedef (Headers or sequence<sequence<ByteString>> or MozMap<ByteString>) HeadersInit;
+ 
+ enum HeadersGuardEnum {
+-  "none",
++  "mozNone",
+   "request",
+   "request-no-cors",
+   "response",
+   "immutable"
+ };
+ 
+ [Constructor(optional HeadersInit init),
+  Exposed=(Window,Worker),

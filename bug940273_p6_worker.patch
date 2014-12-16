@@ -1,0 +1,206 @@
+# HG changeset patch
+# Parent 7ae0892d0674f1719ee4c5b5bbd5432a59dad8f7
+# User Ben Kelly <ben@wanderview.com>
+Bug940273 P6 Expose Service Worker Cache on workers as self.caches.
+
+diff --git a/dom/webidl/WorkerGlobalScope.webidl b/dom/webidl/WorkerGlobalScope.webidl
+--- a/dom/webidl/WorkerGlobalScope.webidl
++++ b/dom/webidl/WorkerGlobalScope.webidl
+@@ -47,9 +47,12 @@ WorkerGlobalScope implements GlobalFetch
+ partial interface WorkerGlobalScope {
+   attribute EventHandler onclose;
+ 
+   void dump(optional DOMString str);
+ 
+   // XXXbz no spec for this yet, because the webperf WG is a bit dysfunctional
+   [Constant, Cached]
+   readonly attribute Performance performance;
++
++  [Throws, Func="mozilla::dom::cache::CacheStorage::PrefEnabled"]
++  readonly attribute CacheStorage caches;
+ };
+diff --git a/dom/workers/WorkerScope.cpp b/dom/workers/WorkerScope.cpp
+--- a/dom/workers/WorkerScope.cpp
++++ b/dom/workers/WorkerScope.cpp
+@@ -10,16 +10,17 @@
+ #include "mozilla/EventListenerManager.h"
+ #include "mozilla/dom/Console.h"
+ #include "mozilla/dom/DedicatedWorkerGlobalScopeBinding.h"
+ #include "mozilla/dom/Fetch.h"
+ #include "mozilla/dom/FunctionBinding.h"
+ #include "mozilla/dom/Promise.h"
+ #include "mozilla/dom/ServiceWorkerGlobalScopeBinding.h"
+ #include "mozilla/dom/SharedWorkerGlobalScopeBinding.h"
++#include "mozilla/dom/cache/CacheStorage.h"
+ #include "mozilla/Services.h"
+ #include "nsServiceManagerUtils.h"
+ 
+ #include "nsIDocument.h"
+ #include "nsIServiceWorkerManager.h"
+ 
+ #ifdef ANDROID
+ #include <android/log.h>
+@@ -36,16 +37,17 @@
+ #include "ServiceWorkerClients.h"
+ 
+ #define UNWRAP_WORKER_OBJECT(Interface, obj, value)                           \
+   UnwrapObject<prototypes::id::Interface##_workers,                           \
+     mozilla::dom::Interface##Binding_workers::NativeType>(obj, value)
+ 
+ using namespace mozilla;
+ using namespace mozilla::dom;
++using mozilla::dom::cache::CacheStorage;
+ USING_WORKERS_NAMESPACE
+ 
+ using mozilla::ipc::PrincipalInfo;
+ 
+ BEGIN_WORKERS_NAMESPACE
+ 
+ WorkerGlobalScope::WorkerGlobalScope(WorkerPrivate* aWorkerPrivate)
+ : mWorkerPrivate(aWorkerPrivate)
+@@ -62,25 +64,27 @@ NS_IMPL_CYCLE_COLLECTION_CLASS(WorkerGlo
+ 
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(WorkerGlobalScope,
+                                                   DOMEventTargetHelper)
+   tmp->mWorkerPrivate->AssertIsOnWorkerThread();
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mConsole)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mPerformance)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mLocation)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mNavigator)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mCacheStorage)
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+ 
+ NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(WorkerGlobalScope,
+                                                 DOMEventTargetHelper)
+   tmp->mWorkerPrivate->AssertIsOnWorkerThread();
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mConsole)
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mPerformance)
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mLocation)
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mNavigator)
++  NS_IMPL_CYCLE_COLLECTION_UNLINK(mCacheStorage)
+ NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+ 
+ NS_IMPL_CYCLE_COLLECTION_TRACE_BEGIN_INHERITED(WorkerGlobalScope,
+                                                DOMEventTargetHelper)
+   tmp->mWorkerPrivate->AssertIsOnWorkerThread();
+ 
+   tmp->mWorkerPrivate->TraceTimeouts(aCallbacks, aClosure);
+ NS_IMPL_CYCLE_COLLECTION_TRACE_END
+@@ -105,16 +109,32 @@ WorkerGlobalScope::GetConsole()
+ 
+   if (!mConsole) {
+     mConsole = new Console(nullptr);
+   }
+ 
+   return mConsole;
+ }
+ 
++already_AddRefed<CacheStorage>
++WorkerGlobalScope::GetCaches(ErrorResult& aRv)
++{
++  if (!mCacheStorage) {
++    MOZ_ASSERT(mWorkerPrivate);
++    mCacheStorage = CacheStorage::CreateOnWorker(cache::DEFAULT_NAMESPACE, this,
++                                                 mWorkerPrivate, aRv);
++    if (aRv.Failed()) {
++      return nullptr;
++    }
++  }
++
++  nsRefPtr<CacheStorage> ref = mCacheStorage;
++  return ref.forget();
++}
++
+ already_AddRefed<WorkerLocation>
+ WorkerGlobalScope::Location()
+ {
+   mWorkerPrivate->AssertIsOnWorkerThread();
+ 
+   if (!mLocation) {
+     WorkerPrivate::LocationInfo& info = mWorkerPrivate->GetLocationInfo();
+ 
+diff --git a/dom/workers/WorkerScope.h b/dom/workers/WorkerScope.h
+--- a/dom/workers/WorkerScope.h
++++ b/dom/workers/WorkerScope.h
+@@ -14,16 +14,20 @@
+ namespace mozilla {
+ namespace dom {
+ 
+ class Console;
+ class Function;
+ class Promise;
+ class RequestOrUSVString;
+ 
++namespace cache {
++class CacheStorage;
++}
++
+ } // namespace dom
+ } // namespace mozilla
+ 
+ BEGIN_WORKERS_NAMESPACE
+ 
+ class ServiceWorkerClients;
+ class WorkerPrivate;
+ class WorkerLocation;
+@@ -32,16 +36,17 @@ class Performance;
+ 
+ class WorkerGlobalScope : public DOMEventTargetHelper,
+                           public nsIGlobalObject
+ {
+   nsRefPtr<Console> mConsole;
+   nsRefPtr<WorkerLocation> mLocation;
+   nsRefPtr<WorkerNavigator> mNavigator;
+   nsRefPtr<Performance> mPerformance;
++  nsRefPtr<cache::CacheStorage> mCacheStorage;
+ 
+ protected:
+   WorkerPrivate* mWorkerPrivate;
+ 
+   explicit WorkerGlobalScope(WorkerPrivate* aWorkerPrivate);
+   virtual ~WorkerGlobalScope();
+ 
+ public:
+@@ -122,16 +127,18 @@ public:
+ 
+   void
+   Dump(const Optional<nsAString>& aString) const;
+ 
+   Performance* GetPerformance();
+ 
+   already_AddRefed<Promise>
+   Fetch(const RequestOrUSVString& aInput, const RequestInit& aInit, ErrorResult& aRv);
++
++  already_AddRefed<cache::CacheStorage> GetCaches(ErrorResult& aRv);
+ };
+ 
+ class DedicatedWorkerGlobalScope MOZ_FINAL : public WorkerGlobalScope
+ {
+   ~DedicatedWorkerGlobalScope() { }
+ 
+ public:
+   explicit DedicatedWorkerGlobalScope(WorkerPrivate* aWorkerPrivate);
+diff --git a/dom/workers/test/test_worker_interfaces.js b/dom/workers/test/test_worker_interfaces.js
+--- a/dom/workers/test/test_worker_interfaces.js
++++ b/dom/workers/test/test_worker_interfaces.js
+@@ -83,16 +83,20 @@ if (typeof Symbol === "function") {
+ }
+ 
+ // IMPORTANT: Do not change the list below without review from a DOM peer!
+ var interfaceNamesInGlobalScope =
+   [
+ // IMPORTANT: Do not change this list without review from a DOM peer!
+     "Blob",
+ // IMPORTANT: Do not change this list without review from a DOM peer!
++    { name: "Cache", pref: "dom.worker-caches.enabled" },
++// IMPORTANT: Do not change this list without review from a DOM peer!
++    { name: "CacheStorage", pref: "dom.worker-caches.enabled" },
++// IMPORTANT: Do not change this list without review from a DOM peer!
+     "DedicatedWorkerGlobalScope",
+ // IMPORTANT: Do not change this list without review from a DOM peer!
+     { name: "DataStore", b2g: true },
+ // IMPORTANT: Do not change this list without review from a DOM peer!
+     { name: "DataStoreCursor", b2g: true },
+ // IMPORTANT: Do not change this list without review from a DOM peer!
+     "DOMException",
+ // IMPORTANT: Do not change this list without review from a DOM peer!
