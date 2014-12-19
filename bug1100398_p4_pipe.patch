@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent 65f3c3b1421f763b9b12f195d6e1c351a57553dd
+# Parent 1864cdca9d89a2f5a9ba276f67ab5ea77a36a1ac
 # User Ben Kelly <ben@wanderview.com>
 Bug 1100398 P4 Make nsPipeInputStream cloneable.
 
@@ -29,7 +29,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  #include "nsIClassInfoImpl.h"
  #include "nsAlgorithm.h"
  #include "nsMemory.h"
-@@ -83,83 +85,122 @@ private:
+@@ -83,83 +85,126 @@ private:
    nsCOMPtr<nsIAsyncInputStream>     mInputStream;
    nsCOMPtr<nsIInputStreamCallback>  mInputCallback;
    nsCOMPtr<nsIAsyncOutputStream>    mOutputStream;
@@ -84,6 +84,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
      , mReaderRefCnt(0)
      , mLogicalOffset(0)
      , mBlocking(true)
++    , mClosed(false)
      , mBlocked(false)
      , mAvailable(0)
      , mCallbackFlags(0)
@@ -94,9 +95,11 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 +    , mReaderRefCnt(0)
 +    , mLogicalOffset(aOther.mLogicalOffset)
 +    , mBlocking(aOther.mBlocking)
++    , mClosed(aOther.mClosed)
 +    , mBlocked(false)
 +    , mAvailable(aOther.mAvailable)
 +    , mCallbackFlags(0)
++    , mReadState(aOther.mReadState)
 +  { }
 +
    nsresult Fill();
@@ -139,6 +142,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
    mozilla::ThreadSafeAutoRefCnt  mReaderRefCnt;
    int64_t                        mLogicalOffset;
    bool                           mBlocking;
++  bool                           mClosed;
  
    // these variables can only be accessed while inside the pipe's monitor
    bool                           mBlocked;
@@ -156,7 +160,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  class nsPipeOutputStream
    : public nsIAsyncOutputStream
    , public nsIClassInfo
-@@ -235,43 +276,56 @@ public:
+@@ -235,43 +280,57 @@ public:
  private:
    ~nsPipe();
  
@@ -183,6 +187,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
    nsresult GetWriteSegment(char*& aSegment, uint32_t& aSegmentLen);
    void     AdvanceWriteCursor(uint32_t aCount);
  
++  void     CloseInputStream(nsPipeInputStream* aStream, nsresult aReason);
    void     OnPipeException(nsresult aReason, bool aOutputOnly = false);
  
 +  nsresult CloneInputStream(nsPipeInputStream* aOriginal,
@@ -192,6 +197,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 +  uint32_t CountSegmentReferences(int32_t aSegment) const;
 +  void SetAllNullReadCursors();
 +  bool AllReadCursorsMatchWriteCursor() const;
++  void RollBackAllReadCursors(char* aWriteCursor);
 +  void UpdateAllReadCursors(char* aWriteCursor);
 +  void ValidateAllReadCursors();
 +
@@ -202,8 +208,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
    nsPipeOutputStream  mOutput;
  
 +  // Since the input stream can be cloned, we may have more than one.  There
-+  // will always be at least one stream in this list.  mInputList[0] is the
-+  // canonical, original stream for the pipe.
++  // will always be at least one stream in this list.
 +  nsTArray<nsRefPtr<nsPipeInputStream>> mInputList;
 +
    ReentrantMonitor    mReentrantMonitor;
@@ -220,7 +225,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
    bool                mInited;
  };
  
-@@ -314,27 +368,25 @@ protected:
+@@ -314,27 +373,25 @@ protected:
  // making changes to this file, please keep this fact in mind.
  //
  
@@ -250,7 +255,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  
  NS_IMPL_ISUPPORTS(nsPipe, nsIPipe)
  
-@@ -359,122 +411,144 @@ nsPipe::Init(bool aNonBlockingIn,
+@@ -359,122 +416,150 @@ nsPipe::Init(bool aNonBlockingIn,
      aSegmentCount = maxCount;
    }
  
@@ -390,12 +395,17 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 -        // buffer is completely empty
 -        mReadCursor = nullptr;
 -        mReadLimit = nullptr;
+-        mWriteCursor = nullptr;
+-        mWriteLimit = nullptr;
 +      // If this was the last reference to the first segment, then remove it.
 +      if (currentSegment == 0 && CountSegmentReferences(currentSegment) == 0) {
 +
 +        // shift write and read segment index (-1 indicates an empty buffer).
 +        mWriteSegment -= 1;
-+        aReadState.mSegment -= 1;
++
++        for (uint32_t i = 0; i < mInputList.Length(); ++i) {
++          mInputList[i]->ReadState().mSegment -= 1;
++        }
 +
 +        // done with this segment
 +        mBuffer.DeleteFirstSegment();
@@ -403,12 +413,15 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 +      }
 +
 +      if (mWriteSegment < aReadState.mSegment) {
-+        // buffer is completely empty or we've read to end of last segment
++        // read cursor has hit the end of written data, so reset it
 +        MOZ_ASSERT(mWriteSegment == (aReadState.mSegment - 1));
 +        aReadState.mReadCursor = nullptr;
 +        aReadState.mReadLimit = nullptr;
-         mWriteCursor = nullptr;
-         mWriteLimit = nullptr;
++        // also, the buffer is completely empty, so reset the write cursor
++        if (mWriteSegment == -1) {
++          mWriteCursor = nullptr;
++          mWriteLimit = nullptr;
++        }
        } else {
          // advance read cursor and limit to next buffer segment
 -        mReadCursor = mBuffer.GetSegment(0);
@@ -428,7 +441,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
        if (mOutput.OnOutputWritable(events)) {
          mon.Notify();
        }
-@@ -500,27 +574,25 @@ nsPipe::GetWriteSegment(char*& aSegment,
+@@ -500,27 +585,25 @@ nsPipe::GetWriteSegment(char*& aSegment,
      }
      LOG(("OOO appended new segment\n"));
      mWriteCursor = seg;
@@ -450,7 +463,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
      char* head = mBuffer.GetSegment(0);
      LOG(("OOO rolling back write cursor %u bytes\n", mWriteCursor - head));
 -    mWriteCursor = mReadCursor = mReadLimit = head;
-+    UpdateAllReadCursors(head);
++    RollBackAllReadCursors(head);
 +    mWriteCursor = head;
    }
  
@@ -460,7 +473,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  }
  
  void
-@@ -533,56 +605,34 @@ nsPipe::AdvanceWriteCursor(uint32_t aByt
+@@ -533,94 +616,213 @@ nsPipe::AdvanceWriteCursor(uint32_t aByt
      ReentrantMonitorAutoEnter mon(mReentrantMonitor);
  
      LOG(("OOO advancing write cursor by %u\n", aBytesWritten));
@@ -520,10 +533,48 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  }
  
  void
++nsPipe::CloseInputStream(nsPipeInputStream* aStream, nsresult aReason)
++{
++  nsPipeEvents events;
++  {
++    ReentrantMonitorAutoEnter mon(mReentrantMonitor);
++
++    for (uint32_t i = 0; i < mInputList.Length(); ++i) {
++      if (mInputList[i].get() != aStream) {
++        continue;
++      }
++
++      // If there are more input streams open, then simply notify
++      // this stream, remove it from the list, and allow the remaining
++      // streams to continue functioning
++      if (mInputList.Length() > 1) {
++        if (mInputList[i]->OnInputException(aReason, events)) {
++          mon.Notify();
++        }
++        mInputList.RemoveElementAt(i);
++        return;
++      }
++
++      // Otherwise, this is the last input stream being closed.  Since
++      // there will be no way to get another open input stream, just
++      // shut the whole pipe down.
++      OnPipeException(aReason);
++      return;
++    }
++  }
++
++  MOZ_ASSERT_UNREACHABLE("Closing unknown pipe stream!");
++}
++
++void
  nsPipe::OnPipeException(nsresult aReason, bool aOutputOnly)
  {
    LOG(("PPP nsPipe::OnPipeException [reason=%x output-only=%d]\n",
-@@ -594,33 +644,127 @@ nsPipe::OnPipeException(nsresult aReason
+        aReason, aOutputOnly));
+ 
+   nsPipeEvents events;
+   {
+     ReentrantMonitorAutoEnter mon(mReentrantMonitor);
  
      // if we've already hit an exception, then ignore this one.
      if (NS_FAILED(mStatus)) {
@@ -606,6 +657,19 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 +}
 +
 +void
++nsPipe::RollBackAllReadCursors(char* aWriteCursor)
++{
++  for (uint32_t i = 0; i < mInputList.Length(); ++i) {
++    nsPipeReadState& readState = mInputList[i]->ReadState();
++    MOZ_ASSERT(mWriteSegment == readState.mSegment);
++    MOZ_ASSERT(mWriteCursor == readState.mReadCursor);
++    MOZ_ASSERT(mWriteCursor == readState.mReadLimit);
++    readState.mReadCursor = aWriteCursor;
++    readState.mReadLimit = aWriteCursor;
++  }
++}
++
++void
 +nsPipe::UpdateAllReadCursors(char* aWriteCursor)
 +{
 +  for (uint32_t i = 0; i < mInputList.Length(); ++i) {
@@ -658,7 +722,63 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  {
    // dispatch any pending events
  
-@@ -778,17 +922,17 @@ nsPipeInputStream::ReadSegments(nsWriteS
+@@ -640,23 +842,25 @@ nsPipeEvents::~nsPipeEvents()
+ // nsPipeInputStream methods:
+ //-----------------------------------------------------------------------------
+ 
+ NS_IMPL_QUERY_INTERFACE(nsPipeInputStream,
+                         nsIInputStream,
+                         nsIAsyncInputStream,
+                         nsISeekableStream,
+                         nsISearchableInputStream,
++                        nsICloneableInputStream,
+                         nsIClassInfo)
+ 
+ NS_IMPL_CI_INTERFACE_GETTER(nsPipeInputStream,
+                             nsIInputStream,
+                             nsIAsyncInputStream,
+                             nsISeekableStream,
+-                            nsISearchableInputStream)
++                            nsISearchableInputStream,
++                            nsICloneableInputStream)
+ 
+ NS_IMPL_THREADSAFE_CI(nsPipeInputStream)
+ 
+ nsresult
+ nsPipeInputStream::Wait()
+ {
+   NS_ASSERTION(mBlocking, "wait on non-blocking pipe input stream");
+ 
+@@ -734,21 +938,27 @@ nsPipeInputStream::Release(void)
+   return mPipe->Release();
+ }
+ 
+ NS_IMETHODIMP
+ nsPipeInputStream::CloseWithStatus(nsresult aReason)
+ {
+   LOG(("III CloseWithStatus [this=%x reason=%x]\n", this, aReason));
+ 
++  if (mClosed) {
++    return NS_OK;
++  }
++
++  mClosed = true;
++
+   if (NS_SUCCEEDED(aReason)) {
+     aReason = NS_BASE_STREAM_CLOSED;
+   }
+ 
+-  mPipe->OnPipeException(aReason);
++  mPipe->CloseInputStream(this, aReason);
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsPipeInputStream::Close()
+ {
+   return CloseWithStatus(NS_BASE_STREAM_CLOSED);
+ }
+@@ -778,17 +988,17 @@ nsPipeInputStream::ReadSegments(nsWriteS
  
    nsresult rv = NS_OK;
  
@@ -677,7 +797,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
        }
        if (rv == NS_BASE_STREAM_WOULD_BLOCK) {
          // pipe is empty
-@@ -833,17 +977,17 @@ nsPipeInputStream::ReadSegments(nsWriteS
+@@ -833,17 +1043,17 @@ nsPipeInputStream::ReadSegments(nsWriteS
        segment += writeCount;
        segmentLen -= writeCount;
        aCount -= writeCount;
@@ -696,7 +816,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  
  NS_IMETHODIMP
  nsPipeInputStream::Read(char* aToBuf, uint32_t aBufLen, uint32_t* aReadCount)
-@@ -940,17 +1084,17 @@ nsPipeInputStream::Search(const char* aF
+@@ -940,17 +1150,17 @@ nsPipeInputStream::Search(const char* aF
  
    ReentrantMonitorAutoEnter mon(mPipe->mReentrantMonitor);
  
@@ -715,7 +835,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
    }
  
    while (true) {
-@@ -969,17 +1113,17 @@ nsPipeInputStream::Search(const char* aF
+@@ -969,17 +1179,17 @@ nsPipeInputStream::Search(const char* aF
      // get the next segment
      char* cursor2;
      char* limit2;
@@ -734,7 +854,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
      }
      len2 = limit2 - cursor2;
  
-@@ -1003,16 +1147,29 @@ nsPipeInputStream::Search(const char* aF
+@@ -1003,16 +1213,29 @@ nsPipeInputStream::Search(const char* aF
      cursor1 = cursor2;
      limit1 = limit2;
    }
@@ -768,7 +888,7 @@ diff --git a/xpcom/tests/gtest/TestPipe.cpp b/xpcom/tests/gtest/TestPipe.cpp
 new file mode 100644
 --- /dev/null
 +++ b/xpcom/tests/gtest/TestPipe.cpp
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,274 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -776,7 +896,9 @@ new file mode 100644
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 +
 +#include <algorithm>
++#include "gtest/gtest.h"
 +#include "nsCOMPtr.h"
++#include "nsICloneableInputStream.h"
 +#include "nsIInputStream.h"
 +#include "nsIOutputStream.h"
 +#include "nsIPipe.h"
@@ -786,12 +908,18 @@ new file mode 100644
 +
 +namespace {
 +
-+static void TestPipe(uint32_t aNumBytes)
++static const uint32_t DEFAULT_SEGMENT_SIZE = 4 * 1024;
++
++static void TestPipe(uint32_t aNumBytes,
++                     uint32_t aSegmentSize = DEFAULT_SEGMENT_SIZE)
 +{
 +  nsCOMPtr<nsIInputStream> reader;
 +  nsCOMPtr<nsIOutputStream> writer;
 +
-+  nsresult rv = NS_NewPipe(getter_AddRefs(reader), getter_AddRefs(writer));
++  uint32_t maxSize = std::max(aNumBytes, aSegmentSize);
++
++  nsresult rv = NS_NewPipe(getter_AddRefs(reader), getter_AddRefs(writer),
++                           aSegmentSize, maxSize);
 +  ASSERT_TRUE(NS_SUCCEEDED(rv));
 +
 +  nsTArray<char> inputData;
@@ -803,7 +931,162 @@ new file mode 100644
 +  rv = NS_ConsumeStream(reader, UINT32_MAX, outputData);
 +  ASSERT_TRUE(NS_SUCCEEDED(rv));
 +
-+  ASSERT_EQ(outputData.Length(), inputData.Length());
++  ASSERT_EQ(inputData.Length(), outputData.Length());
++}
++
++// Utility routine to validate pipe clone before.  There are many knobs.
++//
++// aTotalBytes              Total number of bytes to write to the pipe.
++// aNumWrites               How many separate write calls should be made.  Bytes
++//                          are evenly distributed over these write calls.
++// aNumInitialClones        How many clones of the pipe input stream should be
++//                          made before writing begins.
++// aNumToCloseAfterWrite    How many streams should be closed after each write.
++//                          One stream is always kept open.  This verifies that
++//                          closing one stream does not effect other open
++//                          streams.
++// aNumToCloneAfterWrite    How many clones to create after each write.  Occurs
++//                          after closing any streams.  This tests cloning
++//                          active streams on a pipe that is being written to.
++// aNumStreamToReadPerWrite How many streams to read fully after each write.
++//                          This tests reading cloned streams at different rates
++//                          while the pipe is being written to.
++static void TestPipeClone(uint32_t aTotalBytes,
++                          uint32_t aNumWrites,
++                          uint32_t aNumInitialClones,
++                          uint32_t aNumToCloseAfterWrite,
++                          uint32_t aNumToCloneAfterWrite,
++                          uint32_t aNumStreamsToReadPerWrite,
++                          uint32_t aSegmentSize = DEFAULT_SEGMENT_SIZE)
++{
++  nsCOMPtr<nsIInputStream> reader;
++  nsCOMPtr<nsIOutputStream> writer;
++
++  uint32_t maxSize = std::max(aTotalBytes, aSegmentSize);
++
++  // Use async input streams so we can NS_ConsumeStream() the current data
++  // while the pipe is still being written to.
++  nsresult rv = NS_NewPipe(getter_AddRefs(reader), getter_AddRefs(writer),
++                           aSegmentSize, maxSize,
++                           true, false); // non-blocking - reader, writer
++  ASSERT_TRUE(NS_SUCCEEDED(rv));
++
++  nsCOMPtr<nsICloneableInputStream> cloneable = do_QueryInterface(reader);
++  ASSERT_TRUE(cloneable);
++
++  bool canClone;
++  rv = cloneable->GetCloneable(&canClone);
++  ASSERT_TRUE(NS_SUCCEEDED(rv));
++  ASSERT_TRUE(canClone);
++
++  nsTArray<nsCString> outputDataList;
++
++  nsTArray<nsCOMPtr<nsIInputStream>> streamList;
++
++  // first stream is our original reader from the pipe
++  streamList.AppendElement(reader);
++  outputDataList.AppendElement();
++
++  // Clone the initial input stream the specified number of times
++  // before performing any writes.
++  for (uint32_t i = 0; i < aNumInitialClones; ++i) {
++    nsCOMPtr<nsIInputStream>* clone = streamList.AppendElement();
++    rv = cloneable->Clone(getter_AddRefs(*clone));
++    ASSERT_TRUE(NS_SUCCEEDED(rv));
++    ASSERT_TRUE(*clone);
++
++    outputDataList.AppendElement();
++  }
++
++  nsTArray<char> inputData;
++  testing::CreateData(aTotalBytes, inputData);
++
++  const uint32_t bytesPerWrite = ((aTotalBytes - 1)/ aNumWrites) + 1;
++  uint32_t offset = 0;
++  uint32_t remaining = aTotalBytes;
++  uint32_t nextStreamToRead = 0;
++
++  while (remaining) {
++    uint32_t numToWrite = std::min(bytesPerWrite, remaining);
++    testing::Write(writer, inputData, offset, numToWrite);
++    offset += numToWrite;
++    remaining -= numToWrite;
++
++    // Close the specified number of streams.  This allows us to
++    // test that one closed clone does not break other open clones.
++    for (uint32_t i = 0; i < aNumToCloseAfterWrite &&
++                         streamList.Length() > 1; ++i) {
++
++      uint32_t lastIndex = streamList.Length() - 1;
++      streamList[lastIndex]->Close();
++      streamList.RemoveElementAt(lastIndex);
++      outputDataList.RemoveElementAt(lastIndex);
++
++      if (nextStreamToRead >= streamList.Length()) {
++        nextStreamToRead = 0;
++      }
++    }
++
++    // Create the specified number of clones.  This lets us verify
++    // that we can create clones in the middle of pipe reading and
++    // writing.
++    for (uint32_t i = 0; i < aNumToCloneAfterWrite; ++i) {
++      nsCOMPtr<nsIInputStream>* clone = streamList.AppendElement();
++      rv = cloneable->Clone(getter_AddRefs(*clone));
++      ASSERT_TRUE(NS_SUCCEEDED(rv));
++      ASSERT_TRUE(*clone);
++
++      // Initialize the new output data to make whats been read to data for
++      // the original stream.  First stream is always the original stream.
++      nsCString* outputData = outputDataList.AppendElement();
++      *outputData = outputDataList[0];
++    }
++
++    // Read the specified number of streams.  This lets us verify that we
++    // can read from the clones at different rates while the pipe is being
++    // written to.
++    for (uint32_t i = 0; i < aNumStreamsToReadPerWrite; ++i) {
++      nsCOMPtr<nsIInputStream>& stream = streamList[nextStreamToRead];
++      nsCString& outputData = outputDataList[nextStreamToRead];
++
++      nsAutoCString tmpOutputData;
++      rv = NS_ConsumeStream(stream, UINT32_MAX, tmpOutputData);
++      ASSERT_TRUE(rv == NS_BASE_STREAM_WOULD_BLOCK || NS_SUCCEEDED(rv));
++      ASSERT_GE(tmpOutputData.Length(), numToWrite);
++
++      outputData += tmpOutputData;
++
++      nextStreamToRead += 1;
++      if (nextStreamToRead >= streamList.Length()) {
++        // Note: When we wrap around on the streams being read, its possible
++        //       we will trigger a segment to be deleted from the pipe.  It
++        //       would be nice to validate this here, but we don't have any
++        //       QI'able interface that would let us check easily.
++
++        nextStreamToRead = 0;
++      }
++    }
++  }
++
++  rv = writer->Close();
++  ASSERT_TRUE(NS_SUCCEEDED(rv));
++
++  // Finally, read the remaining bytes from each stream.  This may be
++  // different amounts of data depending on how much reading we did while
++  // writing.  Verify that the end result matches the input data.
++  for (uint32_t i = 0; i < streamList.Length(); ++i) {
++    nsCOMPtr<nsIInputStream>& stream = streamList[i];
++    nsCString& outputData = outputDataList[i];
++
++    nsAutoCString tmpOutputData;
++    rv = NS_ConsumeStream(stream, UINT32_MAX, tmpOutputData);
++    ASSERT_TRUE(rv == NS_BASE_STREAM_WOULD_BLOCK || NS_SUCCEEDED(rv));
++    stream->Close();
++
++    outputData += tmpOutputData;
++
++    ASSERT_EQ(inputData.Length(), outputData.Length());
++  }
 +}
 +
 +} // anonymous namespace
@@ -816,6 +1099,69 @@ new file mode 100644
 +TEST(Pipe, Blocking_64k)
 +{
 +  TestPipe(64 * 1024);
++}
++
++TEST(Pipe, Blocking_128k)
++{
++  TestPipe(128 * 1024);
++}
++
++TEST(Pipe, Clone_BeforeWrite_ReadAtEnd)
++{
++  TestPipeClone(32 * 1024, // total bytes
++                16,        // num writes
++                3,         // num initial clones
++                0,         // num streams to close after each write
++                0,         // num clones to add after each write
++                0);        // num streams to read after each write
++}
++
++TEST(Pipe, Clone_BeforeWrite_ReadDuringWrite)
++{
++  // Since this reads all streams on every write, it should trigger the
++  // pipe cursor roll back optimization.  Currently we can only verify
++  // this with logging.
++
++  TestPipeClone(32 * 1024, // total bytes
++                16,        // num writes
++                3,         // num initial clones
++                0,         // num streams to close after each write
++                0,         // num clones to add after each write
++                4);        // num streams to read after each write
++}
++
++TEST(Pipe, Clone_DuringWrite_ReadAtEnd)
++{
++  TestPipeClone(32 * 1024, // total bytes
++                16,        // num writes
++                0,         // num initial clones
++                0,         // num streams to close after each write
++                1,         // num clones to add after each write
++                0);        // num streams to read after each write
++}
++
++TEST(Pipe, Clone_DuringWrite_ReadDuringWrite)
++{
++  TestPipeClone(32 * 1024, // total bytes
++                16,        // num writes
++                0,         // num initial clones
++                0,         // num streams to close after each write
++                1,         // num clones to add after each write
++                1);        // num streams to read after each write
++}
++
++TEST(Pipe, Clone_DuringWrite_ReadDuringWrite_CloseDuringWrite)
++{
++  // Since this reads streams faster than we clone new ones, it should
++  // trigger pipe segment deletion periodically.  Currently we can
++  // only verify this with logging.
++
++  TestPipeClone(32 * 1024, // total bytes
++                16,        // num writes
++                1,         // num initial clones
++                1,         // num streams to close after each write
++                2,         // num clones to add after each write
++                3);        // num streams to read after each write
 +}
 diff --git a/xpcom/tests/gtest/moz.build b/xpcom/tests/gtest/moz.build
 --- a/xpcom/tests/gtest/moz.build
