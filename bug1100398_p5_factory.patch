@@ -1,0 +1,122 @@
+# HG changeset patch
+# Parent 621ed024842de5f2df1cd4f6e6c0eb225976c6b4
+# User Ben Kelly <ben@wanderview.com>
+Bug 1100398 P5 Provide NS_CloneInputStream() factory method in nsStreamUtils.h.
+
+diff --git a/xpcom/io/nsStreamUtils.cpp b/xpcom/io/nsStreamUtils.cpp
+--- a/xpcom/io/nsStreamUtils.cpp
++++ b/xpcom/io/nsStreamUtils.cpp
+@@ -12,16 +12,18 @@
+ #include "nsIPipe.h"
+ #include "nsIEventTarget.h"
+ #include "nsIRunnable.h"
+ #include "nsISafeOutputStream.h"
+ #include "nsString.h"
+ #include "nsIAsyncInputStream.h"
+ #include "nsIAsyncOutputStream.h"
+ #include "nsIBufferedStreams.h"
++#include "nsNetCID.h"
++#include "nsServiceManagerUtils.h"
+ 
+ using namespace mozilla;
+ 
+ //-----------------------------------------------------------------------------
+ 
+ class nsInputStreamReadyEvent MOZ_FINAL
+   : public nsIRunnable
+   , public nsIInputStreamCallback
+@@ -844,8 +846,59 @@ NS_FillArray(FallibleTArray<char>& aDest
+   // NOTE: we rely on the fact that the new slots are NOT initialized by
+   // SetLengthAndRetainStorage here, see nsTArrayElementTraits::Construct()
+   // in nsTArray.h:
+   aDest.SetLengthAndRetainStorage(aKeep + *aNewBytes);
+ 
+   MOZ_ASSERT(aDest.Length() <= aDest.Capacity(), "buffer overflow");
+   return rv;
+ }
++
++nsresult
++NS_CloneInputStream(nsIInputStream* aSource, nsIInputStream** aCloneOut,
++                    nsIInputStream** aReplacementOut)
++{
++  // Attempt to perform the clone directly on the source stream
++  nsCOMPtr<nsICloneableInputStream> cloneable = do_QueryInterface(aSource);
++  if (cloneable && cloneable->GetCloneable()) {
++    if (aReplacementOut) {
++      *aReplacementOut = nullptr;
++    }
++    return cloneable->Clone(aCloneOut);
++  }
++
++  // If we failed the clone and the caller does not want to replace their
++  // original stream, then we are done.  Return error.
++  if (!aReplacementOut) {
++    return NS_ERROR_FAILURE;
++  }
++
++  // The caller has opted-in to the fallback clone support that replaces
++  // the original stream.  Copy the data to a pipe and return two cloned
++  // input streams.
++
++  nsCOMPtr<nsIInputStream> reader;
++  nsCOMPtr<nsIInputStream> readerClone;
++  nsCOMPtr<nsIOutputStream> writer;
++
++  nsresult rv = NS_NewPipe(getter_AddRefs(reader), getter_AddRefs(writer),
++                           0, 0,        // default segment size and max size
++                           true, true); // non-blocking
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  cloneable = do_QueryInterface(reader);
++  MOZ_ASSERT(cloneable && cloneable->GetCloneable());
++
++  rv = cloneable->Clone(getter_AddRefs(readerClone));
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  nsCOMPtr<nsIEventTarget> target =
++    do_GetService(NS_STREAMTRANSPORTSERVICE_CONTRACTID, &rv);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  rv = NS_AsyncCopy(aSource, writer, target, NS_ASYNCCOPY_VIA_WRITESEGMENTS);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  readerClone.forget(aCloneOut);
++  reader.forget(aReplacementOut);
++
++  return NS_OK;
++}
+diff --git a/xpcom/io/nsStreamUtils.h b/xpcom/io/nsStreamUtils.h
+--- a/xpcom/io/nsStreamUtils.h
++++ b/xpcom/io/nsStreamUtils.h
+@@ -259,9 +259,31 @@ struct nsWriteSegmentThunk
+  * @param aNewBytes (out) number of bytes read from aInput or zero if Read()
+  *        failed
+  * @return the result from aInput->Read(...)
+  */
+ extern NS_METHOD
+ NS_FillArray(FallibleTArray<char>& aDest, nsIInputStream* aInput,
+              uint32_t aKeep, uint32_t* aNewBytes);
+ 
++/**
++ * Clone the provided source stream in the most efficient way possible.  This
++ * first attempts to QI to nsICloneableInputStream to use Clone().  If that is
++ * not supported, then a fallback clone is provided by copying the source to
++ * a pipe.  In this case the caller must replace the source stream with the
++ * resulting replacement stream.  The clone and the replacement stream are then
++ * cloneable using nsICloneableInputStream without duplicating memory.  This
++ * fallback clone using the pipe is only performed if a replacement stream
++ * parameter is also passed in.
++ * @param aSource         The input stream to clone.
++ * @param aCloneOut       Required out parameter to hold resulting clone.
++ * @param aReplacementOut Optional out parameter to hold stream to replace
++ *                        original source stream after clone.  If not
++ *                        provided then the fallback clone process is not
++ *                        supported and a non-cloneable source will result
++ *                        in failure.  Replacement streams are non-blocking.
++ * @return NS_OK on successful clone.  Error otherwise.
++ */
++extern nsresult
++NS_CloneInputStream(nsIInputStream* aSource, nsIInputStream** aCloneOut,
++                    nsIInputStream** aReplacementOut = nullptr);
++
+ #endif // !nsStreamUtils_h__

@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent 1864cdca9d89a2f5a9ba276f67ab5ea77a36a1ac
+# Parent e5a5b676b624c28a448a0b6a26b9b2d7c5560840
 # User Ben Kelly <ben@wanderview.com>
 Bug 1100398 P4 Make nsPipeInputStream cloneable.
 
@@ -29,7 +29,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  #include "nsIClassInfoImpl.h"
  #include "nsAlgorithm.h"
  #include "nsMemory.h"
-@@ -83,83 +85,126 @@ private:
+@@ -83,83 +85,120 @@ private:
    nsCOMPtr<nsIAsyncInputStream>     mInputStream;
    nsCOMPtr<nsIInputStreamCallback>  mInputCallback;
    nsCOMPtr<nsIAsyncOutputStream>    mOutputStream;
@@ -65,13 +65,14 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
    , public nsIClassInfo
  {
  public:
-   // since this class will be allocated as a member of the pipe, we do not
-   // need our own ref count.  instead, we share the lifetime (the ref count)
-   // of the entire pipe.  this macro is just convenience since it does not
-   // declare a mRefCount variable; however, don't let the name fool you...
-   // we are not inheriting from nsPipe ;-)
-   NS_DECL_ISUPPORTS_INHERITED
- 
+-  // since this class will be allocated as a member of the pipe, we do not
+-  // need our own ref count.  instead, we share the lifetime (the ref count)
+-  // of the entire pipe.  this macro is just convenience since it does not
+-  // declare a mRefCount variable; however, don't let the name fool you...
+-  // we are not inheriting from nsPipe ;-)
+-  NS_DECL_ISUPPORTS_INHERITED
+-
++  NS_DECL_THREADSAFE_ISUPPORTS
    NS_DECL_NSIINPUTSTREAM
    NS_DECL_NSIASYNCINPUTSTREAM
    NS_DECL_NSISEEKABLESTREAM
@@ -81,10 +82,10 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  
    explicit nsPipeInputStream(nsPipe* aPipe)
      : mPipe(aPipe)
-     , mReaderRefCnt(0)
+-    , mReaderRefCnt(0)
      , mLogicalOffset(0)
      , mBlocking(true)
-+    , mClosed(false)
++    , mStatus(NS_OK)
      , mBlocked(false)
      , mAvailable(0)
      , mCallbackFlags(0)
@@ -92,10 +93,9 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  
 +  explicit nsPipeInputStream(const nsPipeInputStream& aOther)
 +    : mPipe(aOther.mPipe)
-+    , mReaderRefCnt(0)
 +    , mLogicalOffset(aOther.mLogicalOffset)
 +    , mBlocking(aOther.mBlocking)
-+    , mClosed(aOther.mClosed)
++    , mStatus(aOther.mStatus)
 +    , mBlocked(false)
 +    , mAvailable(aOther.mAvailable)
 +    , mCallbackFlags(0)
@@ -135,14 +135,19 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 +    return mReadState;
 +  }
 +
++  nsresult Status() const;
++
  private:
-   nsPipe*                        mPipe;
+-  nsPipe*                        mPipe;
++  virtual ~nsPipeInputStream();
  
-   // separate refcnt so that we know when to close the consumer
-   mozilla::ThreadSafeAutoRefCnt  mReaderRefCnt;
+-  // separate refcnt so that we know when to close the consumer
+-  mozilla::ThreadSafeAutoRefCnt  mReaderRefCnt;
++  nsRefPtr<nsPipe>               mPipe;
++
    int64_t                        mLogicalOffset;
    bool                           mBlocking;
-+  bool                           mClosed;
++  nsresult                       mStatus;
  
    // these variables can only be accessed while inside the pipe's monitor
    bool                           mBlocked;
@@ -160,7 +165,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  class nsPipeOutputStream
    : public nsIAsyncOutputStream
    , public nsIClassInfo
-@@ -235,43 +280,57 @@ public:
+@@ -235,43 +274,63 @@ public:
  private:
    ~nsPipe();
  
@@ -187,7 +192,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
    nsresult GetWriteSegment(char*& aSegment, uint32_t& aSegmentLen);
    void     AdvanceWriteCursor(uint32_t aCount);
  
-+  void     CloseInputStream(nsPipeInputStream* aStream, nsresult aReason);
++  void     OnInputStreamException(nsPipeInputStream* aStream, nsresult aReason);
    void     OnPipeException(nsresult aReason, bool aOutputOnly = false);
  
 +  nsresult CloneInputStream(nsPipeInputStream* aOriginal,
@@ -207,9 +212,15 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 -  nsPipeInputStream   mInput;
    nsPipeOutputStream  mOutput;
  
-+  // Since the input stream can be cloned, we may have more than one.  There
-+  // will always be at least one stream in this list.
-+  nsTArray<nsRefPtr<nsPipeInputStream>> mInputList;
++  // Since the input stream can be cloned, we may have more than one.  Use
++  // a weak reference as the streams will clear their entry here in their
++  // destructor.  Using a strong reference would create a reference cycle.
++  nsTArray<nsPipeInputStream*> mInputList;
++
++  // But hold a strong ref to our original input stream.  For backward
++  // compatibility we need to be able to consistently return this same
++  // object from GetInputStream().
++  nsRefPtr<nsPipeInputStream> mOriginalInput;
 +
    ReentrantMonitor    mReentrantMonitor;
    nsSegmentedBuffer   mBuffer;
@@ -225,7 +236,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
    bool                mInited;
  };
  
-@@ -314,27 +373,25 @@ protected:
+@@ -314,34 +373,51 @@ protected:
  // making changes to this file, please keep this fact in mind.
  //
  
@@ -237,6 +248,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 -  : mInput(MOZ_THIS_IN_INITIALIZER_LIST())
 -  , mOutput(MOZ_THIS_IN_INITIALIZER_LIST())
 +  : mOutput(MOZ_THIS_IN_INITIALIZER_LIST())
++  , mOriginalInput(new nsPipeInputStream(MOZ_THIS_IN_INITIALIZER_LIST()))
    , mReentrantMonitor("nsPipe.mReentrantMonitor")
 -  , mReadCursor(nullptr)
 -  , mReadLimit(nullptr)
@@ -246,16 +258,42 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
    , mStatus(NS_OK)
    , mInited(false)
  {
-+  mInputList.AppendElement(new nsPipeInputStream(this));
++  mInputList.AppendElement(mOriginalInput);
  }
  
  nsPipe::~nsPipe()
  {
  }
  
- NS_IMPL_ISUPPORTS(nsPipe, nsIPipe)
+-NS_IMPL_ISUPPORTS(nsPipe, nsIPipe)
++NS_IMPL_ADDREF(nsPipe)
++NS_IMPL_QUERY_INTERFACE(nsPipe, nsIPipe)
++
++NS_IMETHODIMP_(MozExternalRefCountType)
++nsPipe::Release()
++{
++  MOZ_ASSERT(int32_t(mRefCnt) > 0, "dup release");
++  nsrefcnt count = --mRefCnt;
++  NS_LOG_RELEASE(this, count, "nsPipe");
++  if (count == 0) {
++    delete (this);
++    return 0;
++  }
++  if (mOriginalInput && count == 1) {
++    mOriginalInput = nullptr;
++    return 1;
++  }
++  return count;
++}
  
-@@ -359,122 +416,150 @@ nsPipe::Init(bool aNonBlockingIn,
+ NS_IMETHODIMP
+ nsPipe::Init(bool aNonBlockingIn,
+              bool aNonBlockingOut,
+              uint32_t aSegmentSize,
+              uint32_t aSegmentCount)
+ {
+   mInited = true;
+@@ -359,122 +435,148 @@ nsPipe::Init(bool aNonBlockingIn,
      aSegmentCount = maxCount;
    }
  
@@ -265,10 +303,9 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
    }
  
 -  mInput.SetNonBlocking(aNonBlockingIn);
-+  MOZ_ASSERT(mInputList.Length() == 1);
-+  mInputList[0]->SetNonBlocking(aNonBlockingIn);
-+
    mOutput.SetNonBlocking(aNonBlockingOut);
++  mOriginalInput->SetNonBlocking(aNonBlockingIn);
++
    return NS_OK;
  }
  
@@ -276,8 +313,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  nsPipe::GetInputStream(nsIAsyncInputStream** aInputStream)
  {
 -  NS_ADDREF(*aInputStream = &mInput);
-+  MOZ_ASSERT(mInputList.Length() > 0);
-+  nsRefPtr<nsPipeInputStream> ref = mInputList[0];
++  nsRefPtr<nsPipeInputStream> ref = mOriginalInput;
 +  ref.forget(aInputStream);
    return NS_OK;
  }
@@ -441,7 +477,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
        if (mOutput.OnOutputWritable(events)) {
          mon.Notify();
        }
-@@ -500,27 +585,25 @@ nsPipe::GetWriteSegment(char*& aSegment,
+@@ -500,27 +602,25 @@ nsPipe::GetWriteSegment(char*& aSegment,
      }
      LOG(("OOO appended new segment\n"));
      mWriteCursor = seg;
@@ -473,7 +509,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  }
  
  void
-@@ -533,94 +616,213 @@ nsPipe::AdvanceWriteCursor(uint32_t aByt
+@@ -533,94 +633,218 @@ nsPipe::AdvanceWriteCursor(uint32_t aByt
      ReentrantMonitorAutoEnter mon(mReentrantMonitor);
  
      LOG(("OOO advancing write cursor by %u\n", aBytesWritten));
@@ -533,32 +569,34 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  }
  
  void
-+nsPipe::CloseInputStream(nsPipeInputStream* aStream, nsresult aReason)
++nsPipe::OnInputStreamException(nsPipeInputStream* aStream, nsresult aReason)
 +{
++  MOZ_ASSERT(NS_FAILED(aReason));
++
 +  nsPipeEvents events;
 +  {
 +    ReentrantMonitorAutoEnter mon(mReentrantMonitor);
 +
++    MOZ_ASSERT(mInputList.Length() > 0);
++
++    // If we only have one stream open, then it must be this stream.  Shut
++    // down the entire pipe.
++    if (mInputList.Length() == 1) {
++      MOZ_ASSERT(mInputList[0] == aStream);
++      OnPipeException(aReason);
++      return;
++    }
++
++    // Otherwise just close the particular stream that hit an exception.
 +    for (uint32_t i = 0; i < mInputList.Length(); ++i) {
-+      if (mInputList[i].get() != aStream) {
++      if (mInputList[i] != aStream) {
 +        continue;
 +      }
 +
-+      // If there are more input streams open, then simply notify
-+      // this stream, remove it from the list, and allow the remaining
-+      // streams to continue functioning
-+      if (mInputList.Length() > 1) {
-+        if (mInputList[i]->OnInputException(aReason, events)) {
-+          mon.Notify();
-+        }
-+        mInputList.RemoveElementAt(i);
-+        return;
++      if (mInputList[i]->OnInputException(aReason, events)) {
++        mon.Notify();
 +      }
-+
-+      // Otherwise, this is the last input stream being closed.  Since
-+      // there will be no way to get another open input stream, just
-+      // shut the whole pipe down.
-+      OnPipeException(aReason);
++      mInputList.RemoveElementAt(i);
 +      return;
 +    }
 +  }
@@ -588,10 +626,12 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 -    if (aOutputOnly && !mInput.Available()) {
 -      aOutputOnly = false;
 -    }
++    nsTArray<nsPipeInputStream*> tmpInputList;
 +    for (uint32_t i = 0; i < mInputList.Length(); ++i) {
 +      // an output-only exception applies to the input end if the pipe has
 +      // zero bytes available.
 +      if (aOutputOnly && mInputList[i]->Available()) {
++        tmpInputList.AppendElement(mInputList[i]);
 +        continue;
 +      }
  
@@ -601,6 +641,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
          mon.Notify();
        }
 +    }
++    mInputList = tmpInputList;
  
      if (mOutput.OnOutputException(aReason, events)) {
        mon.Notify();
@@ -722,10 +763,18 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  {
    // dispatch any pending events
  
-@@ -640,23 +842,25 @@ nsPipeEvents::~nsPipeEvents()
+@@ -635,50 +859,55 @@ nsPipeEvents::~nsPipeEvents()
+     mOutputStream = 0;
+   }
+ }
+ 
+ //-----------------------------------------------------------------------------
  // nsPipeInputStream methods:
  //-----------------------------------------------------------------------------
  
++NS_IMPL_ADDREF(nsPipeInputStream);
++NS_IMPL_RELEASE(nsPipeInputStream);
++
  NS_IMPL_QUERY_INTERFACE(nsPipeInputStream,
                          nsIInputStream,
                          nsIAsyncInputStream,
@@ -749,27 +798,90 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  {
    NS_ASSERTION(mBlocking, "wait on non-blocking pipe input stream");
  
-@@ -734,21 +938,27 @@ nsPipeInputStream::Release(void)
-   return mPipe->Release();
+   ReentrantMonitorAutoEnter mon(mPipe->mReentrantMonitor);
+ 
+-  while (NS_SUCCEEDED(mPipe->mStatus) && (mAvailable == 0)) {
++  while (NS_SUCCEEDED(Status()) && (mAvailable == 0)) {
+     LOG(("III pipe input: waiting for data\n"));
+ 
+     mBlocked = true;
+     mon.Wait();
+     mBlocked = false;
+ 
+-    LOG(("III pipe input: woke up [pipe-status=%x available=%u]\n",
+-         mPipe->mStatus, mAvailable));
++    LOG(("III pipe input: woke up [status=%x available=%u]\n",
++         Status(), mAvailable));
+   }
+ 
+-  return mPipe->mStatus == NS_BASE_STREAM_CLOSED ? NS_OK : mPipe->mStatus;
++  return Status() == NS_BASE_STREAM_CLOSED ? NS_OK : Status();
  }
  
+ bool
+ nsPipeInputStream::OnInputReadable(uint32_t aBytesWritten, nsPipeEvents& aEvents)
+ {
+   bool result = false;
+ 
+   mAvailable += aBytesWritten;
+@@ -699,74 +928,66 @@ nsPipeInputStream::OnInputException(nsre
+ {
+   LOG(("nsPipeInputStream::OnInputException [this=%x reason=%x]\n",
+        this, aReason));
+ 
+   bool result = false;
+ 
+   NS_ASSERTION(NS_FAILED(aReason), "huh? successful exception");
+ 
++  if (NS_SUCCEEDED(mStatus)) {
++    mStatus = aReason;
++  }
++
+   // force count of available bytes to zero.
+   mAvailable = 0;
+ 
+   if (mCallback) {
+     aEvents.NotifyInputReady(this, mCallback);
+     mCallback = 0;
+     mCallbackFlags = 0;
+   } else if (mBlocked) {
+     result = true;
+   }
+ 
+   return result;
+ }
+ 
+-NS_IMETHODIMP_(MozExternalRefCountType)
+-nsPipeInputStream::AddRef(void)
+-{
+-  ++mReaderRefCnt;
+-  return mPipe->AddRef();
+-}
+-
+-NS_IMETHODIMP_(MozExternalRefCountType)
+-nsPipeInputStream::Release(void)
+-{
+-  if (--mReaderRefCnt == 0) {
+-    Close();
+-  }
+-  return mPipe->Release();
+-}
+-
  NS_IMETHODIMP
  nsPipeInputStream::CloseWithStatus(nsresult aReason)
  {
    LOG(("III CloseWithStatus [this=%x reason=%x]\n", this, aReason));
  
-+  if (mClosed) {
++  if (NS_FAILED(mStatus)) {
 +    return NS_OK;
 +  }
-+
-+  mClosed = true;
 +
    if (NS_SUCCEEDED(aReason)) {
      aReason = NS_BASE_STREAM_CLOSED;
    }
  
 -  mPipe->OnPipeException(aReason);
-+  mPipe->CloseInputStream(this, aReason);
++  mPipe->OnInputStreamException(this, aReason);
    return NS_OK;
  }
  
@@ -778,7 +890,28 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  {
    return CloseWithStatus(NS_BASE_STREAM_CLOSED);
  }
-@@ -778,17 +988,17 @@ nsPipeInputStream::ReadSegments(nsWriteS
+ 
+ NS_IMETHODIMP
+ nsPipeInputStream::Available(uint64_t* aResult)
+ {
+   // nsPipeInputStream supports under 4GB stream only
+   ReentrantMonitorAutoEnter mon(mPipe->mReentrantMonitor);
+ 
+-  // return error if pipe closed
+-  if (!mAvailable && NS_FAILED(mPipe->mStatus)) {
+-    return mPipe->mStatus;
++  // return error if closed
++  if (!mAvailable && NS_FAILED(Status())) {
++    return Status();
+   }
+ 
+   *aResult = (uint64_t)mAvailable;
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsPipeInputStream::ReadSegments(nsWriteSegmentFun aWriter,
+@@ -778,17 +999,17 @@ nsPipeInputStream::ReadSegments(nsWriteS
  
    nsresult rv = NS_OK;
  
@@ -797,7 +930,26 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
        }
        if (rv == NS_BASE_STREAM_WOULD_BLOCK) {
          // pipe is empty
-@@ -833,17 +1043,17 @@ nsPipeInputStream::ReadSegments(nsWriteS
+@@ -801,17 +1022,17 @@ nsPipeInputStream::ReadSegments(nsWriteS
+           continue;
+         }
+       }
+       // ignore this error, just return.
+       if (rv == NS_BASE_STREAM_CLOSED) {
+         rv = NS_OK;
+         break;
+       }
+-      mPipe->OnPipeException(rv);
++      mPipe->OnInputStreamException(this, rv);
+       break;
+     }
+ 
+     // read no more than aCount
+     if (segmentLen > aCount) {
+       segmentLen = aCount;
+     }
+ 
+@@ -833,17 +1054,17 @@ nsPipeInputStream::ReadSegments(nsWriteS
        segment += writeCount;
        segmentLen -= writeCount;
        aCount -= writeCount;
@@ -816,7 +968,50 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  
  NS_IMETHODIMP
  nsPipeInputStream::Read(char* aToBuf, uint32_t aBufLen, uint32_t* aReadCount)
-@@ -940,17 +1150,17 @@ nsPipeInputStream::Search(const char* aF
+@@ -879,18 +1100,17 @@ nsPipeInputStream::AsyncWait(nsIInputStr
+     }
+ 
+     nsCOMPtr<nsIInputStreamCallback> proxy;
+     if (aTarget) {
+       proxy = NS_NewInputStreamReadyEvent(aCallback, aTarget);
+       aCallback = proxy;
+     }
+ 
+-    if (NS_FAILED(mPipe->mStatus) ||
+-        (mAvailable && !(aFlags & WAIT_CLOSURE_ONLY))) {
++    if (NS_FAILED(Status()) || (mAvailable && !(aFlags & WAIT_CLOSURE_ONLY))) {
+       // stream is already closed or readable; post event.
+       pipeEvents.NotifyInputReady(this, aCallback);
+     } else {
+       // queue up callback object to be notified when data becomes available
+       mCallback = aCallback;
+       mCallbackFlags = aFlags;
+     }
+   }
+@@ -904,19 +1124,19 @@ nsPipeInputStream::Seek(int32_t aWhence,
+   return NS_ERROR_NOT_IMPLEMENTED;
+ }
+ 
+ NS_IMETHODIMP
+ nsPipeInputStream::Tell(int64_t* aOffset)
+ {
+   ReentrantMonitorAutoEnter mon(mPipe->mReentrantMonitor);
+ 
+-  // return error if pipe closed
+-  if (!mAvailable && NS_FAILED(mPipe->mStatus)) {
+-    return mPipe->mStatus;
++  // return error if closed
++  if (!mAvailable && NS_FAILED(Status())) {
++    return Status();
+   }
+ 
+   *aOffset = mLogicalOffset;
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsPipeInputStream::SetEOF()
+@@ -940,17 +1160,17 @@ nsPipeInputStream::Search(const char* aF
  
    ReentrantMonitorAutoEnter mon(mPipe->mReentrantMonitor);
  
@@ -835,7 +1030,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
    }
  
    while (true) {
-@@ -969,17 +1179,17 @@ nsPipeInputStream::Search(const char* aF
+@@ -969,17 +1189,17 @@ nsPipeInputStream::Search(const char* aF
      // get the next segment
      char* cursor2;
      char* limit2;
@@ -854,7 +1049,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
      }
      len2 = limit2 - cursor2;
  
-@@ -1003,16 +1213,29 @@ nsPipeInputStream::Search(const char* aF
+@@ -1003,16 +1223,40 @@ nsPipeInputStream::Search(const char* aF
      cursor1 = cursor2;
      limit1 = limit2;
    }
@@ -874,6 +1069,17 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 +nsPipeInputStream::Clone(nsIInputStream** aCloneOut)
 +{
 +  return mPipe->CloneInputStream(this, aCloneOut);
++}
++
++nsresult
++nsPipeInputStream::Status() const
++{
++  return NS_FAILED(mStatus) ? mStatus : mPipe->mStatus;
++}
++
++nsPipeInputStream::~nsPipeInputStream()
++{
++  Close();
 +}
 +
  //-----------------------------------------------------------------------------
