@@ -1,0 +1,204 @@
+# HG changeset patch
+# Parent 2e9c5301048cba94e3159a55b7a92f839c8ba7c7
+# User Ben Kelly <ben@wanderview.com>
+diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
+--- a/dom/cache/Cache.cpp
++++ b/dom/cache/Cache.cpp
+@@ -70,17 +70,17 @@ namespace cache {
+ 
+ using mozilla::ErrorResult;
+ using mozilla::unused;
+ using mozilla::dom::workers::GetCurrentThreadWorkerPrivate;
+ using mozilla::dom::workers::WorkerPrivate;
+ 
+ NS_IMPL_CYCLE_COLLECTING_ADDREF(mozilla::dom::cache::Cache);
+ NS_IMPL_CYCLE_COLLECTING_RELEASE(mozilla::dom::cache::Cache);
+-NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(Cache, mGlobal)
++NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(Cache, mGlobal, mRequestPromises)
+ 
+ NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Cache)
+   NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+   NS_INTERFACE_MAP_ENTRY(nsISupports)
+ NS_INTERFACE_MAP_END
+ 
+ Cache::Cache(nsIGlobalObject* aGlobal, const nsACString& aOrigin,
+              PCacheChild* aActor)
+@@ -184,33 +184,41 @@ Cache::AddAll(const Sequence<OwningReque
+ {
+   MOZ_ASSERT(mActor);
+ 
+   nsRefPtr<Promise> promise = Promise::Create(mGlobal, aRv);
+   if (!promise) {
+     return nullptr;
+   }
+ 
++  // An empty list of requests has nothing to do.  Resolve immediately.
++  if (aRequests.IsEmpty()) {
++    promise->MaybeResolve(JS::UndefinedHandleValue);
++    return NS_OK;
++  }
++
+   // Be careful not to early exist after this point to avoid leaking
+   // file descriptor resources from stream serialization.
+ 
+   // allocates roughly ~5k on the stack
+   nsAutoTArray<PCacheRequest, 32> requests;
+   requests.SetCapacity(aRequests.Length());
+ 
+-  for(uint32_t i = 0; i < aRequests.Length(); ++i) {
++  for (uint32_t i = 0; i < aRequests.Length(); ++i) {
+     if (!IsValidPutRequestMethod(aRequests[i], aRv)) {
+       break;
+     }
+ 
+-    PCacheRequest* request = requests.AppendElement();
+-    ToPCacheRequest(*request, aRequests[i], ReadBody, ExpandReferrer, aRv);
++    PCacheRequest request;
++    ToPCacheRequest(request, aRequests[i], ReadBody, ExpandReferrer, aRv);
+     if (aRv.Failed()) {
+       break;
+     }
++
++    requests.AppendElement(request);
+   }
+ 
+   if (!aRv.Failed()) {
+     RequestId requestId = AddRequestPromise(promise, aRv);
+     unused << mActor->SendAddAll(requestId, requests);
+   }
+ 
+   for (uint32_t i = 0; i < requests.Length(); ++i) {
+diff --git a/dom/cache/Cache.h b/dom/cache/Cache.h
+--- a/dom/cache/Cache.h
++++ b/dom/cache/Cache.h
+@@ -72,17 +72,17 @@ public:
+          ErrorResult& aRv);
+   already_AddRefed<Promise>
+   Keys(const Optional<RequestOrUSVString>& aRequest,
+        const CacheQueryOptions& aParams, ErrorResult& aRv);
+ 
+   // binding methods
+   static bool PrefEnabled(JSContext* aCx, JSObject* aObj);
+ 
+-  virtual nsISupports* GetParentObject() const;
++  virtual nsISupports* GetParentObject() const MOZ_OVERRIDE;
+   virtual JSObject* WrapObject(JSContext* aContext) MOZ_OVERRIDE;
+ 
+   // methods forwarded from CacheChild
+   void ActorDestroy(mozilla::ipc::IProtocol* aActor);
+   void RecvMatchResponse(RequestId aRequestId, nsresult aRv,
+                          const PCacheResponseOrVoid& aResponse);
+   void RecvMatchAllResponse(RequestId aRequestId, nsresult aRv,
+                             const nsTArray<PCacheResponse>& aResponses);
+@@ -99,18 +99,19 @@ public:
+   GetGlobalObject() const MOZ_OVERRIDE;
+   const nsACString& Origin() const MOZ_OVERRIDE;
+ 
+ #ifdef DEBUG
+   virtual void AssertOwningThread() const MOZ_OVERRIDE;
+ #endif
+ 
+ private:
+-  virtual ~Cache();
++  ~Cache();
+ 
++  // TODO: replace with actor-per-request model in IPC refactor (bug 1110485)
+   RequestId AddRequestPromise(Promise* aPromise, ErrorResult& aRv);
+   already_AddRefed<Promise> RemoveRequestPromise(RequestId aRequestId);
+ 
+ private:
+   nsCOMPtr<nsIGlobalObject> mGlobal;
+   const nsCString mOrigin;
+   CacheChild* mActor;
+   nsTArray<nsRefPtr<Promise>> mRequestPromises;
+diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
+--- a/dom/cache/TypeUtils.cpp
++++ b/dom/cache/TypeUtils.cpp
+@@ -110,16 +110,55 @@ using mozilla::unused;
+ using mozilla::void_t;
+ using mozilla::ipc::BackgroundChild;
+ using mozilla::ipc::FileDescriptor;
+ using mozilla::ipc::FileDescriptorSetChild;
+ using mozilla::ipc::PFileDescriptorSetChild;
+ using mozilla::ipc::PBackgroundChild;
+ using mozilla::ipc::OptionalFileDescriptorSet;
+ 
++TypeUtils::AutoCleanUpFds::AutoCleanUpFds()
++{
++}
++
++TypeUtils::AutoCleanUpFds::~AutoCleanUpFds()
++{
++  for (uint32_t i = 0; i < mStreamBodies.Length(); ++i) {
++    PCacheReadStream& stream = mStreamBodies[i];
++    if (stream.fds().type() !=
++        OptionalFileDescriptorSet::TPFileDescriptorSetChild) {
++      continue;
++    }
++
++    nsAutoTArray<FileDescriptor, 4> fds;
++
++    FileDescriptorSetChild* fdSetActor =
++      static_cast<FileDescriptorSetChild*>(stream.fds().get_PFileDescriptorSetChild());
++    MOZ_ASSERT(fdSetActor);
++
++    fdSetActor->ForgetFileDescriptors(fds);
++  }
++}
++
++void
++TypeUtils::AutoCleanUpFds::Add(PCacheReadStreamOrVoid& aReadStreamOrVoid)
++{
++  if (aReadStreamOrVoid.type() == PCacheReadStreamOrVoid::Tvoid_t) {
++    return;
++  }
++
++  Add(aReadStreamOrVoid.get_PCacheReadStream());
++}
++
++void
++TypeUtils::AutoCleanUpFds::Add(PCacheReadStream& aReadStream)
++{
++  mStreamBodies.AppendElement(aReadStream);
++}
++
+ void
+ TypeUtils::ToPCacheRequest(PCacheRequest& aOut,
+                            const RequestOrUSVString& aIn,
+                            BodyAction aBodyAction,
+                            ReferrerAction aReferrerAction, ErrorResult& aRv)
+ {
+   AutoJSAPI jsapi;
+   jsapi.Init(GetGlobalObject());
+diff --git a/dom/cache/TypeUtils.h b/dom/cache/TypeUtils.h
+--- a/dom/cache/TypeUtils.h
++++ b/dom/cache/TypeUtils.h
+@@ -35,16 +35,28 @@ class PCacheReadStreamOrVoid;
+ class PCacheRequest;
+ class PCacheRequestOrVoid;
+ class PCacheResponse;
+ class PCacheStreamControlChild;
+ 
+ class TypeUtils
+ {
+ protected:
++  class AutoCleanUpFds MOZ_STACK_CLASS MOZ_FINAL
++  {
++  public:
++    AutoCleanUpFds();
++    ~AutoCleanUpFds();
++
++    void Add(PCacheReadStreamOrVoid& aRequest);
++    void Add(PCacheReadStream& aReadStream);
++  private:
++    nsTArray<PCacheReadStream> mStreamBodies;
++  };
++
+   enum BodyAction
+   {
+     IgnoreBody,
+     ReadBody
+   };
+ 
+   enum ReferrerAction
+   {
