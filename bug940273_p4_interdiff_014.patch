@@ -1,0 +1,490 @@
+# HG changeset patch
+# Parent 5b95820f8356fec91823fec233bb9aa90e02a380
+# User Ben Kelly <ben@wanderview.com>
+Bug 940273 P4 interdiff 014 use RAII objects to cleanup fds
+
+diff --git a/dom/cache/AutoUtils.cpp b/dom/cache/AutoUtils.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/AutoUtils.cpp
+@@ -0,0 +1,160 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "mozilla/dom/cache/AutoUtils.h"
++
++#include "mozilla/dom/cache/TypeUtils.h"
++#include "mozilla/ipc/FileDescriptorSetChild.h"
++
++namespace {
++
++using mozilla::dom::cache::PCacheReadStream;
++using mozilla::dom::cache::PCacheReadStreamOrVoid;
++using mozilla::ipc::FileDescriptor;
++using mozilla::ipc::FileDescriptorSetChild;
++using mozilla::ipc::OptionalFileDescriptorSet;
++
++enum CleanupAction
++{
++  ForgetFds,
++  DeleteFds
++};
++
++void
++CleanupChildFds(PCacheReadStream& aReadStream, CleanupAction aAction)
++{
++  if (aReadStream.fds().type() !=
++      OptionalFileDescriptorSet::TPFileDescriptorSetChild) {
++    return;
++  }
++
++  nsAutoTArray<FileDescriptor, 4> fds;
++
++  FileDescriptorSetChild* fdSetActor =
++    static_cast<FileDescriptorSetChild*>(aReadStream.fds().get_PFileDescriptorSetChild());
++  MOZ_ASSERT(fdSetActor);
++
++  if (aAction == DeleteFds) {
++    fdSetActor->Send__delete__(fdSetActor);
++  }
++
++  // FileDescriptorSet doesn't clear its fds in its ActorDestroy, so we
++  // unconditionally forget them here.
++  fdSetActor->ForgetFileDescriptors(fds);
++}
++
++void
++CleanupChildFds(PCacheReadStreamOrVoid& aReadStreamOrVoid, CleanupAction aAction)
++{
++  if (aReadStreamOrVoid.type() == PCacheReadStreamOrVoid::Tvoid_t) {
++    return;
++  }
++
++  CleanupChildFds(aReadStreamOrVoid.get_PCacheReadStream(), aAction);
++}
++
++} // anonymous namespace
++
++namespace mozilla {
++namespace dom {
++namespace cache {
++
++AutoChildRequestList::AutoChildRequestList(TypeUtils* aTypeUtils,
++                                           uint32_t aCapacity)
++  : mTypeUtils(aTypeUtils)
++  , mSent(false)
++{
++  MOZ_ASSERT(mTypeUtils);
++  mRequestList.SetCapacity(aCapacity);
++}
++
++AutoChildRequestList::~AutoChildRequestList()
++{
++  CleanupAction action = mSent ? ForgetFds : DeleteFds;
++  for (uint32_t i = 0; i < mRequestList.Length(); ++i) {
++    CleanupChildFds(mRequestList[i].body(), action);
++  }
++}
++
++void
++AutoChildRequestList::Add(const RequestOrUSVString& aRequest,
++                          BodyAction aBodyAction,
++                          ReferrerAction aReferrerAction, ErrorResult& aRv)
++{
++  PCacheRequest* request = mRequestList.AppendElement();
++  mTypeUtils->ToPCacheRequest(*request, aRequest, aBodyAction, aReferrerAction,
++                              aRv);
++  if (aRv.Failed()) {
++    mRequestList.RemoveElementAt(mRequestList.Length() - 1);
++  }
++}
++
++void
++AutoChildRequestList::Add(const OwningRequestOrUSVString& aRequest,
++                          BodyAction aBodyAction,
++                          ReferrerAction aReferrerAction, ErrorResult& aRv)
++{
++  PCacheRequest* request = mRequestList.AppendElement();
++  mTypeUtils->ToPCacheRequest(*request, aRequest, aBodyAction, aReferrerAction,
++                              aRv);
++  if (aRv.Failed()) {
++    mRequestList.RemoveElementAt(mRequestList.Length() - 1);
++  }
++}
++
++const nsTArray<PCacheRequest>&
++AutoChildRequestList::SendAsRequestList()
++{
++  MOZ_ASSERT(!mSent);
++  mSent = true;
++  return mRequestList;
++}
++
++// --------------------------------------------
++
++AutoChildRequestResponse::AutoChildRequestResponse(TypeUtils* aTypeUtils)
++  : mTypeUtils(aTypeUtils)
++  , mSent(false)
++{
++  // Default IPC-generated constructor does not initialize these correctly
++  // and we check them later when cleaning up.
++  mRequestResponse.request().body() = void_t();
++  mRequestResponse.response().body() = void_t();
++}
++
++AutoChildRequestResponse::~AutoChildRequestResponse()
++{
++  CleanupAction action = mSent ? ForgetFds : DeleteFds;
++  CleanupChildFds(mRequestResponse.request().body(), action);
++  CleanupChildFds(mRequestResponse.response().body(), action);
++}
++
++void
++AutoChildRequestResponse::Add(const RequestOrUSVString& aRequest,
++                              BodyAction aBodyAction,
++                              ReferrerAction aReferrerAction, ErrorResult& aRv)
++{
++  mTypeUtils->ToPCacheRequest(mRequestResponse.request(), aRequest, aBodyAction,
++                              aReferrerAction, aRv);
++}
++
++void
++AutoChildRequestResponse::Add(Response& aResponse, ErrorResult& aRv)
++{
++  mTypeUtils->ToPCacheResponse(mRequestResponse.response(), aResponse, aRv);
++}
++
++const CacheRequestResponse&
++AutoChildRequestResponse::SendAsRequestResponse()
++{
++  MOZ_ASSERT(!mSent);
++  mSent = true;
++  return mRequestResponse;
++}
++
++} // namespace cache
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/cache/AutoUtils.h b/dom/cache/AutoUtils.h
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/AutoUtils.h
+@@ -0,0 +1,75 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_cache_AutoUtils_h
++#define mozilla_dom_cache_AutoUtils_h
++
++#include "mozilla/Attributes.h"
++#include "mozilla/dom/cache/PCacheTypes.h"
++#include "mozilla/dom/cache/TypeUtils.h"
++#include "nsTArray.h"
++
++namespace mozilla {
++
++class ErrorResult;
++
++namespace dom {
++
++class OwningRequestOrUSVString;
++class RequestOrUSVString;
++
++namespace cache {
++
++class AutoChildRequestList MOZ_STACK_CLASS MOZ_FINAL
++{
++public:
++  typedef TypeUtils::BodyAction BodyAction;
++  typedef TypeUtils::ReferrerAction ReferrerAction;
++
++  AutoChildRequestList(TypeUtils* aTypeUtils, uint32_t aCapacity);
++  ~AutoChildRequestList();
++
++  void Add(const RequestOrUSVString& aRequest, BodyAction aBodyAction,
++           ReferrerAction aReferrerAction, ErrorResult& aRv);
++  void Add(const OwningRequestOrUSVString& aRequest, BodyAction aBodyAction,
++           ReferrerAction aReferrerAction, ErrorResult& aRv);
++
++  const nsTArray<PCacheRequest>& SendAsRequestList();
++
++private:
++  TypeUtils* mTypeUtils;
++  bool mSent;
++
++  // Allocates ~5k inline in the stack-only class
++  nsAutoTArray<PCacheRequest, 32> mRequestList;
++};
++
++class AutoChildRequestResponse MOZ_STACK_CLASS MOZ_FINAL
++{
++public:
++  typedef TypeUtils::BodyAction BodyAction;
++  typedef TypeUtils::ReferrerAction ReferrerAction;
++
++  AutoChildRequestResponse(TypeUtils* aTypeUtils);
++  ~AutoChildRequestResponse();
++
++  void Add(const RequestOrUSVString& aRequest, BodyAction aBodyAction,
++           ReferrerAction aReferrerAction, ErrorResult& aRv);
++  void Add(Response& aResponse, ErrorResult& aRv);
++
++  const CacheRequestResponse& SendAsRequestResponse();
++
++private:
++  TypeUtils* mTypeUtils;
++  bool mSent;
++  CacheRequestResponse mRequestResponse;
++};
++
++} // namespace cache
++} // namespace dom
++} // namespace mozilla
++
++#endif // mozilla_dom_cache_AutoUtils_h
+diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
+--- a/dom/cache/Cache.cpp
++++ b/dom/cache/Cache.cpp
+@@ -7,16 +7,17 @@
+ #include "mozilla/dom/cache/Cache.h"
+ 
+ #include "mozilla/dom/Headers.h"
+ #include "mozilla/dom/InternalResponse.h"
+ #include "mozilla/dom/Promise.h"
+ #include "mozilla/dom/Response.h"
+ #include "mozilla/dom/WorkerPrivate.h"
+ #include "mozilla/dom/CacheBinding.h"
++#include "mozilla/dom/cache/AutoUtils.h"
+ #include "mozilla/dom/cache/CacheChild.h"
+ #include "mozilla/dom/cache/ReadStream.h"
+ #include "mozilla/dom/cache/TypeUtils.h"
+ #include "mozilla/ErrorResult.h"
+ #include "mozilla/Preferences.h"
+ #include "mozilla/unused.h"
+ #include "nsIGlobalObject.h"
+ #include "nsNetUtil.h"
+@@ -70,17 +71,17 @@ namespace cache {
+ 
+ using mozilla::ErrorResult;
+ using mozilla::unused;
+ using mozilla::dom::workers::GetCurrentThreadWorkerPrivate;
+ using mozilla::dom::workers::WorkerPrivate;
+ 
+ NS_IMPL_CYCLE_COLLECTING_ADDREF(mozilla::dom::cache::Cache);
+ NS_IMPL_CYCLE_COLLECTING_RELEASE(mozilla::dom::cache::Cache);
+-NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(Cache, mGlobal)
++NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(Cache, mGlobal, mRequestPromises)
+ 
+ NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Cache)
+   NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+   NS_INTERFACE_MAP_ENTRY(nsISupports)
+ NS_INTERFACE_MAP_END
+ 
+ Cache::Cache(nsIGlobalObject* aGlobal, const nsACString& aOrigin,
+              PCacheChild* aActor)
+@@ -156,75 +157,56 @@ Cache::Add(const RequestOrUSVString& aRe
+     return nullptr;
+   }
+ 
+   nsRefPtr<Promise> promise = Promise::Create(mGlobal, aRv);
+   if (!promise) {
+     return nullptr;
+   }
+ 
+-
+-  nsAutoTArray<PCacheRequest, 1> requests;
+-  PCacheRequest* request = requests.AppendElement();
+-  ToPCacheRequest(*request, aRequest, ReadBody, ExpandReferrer, aRv);
++  AutoChildRequestList requests(this, 1);
++  requests.Add(aRequest, ReadBody, ExpandReferrer, aRv);
+   if (aRv.Failed()) {
+     return nullptr;
+   }
+ 
+   RequestId requestId = AddRequestPromise(promise, aRv);
+ 
+-  unused << mActor->SendAddAll(requestId, requests);
+-
+-  CleanupChildFds(request->body());
++  unused << mActor->SendAddAll(requestId, requests.SendAsRequestList());
+ 
+   return promise.forget();
+ }
+ 
+ already_AddRefed<Promise>
+ Cache::AddAll(const Sequence<OwningRequestOrUSVString>& aRequests,
+               ErrorResult& aRv)
+ {
+   MOZ_ASSERT(mActor);
+ 
+   nsRefPtr<Promise> promise = Promise::Create(mGlobal, aRv);
+   if (!promise) {
+     return nullptr;
+   }
+ 
+-  // Be careful not to early exist after this point to avoid leaking
+-  // file descriptor resources from stream serialization.
++  AutoChildRequestList requests(this, aRequests.Length());
+ 
+-  // allocates roughly ~5k on the stack
+-  nsAutoTArray<PCacheRequest, 32> requests;
+-  requests.SetCapacity(aRequests.Length());
+-
+-  for(uint32_t i = 0; i < aRequests.Length(); ++i) {
++  for (uint32_t i = 0; i < aRequests.Length(); ++i) {
+     if (!IsValidPutRequestMethod(aRequests[i], aRv)) {
+-      break;
++      return nullptr;
+     }
+ 
+-    PCacheRequest* request = requests.AppendElement();
+-    ToPCacheRequest(*request, aRequests[i], ReadBody, ExpandReferrer, aRv);
++    requests.Add(aRequests[i], ReadBody, ExpandReferrer, aRv);
+     if (aRv.Failed()) {
+-      break;
++      return nullptr;
+     }
+   }
+ 
+-  if (!aRv.Failed()) {
+-    RequestId requestId = AddRequestPromise(promise, aRv);
+-    unused << mActor->SendAddAll(requestId, requests);
+-  }
++  RequestId requestId = AddRequestPromise(promise, aRv);
+ 
+-  for (uint32_t i = 0; i < requests.Length(); ++i) {
+-    CleanupChildFds(requests[i].body());
+-  }
+-
+-  if (aRv.Failed()) {
+-    return nullptr;
+-  }
++  unused << mActor->SendAddAll(requestId, requests.SendAsRequestList());
+ 
+   return promise.forget();
+ }
+ 
+ already_AddRefed<Promise>
+ Cache::Put(const RequestOrUSVString& aRequest, Response& aResponse,
+            ErrorResult& aRv)
+ {
+@@ -234,41 +216,32 @@ Cache::Put(const RequestOrUSVString& aRe
+     return nullptr;
+   }
+ 
+   nsRefPtr<Promise> promise = Promise::Create(mGlobal, aRv);
+   if (!promise) {
+     return nullptr;
+   }
+ 
+-  CacheRequestResponse put;
++  AutoChildRequestResponse put(this);
+ 
+-  // Be careful not to early exist after this point to avoid leaking
+-  // file descriptor resources from stream serialization.
+-
+-  ToPCacheRequest(put.request(), aRequest, ReadBody, PassThroughReferrer, aRv);
+-
+-  put.response().body() = void_t();
+-  if (!aRv.Failed()) {
+-    ToPCacheResponse(put.response(), aResponse, aRv);
+-  }
+-
+-  if (!aRv.Failed()) {
+-    RequestId requestId = AddRequestPromise(promise, aRv);
+-
+-    unused << mActor->SendPut(requestId, put);
+-  }
+-
+-  CleanupChildFds(put.request().body());
+-  CleanupChildFds(put.response().body());
+-
++  put.Add(aRequest, ReadBody, PassThroughReferrer, aRv);
+   if (aRv.Failed()) {
+     return nullptr;
+   }
+ 
++  put.Add(aResponse, aRv);
++  if (aRv.Failed()) {
++    return nullptr;
++  }
++
++  RequestId requestId = AddRequestPromise(promise, aRv);
++
++  unused << mActor->SendPut(requestId, put.SendAsRequestResponse());
++
+   return promise.forget();
+ }
+ 
+ already_AddRefed<Promise>
+ Cache::Delete(const RequestOrUSVString& aRequest,
+               const CacheQueryOptions& aOptions, ErrorResult& aRv)
+ {
+   MOZ_ASSERT(mActor);
+diff --git a/dom/cache/TypeUtils.h b/dom/cache/TypeUtils.h
+--- a/dom/cache/TypeUtils.h
++++ b/dom/cache/TypeUtils.h
+@@ -34,17 +34,17 @@ class PCacheReadStream;
+ class PCacheReadStreamOrVoid;
+ class PCacheRequest;
+ class PCacheRequestOrVoid;
+ class PCacheResponse;
+ class PCacheStreamControlChild;
+ 
+ class TypeUtils
+ {
+-protected:
++public:
+   enum BodyAction
+   {
+     IgnoreBody,
+     ReadBody
+   };
+ 
+   enum ReferrerAction
+   {
+diff --git a/dom/cache/moz.build b/dom/cache/moz.build
+--- a/dom/cache/moz.build
++++ b/dom/cache/moz.build
+@@ -1,16 +1,17 @@
+ # -*- Mode: python; c-basic-offset: 4; indent-tabs-mode: nil; tab-width: 40 -*-
+ # vim: set filetype=python:
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ EXPORTS.mozilla.dom.cache += [
+     'Action.h',
++    'AutoUtils.h',
+     'Cache.h',
+     'CacheChild.h',
+     'CacheParent.h',
+     'CacheStorage.h',
+     'CacheStorageChild.h',
+     'CacheStorageParent.h',
+     'CacheStreamControlChild.h',
+     'CacheStreamControlParent.h',
+@@ -29,16 +30,17 @@ EXPORTS.mozilla.dom.cache += [
+     'ShutdownObserver.h',
+     'StreamList.h',
+     'Types.h',
+     'TypeUtils.h',
+ ]
+ 
+ SOURCES += [
+     'Action.cpp',
++    'AutoUtils.cpp',
+     'Cache.cpp',
+     'CacheChild.cpp',
+     'CacheParent.cpp',
+     'CacheStorage.cpp',
+     'CacheStorageChild.cpp',
+     'CacheStorageParent.cpp',
+     'CacheStreamControlChild.cpp',
+     'CacheStreamControlParent.cpp',
