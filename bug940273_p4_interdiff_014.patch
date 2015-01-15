@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent 5b95820f8356fec91823fec233bb9aa90e02a380
+# Parent 7872ba2c49778e28869016b2657809d6829618a5
 # User Ben Kelly <ben@wanderview.com>
 Bug 940273 P4 interdiff 014 use RAII objects to cleanup fds
 
@@ -7,7 +7,7 @@ diff --git a/dom/cache/AutoUtils.cpp b/dom/cache/AutoUtils.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/AutoUtils.cpp
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,392 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -16,15 +16,24 @@ new file mode 100644
 +
 +#include "mozilla/dom/cache/AutoUtils.h"
 +
++#include "mozilla/unused.h"
++#include "mozilla/dom/cache/CacheStreamControlParent.h"
++#include "mozilla/dom/cache/ReadStream.h"
++#include "mozilla/dom/cache/SavedTypes.h"
++#include "mozilla/dom/cache/StreamList.h"
 +#include "mozilla/dom/cache/TypeUtils.h"
 +#include "mozilla/ipc/FileDescriptorSetChild.h"
++#include "mozilla/ipc/FileDescriptorSetParent.h"
++#include "mozilla/ipc/PBackgroundParent.h"
 +
 +namespace {
 +
++using mozilla::unused;
 +using mozilla::dom::cache::PCacheReadStream;
 +using mozilla::dom::cache::PCacheReadStreamOrVoid;
 +using mozilla::ipc::FileDescriptor;
 +using mozilla::ipc::FileDescriptorSetChild;
++using mozilla::ipc::FileDescriptorSetParent;
 +using mozilla::ipc::OptionalFileDescriptorSet;
 +
 +enum CleanupAction
@@ -48,7 +57,7 @@ new file mode 100644
 +  MOZ_ASSERT(fdSetActor);
 +
 +  if (aAction == DeleteFds) {
-+    fdSetActor->Send__delete__(fdSetActor);
++    unused << fdSetActor->Send__delete__(fdSetActor);
 +  }
 +
 +  // FileDescriptorSet doesn't clear its fds in its ActorDestroy, so we
@@ -66,11 +75,46 @@ new file mode 100644
 +  CleanupChildFds(aReadStreamOrVoid.get_PCacheReadStream(), aAction);
 +}
 +
++void
++CleanupParentFds(PCacheReadStream& aReadStream, CleanupAction aAction)
++{
++  if (aReadStream.fds().type() !=
++      OptionalFileDescriptorSet::TPFileDescriptorSetParent) {
++    return;
++  }
++
++  nsAutoTArray<FileDescriptor, 4> fds;
++
++  FileDescriptorSetParent* fdSetActor =
++    static_cast<FileDescriptorSetParent*>(aReadStream.fds().get_PFileDescriptorSetParent());
++  MOZ_ASSERT(fdSetActor);
++
++  if (aAction == DeleteFds) {
++    unused << fdSetActor->Send__delete__(fdSetActor);
++  }
++
++  // FileDescriptorSet doesn't clear its fds in its ActorDestroy, so we
++  // unconditionally forget them here.
++  fdSetActor->ForgetFileDescriptors(fds);
++}
++
++void
++CleanupParentFds(PCacheReadStreamOrVoid& aReadStreamOrVoid, CleanupAction aAction)
++{
++  if (aReadStreamOrVoid.type() == PCacheReadStreamOrVoid::Tvoid_t) {
++    return;
++  }
++
++  CleanupParentFds(aReadStreamOrVoid.get_PCacheReadStream(), aAction);
++}
++
 +} // anonymous namespace
 +
 +namespace mozilla {
 +namespace dom {
 +namespace cache {
++
++using mozilla::ipc::PBackgroundParent;
 +
 +AutoChildRequestList::AutoChildRequestList(TypeUtils* aTypeUtils,
 +                                           uint32_t aCapacity)
@@ -94,6 +138,16 @@ new file mode 100644
 +                          BodyAction aBodyAction,
 +                          ReferrerAction aReferrerAction, ErrorResult& aRv)
 +{
++  MOZ_ASSERT(!mSent);
++
++  // The FileDescriptorSetChild asserts in its destructor that all fds have
++  // been removed.  The copy constructor, however, simply duplicates the
++  // fds without removing any.  This means each temporary and copy must be
++  // explicitly cleaned up.
++  //
++  // Avoid a lot of this hassle by making sure we only create one here.  On
++  // error we remove it.
++
 +  PCacheRequest* request = mRequestList.AppendElement();
 +  mTypeUtils->ToPCacheRequest(*request, aRequest, aBodyAction, aReferrerAction,
 +                              aRv);
@@ -107,6 +161,11 @@ new file mode 100644
 +                          BodyAction aBodyAction,
 +                          ReferrerAction aReferrerAction, ErrorResult& aRv)
 +{
++  MOZ_ASSERT(!mSent);
++
++  // Same issue as above.  Make sure only one object is created and remove it
++  // on error.
++
 +  PCacheRequest* request = mRequestList.AppendElement();
 +  mTypeUtils->ToPCacheRequest(*request, aRequest, aBodyAction, aReferrerAction,
 +                              aRv);
@@ -147,6 +206,7 @@ new file mode 100644
 +                              BodyAction aBodyAction,
 +                              ReferrerAction aReferrerAction, ErrorResult& aRv)
 +{
++  MOZ_ASSERT(!mSent);
 +  mTypeUtils->ToPCacheRequest(mRequestResponse.request(), aRequest, aBodyAction,
 +                              aReferrerAction, aRv);
 +}
@@ -154,6 +214,7 @@ new file mode 100644
 +void
 +AutoChildRequestResponse::Add(Response& aResponse, ErrorResult& aRv)
 +{
++  MOZ_ASSERT(!mSent);
 +  mTypeUtils->ToPCacheResponse(mRequestResponse.response(), aResponse, aRv);
 +}
 +
@@ -165,6 +226,177 @@ new file mode 100644
 +  return mRequestResponse;
 +}
 +
++// --------------------------------------------
++
++AutoParentBase::AutoParentBase(PBackgroundParent* aManager)
++  : mManager(aManager)
++  , mSent(false)
++{
++  MOZ_ASSERT(mManager);
++}
++
++AutoParentBase::~AutoParentBase()
++{
++  if (!mSent && mStreamControl) {
++    unused << PCacheStreamControlParent::Send__delete__(mStreamControl);
++  }
++}
++
++void
++AutoParentBase::SerializeReadStream(const nsID& aId, StreamList* aStreamList,
++                                    PCacheReadStream* aReadStreamOut)
++{
++  MOZ_ASSERT(aStreamList);
++  MOZ_ASSERT(aReadStreamOut);
++  MOZ_ASSERT(!mSent);
++
++  nsCOMPtr<nsIInputStream> stream = aStreamList->Extract(aId);
++  MOZ_ASSERT(stream);
++
++  if (!mStreamControl) {
++    mStreamControl = new CacheStreamControlParent();
++    DebugOnly<PCacheStreamControlParent*> actor =
++      mManager->SendPCacheStreamControlConstructor(mStreamControl);
++    MOZ_ASSERT(mStreamControl == actor);
++  }
++
++  aStreamList->SetStreamControl(mStreamControl);
++
++  nsRefPtr<ReadStream> readStream = ReadStream::Create(mStreamControl,
++                                                       aId, stream);
++  readStream->Serialize(aReadStreamOut);
++}
++
++// --------------------------------------------
++
++AutoParentRequestList::AutoParentRequestList(PBackgroundParent* aManager,
++                                             uint32_t aCapacity)
++  : AutoParentBase(aManager)
++{
++  mRequestList.SetCapacity(aCapacity);
++}
++
++AutoParentRequestList::~AutoParentRequestList()
++{
++  CleanupAction action = mSent ? ForgetFds : DeleteFds;
++  for (uint32_t i = 0; i < mRequestList.Length(); ++i) {
++    CleanupParentFds(mRequestList[i].body(), action);
++  }
++}
++
++void
++AutoParentRequestList::Add(const SavedRequest& aSavedRequest,
++                           StreamList* aStreamList)
++{
++  MOZ_ASSERT(!mSent);
++
++  PCacheRequest* request = mRequestList.AppendElement();
++  *request = aSavedRequest.mValue;
++
++  if (!aSavedRequest.mHasBodyId) {
++    request->body() = void_t();
++    return;
++  }
++
++  SerializeReadStream(aSavedRequest.mBodyId, aStreamList,
++                      &request->body().get_PCacheReadStream());
++}
++
++const nsTArray<PCacheRequest>&
++AutoParentRequestList::SendAsRequestList()
++{
++  MOZ_ASSERT(!mSent);
++  mSent = true;
++  return mRequestList;
++}
++
++// --------------------------------------------
++
++AutoParentResponseList::AutoParentResponseList(PBackgroundParent* aManager,
++                                               uint32_t aCapacity)
++  : AutoParentBase(aManager)
++{
++  mResponseList.SetCapacity(aCapacity);
++}
++
++AutoParentResponseList::~AutoParentResponseList()
++{
++  CleanupAction action = mSent ? ForgetFds : DeleteFds;
++  for (uint32_t i = 0; i < mResponseList.Length(); ++i) {
++    CleanupParentFds(mResponseList[i].body(), action);
++  }
++}
++
++void
++AutoParentResponseList::Add(const SavedResponse& aSavedResponse,
++                            StreamList* aStreamList)
++{
++  MOZ_ASSERT(!mSent);
++
++  mResponseList.AppendElement(aSavedResponse.mValue);
++  PCacheResponse& response = mResponseList.LastElement();
++
++  if (!aSavedResponse.mHasBodyId) {
++    response.body() = void_t();
++    return;
++  }
++
++  SerializeReadStream(aSavedResponse.mBodyId, aStreamList,
++                      &response.body().get_PCacheReadStream());
++}
++
++const nsTArray<PCacheResponse>&
++AutoParentResponseList::SendAsResponseList()
++{
++  MOZ_ASSERT(!mSent);
++  mSent = true;
++  return mResponseList;
++}
++
++// --------------------------------------------
++
++AutoParentResponseOrVoid::AutoParentResponseOrVoid(ipc::PBackgroundParent* aManager)
++  : AutoParentBase(aManager)
++{
++  mResponseOrVoid = void_t();
++}
++
++AutoParentResponseOrVoid::~AutoParentResponseOrVoid()
++{
++  if (mResponseOrVoid.type() != PCacheResponseOrVoid::TPCacheResponse) {
++    return;
++  }
++
++  CleanupAction action = mSent ? ForgetFds : DeleteFds;
++  CleanupParentFds(mResponseOrVoid.get_PCacheResponse().body(), action);
++}
++
++void
++AutoParentResponseOrVoid::Add(const SavedResponse& aSavedResponse,
++                              StreamList* aStreamList)
++{
++  MOZ_ASSERT(!mSent);
++
++  mResponseOrVoid = aSavedResponse.mValue;
++  PCacheResponse& response = mResponseOrVoid.get_PCacheResponse();
++
++  if (!aSavedResponse.mHasBodyId) {
++    response.body() = void_t();
++    return;
++  }
++
++  SerializeReadStream(aSavedResponse.mBodyId, aStreamList,
++                      &response.body().get_PCacheReadStream());
++}
++
++const PCacheResponseOrVoid&
++AutoParentResponseOrVoid::SendAsResponseOrVoid()
++{
++  MOZ_ASSERT(!mSent);
++  mSent = true;
++  return mResponseOrVoid;
++}
++
 +} // namespace cache
 +} // namespace dom
 +} // namespace mozilla
@@ -172,7 +404,7 @@ diff --git a/dom/cache/AutoUtils.h b/dom/cache/AutoUtils.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/AutoUtils.h
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,144 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -187,9 +419,15 @@ new file mode 100644
 +#include "mozilla/dom/cache/TypeUtils.h"
 +#include "nsTArray.h"
 +
++struct nsID;
++
 +namespace mozilla {
 +
 +class ErrorResult;
++
++namespace ipc {
++class PBackgroundParent;
++}
 +
 +namespace dom {
 +
@@ -197,6 +435,11 @@ new file mode 100644
 +class RequestOrUSVString;
 +
 +namespace cache {
++
++class CacheStreamControlParent;
++class SavedRequest;
++class SavedResponse;
++class StreamList;
 +
 +class AutoChildRequestList MOZ_STACK_CLASS MOZ_FINAL
 +{
@@ -241,6 +484,64 @@ new file mode 100644
 +  TypeUtils* mTypeUtils;
 +  bool mSent;
 +  CacheRequestResponse mRequestResponse;
++};
++
++class AutoParentBase MOZ_STACK_CLASS
++{
++protected:
++  AutoParentBase(ipc::PBackgroundParent* aManager);
++  virtual ~AutoParentBase() = 0;
++
++  void SerializeReadStream(const nsID& aId, StreamList* aStreamList,
++                           PCacheReadStream* aReadStreamOut);
++
++  ipc::PBackgroundParent* mManager;
++  CacheStreamControlParent* mStreamControl;
++  bool mSent;
++};
++
++class AutoParentRequestList MOZ_STACK_CLASS MOZ_FINAL : public AutoParentBase
++{
++public:
++  AutoParentRequestList(ipc::PBackgroundParent* aManager, uint32_t aCapacity);
++  ~AutoParentRequestList();
++
++  void Add(const SavedRequest& aSavedRequest, StreamList* aStreamList);
++
++  const nsTArray<PCacheRequest>& SendAsRequestList();
++
++private:
++  // Allocates ~5k inline in the stack-only class
++  nsAutoTArray<PCacheRequest, 32> mRequestList;
++};
++
++class AutoParentResponseList MOZ_STACK_CLASS MOZ_FINAL : public AutoParentBase
++{
++public:
++  AutoParentResponseList(ipc::PBackgroundParent* aManager, uint32_t aCapacity);
++  ~AutoParentResponseList();
++
++  void Add(const SavedResponse& aSavedResponse, StreamList* aStreamList);
++
++  const nsTArray<PCacheResponse>& SendAsResponseList();
++
++private:
++  // Allocates ~4k inline in the stack-only class
++  nsAutoTArray<PCacheResponse, 32> mResponseList;
++};
++
++class AutoParentResponseOrVoid MOZ_STACK_CLASS MOZ_FINAL : public AutoParentBase
++{
++public:
++  AutoParentResponseOrVoid(ipc::PBackgroundParent* aManager);
++  ~AutoParentResponseOrVoid();
++
++  void Add(const SavedResponse& aSavedResponse, StreamList* aStreamList);
++
++  const PCacheResponseOrVoid& SendAsResponseOrVoid();
++
++private:
++  PCacheResponseOrVoid mResponseOrVoid;
 +};
 +
 +} // namespace cache
@@ -427,6 +728,214 @@ diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
                const CacheQueryOptions& aOptions, ErrorResult& aRv)
  {
    MOZ_ASSERT(mActor);
+diff --git a/dom/cache/CacheParent.cpp b/dom/cache/CacheParent.cpp
+--- a/dom/cache/CacheParent.cpp
++++ b/dom/cache/CacheParent.cpp
+@@ -3,16 +3,17 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/CacheParent.h"
+ 
+ #include "mozilla/DebugOnly.h"
+ #include "mozilla/unused.h"
++#include "mozilla/dom/cache/AutoUtils.h"
+ #include "mozilla/dom/cache/CacheStreamControlParent.h"
+ #include "mozilla/dom/cache/ReadStream.h"
+ #include "mozilla/dom/cache/SavedTypes.h"
+ #include "mozilla/dom/cache/StreamList.h"
+ #include "mozilla/ipc/InputStreamUtils.h"
+ #include "mozilla/ipc/PBackgroundParent.h"
+ #include "mozilla/ipc/FileDescriptorSetParent.h"
+ #include "mozilla/ipc/PFileDescriptorSetParent.h"
+@@ -145,71 +146,44 @@ CacheParent::RecvKeys(const RequestId& a
+   return true;
+ }
+ 
+ void
+ CacheParent::OnCacheMatch(RequestId aRequestId, nsresult aRv,
+                           const SavedResponse* aSavedResponse,
+                           StreamList* aStreamList)
+ {
+-  PCacheResponseOrVoid responseOrVoid;
++  AutoParentResponseOrVoid response(Manager());
+ 
+   // no match
+   if (NS_FAILED(aRv) || !aSavedResponse || !aStreamList) {
+-    responseOrVoid = void_t();
+-    unused << SendMatchResponse(aRequestId, aRv, responseOrVoid);
++    unused << SendMatchResponse(aRequestId, aRv,
++                                response.SendAsResponseOrVoid());
+     return;
+   }
+ 
+-  // match without body data to stream
+-  if (!aSavedResponse->mHasBodyId) {
+-    responseOrVoid = aSavedResponse->mValue;
+-    responseOrVoid.get_PCacheResponse().body() = void_t();
+-    unused << SendMatchResponse(aRequestId, aRv, responseOrVoid);
+-    return;
++  if (aSavedResponse) {
++    response.Add(*aSavedResponse, aStreamList);
+   }
+ 
+-  PCacheReadStream readStream;
+-  SerializeReadStream(nullptr, aSavedResponse->mBodyId, aStreamList,
+-                      &readStream);
+-
+-  responseOrVoid = aSavedResponse->mValue;
+-  responseOrVoid.get_PCacheResponse().body() = readStream;
+-
+-  unused << SendMatchResponse(aRequestId, aRv, responseOrVoid);
++  unused << SendMatchResponse(aRequestId, aRv, response.SendAsResponseOrVoid());
+ }
+ 
+ void
+ CacheParent::OnCacheMatchAll(RequestId aRequestId, nsresult aRv,
+                              const nsTArray<SavedResponse>& aSavedResponses,
+                              StreamList* aStreamList)
+ {
+-  CacheStreamControlParent* streamControl = nullptr;
+-
+-  // Allocates ~4k on the stack
+-  nsAutoTArray<PCacheResponse, 32> responses;
+-  responses.SetCapacity(aSavedResponses.Length());
++  AutoParentResponseList responses(Manager(), aSavedResponses.Length());
+ 
+   for (uint32_t i = 0; i < aSavedResponses.Length(); ++i) {
+-    PCacheResponse* res = responses.AppendElement();
+-    *res = aSavedResponses[i].mValue;
+-
+-    if (!aSavedResponses[i].mHasBodyId) {
+-      res->body() = void_t();
+-      continue;
+-    }
+-
+-    PCacheReadStream readStream;
+-    streamControl =
+-      SerializeReadStream(streamControl, aSavedResponses[i].mBodyId,
+-                          aStreamList, &readStream);
+-    res->body() = readStream;
++    responses.Add(aSavedResponses[i], aStreamList);
+   }
+ 
+-  unused << SendMatchAllResponse(aRequestId, aRv, responses);
++  unused << SendMatchAllResponse(aRequestId, aRv, responses.SendAsResponseList());
+ }
+ 
+ void
+ CacheParent::OnCachePutAll(RequestId aRequestId, nsresult aRv)
+ {
+   unused << SendPutResponse(aRequestId, aRv);
+ }
+ 
+@@ -219,77 +193,33 @@ CacheParent::OnCacheDelete(RequestId aRe
+   unused << SendDeleteResponse(aRequestId, aRv, aSuccess);
+ }
+ 
+ void
+ CacheParent::OnCacheKeys(RequestId aRequestId, nsresult aRv,
+                          const nsTArray<SavedRequest>& aSavedRequests,
+                          StreamList* aStreamList)
+ {
+-  CacheStreamControlParent* streamControl = nullptr;
+-
+-  // Allocates ~5k on the stack
+-  nsAutoTArray<PCacheRequest, 32> requests;
+-  requests.SetCapacity(aSavedRequests.Length());
++  AutoParentRequestList requests(Manager(), aSavedRequests.Length());
+ 
+   for (uint32_t i = 0; i < aSavedRequests.Length(); ++i) {
+-    PCacheRequest* req = requests.AppendElement();
+-    *req = aSavedRequests[i].mValue;
+-
+-    if (!aSavedRequests[i].mHasBodyId) {
+-      req->body() = void_t();
+-      continue;
+-    }
+-
+-    PCacheReadStream readStream;
+-    streamControl =
+-      SerializeReadStream(streamControl, aSavedRequests[i].mBodyId,
+-                          aStreamList, &readStream);
+-    req->body() = readStream;
++    requests.Add(aSavedRequests[i], aStreamList);
+   }
+ 
+-  unused << SendKeysResponse(aRequestId, aRv, requests);
++  unused << SendKeysResponse(aRequestId, aRv, requests.SendAsRequestList());
+ }
+ 
+ void
+ CacheParent::OnFetchPut(FetchPut* aFetchPut, RequestId aRequestId, nsresult aRv)
+ {
+   aFetchPut->ClearListener();
+   mFetchPutList.RemoveElement(aFetchPut);
+   unused << SendAddAllResponse(aRequestId, aRv);
+ }
+ 
+-CacheStreamControlParent*
+-CacheParent::SerializeReadStream(CacheStreamControlParent *aStreamControl,
+-                                 const nsID& aId,
+-                                 StreamList* aStreamList,
+-                                 PCacheReadStream* aReadStreamOut)
+-{
+-  MOZ_ASSERT(aStreamList);
+-  MOZ_ASSERT(aReadStreamOut);
+-
+-  nsCOMPtr<nsIInputStream> stream = aStreamList->Extract(aId);
+-  MOZ_ASSERT(stream);
+-
+-  if (!aStreamControl) {
+-    aStreamControl = new CacheStreamControlParent();
+-    DebugOnly<PCacheStreamControlParent*> actor =
+-      Manager()->SendPCacheStreamControlConstructor(aStreamControl);
+-    MOZ_ASSERT(aStreamControl == actor);
+-  }
+-
+-  aStreamList->SetStreamControl(aStreamControl);
+-
+-  nsRefPtr<ReadStream> readStream = ReadStream::Create(aStreamControl,
+-                                                       aId, stream);
+-  readStream->Serialize(aReadStreamOut);
+-
+-  return aStreamControl;
+-}
+-
+ already_AddRefed<nsIInputStream>
+ CacheParent::DeserializeCacheStream(const PCacheReadStreamOrVoid& aStreamOrVoid)
+ {
+   if (aStreamOrVoid.type() == PCacheReadStreamOrVoid::Tvoid_t) {
+     return nullptr;
+   }
+ 
+   const PCacheReadStream& readStream = aStreamOrVoid.get_PCacheReadStream();
+diff --git a/dom/cache/CacheParent.h b/dom/cache/CacheParent.h
+--- a/dom/cache/CacheParent.h
++++ b/dom/cache/CacheParent.h
+@@ -66,21 +66,16 @@ public:
+                            const nsTArray<SavedRequest>& aSavedRequests,
+                            StreamList* aStreamList) MOZ_OVERRIDE;
+ 
+   // FetchPut::Listener methods
+   virtual void OnFetchPut(FetchPut* aFetchPut, RequestId aRequestId,
+                           nsresult aRv) MOZ_OVERRIDE;
+ 
+ private:
+-  CacheStreamControlParent*
+-  SerializeReadStream(CacheStreamControlParent *aStreamControl, const nsID& aId,
+-                      StreamList* aStreamList,
+-                      PCacheReadStream* aReadStreamOut);
+-
+   already_AddRefed<nsIInputStream>
+   DeserializeCacheStream(const PCacheReadStreamOrVoid& aStreamOrVoid);
+ 
+   nsRefPtr<cache::Manager> mManager;
+   const CacheId mCacheId;
+   nsTArray<nsRefPtr<FetchPut>> mFetchPutList;
+ };
+ 
 diff --git a/dom/cache/TypeUtils.h b/dom/cache/TypeUtils.h
 --- a/dom/cache/TypeUtils.h
 +++ b/dom/cache/TypeUtils.h
