@@ -7,7 +7,7 @@ diff --git a/dom/cache/AutoUtils.cpp b/dom/cache/AutoUtils.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/AutoUtils.cpp
-@@ -0,0 +1,395 @@
+@@ -0,0 +1,396 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -230,6 +230,7 @@ new file mode 100644
 +
 +AutoParentBase::AutoParentBase(PBackgroundParent* aManager)
 +  : mManager(aManager)
++  , mStreamControl(nullptr)
 +  , mSent(false)
 +{
 +  MOZ_ASSERT(mManager);
@@ -407,7 +408,7 @@ diff --git a/dom/cache/AutoUtils.h b/dom/cache/AutoUtils.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/AutoUtils.h
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,154 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -443,6 +444,14 @@ new file mode 100644
 +class SavedRequest;
 +class SavedResponse;
 +class StreamList;
++
++// A collection of RAII-style helper classes to ensure that IPC
++// FileDescriptorSet actors are properly cleaned up.  The user of these actors
++// must manually either Forget() the Fds or Send__delete__() the actor
++// depending on if the descriptors were actually sent.
++//
++// Note, these should only be used when *sending* streams across IPC.  The
++// deserialization case is handled by creating a ReadStream object.
 +
 +class AutoChildRequestList MOZ_STACK_CLASS MOZ_FINAL
 +{
@@ -492,13 +501,13 @@ new file mode 100644
 +class AutoParentBase MOZ_STACK_CLASS
 +{
 +protected:
-+  AutoParentBase(ipc::PBackgroundParent* aManager);
++  AutoParentBase(mozilla::ipc::PBackgroundParent* aManager);
 +  virtual ~AutoParentBase() = 0;
 +
 +  void SerializeReadStream(const nsID& aId, StreamList* aStreamList,
 +                           PCacheReadStream* aReadStreamOut);
 +
-+  ipc::PBackgroundParent* mManager;
++  mozilla::ipc::PBackgroundParent* mManager;
 +  CacheStreamControlParent* mStreamControl;
 +  bool mSent;
 +};
@@ -506,7 +515,8 @@ new file mode 100644
 +class AutoParentRequestList MOZ_STACK_CLASS MOZ_FINAL : public AutoParentBase
 +{
 +public:
-+  AutoParentRequestList(ipc::PBackgroundParent* aManager, uint32_t aCapacity);
++  AutoParentRequestList(mozilla::ipc::PBackgroundParent* aManager,
++                        uint32_t aCapacity);
 +  ~AutoParentRequestList();
 +
 +  void Add(const SavedRequest& aSavedRequest, StreamList* aStreamList);
@@ -521,7 +531,8 @@ new file mode 100644
 +class AutoParentResponseList MOZ_STACK_CLASS MOZ_FINAL : public AutoParentBase
 +{
 +public:
-+  AutoParentResponseList(ipc::PBackgroundParent* aManager, uint32_t aCapacity);
++  AutoParentResponseList(mozilla::ipc::PBackgroundParent* aManager,
++                         uint32_t aCapacity);
 +  ~AutoParentResponseList();
 +
 +  void Add(const SavedResponse& aSavedResponse, StreamList* aStreamList);
@@ -536,7 +547,7 @@ new file mode 100644
 +class AutoParentResponseOrVoid MOZ_STACK_CLASS MOZ_FINAL : public AutoParentBase
 +{
 +public:
-+  AutoParentResponseOrVoid(ipc::PBackgroundParent* aManager);
++  AutoParentResponseOrVoid(mozilla::ipc::PBackgroundParent* aManager);
 +  ~AutoParentResponseOrVoid();
 +
 +  void Add(const SavedResponse& aSavedResponse, StreamList* aStreamList);
@@ -939,6 +950,117 @@ diff --git a/dom/cache/CacheParent.h b/dom/cache/CacheParent.h
    nsTArray<nsRefPtr<FetchPut>> mFetchPutList;
  };
  
+diff --git a/dom/cache/CacheStorageParent.cpp b/dom/cache/CacheStorageParent.cpp
+--- a/dom/cache/CacheStorageParent.cpp
++++ b/dom/cache/CacheStorageParent.cpp
+@@ -2,16 +2,17 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/CacheStorageParent.h"
+ 
+ #include "mozilla/dom/ContentParent.h"
++#include "mozilla/dom/cache/AutoUtils.h"
+ #include "mozilla/dom/cache/CacheParent.h"
+ #include "mozilla/dom/cache/CacheStreamControlParent.h"
+ #include "mozilla/dom/cache/Manager.h"
+ #include "mozilla/dom/cache/ManagerId.h"
+ #include "mozilla/dom/cache/ReadStream.h"
+ #include "mozilla/dom/cache/SavedTypes.h"
+ #include "mozilla/dom/cache/StreamList.h"
+ #include "mozilla/ipc/PBackgroundParent.h"
+@@ -173,38 +174,29 @@ void
+ CacheStorageParent::OnStorageMatch(RequestId aRequestId, nsresult aRv,
+                                    const SavedResponse* aSavedResponse,
+                                    StreamList* aStreamList)
+ {
+   PCacheResponseOrVoid responseOrVoid;
+ 
+   ReleaseManager(aRequestId);
+ 
++  AutoParentResponseOrVoid response(Manager());
++
+   // no match
+   if (NS_FAILED(aRv) || !aSavedResponse) {
+-    responseOrVoid = void_t();
+-    unused << SendMatchResponse(aRequestId, aRv, responseOrVoid);
++    unused << SendMatchResponse(aRequestId, aRv, response.SendAsResponseOrVoid());
+     return;
+   }
+ 
+-  // match without body data to stream
+-  if (!aSavedResponse->mHasBodyId) {
+-    responseOrVoid = aSavedResponse->mValue;
+-    unused << SendMatchResponse(aRequestId, aRv, responseOrVoid);
+-    return;
++  if (aSavedResponse) {
++    response.Add(*aSavedResponse, aStreamList);
+   }
+ 
+-  PCacheReadStream readStream;
+-  SerializeReadStream(nullptr, aSavedResponse->mBodyId, aStreamList,
+-                      &readStream);
+-
+-  responseOrVoid = aSavedResponse->mValue;
+-  responseOrVoid.get_PCacheResponse().body() = readStream;
+-
+-  unused << SendMatchResponse(aRequestId, aRv, responseOrVoid);
++  unused << SendMatchResponse(aRequestId, aRv, response.SendAsResponseOrVoid());
+ }
+ 
+ void
+ CacheStorageParent::OnStorageHas(RequestId aRequestId, nsresult aRv,
+                                  bool aCacheFound)
+ {
+   ReleaseManager(aRequestId);
+   unused << SendHasResponse(aRequestId, aRv, aCacheFound);
+@@ -241,44 +233,16 @@ CacheStorageParent::OnStorageDelete(Requ
+ void
+ CacheStorageParent::OnStorageKeys(RequestId aRequestId, nsresult aRv,
+                                   const nsTArray<nsString>& aKeys)
+ {
+   ReleaseManager(aRequestId);
+   unused << SendKeysResponse(aRequestId, aRv, aKeys);
+ }
+ 
+-CacheStreamControlParent*
+-CacheStorageParent::SerializeReadStream(CacheStreamControlParent *aStreamControl,
+-                                        const nsID& aId,
+-                                        StreamList* aStreamList,
+-                                        PCacheReadStream* aReadStreamOut)
+-{
+-  MOZ_ASSERT(aStreamList);
+-  MOZ_ASSERT(aReadStreamOut);
+-
+-  nsCOMPtr<nsIInputStream> stream = aStreamList->Extract(aId);
+-  MOZ_ASSERT(stream);
+-
+-  if (!aStreamControl) {
+-    aStreamControl = new CacheStreamControlParent();
+-    DebugOnly<PCacheStreamControlParent*> actor =
+-      Manager()->SendPCacheStreamControlConstructor(aStreamControl);
+-    MOZ_ASSERT(aStreamControl == actor);
+-  }
+-
+-  aStreamList->SetStreamControl(aStreamControl);
+-
+-  nsRefPtr<ReadStream> readStream = ReadStream::Create(aStreamControl,
+-                                                       aId, stream);
+-  readStream->Serialize(aReadStreamOut);
+-
+-  return aStreamControl;
+-}
+-
+ void
+ CacheStorageParent::RetryPendingRequests()
+ {
+   for (uint32_t i = 0; i < mPendingRequests.Length(); ++i) {
+     Entry& entry = mPendingRequests[i];
+     switch(entry.mOp) {
+       case OP_MATCH:
+         RecvMatch(entry.mRequestId, entry.mRequest, entry.mParams);
 diff --git a/dom/cache/TypeUtils.h b/dom/cache/TypeUtils.h
 --- a/dom/cache/TypeUtils.h
 +++ b/dom/cache/TypeUtils.h
