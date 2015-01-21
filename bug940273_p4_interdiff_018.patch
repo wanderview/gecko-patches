@@ -1,0 +1,846 @@
+# HG changeset patch
+# Parent 22bdb6641deb64507bc79ca7f5cbc4ed44147144
+# User Ben Kelly <ben@wanderview.com>
+Bug 940273 P4 interdiff 018 CacheStorage action items. Make RemovePromise() infallible.
+
+
+diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
+--- a/dom/cache/Cache.cpp
++++ b/dom/cache/Cache.cpp
+@@ -75,17 +75,16 @@ using mozilla::dom::workers::GetCurrentT
+ using mozilla::dom::workers::WorkerPrivate;
+ 
+ NS_IMPL_CYCLE_COLLECTING_ADDREF(mozilla::dom::cache::Cache);
+ NS_IMPL_CYCLE_COLLECTING_RELEASE(mozilla::dom::cache::Cache);
+ NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(Cache, mGlobal, mRequestPromises)
+ 
+ NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Cache)
+   NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+-  NS_INTERFACE_MAP_ENTRY(nsISupports)
+ NS_INTERFACE_MAP_END
+ 
+ Cache::Cache(nsIGlobalObject* aGlobal, const nsACString& aOrigin,
+              PCacheChild* aActor)
+   : mGlobal(aGlobal)
+   , mOrigin(aOrigin)
+   , mActor(static_cast<CacheChild*>(aActor))
+ {
+@@ -349,128 +348,122 @@ Cache::ActorDestroy(mozilla::ipc::IProto
+   mActor->ClearListener();
+   mActor = nullptr;
+ }
+ 
+ void
+ Cache::RecvMatchResponse(RequestId aRequestId, nsresult aRv,
+                          const PCacheResponseOrVoid& aResponse)
+ {
++  // Convert the response immediately if its present.  This ensures that
++  // any stream actors are cleaned up, even if we error out below.
++  nsRefPtr<Response> response;
++  if (aResponse.type() == PCacheResponseOrVoid::TPCacheResponse) {
++    response = ToResponse(aResponse);
++  }
++
+   nsRefPtr<Promise> promise = RemoveRequestPromise(aRequestId);
+-  if (NS_WARN_IF(!promise)) {
+-    return;
+-  }
+ 
+   if (NS_FAILED(aRv)) {
+     promise->MaybeReject(aRv);
+     return;
+   }
+ 
+-  if (aResponse.type() == PCacheResponseOrVoid::Tvoid_t) {
++  if (!response) {
+     promise->MaybeResolve(JS::UndefinedHandleValue);
+     return;
+   }
+ 
+-  nsRefPtr<Response> response = ToResponse(aResponse);
+   promise->MaybeResolve(response);
+ }
+ 
+ void
+ Cache::RecvMatchAllResponse(RequestId aRequestId, nsresult aRv,
+                             const nsTArray<PCacheResponse>& aResponses)
+ {
+-  nsRefPtr<Promise> promise = RemoveRequestPromise(aRequestId);
+-  if (NS_WARN_IF(!promise)) {
+-    return;
+-  }
+-
+-  if (NS_FAILED(aRv)) {
+-    promise->MaybeReject(aRv);
+-    return;
+-  }
+-
++  // Convert responses immediately.  This ensures that any stream actors are
++  // cleaned up, even if we error out below.
+   nsAutoTArray<nsRefPtr<Response>, 256> responses;
+   responses.SetCapacity(aResponses.Length());
+ 
+   for (uint32_t i = 0; i < aResponses.Length(); ++i) {
+     nsRefPtr<Response> response = ToResponse(aResponses[i]);
+     responses.AppendElement(response.forget());
+   }
++
++  nsRefPtr<Promise> promise = RemoveRequestPromise(aRequestId);
++
++  if (NS_FAILED(aRv)) {
++    promise->MaybeReject(aRv);
++    return;
++  }
++
+   promise->MaybeResolve(responses);
+ }
+ 
+ void
+ Cache::RecvAddAllResponse(RequestId aRequestId, nsresult aRv)
+ {
+   nsRefPtr<Promise> promise = RemoveRequestPromise(aRequestId);
+-  if (NS_WARN_IF(!promise)) {
+-    return;
+-  }
+ 
+   if (NS_FAILED(aRv)) {
+     promise->MaybeReject(aRv);
+     return;
+   }
+ 
+   promise->MaybeResolve(JS::UndefinedHandleValue);
+ }
+ 
+ void
+ Cache::RecvPutResponse(RequestId aRequestId, nsresult aRv)
+ {
+   nsRefPtr<Promise> promise = RemoveRequestPromise(aRequestId);
+-  if (NS_WARN_IF(!promise)) {
+-    return;
+-  }
+ 
+   if (NS_FAILED(aRv)) {
+     promise->MaybeReject(aRv);
+     return;
+   }
+ 
+   promise->MaybeResolve(JS::UndefinedHandleValue);
+ }
+ 
+ void
+ Cache::RecvDeleteResponse(RequestId aRequestId, nsresult aRv, bool aSuccess)
+ {
+   nsRefPtr<Promise> promise = RemoveRequestPromise(aRequestId);
+-  if (NS_WARN_IF(!promise)) {
+-    return;
+-  }
+ 
+   if (NS_FAILED(aRv)) {
+     promise->MaybeReject(aRv);
+     return;
+   }
+ 
+   promise->MaybeResolve(aSuccess);
+ }
+ 
+ void
+ Cache::RecvKeysResponse(RequestId aRequestId, nsresult aRv,
+                         const nsTArray<PCacheRequest>& aRequests)
+ {
+-  nsRefPtr<Promise> promise = RemoveRequestPromise(aRequestId);
+-  if (NS_WARN_IF(!promise)) {
+-    return;
+-  }
+-
+-  if (NS_FAILED(aRv)) {
+-    promise->MaybeReject(aRv);
+-    return;
+-  }
+-
++  // Convert requests immediately.  This ensures that any stream actors are
++  // cleaned up, even if we error out below.
+   nsAutoTArray<nsRefPtr<Request>, 256> requests;
+   requests.SetCapacity(aRequests.Length());
+ 
+   for (uint32_t i = 0; i < aRequests.Length(); ++i) {
+     nsRefPtr<Request> request = ToRequest(aRequests[i]);
+     requests.AppendElement(request.forget());
+   }
++
++  nsRefPtr<Promise> promise = RemoveRequestPromise(aRequestId);
++
++  if (NS_FAILED(aRv)) {
++    promise->MaybeReject(aRv);
++    return;
++  }
++
+   promise->MaybeResolve(requests);
+ }
+ 
+ nsIGlobalObject*
+ Cache::GetGlobalObject() const
+ {
+   return mGlobal;
+ }
+@@ -498,16 +491,17 @@ Cache::~Cache()
+     MOZ_ASSERT(!mActor);
+   }
+ }
+ 
+ RequestId
+ Cache::AddRequestPromise(Promise* aPromise, ErrorResult& aRv)
+ {
+   MOZ_ASSERT(aPromise);
++  MOZ_ASSERT(!mRequestPromises.Contains(aPromise));
+ 
+   mRequestPromises.AppendElement(aPromise);
+ 
+   // (Ab)use the promise pointer as our request ID.  This is a fast, thread-safe
+   // way to get a unique ID for the promise to be resolved later.
+   return reinterpret_cast<RequestId>(aPromise);
+ }
+ 
+@@ -522,14 +516,14 @@ Cache::RemoveRequestPromise(RequestId aR
+     // type and never cast an integer to a pointer.
+     if (aRequestId == reinterpret_cast<RequestId>(promise.get())) {
+       nsRefPtr<Promise> ref;
+       ref.swap(promise);
+       mRequestPromises.RemoveElementAt(i);
+       return ref.forget();
+     }
+   }
+-  return nullptr;
++  MOZ_ASSERT_UNREACHABLE("Received response without a matching promise!");
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/CacheStorage.cpp b/dom/cache/CacheStorage.cpp
+--- a/dom/cache/CacheStorage.cpp
++++ b/dom/cache/CacheStorage.cpp
+@@ -38,17 +38,16 @@ using mozilla::ipc::PrincipalToPrincipal
+ 
+ NS_IMPL_CYCLE_COLLECTING_ADDREF(mozilla::dom::cache::CacheStorage);
+ NS_IMPL_CYCLE_COLLECTING_RELEASE(mozilla::dom::cache::CacheStorage);
+ NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(CacheStorage, mGlobal,
+                                                     mRequestPromises)
+ 
+ NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(CacheStorage)
+   NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+-  NS_INTERFACE_MAP_ENTRY(nsISupports)
+   NS_INTERFACE_MAP_ENTRY(nsIIPCBackgroundChildCreateCallback)
+ NS_INTERFACE_MAP_END
+ 
+ // static
+ already_AddRefed<CacheStorage>
+ CacheStorage::CreateOnMainThread(Namespace aNamespace,
+                                  nsIGlobalObject* aGlobal,
+                                  nsIPrincipal* aPrincipal,
+@@ -66,23 +65,22 @@ CacheStorage::CreateOnMainThread(Namespa
+   }
+ 
+   if (nullPrincipal) {
+     NS_WARNING("CacheStorage not supported on null principal.");
+     aRv.Throw(NS_ERROR_FAILURE);
+     return nullptr;
+   }
+ 
+-  bool unknownAppId;
+-  rv = aPrincipal->GetUnknownAppId(&unknownAppId);
+-  if (NS_WARN_IF(NS_FAILED(rv))) {
+-    aRv.Throw(rv);
+-    return nullptr;
+-  }
+-
++  // An unknown appId means that this principal was created for the codebase
++  // without all the security information from the end document or worker.
++  // We require exact knowledge of this information before allowing the
++  // caller to touch the disk using the Cache API.
++  bool unknownAppId = false;
++  aPrincipal->GetUnknownAppId(&unknownAppId);
+   if (unknownAppId) {
+     NS_WARNING("CacheStorage not supported on principal with unknown appId.");
+     aRv.Throw(NS_ERROR_FAILURE);
+     return nullptr;
+   }
+ 
+   nsAutoCString origin;
+   rv = aPrincipal->GetOrigin(getter_Copies(origin));
+@@ -138,30 +136,35 @@ CacheStorage::CreateOnWorker(Namespace a
+ 
+ CacheStorage::CacheStorage(Namespace aNamespace,
+                            nsIGlobalObject* aGlobal,
+                            const nsACString& aOrigin,
+                            const PrincipalInfo& aPrincipalInfo)
+   : mNamespace(aNamespace)
+   , mGlobal(aGlobal)
+   , mOrigin(aOrigin)
+-  , mPrincipalInfo(new PrincipalInfo(aPrincipalInfo))
++  , mPrincipalInfo(MakeUnique<PrincipalInfo>(aPrincipalInfo))
+   , mActor(nullptr)
+   , mFailedActor(false)
+ {
+   MOZ_ASSERT(mGlobal);
+ 
++  // If the PBackground actor is already initialized then we can
++  // immediately use it
+   PBackgroundChild* actor = BackgroundChild::GetForCurrentThread();
+   if (actor) {
+     ActorCreated(actor);
+-  } else {
+-    bool ok = BackgroundChild::GetOrCreateForCurrentThread(this);
+-    if (!ok) {
+-      ActorFailed();
+-    }
++    return;
++  }
++
++  // Otherwise we must begin the PBackground initialization process and
++  // wait for the async ActorCreated() callback.
++  bool ok = BackgroundChild::GetOrCreateForCurrentThread(this);
++  if (!ok) {
++    ActorFailed();
+   }
+ }
+ 
+ already_AddRefed<Promise>
+ CacheStorage::Match(const RequestOrUSVString& aRequest,
+                     const CacheQueryOptions& aOptions, ErrorResult& aRv)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorage);
+@@ -173,45 +176,30 @@ CacheStorage::Match(const RequestOrUSVSt
+ 
+   if (mFailedActor) {
+     promise->MaybeReject(NS_ERROR_UNEXPECTED);
+     return promise.forget();
+   }
+ 
+   RequestId requestId = AddRequestPromise(promise, aRv);
+ 
+-  if (!mActor) {
+-    Entry* entry = mPendingRequests.AppendElement();
+-    entry->mRequestId = requestId;
+-    entry->mOp = OP_MATCH;
+-    entry->mOptions = aOptions;
++  Entry* entry = mPendingRequests.AppendElement();
++  entry->mRequestId = requestId;
++  entry->mOp = OP_MATCH;
++  entry->mOptions = aOptions;
+ 
+-    if (aRequest.IsUSVString()) {
+-      *entry->mRequest.SetAsUSVString().ToAStringPtr() =
+-        aRequest.GetAsUSVString();
+-    } else {
+-      entry->mRequest.SetAsRequest() =
+-        &aRequest.GetAsRequest();
+-    }
+-
+-    return promise.forget();
++  if (aRequest.IsUSVString()) {
++    *entry->mRequest.SetAsUSVString().ToAStringPtr() =
++      aRequest.GetAsUSVString();
++  } else {
++    entry->mRequest.SetAsRequest() =
++      &aRequest.GetAsRequest();
+   }
+ 
+-  PCacheRequest request;
+-  ToPCacheRequest(request, aRequest, IgnoreBody, PassThroughReferrer,
+-                  IgnoreInvalidScheme, aRv);
+-  if (NS_WARN_IF(aRv.Failed())) {
+-    nsRefPtr<Promise> unused = RemoveRequestPromise(requestId);
+-    return nullptr;
+-  }
+-
+-  PCacheQueryParams params;
+-  ToPCacheQueryParams(params, aOptions);
+-
+-  unused << mActor->SendMatch(requestId, request, params);
++  MaybeRunPendingRequests();
+ 
+   return promise.forget();
+ }
+ 
+ already_AddRefed<Promise>
+ CacheStorage::Has(const nsAString& aKey, ErrorResult& aRv)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorage);
+@@ -223,26 +211,22 @@ CacheStorage::Has(const nsAString& aKey,
+ 
+   if (mFailedActor) {
+     promise->MaybeReject(NS_ERROR_UNEXPECTED);
+     return promise.forget();
+   }
+ 
+   RequestId requestId = AddRequestPromise(promise, aRv);
+ 
+-  if (!mActor) {
+-    Entry* entry = mPendingRequests.AppendElement();
+-    entry->mRequestId = requestId;
+-    entry->mOp = OP_HAS;
+-    entry->mKey = aKey;
++  Entry* entry = mPendingRequests.AppendElement();
++  entry->mRequestId = requestId;
++  entry->mOp = OP_HAS;
++  entry->mKey = aKey;
+ 
+-    return promise.forget();
+-  }
+-
+-  unused << mActor->SendHas(requestId, nsString(aKey));
++  MaybeRunPendingRequests();
+ 
+   return promise.forget();
+ }
+ 
+ already_AddRefed<Promise>
+ CacheStorage::Open(const nsAString& aKey, ErrorResult& aRv)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorage);
+@@ -254,26 +238,22 @@ CacheStorage::Open(const nsAString& aKey
+ 
+   if (mFailedActor) {
+     promise->MaybeReject(NS_ERROR_UNEXPECTED);
+     return promise.forget();
+   }
+ 
+   RequestId requestId = AddRequestPromise(promise, aRv);
+ 
+-  if (!mActor) {
+-    Entry* entry = mPendingRequests.AppendElement();
+-    entry->mRequestId = requestId;
+-    entry->mOp = OP_OPEN;
+-    entry->mKey = aKey;
++  Entry* entry = mPendingRequests.AppendElement();
++  entry->mRequestId = requestId;
++  entry->mOp = OP_OPEN;
++  entry->mKey = aKey;
+ 
+-    return promise.forget();
+-  }
+-
+-  unused << mActor->SendOpen(requestId, nsString(aKey));
++  MaybeRunPendingRequests();
+ 
+   return promise.forget();
+ }
+ 
+ already_AddRefed<Promise>
+ CacheStorage::Delete(const nsAString& aKey, ErrorResult& aRv)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorage);
+@@ -285,26 +265,22 @@ CacheStorage::Delete(const nsAString& aK
+ 
+   if (mFailedActor) {
+     promise->MaybeReject(NS_ERROR_UNEXPECTED);
+     return promise.forget();
+   }
+ 
+   RequestId requestId = AddRequestPromise(promise, aRv);
+ 
+-  if (!mActor) {
+-    Entry* entry = mPendingRequests.AppendElement();
+-    entry->mRequestId = requestId;
+-    entry->mOp = OP_DELETE;
+-    entry->mKey = aKey;
++  Entry* entry = mPendingRequests.AppendElement();
++  entry->mRequestId = requestId;
++  entry->mOp = OP_DELETE;
++  entry->mKey = aKey;
+ 
+-    return promise.forget();
+-  }
+-
+-  unused << mActor->SendDelete(requestId, nsString(aKey));
++  MaybeRunPendingRequests();
+ 
+   return promise.forget();
+ }
+ 
+ already_AddRefed<Promise>
+ CacheStorage::Keys(ErrorResult& aRv)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorage);
+@@ -316,25 +292,21 @@ CacheStorage::Keys(ErrorResult& aRv)
+ 
+   if (mFailedActor) {
+     promise->MaybeReject(NS_ERROR_UNEXPECTED);
+     return promise.forget();
+   }
+ 
+   RequestId requestId = AddRequestPromise(promise, aRv);
+ 
+-  if (!mActor) {
+-    Entry* entry = mPendingRequests.AppendElement();
+-    entry->mRequestId = requestId;
+-    entry->mOp = OP_KEYS;
++  Entry* entry = mPendingRequests.AppendElement();
++  entry->mRequestId = requestId;
++  entry->mOp = OP_KEYS;
+ 
+-    return promise.forget();
+-  }
+-
+-  unused << mActor->SendKeys(requestId);
++  MaybeRunPendingRequests();
+ 
+   return promise.forget();
+ }
+ 
+ // static
+ bool
+ CacheStorage::PrefEnabled(JSContext* aCx, JSObject* aObj)
+ {
+@@ -355,87 +327,42 @@ CacheStorage::WrapObject(JSContext* aCon
+ 
+ void
+ CacheStorage::ActorCreated(PBackgroundChild* aActor)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorage);
+   MOZ_ASSERT(aActor);
+ 
+   CacheStorageChild* newActor = new CacheStorageChild(this);
+-  if (NS_WARN_IF(!newActor)) {
+-    ActorFailed();
+-    return;
+-  }
+-
+   PCacheStorageChild* constructedActor =
+     aActor->SendPCacheStorageConstructor(newActor, mNamespace, *mPrincipalInfo);
+ 
+   if (NS_WARN_IF(!constructedActor)) {
+     ActorFailed();
+     return;
+   }
+ 
+   MOZ_ASSERT(constructedActor == newActor);
+   mActor = newActor;
+ 
+-  for (uint32_t i = 0; i < mPendingRequests.Length(); ++i) {
+-    Entry& entry = mPendingRequests[i];
+-    RequestId requestId = entry.mRequestId;
+-    switch(entry.mOp) {
+-      case OP_MATCH:
+-      {
+-        PCacheRequest request;
+-        ErrorResult rv;
+-        ToPCacheRequest(request, entry.mRequest, IgnoreBody,
+-                        PassThroughReferrer, IgnoreInvalidScheme, rv);
+-        if (NS_WARN_IF(rv.Failed())) {
+-          nsRefPtr<Promise> promise = RemoveRequestPromise(requestId);
+-          if (promise) {
+-            promise->MaybeReject(rv);
+-          }
+-          return;
+-        }
+-
+-        PCacheQueryParams params;
+-        ToPCacheQueryParams(params, entry.mOptions);
+-
+-        unused << mActor->SendMatch(requestId, request, params);
+-        break;
+-      }
+-      case OP_HAS:
+-        unused << mActor->SendHas(requestId, entry.mKey);
+-        break;
+-      case OP_OPEN:
+-        unused << mActor->SendOpen(requestId, entry.mKey);
+-        break;
+-      case OP_DELETE:
+-        unused << mActor->SendDelete(requestId, entry.mKey);
+-        break;
+-      case OP_KEYS:
+-        unused << mActor->SendKeys(requestId);
+-        break;
+-    }
+-  }
+-  mPendingRequests.Clear();
++  MaybeRunPendingRequests();
++  MOZ_ASSERT(mPendingRequests.IsEmpty());
+ }
+ 
+ void
+ CacheStorage::ActorFailed()
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorage);
+   MOZ_ASSERT(!mFailedActor);
+ 
+   mFailedActor = true;
+ 
+   for (uint32_t i = 0; i < mPendingRequests.Length(); ++i) {
+     RequestId requestId = mPendingRequests[i].mRequestId;
+     nsRefPtr<Promise> promise = RemoveRequestPromise(requestId);
+-    if (!promise) {
+-      continue;
+-    }
+     promise->MaybeReject(NS_ERROR_UNEXPECTED);
+   }
+   mPendingRequests.Clear();
+ }
+ 
+ void
+ CacheStorage::ActorDestroy(IProtocol* aActor)
+ {
+@@ -451,69 +378,73 @@ CacheStorage::ActorDestroy(IProtocol* aA
+ }
+ 
+ void
+ CacheStorage::RecvMatchResponse(RequestId aRequestId, nsresult aRv,
+                                 const PCacheResponseOrVoid& aResponse)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorage);
+ 
++  // Convert the response immediately if its present.  This ensures that
++  // any stream actors are cleaned up, even if we error out below.
++  nsRefPtr<Response> response;
++  if (aResponse.type() == PCacheResponseOrVoid::TPCacheResponse) {
++    response = ToResponse(aResponse);
++  }
++
+   nsRefPtr<Promise> promise = RemoveRequestPromise(aRequestId);
+-  if (NS_WARN_IF(!promise)) {
+-    return;
+-  }
+ 
+   if (NS_FAILED(aRv)) {
+     promise->MaybeReject(aRv);
+     return;
+   }
+ 
+-  if (aResponse.type() == PCacheResponseOrVoid::Tvoid_t) {
+-    promise->MaybeReject(NS_ERROR_DOM_NOT_FOUND_ERR);
++  // If cache name was specified in the request options and the cache does
++  // not exist, then an error code will already have been set.  If we
++  // still do not have a response, then we just resolve undefined like a
++  // normal Cache::Match.
++  if (!response) {
++    promise->MaybeResolve(JS::UndefinedHandleValue);
+     return;
+   }
+ 
+-  nsRefPtr<Response> response = ToResponse(aResponse);
+   promise->MaybeResolve(response);
+ }
+ 
+ void
+ CacheStorage::RecvHasResponse(RequestId aRequestId, nsresult aRv, bool aSuccess)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorage);
+ 
+   nsRefPtr<Promise> promise = RemoveRequestPromise(aRequestId);
+-  if (NS_WARN_IF(!promise)) {
+-    return;
+-  }
+ 
+   if (NS_FAILED(aRv)) {
+     promise->MaybeReject(aRv);
+     return;
+ 
+   }
+ 
+   promise->MaybeResolve(aSuccess);
+ }
+ 
+ void
+ CacheStorage::RecvOpenResponse(RequestId aRequestId, nsresult aRv,
+                                PCacheChild* aActor)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorage);
+ 
++  // Unlike most of our async callback Recv*() methods, this one gets back
++  // an actor.  We need to make sure to clean it up in case of error.
++
+   nsRefPtr<Promise> promise = RemoveRequestPromise(aRequestId);
+-  if (NS_WARN_IF(!promise)) {
++
++  if (NS_FAILED(aRv)) {
+     if (aActor) {
+       PCacheChild::Send__delete__(aActor);
+     }
+-    return;
+-  }
+-
+-  if (NS_FAILED(aRv)) {
+     promise->MaybeReject(aRv);
+     return;
+   }
+ 
+   if (!aActor) {
+     promise->MaybeReject(NS_ERROR_DOM_INVALID_ACCESS_ERR);
+     return;
+   }
+@@ -524,38 +455,32 @@ CacheStorage::RecvOpenResponse(RequestId
+ 
+ void
+ CacheStorage::RecvDeleteResponse(RequestId aRequestId, nsresult aRv,
+                                  bool aSuccess)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorage);
+ 
+   nsRefPtr<Promise> promise = RemoveRequestPromise(aRequestId);
+-  if (NS_WARN_IF(!promise)) {
+-    return;
+-  }
+ 
+   if (NS_FAILED(aRv)) {
+     promise->MaybeReject(aRv);
+     return;
+   }
+ 
+   promise->MaybeResolve(aSuccess);
+ }
+ 
+ void
+ CacheStorage::RecvKeysResponse(RequestId aRequestId, nsresult aRv,
+                                const nsTArray<nsString>& aKeys)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorage);
+ 
+   nsRefPtr<Promise> promise = RemoveRequestPromise(aRequestId);
+-  if (NS_WARN_IF(!promise)) {
+-    return;
+-  }
+ 
+   if (NS_FAILED(aRv)) {
+     promise->MaybeReject(aRv);
+     return;
+   }
+ 
+   promise->MaybeResolve(aKeys);
+ }
+@@ -587,21 +512,70 @@ CacheStorage::~CacheStorage()
+   if (mActor) {
+     PCacheStorageChild::Send__delete__(mActor);
+     // ActorDestroy() is called synchronously by Send__delete__().  So we
+     // should have already cleared the mActor.
+     MOZ_ASSERT(!mActor);
+   }
+ }
+ 
++void
++CacheStorage::MaybeRunPendingRequests()
++{
++  if (!mActor) {
++    return;
++  }
++
++  for (uint32_t i = 0; i < mPendingRequests.Length(); ++i) {
++    // Note, the entry can be modified below due to Request/Response body
++    // being marked used.
++    Entry& entry = mPendingRequests[i];
++    RequestId requestId = entry.mRequestId;
++    switch(entry.mOp) {
++      case OP_MATCH:
++      {
++        PCacheRequest request;
++        ErrorResult rv;
++        ToPCacheRequest(request, entry.mRequest, IgnoreBody,
++                        PassThroughReferrer, IgnoreInvalidScheme, rv);
++        if (NS_WARN_IF(rv.Failed())) {
++          nsRefPtr<Promise> promise = RemoveRequestPromise(requestId);
++          promise->MaybeReject(rv);
++          return;
++        }
++
++        PCacheQueryParams params;
++        ToPCacheQueryParams(params, entry.mOptions);
++
++        unused << mActor->SendMatch(requestId, request, params);
++        break;
++      }
++      case OP_HAS:
++        unused << mActor->SendHas(requestId, entry.mKey);
++        break;
++      case OP_OPEN:
++        unused << mActor->SendOpen(requestId, entry.mKey);
++        break;
++      case OP_DELETE:
++        unused << mActor->SendDelete(requestId, entry.mKey);
++        break;
++      case OP_KEYS:
++        unused << mActor->SendKeys(requestId);
++        break;
++    }
++  }
++  mPendingRequests.Clear();
++}
++
+ RequestId
+ CacheStorage::AddRequestPromise(Promise* aPromise, ErrorResult& aRv)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorage);
+   MOZ_ASSERT(aPromise);
++  MOZ_ASSERT(!mRequestPromises.Contains(aPromise));
+ 
+   mRequestPromises.AppendElement(aPromise);
+ 
+   // (Ab)use the promise pointer as our request ID.  This is a fast, thread-safe
+   // way to get a unique ID for the promise to be resolved later.
+   return reinterpret_cast<RequestId>(aPromise);
+ }
+ 
+@@ -617,14 +591,14 @@ CacheStorage::RemoveRequestPromise(Reque
+     // type and never cast an integer to a pointer.
+     if (aRequestId == reinterpret_cast<RequestId>(promise.get())) {
+       nsRefPtr<Promise> ref;
+       ref.swap(promise);
+       mRequestPromises.RemoveElementAt(i);
+       return ref.forget();
+     }
+   }
+-  return nullptr;
++  MOZ_ASSERT_UNREACHABLE("Received response without a matching promise!");
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/CacheStorage.h b/dom/cache/CacheStorage.h
+--- a/dom/cache/CacheStorage.h
++++ b/dom/cache/CacheStorage.h
+@@ -91,20 +91,22 @@ public:
+   // TypeUtils method
+   virtual nsIGlobalObject* GetGlobalObject() const MOZ_OVERRIDE;
+   virtual const nsACString& Origin() const MOZ_OVERRIDE;
+ #ifdef DEBUG
+   virtual void AssertOwningThread() const MOZ_OVERRIDE;
+ #endif
+ 
+ private:
+-  CacheStorage(Namespace aNamespace,
+-               nsIGlobalObject* aGlobal, const nsACString& aOrigin,
++  CacheStorage(Namespace aNamespace, nsIGlobalObject* aGlobal,
++               const nsACString& aOrigin,
+                const mozilla::ipc::PrincipalInfo& aPrincipalInfo);
+-  virtual ~CacheStorage();
++  ~CacheStorage();
++
++  void MaybeRunPendingRequests();
+ 
+   RequestId AddRequestPromise(Promise* aPromise, ErrorResult& aRv);
+   already_AddRefed<Promise> RemoveRequestPromise(RequestId aRequestId);
+ 
+   // Would like to use CacheInitData here, but we cannot because
+   // its an IPC struct which breaks webidl by including windows.h.
+   const Namespace mNamespace;
+   nsCOMPtr<nsIGlobalObject> mGlobal;
+@@ -119,18 +121,16 @@ private:
+     OP_HAS,
+     OP_OPEN,
+     OP_DELETE,
+     OP_KEYS
+   };
+ 
+   struct Entry
+   {
+-    Entry() { }
+-    ~Entry() { }
+     RequestId mRequestId;
+     Op mOp;
+     // Would prefer to use PCacheRequest/PCacheCacheQueryOptions, but can't
+     // because they introduce a header dependency on windows.h which
+     // breaks the bindings build.
+     RequestOrUSVString mRequest;
+     CacheQueryOptions mOptions;
+     // It would also be nice to union the key with the match args above,

@@ -1,0 +1,268 @@
+# HG changeset patch
+# Parent c0167d40526f33898003a06c1f2ea2e8b7fd647b
+# User Ben Kelly <ben@wanderview.com>
+Bug 940273 P4 interdiff 029 ReadStream updates
+
+
+diff --git a/dom/cache/ReadStream.cpp b/dom/cache/ReadStream.cpp
+--- a/dom/cache/ReadStream.cpp
++++ b/dom/cache/ReadStream.cpp
+@@ -34,46 +34,60 @@ using mozilla::dom::cache::CacheStreamCo
+ using mozilla::dom::cache::PCacheReadStream;
+ using mozilla::dom::cache::PCacheStreamControlChild;
+ using mozilla::dom::cache::PCacheStreamControlParent;
+ using mozilla::dom::cache::ReadStream;
+ using mozilla::ipc::FileDescriptor;
+ using mozilla::ipc::PFileDescriptorSetChild;
+ using mozilla::ipc::PFileDescriptorSetParent;
+ 
++// There are separate concrete implementations of ReadStream for the child
++// and parent processes.  This is unfortunately necessary because the
++// actor types are distinct for these two cases.  Also, the interface for
++// reporting the close event differs slightly for the child and parent
++// StreamControl actors.
++
++// ----------------------------------------------------------------------------
++
+ class ReadStreamChild MOZ_FINAL : public ReadStream
+ {
+ public:
+   ReadStreamChild(PCacheStreamControlChild* aControl, const nsID& aId,
+                   nsIInputStream* aStream)
+     : ReadStream(aId, aStream)
+     , mControl(static_cast<CacheStreamControlChild*>(aControl))
+   {
+     MOZ_ASSERT(mControl);
+     mControl->AddListener(this);
+   }
+ 
+   virtual ~ReadStreamChild()
+   {
++    NS_ASSERT_OWNINGTHREAD(ReadStream);
++
+     NoteClosed();
+   }
+ 
+   virtual void NoteClosedOnWorkerThread() MOZ_OVERRIDE
+   {
++    NS_ASSERT_OWNINGTHREAD(ReadStream);
++
+     if (mClosed) {
+       return;
+     }
+ 
+     mClosed = true;
+     mControl->RemoveListener(this);
+     mControl->NoteClosed(mId);
+   }
+ 
+   virtual void ForgetOnWorkerThread() MOZ_OVERRIDE
+   {
++    NS_ASSERT_OWNINGTHREAD(ReadStream);
++
+     if (mClosed) {
+       return;
+     }
+ 
+     mClosed = true;
+     mControl->RemoveListener(this);
+   }
+ 
+@@ -102,54 +116,62 @@ public:
+       aReadStreamOut->fds() = void_t();
+     }
+   }
+ 
+ private:
+   CacheStreamControlChild* mControl;
+ };
+ 
++// ----------------------------------------------------------------------------
++
+ class ReadStreamParent MOZ_FINAL : public ReadStream
+ {
+ public:
+   ReadStreamParent(PCacheStreamControlParent* aControl, const nsID& aId,
+                   nsIInputStream* aStream)
+     : ReadStream(aId, aStream)
+     , mControl(static_cast<CacheStreamControlParent*>(aControl))
+   {
+     MOZ_ASSERT(mControl);
+     mControl->AddListener(this);
+   }
+ 
+   virtual ~ReadStreamParent()
+   {
++    NS_ASSERT_OWNINGTHREAD(ReadStream);
++
+     NoteClosed();
+   }
+ 
+   virtual void NoteClosedOnWorkerThread() MOZ_OVERRIDE
+   {
++    NS_ASSERT_OWNINGTHREAD(ReadStream);
++
+     if (mClosed) {
+       return;
+     }
+ 
+     mClosed = true;
+     mControl->RemoveListener(this);
+     // This can cause mControl to be destructed
+     mControl->RecvNoteClosed(mId);
+     mControl = nullptr;
+   }
+ 
+   virtual void ForgetOnWorkerThread() MOZ_OVERRIDE
+   {
++    NS_ASSERT_OWNINGTHREAD(ReadStream);
++
+     if (mClosed) {
+       return;
+     }
+ 
+     mClosed = true;
+-    // This can cause mControl to be destructed
++    // This can cause mControl to be destroyed
+     mControl->RemoveListener(this);
+     mControl = nullptr;
+   }
+ 
+   virtual void SerializeControl(PCacheReadStream* aReadStreamOut) MOZ_OVERRIDE
+   {
+     MOZ_ASSERT(aReadStreamOut);
+     MOZ_ASSERT(!mClosed);
+@@ -178,60 +200,80 @@ public:
+       aReadStreamOut->fds() = void_t();
+     }
+   }
+ 
+ private:
+   CacheStreamControlParent* mControl;
+ };
+ 
++// ----------------------------------------------------------------------------
++
+ } // anonymous namespace
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ using mozilla::unused;
+ using mozilla::ipc::FileDescriptor;
+ using mozilla::ipc::FileDescriptorSetChild;
+ using mozilla::ipc::FileDescriptorSetParent;
+ using mozilla::ipc::InputStreamParams;
+ using mozilla::ipc::OptionalFileDescriptorSet;
+ using mozilla::ipc::PFileDescriptorSetChild;
+ 
++// Runnable to notify actors that the ReadStream has closed.  This must
++// be done on the thread associated with the PBackground actor.  Must be
++// cancelable to execute on Worker threads (which can occur when the
++// ReadStream is constructed on a child process Worker thread).
+ class ReadStream::NoteClosedRunnable MOZ_FINAL : public nsCancelableRunnable
+ {
+ public:
+   NoteClosedRunnable(ReadStream* aStream)
+     : mStream(aStream)
+   { }
+ 
+   NS_IMETHOD Run()
+   {
+     mStream->NoteClosedOnWorkerThread();
+     return NS_OK;
+   }
++
++  // Safe to do nothing if canceled here as the worker thread is being
++  // destroyed.  The resulting IPC actor destruction will trigger all
++  // attached streams to be noted as closed.
++
+ private:
+   ~NoteClosedRunnable() { }
+ 
+   nsRefPtr<ReadStream> mStream;
+ };
+ 
++// Runnable to clear actors without reporting that the ReadStream has
++// closed.  Since this can trigger actor destruction, we need to do
++// it on the thread associated with the PBackground actor.  Must be
++// cancelable to execute on Worker threads (which can occur when the
++// ReadStream is constructed on a child process Worker thread).
+ class ReadStream::ForgetRunnable MOZ_FINAL : public nsCancelableRunnable
+ {
+ public:
+   ForgetRunnable(ReadStream* aStream)
+     : mStream(aStream)
+   { }
+ 
+   NS_IMETHOD Run()
+   {
+     mStream->ForgetOnWorkerThread();
+     return NS_OK;
+   }
++
++  // Safe to do nothing if canceled here as the worker thread is being
++  // destroyed.  Therefore the actor will be destroyed anyway.
++
+ private:
+   ~ForgetRunnable() { }
+ 
+   nsRefPtr<ReadStream> mStream;
+ };
+ 
+ NS_IMPL_ISUPPORTS(mozilla::dom::cache::ReadStream, nsIInputStream,
+                                                    ReadStream);
+@@ -368,16 +410,21 @@ ReadStream::ReadStream(const nsID& aId, 
+   , mThread(NS_GetCurrentThread())
+   , mClosed(false)
+ {
+   MOZ_ASSERT(mStream);
+ }
+ 
+ ReadStream::~ReadStream()
+ {
++  NS_ASSERT_OWNINGTHREAD(ReadStream);
++
++  // We cannot directly call NoteClosed() here.  The concrete subclasses
++  // destructors must do this because it takes code paths through virtual
++  // methods.  We don't want to execute these while partially destroyed.
+ }
+ 
+ void
+ ReadStream::NoteClosed()
+ {
+   if (mClosed) {
+     return;
+   }
+diff --git a/dom/cache/ReadStream.h b/dom/cache/ReadStream.h
+--- a/dom/cache/ReadStream.h
++++ b/dom/cache/ReadStream.h
+@@ -24,16 +24,27 @@ class PCacheReadStream;
+ class PCacheReadStreamOrVoid;
+ class PCacheStreamControlParent;
+ 
+ // IID for the dom::cache::ReadStream interface
+ #define NS_DOM_CACHE_IID \
+ {0x8e5da7c9, 0x0940, 0x4f1d, \
+   {0x97, 0x25, 0x5c, 0x59, 0x38, 0xdd, 0xb9, 0x9f}}
+ 
++// Custom stream class for Request and Response bodies being read from
++// a Cache.  The main purpose of this class is to report back to the
++// Cache's Manager when the stream is closed.  This allows the Cache to
++// accurately determine when the underlying body file can be deleted,
++// etc.
++//
++// The ReadStream class also provides us with a convenient QI'able
++// interface that we can use to pass additional meta-data with the
++// stream channel.  For example, Cache.put() can detect that the content
++// script is passing a Cache-originated-stream back into the Cache
++// again.  This enables certain optimizations.
+ class ReadStream : public nsIInputStream
+ {
+ public:
+   static already_AddRefed<ReadStream>
+   Create(const PCacheReadStreamOrVoid& aReadStreamOrVoid);
+ 
+   static already_AddRefed<ReadStream>
+   Create(const PCacheReadStream& aReadStream);
