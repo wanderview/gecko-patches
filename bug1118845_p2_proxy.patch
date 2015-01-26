@@ -1,13 +1,14 @@
 # HG changeset patch
-# Parent 1f5cb49278d3662524e517c7e3a7086883f76e38
+# Parent 4db7b028bf24010e99afef75d927b35048e55507
 # User Ben Kelly <ben@wanderview.com>
+Bug 1118845 P2 Handle nsILoadGroup callbacks correctly for SharedWorker.
+* * *
 Bug 1118845 P3 Force the creation of a new load group for SharedWorkers. r=sicking
-
 
 diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
 --- a/dom/workers/RuntimeService.cpp
 +++ b/dom/workers/RuntimeService.cpp
-@@ -2248,17 +2248,18 @@ RuntimeService::CreateSharedWorkerIntern
+@@ -2246,17 +2246,18 @@ RuntimeService::CreateSharedWorkerIntern
  
    nsCOMPtr<nsPIDOMWindow> window = do_QueryInterface(aGlobal.GetAsSupports());
    MOZ_ASSERT(window);
@@ -30,7 +31,112 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
 diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
 --- a/dom/workers/WorkerPrivate.cpp
 +++ b/dom/workers/WorkerPrivate.cpp
-@@ -3983,17 +3983,18 @@ WorkerPrivate::Constructor(JSContext* aC
+@@ -10,21 +10,23 @@
+ #include "nsIClassInfo.h"
+ #include "nsIContentSecurityPolicy.h"
+ #include "nsIConsoleService.h"
+ #include "nsIDOMDOMException.h"
+ #include "nsIDOMEvent.h"
+ #include "nsIDOMMessageEvent.h"
+ #include "nsIDocument.h"
+ #include "nsIDocShell.h"
++#include "nsIInterfaceRequestor.h"
+ #include "nsIMemoryReporter.h"
+ #include "nsIPermissionManager.h"
+ #include "nsIScriptError.h"
+ #include "nsIScriptGlobalObject.h"
+ #include "nsIScriptSecurityManager.h"
++#include "nsITabChild.h"
+ #include "nsITextToSubURI.h"
+ #include "nsIThreadInternal.h"
+ #include "nsITimer.h"
+ #include "nsIURI.h"
+ #include "nsIURL.h"
+ #include "nsIWorkerDebugger.h"
+ #include "nsIXPConnect.h"
+ #include "nsPerformance.h"
+@@ -1890,16 +1892,80 @@ PRThreadFromThread(nsIThread* aThread)
+ 
+   PRThread* result;
+   MOZ_ALWAYS_TRUE(NS_SUCCEEDED(aThread->GetPRThread(&result)));
+   MOZ_ASSERT(result);
+ 
+   return result;
+ }
+ 
++class WorkerInterfaceRequestor MOZ_FINAL : public nsIInterfaceRequestor
++{
++public:
++  WorkerInterfaceRequestor(nsIPrincipal* aPrincipal, nsILoadGroup* aLoadGroup)
++  {
++    MOZ_ASSERT(aPrincipal);
++
++    nsCOMPtr<nsIInterfaceRequestor> callbacks;
++    if (aLoadGroup) {
++      aLoadGroup->GetNotificationCallbacks(getter_AddRefs(callbacks));
++    }
++
++    // Create a load context, using the base context if present.
++    nsCOMPtr<nsILoadContext> baseContext;
++    if (callbacks) {
++      callbacks->GetInterface(NS_GET_IID(nsILoadContext),
++                              getter_AddRefs(baseContext));
++      // ok if we don't find the interface
++    }
++    mLoadContext = new LoadContext(aPrincipal, baseContext);
++
++    // Find the tab child if the load group has one.
++    if (callbacks) {
++      callbacks->GetInterface(NS_GET_IID(nsITabChild),
++                              getter_AddRefs(mTabChild));
++      // ok if we don't find the interface
++    }
++  }
++
++  NS_IMETHOD
++  GetInterface(const nsIID& aIID, void** aSink) MOZ_OVERRIDE
++  {
++    MOZ_ASSERT(mLoadContext);
++
++    if(aIID.Equals(NS_GET_IID(nsITabChild))) {
++      if (!mTabChild) {
++        return NS_NOINTERFACE;
++      }
++      nsCOMPtr<nsITabChild> ref = mTabChild;
++      ref.forget(aSink);
++      return NS_OK;
++    }
++
++    if (aIID.Equals(NS_GET_IID(nsILoadContext))) {
++      nsCOMPtr<nsILoadContext> ref = mLoadContext;
++      ref.forget(aSink);
++      return NS_OK;
++    }
++
++    return NS_NOINTERFACE;
++  }
++
++private:
++  ~WorkerInterfaceRequestor() { }
++
++  nsCOMPtr<nsILoadContext> mLoadContext;
++  nsCOMPtr<nsITabChild> mTabChild;
++
++private:
++  NS_DECL_THREADSAFE_ISUPPORTS
++};
++
++NS_IMPL_ISUPPORTS(WorkerInterfaceRequestor, nsIInterfaceRequestor);
++
+ } /* anonymous namespace */
+ 
+ NS_IMPL_ISUPPORTS_INHERITED0(MainThreadReleaseRunnable, nsRunnable)
+ 
+ NS_IMPL_ISUPPORTS_INHERITED0(TopLevelWorkerFinishedRunnable, nsRunnable)
+ 
+ NS_IMPL_ISUPPORTS(TimerThreadEventTarget, nsIEventTarget)
+ 
+@@ -4057,17 +4123,18 @@ WorkerPrivate::Constructor(JSContext* aC
    MOZ_ASSERT_IF(aWorkerType == WorkerTypeDedicated,
                  aSharedWorkerName.IsEmpty());
  
@@ -50,7 +156,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
  
      aLoadInfo = stackLoadInfo.ptr();
    }
-@@ -4038,17 +4039,19 @@ WorkerPrivate::Constructor(JSContext* aC
+@@ -4112,17 +4179,19 @@ WorkerPrivate::Constructor(JSContext* aC
  
    return worker.forget();
  }
@@ -71,7 +177,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
    MOZ_ASSERT_IF(NS_IsMainThread(), aCx == nsContentUtils::GetCurrentJSContext());
  
    if (aWindow) {
-@@ -4271,19 +4274,19 @@ WorkerPrivate::GetLoadInfo(JSContext* aC
+@@ -4345,20 +4414,27 @@ WorkerPrivate::GetLoadInfo(JSContext* aC
        rv = loadInfo.mCSP->GetAllowsEval(&loadInfo.mReportCSPViolations,
                                          &loadInfo.mEvalAllowed);
        NS_ENSURE_SUCCESS(rv, rv);
@@ -81,11 +187,19 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
      }
  
 -    if (!loadInfo.mLoadGroup) {
-+    if (!loadInfo.mLoadGroup || aLoadGroupBehavior == ForceNewLoadGroup) {
-       rv = NS_NewLoadGroup(getter_AddRefs(loadInfo.mLoadGroup),
+-      rv = NS_NewLoadGroup(getter_AddRefs(loadInfo.mLoadGroup),
 -                           loadInfo.mPrincipal);
-+                           loadInfo.mPrincipal, loadInfo.mLoadGroup);
++    if (!loadInfo.mLoadGroup || aLoadGroupBehavior == ForceNewLoadGroup) {
++      nsCOMPtr<nsIInterfaceRequestor> callbacks =
++        new WorkerInterfaceRequestor(loadInfo.mPrincipal, loadInfo.mLoadGroup);
++
++      nsCOMPtr<nsILoadGroup> loadGroup =
++        do_CreateInstance(NS_LOADGROUP_CONTRACTID);
++
++      rv = loadGroup->SetNotificationCallbacks(callbacks);
        NS_ENSURE_SUCCESS(rv, rv);
++
++      loadInfo.mLoadGroup = loadGroup.forget();
      }
      MOZ_ASSERT(NS_LoadGroupMatchesPrincipal(loadInfo.mLoadGroup,
                                              loadInfo.mPrincipal));
@@ -93,6 +207,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
      rv = ChannelFromScriptURLMainThread(loadInfo.mPrincipal, loadInfo.mBaseURI,
                                          document, loadInfo.mLoadGroup,
                                          aScriptURL,
+                                         getter_AddRefs(loadInfo.mChannel));
 diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
 --- a/dom/workers/WorkerPrivate.h
 +++ b/dom/workers/WorkerPrivate.h
