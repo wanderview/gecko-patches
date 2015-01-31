@@ -1,0 +1,376 @@
+# HG changeset patch
+# Parent 73cd1addc287687ad387869f5e5e620a46b88c4b
+# User Ben Kelly <ben@wanderview.com>
+Bug 940273 P4 interdiff 040 Trigger ShutdownObserver solely from QM
+
+diff --git a/dom/cache/ShutdownObserver.cpp b/dom/cache/ShutdownObserver.cpp
+--- a/dom/cache/ShutdownObserver.cpp
++++ b/dom/cache/ShutdownObserver.cpp
+@@ -6,137 +6,114 @@
+ 
+ #include "mozilla/dom/cache/ShutdownObserver.h"
+ 
+ #include "mozilla/Attributes.h"
+ #include "mozilla/StaticPtr.h"
+ #include "mozilla/dom/cache/Manager.h"
+ #include "mozilla/dom/cache/ManagerId.h"
+ #include "mozilla/ipc/BackgroundParent.h"
+-#include "mozilla/Services.h"
+ #include "nsCOMPtr.h"
+-#include "nsIObserver.h"
+-#include "nsIObserverService.h"
+ #include "nsIThread.h"
+ #include "nsString.h"
+ #include "nsTArray.h"
+ #include "nsThreadUtils.h"
+ 
+ namespace {
+ 
+ using mozilla::DebugOnly;
+ using mozilla::StaticRefPtr;
+ using mozilla::dom::cache::Manager;
+ using mozilla::dom::cache::ManagerId;
+ using mozilla::services::GetObserverService;
+ 
+-// An nsIObserver that will terminate all Cache Managers and wait for
+-// them to complete.  This is somewhat complex because observer notifications
+-// and shutdown occurs on the main thread while Cache Managers work on
+-// background threads.
++// A singleton that tracks active Cache Managers and provides a main thread
++// shutdown mechanism.  When called, the singleton cancels the Managers and
++// waits for them to exit.  This is somewhat complex because shutdown
++// occurs on the main thread while Cache Managers work on background threads.
+ //
+ // The basic implementation is to hold an array of known ManagerIds on
+ // the main thread.  New Manager objects register their ManagerId when
+ // created by proxying to the main thread.  At shutdown, we proxy to
+ // the PBackground worker thread and call Manager::ShutdownAll().  We
+ // then spin the main thread event loop until all known ManagerIds are
+ // gone.
+-class CacheShutdownObserver MOZ_FINAL : public nsIObserver
++class CacheShutdownObserver MOZ_FINAL
+ {
+ public:
+   static already_AddRefed<CacheShutdownObserver> Instance();
+ 
+   nsresult AddManagerId(ManagerId* aManagerId);
+   void RemoveManagerId(ManagerId* aManagerId);
+ 
++  void DoShutdown();
++
+ private:
+   CacheShutdownObserver();
+-  virtual ~CacheShutdownObserver();
++  ~CacheShutdownObserver();
+ 
+-  void InitOnMainThread();
+   void AddManagerIdOnMainThread(ManagerId* aManagerId);
+   void RemoveManagerIdOnMainThread(ManagerId* aManagerId);
+ 
+   void StartShutdownOnBgThread();
+-  void FinishShutdownOnBgThread();
+ 
+-  void DoShutdown();
++  void ReleaseInstance();
+ 
+   nsCOMPtr<nsIThread> mBackgroundThread;
+ 
+-  // main thread only
++  // Main thread only
+   nsTArray<nsRefPtr<ManagerId>> mManagerIds;
+ 
+-  // bg thread only
+-  bool mShuttingDown;
++  // PBackground worker thread only
++  uint32_t mManagerCount;
+ 
+ public:
+-  NS_DECL_THREADSAFE_ISUPPORTS
+-  NS_DECL_NSIOBSERVER
++  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(CacheShutdownObserver)
+ };
+ 
+-// ShutdownObserver conflicts with other code here, so use CacheShutdownObserver
+-NS_IMPL_ISUPPORTS(CacheShutdownObserver, nsIObserver);
+-
+ // PBackground worker thread only
+-static bool gInstanceInit = false;
++static bool gShuttingDown = false;
+ static StaticRefPtr<CacheShutdownObserver> gInstance;
+ 
+ // Main thread only
+ static bool gActive = false;
+ 
+ // static
+ already_AddRefed<CacheShutdownObserver>
+ CacheShutdownObserver::Instance()
+ {
+   mozilla::ipc::AssertIsOnBackgroundThread();
+ 
+-  // Use a separate init variable here.  Since we clear gInstance after
+-  // shutdown we can't just compare against nullptr.  The init variable
+-  // allows us to ensure that a observer is not created in this case.
+-  if (!gInstanceInit) {
+-    gInstanceInit = true;
++  // Lazily create the singleton unless we have already started shutdown.
++  if (!gInstance && !gShuttingDown) {
+ 
+     // We cannot use ClearOnShutdown() because we are not on the main
+     // thread.  Of course, we are implementing a shutdown handler,
+     // so its not a problem to clear it manually.  This is done in
+-    // FinishShutdownOnBgThread().
++    // ReleaseInstance().
+     gInstance = new CacheShutdownObserver();
+-
+-    // We must initialize our new observer on the main thread.  Do this
+-    // outside the constructor because its fallible.
+-    nsCOMPtr<nsIRunnable> runnable =
+-      NS_NewRunnableMethod<nsRefPtr<CacheShutdownObserver>>(
+-                                      gInstance.get(),
+-                                      &CacheShutdownObserver::InitOnMainThread);
+-    nsresult rv = NS_DispatchToMainThread(runnable, nsIThread::DISPATCH_NORMAL);
+-
+-    // If we try to create an instance after shutdown somehow when no
+-    // Cache managers have ever been used, then we may fail to dispatch
+-    // to the main thread.  Treat this the same as calling Instance() with
+-    // gInstanceInit equal to true.
+-    if (NS_WARN_IF(NS_FAILED(rv))) {
+-      gInstance = nullptr;
+-    }
+   }
+ 
+   // can be null if we've already shutdown!
+   nsRefPtr<CacheShutdownObserver> ref = gInstance.get();
+   return ref.forget();
+ }
+ 
+ nsresult
+ CacheShutdownObserver::AddManagerId(ManagerId* aManagerId)
+ {
+   mozilla::ipc::AssertIsOnBackgroundThread();
+ 
+-  if (mShuttingDown) {
++  if (gShuttingDown) {
+     return NS_ERROR_ILLEGAL_DURING_SHUTDOWN;
+   }
+ 
++  MOZ_ASSERT(mManagerCount < UINT32_MAX);
++  mManagerCount += 1;
++
+   nsCOMPtr<nsIRunnable> runnable =
+     NS_NewRunnableMethodWithArg<nsRefPtr<ManagerId>>(
+       this, &CacheShutdownObserver::AddManagerIdOnMainThread, aManagerId);
+ 
+   DebugOnly<nsresult> rv =
+     NS_DispatchToMainThread(runnable, nsIThread::DISPATCH_NORMAL);
+ 
+   MOZ_ASSERT(NS_SUCCEEDED(rv));
+@@ -144,141 +121,132 @@ CacheShutdownObserver::AddManagerId(Mana
+   return NS_OK;
+ }
+ 
+ void
+ CacheShutdownObserver::RemoveManagerId(ManagerId* aManagerId)
+ {
+   mozilla::ipc::AssertIsOnBackgroundThread();
+ 
++  MOZ_ASSERT(mManagerCount != 0);
++  mManagerCount -= 1;
++
+   nsCOMPtr<nsIRunnable> runnable =
+     NS_NewRunnableMethodWithArg<nsRefPtr<ManagerId>>(
+       this, &CacheShutdownObserver::RemoveManagerIdOnMainThread, aManagerId);
+ 
+   DebugOnly<nsresult> rv =
+     NS_DispatchToMainThread(runnable, nsIThread::DISPATCH_NORMAL);
+ 
+   MOZ_ASSERT(NS_SUCCEEDED(rv));
+ }
+ 
+ CacheShutdownObserver::CacheShutdownObserver()
+   : mBackgroundThread(NS_GetCurrentThread())
+-  , mShuttingDown(false)
++  , mManagerCount(0)
+ {
+   mozilla::ipc::AssertIsOnBackgroundThread();
+   MOZ_ASSERT(!gActive);
+ }
+ 
+ CacheShutdownObserver::~CacheShutdownObserver()
+ {
+   // This can happen on either main thread or background thread.
+   MOZ_ASSERT(!gActive);
+-}
+-
+-void
+-CacheShutdownObserver::InitOnMainThread()
+-{
+-  MOZ_ASSERT(NS_IsMainThread());
+-
+-  nsCOMPtr<nsIObserverService> os = GetObserverService();
+-
+-  // If there is no observer service then we are already shutting down,
+-  // but content just tried to use the Cache API for the first time.
+-  // Trigger an immediate Cache shutdown.
+-  if (!os) {
+-    DoShutdown();
+-    return;
+-  }
+-
+-  os->AddObserver(this, "profile-before-change", false /* weak ref */);
++  MOZ_ASSERT(!mManagerCount);
+ }
+ 
+ void
+ CacheShutdownObserver::AddManagerIdOnMainThread(ManagerId* aManagerId)
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+   MOZ_ASSERT(!mManagerIds.Contains(aManagerId, ManagerId::Comparator()));
++  MOZ_ASSERT_IF(!gActive, mManagerIds.IsEmpty());
++
+   mManagerIds.AppendElement(aManagerId);
+   gActive = true;
+ }
+ 
+ void
+ CacheShutdownObserver::RemoveManagerIdOnMainThread(ManagerId* aManagerId)
+ {
+   MOZ_ASSERT(NS_IsMainThread());
++  MOZ_ASSERT(!mManagerIds.IsEmpty());
++
+   mManagerIds.RemoveElement(aManagerId, ManagerId::Comparator());
++
+   gActive = !mManagerIds.IsEmpty();
++  if (gActive) {
++    return;
++  }
++
++  // If there are no active Manager objects then schedule runnable to clear
++  // the singleton ref on the background thread.  The mManagerCount is used
++  // to detect any races with this delayed release.
++  nsCOMPtr<nsIRunnable> runnable =
++    NS_NewRunnableMethod(this, &CacheShutdownObserver::ReleaseInstance);
++  nsresult rv = mBackgroundThread->Dispatch(runnable, nsIThread::DISPATCH_NORMAL);
++  MOZ_ASSERT(NS_SUCCEEDED(rv));
+ }
+ 
+ void
+ CacheShutdownObserver::StartShutdownOnBgThread()
+ {
+   mozilla::ipc::AssertIsOnBackgroundThread();
++  MOZ_ASSERT(!gShuttingDown);
+ 
+-  // prevent any further AddManagerId() calls
+-  mShuttingDown = true;
++  // prevent any further AddManagerId() or Instance() calls
++  gShuttingDown = true;
+ 
+   Manager::ShutdownAll();
+ }
+ 
+ void
+-CacheShutdownObserver::FinishShutdownOnBgThread()
++CacheShutdownObserver::ReleaseInstance()
+ {
+   mozilla::ipc::AssertIsOnBackgroundThread();
+-  MOZ_ASSERT(mShuttingDown);
+ 
++  // Detect if a new ManagerId has been added in the time between
++  // removing the last ManagerId on the main thread and running this
++  // method on the background thread.  If so, then ignore the attempt
++  // to release this singleton.
++  if (mManagerCount != 0) {
++    return;
++  }
++
++  MOZ_ASSERT(gInstance);
+   gInstance = nullptr;
+ }
+ 
+ void
+ CacheShutdownObserver::DoShutdown()
+ {
+   MOZ_ASSERT(NS_IsMainThread());
++  MOZ_ASSERT(gActive);
+ 
+-  nsCOMPtr<nsIObserverService> os = mozilla::services::GetObserverService();
+-  if (os) {
+-    os->RemoveObserver(this, "profile-before-change");
+-  }
+-
+-  // Send shutdown notification to origin managers
++  // Send shutdown notification to origin managers.
+   nsCOMPtr<nsIRunnable> runnable =
+-    NS_NewRunnableMethod<nsRefPtr<CacheShutdownObserver>>(this,
+-                               &CacheShutdownObserver::StartShutdownOnBgThread);
++    NS_NewRunnableMethod(this, &CacheShutdownObserver::StartShutdownOnBgThread);
+   DebugOnly<nsresult> rv =
+     mBackgroundThread->Dispatch(runnable, nsIThread::DISPATCH_NORMAL);
+   MOZ_ASSERT(NS_SUCCEEDED(rv));
+ 
+   runnable = nullptr;
+ 
+-  // Wait for managers to shutdown
++  // Spin the main thread event loop until all Cache Managers have shutdown.
+   while (!mManagerIds.IsEmpty()) {
+     if (!NS_ProcessNextEvent()) {
+       NS_WARNING("Something bad happened!");
+       break;
+     }
+   }
+ 
+-  // schedule runnable to clear singleton ref on background thread
+-  runnable = NS_NewRunnableMethod<nsRefPtr<CacheShutdownObserver>>(this,
+-                              &CacheShutdownObserver::FinishShutdownOnBgThread);
+-  rv = mBackgroundThread->Dispatch(runnable, nsIThread::DISPATCH_NORMAL);
+-  MOZ_ASSERT(NS_SUCCEEDED(rv));
+-}
+-
+-NS_IMETHODIMP
+-CacheShutdownObserver::Observe(nsISupports* aSubject, const char* aTopic,
+-                               const char16_t* aData)
+-{
+-  MOZ_ASSERT(NS_IsMainThread());
+-
+-  if (!strcmp(aTopic, "profile-before-change")) {
+-    DoShutdown();
+-  }
+-
+-  return NS_OK;
++  // The gInstance reference release is automatically initiated when the
++  // last ManagerId is removed.  Once our callers reference is dropped,
++  // then the CacheShutdownObserver is destroyed.  Nothing else to do here.
+ }
+ 
+ } // anonymous namespace
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ namespace shutdown {
+@@ -316,19 +284,21 @@ void ExecuteShutdown()
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+ 
+   if (!gActive) {
+     return;
+   }
+ 
+   // If gActive is true, then we are guaranteed for there to be an observer
+-  // instance available.
+-  MOZ_ASSERT(gInstance);
++  // instance available.  This is helpful since the Instance() method is worker
++  // thread only and we're on the main thread here.
+ 
+-  // Simulate an observer service notification
+-  gInstance->Observe(nullptr, "profile-before-change", nullptr);
++  // Hold a ref on the stack as DoShutdown() will result in gInstance being
++  // nulled out.
++  nsRefPtr<CacheShutdownObserver> so = gInstance.get();
++  so->DoShutdown();
+ }
+ 
+ } // namespace shutdown
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
