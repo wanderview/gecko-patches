@@ -1,7 +1,9 @@
 # HG changeset patch
-# Parent 02c33c59b0d456325f699baf7f0db701d54924bd
+# Parent d17b44cc3363719f4892be1d840d3c7f74bbe362
 # User Ben Kelly <ben@wanderview.com>
 Bug 1100398 P4 Make nsPipeInputStream cloneable.
+* * *
+Bug 1100398 P4 interdiff 001 Add clone locking and handle re-entrant stream exceptions.
 
 diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 --- a/xpcom/io/nsPipe3.cpp
@@ -166,7 +168,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  class nsPipeOutputStream
    : public nsIAsyncOutputStream
    , public nsIClassInfo
-@@ -235,62 +274,82 @@ public:
+@@ -235,62 +274,84 @@ public:
  private:
    ~nsPipe();
  
@@ -200,6 +202,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 +                            nsIInputStream** aCloneOut);
 +
  protected:
++  // Only callable with mReetrantMonitor locked
 +  uint32_t CountSegmentReferences(int32_t aSegment) const;
 +  void SetAllNullReadCursors();
 +  bool AllReadCursorsMatchWriteCursor() const;
@@ -216,6 +219,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 +  // Since the input stream can be cloned, we may have more than one.  Use
 +  // a weak reference as the streams will clear their entry here in their
 +  // destructor.  Using a strong reference would create a reference cycle.
++  // Only usable while mReentrantMonitor is locked.
 +  nsTArray<nsPipeInputStream*> mInputList;
 +
 +  // But hold a strong ref to our original input stream.  For backward
@@ -258,7 +262,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  //       |/////////////////|
  //       |/////////////////|
  //       |/////////////////|
-@@ -302,46 +361,68 @@ protected:
+@@ -302,46 +363,68 @@ protected:
  //       |/////////////////|
  //       + - - - - - - - - + - - mWriteCursor
  //       |                 |
@@ -332,7 +336,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
               uint32_t aSegmentCount)
  {
    mInited = true;
-@@ -359,122 +440,148 @@ nsPipe::Init(bool aNonBlockingIn,
+@@ -359,122 +442,148 @@ nsPipe::Init(bool aNonBlockingIn,
      aSegmentCount = maxCount;
    }
  
@@ -516,7 +520,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
        if (mOutput.OnOutputWritable(events)) {
          mon.Notify();
        }
-@@ -500,27 +607,25 @@ nsPipe::GetWriteSegment(char*& aSegment,
+@@ -500,27 +609,25 @@ nsPipe::GetWriteSegment(char*& aSegment,
      }
      LOG(("OOO appended new segment\n"));
      mWriteCursor = seg;
@@ -548,7 +552,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  }
  
  void
-@@ -533,94 +638,218 @@ nsPipe::AdvanceWriteCursor(uint32_t aByt
+@@ -533,56 +640,82 @@ nsPipe::AdvanceWriteCursor(uint32_t aByt
      ReentrantMonitorAutoEnter mon(mReentrantMonitor);
  
      LOG(("OOO advancing write cursor by %u\n", aBytesWritten));
@@ -599,15 +603,20 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
      // notify input stream that pipe now contains additional data
 -    if (mInput.OnInputReadable(aBytesWritten, events)) {
 -      mon.Notify();
++    bool needNotify = false;
 +    for (uint32_t i = 0; i < mInputList.Length(); ++i) {
 +      if (mInputList[i]->OnInputReadable(aBytesWritten, events)) {
-+        mon.Notify();
++        needNotify = true;
 +      }
-     }
-   }
- }
- 
- void
++    }
++
++    if (needNotify) {
++      mon.NotifyAll();
++    }
++  }
++}
++
++void
 +nsPipe::OnInputStreamException(nsPipeInputStream* aStream, nsresult aReason)
 +{
 +  MOZ_ASSERT(NS_FAILED(aReason));
@@ -616,13 +625,18 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 +  {
 +    ReentrantMonitorAutoEnter mon(mReentrantMonitor);
 +
-+    MOZ_ASSERT(mInputList.Length() > 0);
++    // Its possible to re-enter this method when we call OnPipeException() or
++    // OnInputExection() below.  If there is a caller stuck in our synchronous
++    // Wait() method, then they will get woken up with a failure code which
++    // re-enters this method.  Therefore, gracefully handle unknown streams
++    // here.
 +
-+    // If we only have one stream open, then it must be this stream.  Shut
++    // If we only have one stream open and it is the given stream, then shut
 +    // down the entire pipe.
 +    if (mInputList.Length() == 1) {
-+      MOZ_ASSERT(mInputList[0] == aStream);
-+      OnPipeException(aReason);
++      if (mInputList[0] == aStream) {
++        OnPipeException(aReason);
++      }
 +      return;
 +    }
 +
@@ -632,26 +646,24 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 +        continue;
 +      }
 +
-+      if (mInputList[i]->OnInputException(aReason, events)) {
++      bool needNotify = mInputList[i]->OnInputException(aReason, events);
++      mInputList.RemoveElementAt(i);
++
++      // Notify after element is removed in case we re-enter as a result.
++      if (needNotify) {
 +        mon.Notify();
 +      }
-+      mInputList.RemoveElementAt(i);
++
 +      return;
-+    }
-+  }
-+
-+  MOZ_ASSERT_UNREACHABLE("Closing unknown pipe stream!");
-+}
-+
-+void
+     }
+   }
+ }
+ 
+ void
  nsPipe::OnPipeException(nsresult aReason, bool aOutputOnly)
  {
    LOG(("PPP nsPipe::OnPipeException [reason=%x output-only=%d]\n",
-        aReason, aOutputOnly));
- 
-   nsPipeEvents events;
-   {
-     ReentrantMonitorAutoEnter mon(mReentrantMonitor);
+@@ -594,33 +727,151 @@ nsPipe::OnPipeException(nsresult aReason
  
      // if we've already hit an exception, then ignore this one.
      if (NS_FAILED(mStatus)) {
@@ -664,7 +676,8 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 -    // zero bytes available.
 -    if (aOutputOnly && !mInput.Available()) {
 -      aOutputOnly = false;
--    }
++    bool needNotify = false;
++
 +    nsTArray<nsPipeInputStream*> tmpInputList;
 +    for (uint32_t i = 0; i < mInputList.Length(); ++i) {
 +      // an output-only exception applies to the input end if the pipe has
@@ -673,17 +686,27 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 +        tmpInputList.AppendElement(mInputList[i]);
 +        continue;
 +      }
++
++      if (mInputList[i]->OnInputException(aReason, events)) {
++        needNotify = true;
++      }
++    }
++    mInputList = tmpInputList;
++
++    if (mOutput.OnOutputException(aReason, events)) {
++      needNotify = true;
+     }
  
 -    if (!aOutputOnly)
 -      if (mInput.OnInputException(aReason, events)) {
-+      if (mInputList[i]->OnInputException(aReason, events)) {
-         mon.Notify();
-       }
-+    }
-+    mInputList = tmpInputList;
- 
-     if (mOutput.OnOutputException(aReason, events)) {
-       mon.Notify();
+-        mon.Notify();
+-      }
+-
+-    if (mOutput.OnOutputException(aReason, events)) {
+-      mon.Notify();
++    // Notify after we have removed any input streams from mInputList
++    if (needNotify) {
++      mon.NotifyAll();
      }
    }
  }
@@ -692,6 +715,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 +nsPipe::CloneInputStream(nsPipeInputStream* aOriginal,
 +                         nsIInputStream** aCloneOut)
 +{
++  ReentrantMonitorAutoEnter mon(mReentrantMonitor);
 +  nsRefPtr<nsPipeInputStream> ref = new nsPipeInputStream(*aOriginal);
 +  mInputList.AppendElement(ref);
 +  ref.forget(aCloneOut);
@@ -802,7 +826,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  {
    // dispatch any pending events
  
-@@ -635,50 +864,55 @@ nsPipeEvents::~nsPipeEvents()
+@@ -635,50 +886,55 @@ nsPipeEvents::~nsPipeEvents()
      mOutputStream = 0;
    }
  }
@@ -863,7 +887,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
    bool result = false;
  
    mAvailable += aBytesWritten;
-@@ -699,74 +933,66 @@ nsPipeInputStream::OnInputException(nsre
+@@ -699,74 +955,66 @@ nsPipeInputStream::OnInputException(nsre
  {
    LOG(("nsPipeInputStream::OnInputException [this=%x reason=%x]\n",
         this, aReason));
@@ -950,7 +974,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  
  NS_IMETHODIMP
  nsPipeInputStream::ReadSegments(nsWriteSegmentFun aWriter,
-@@ -778,17 +1004,17 @@ nsPipeInputStream::ReadSegments(nsWriteS
+@@ -778,17 +1026,17 @@ nsPipeInputStream::ReadSegments(nsWriteS
  
    nsresult rv = NS_OK;
  
@@ -969,7 +993,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
        }
        if (rv == NS_BASE_STREAM_WOULD_BLOCK) {
          // pipe is empty
-@@ -801,17 +1027,17 @@ nsPipeInputStream::ReadSegments(nsWriteS
+@@ -801,17 +1049,17 @@ nsPipeInputStream::ReadSegments(nsWriteS
            continue;
          }
        }
@@ -988,7 +1012,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
        segmentLen = aCount;
      }
  
-@@ -833,17 +1059,17 @@ nsPipeInputStream::ReadSegments(nsWriteS
+@@ -833,17 +1081,17 @@ nsPipeInputStream::ReadSegments(nsWriteS
        segment += writeCount;
        segmentLen -= writeCount;
        aCount -= writeCount;
@@ -1007,7 +1031,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  
  NS_IMETHODIMP
  nsPipeInputStream::Read(char* aToBuf, uint32_t aBufLen, uint32_t* aReadCount)
-@@ -879,18 +1105,17 @@ nsPipeInputStream::AsyncWait(nsIInputStr
+@@ -879,18 +1127,17 @@ nsPipeInputStream::AsyncWait(nsIInputStr
      }
  
      nsCOMPtr<nsIInputStreamCallback> proxy;
@@ -1027,7 +1051,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
        mCallbackFlags = aFlags;
      }
    }
-@@ -904,19 +1129,19 @@ nsPipeInputStream::Seek(int32_t aWhence,
+@@ -904,19 +1151,19 @@ nsPipeInputStream::Seek(int32_t aWhence,
    return NS_ERROR_NOT_IMPLEMENTED;
  }
  
@@ -1050,7 +1074,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  
  NS_IMETHODIMP
  nsPipeInputStream::SetEOF()
-@@ -940,17 +1165,17 @@ nsPipeInputStream::Search(const char* aF
+@@ -940,17 +1187,17 @@ nsPipeInputStream::Search(const char* aF
  
    ReentrantMonitorAutoEnter mon(mPipe->mReentrantMonitor);
  
@@ -1069,7 +1093,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
    }
  
    while (true) {
-@@ -969,17 +1194,17 @@ nsPipeInputStream::Search(const char* aF
+@@ -969,17 +1216,17 @@ nsPipeInputStream::Search(const char* aF
      // get the next segment
      char* cursor2;
      char* limit2;
@@ -1088,7 +1112,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
      }
      len2 = limit2 - cursor2;
  
-@@ -1003,16 +1228,40 @@ nsPipeInputStream::Search(const char* aF
+@@ -1003,16 +1250,40 @@ nsPipeInputStream::Search(const char* aF
      cursor1 = cursor2;
      limit1 = limit2;
    }
