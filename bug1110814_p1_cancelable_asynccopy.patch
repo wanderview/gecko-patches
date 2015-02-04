@@ -1,0 +1,209 @@
+# HG changeset patch
+# Parent 5dfe285609b22004d7669bff8eb74bb964c4d46f
+# User Ben Kelly <ben@wanderview.com>
+Bug 1110814 P1 Make NS_AsyncCopy() use nsICancelableRunnables so it can operate on Workers. r=froydnj
+
+diff --git a/xpcom/io/nsStreamUtils.cpp b/xpcom/io/nsStreamUtils.cpp
+--- a/xpcom/io/nsStreamUtils.cpp
++++ b/xpcom/io/nsStreamUtils.cpp
+@@ -6,29 +6,29 @@
+ 
+ #include "mozilla/Mutex.h"
+ #include "mozilla/Attributes.h"
+ #include "nsStreamUtils.h"
+ #include "nsAutoPtr.h"
+ #include "nsCOMPtr.h"
+ #include "nsIPipe.h"
+ #include "nsIEventTarget.h"
+-#include "nsIRunnable.h"
++#include "nsICancelableRunnable.h"
+ #include "nsISafeOutputStream.h"
+ #include "nsString.h"
+ #include "nsIAsyncInputStream.h"
+ #include "nsIAsyncOutputStream.h"
+ #include "nsIBufferedStreams.h"
+ 
+ using namespace mozilla;
+ 
+ //-----------------------------------------------------------------------------
+ 
+ class nsInputStreamReadyEvent MOZ_FINAL
+-  : public nsIRunnable
++  : public nsICancelableRunnable
+   , public nsIInputStreamCallback
+ {
+ public:
+   NS_DECL_THREADSAFE_ISUPPORTS
+ 
+   nsInputStreamReadyEvent(nsIInputStreamCallback* aCallback,
+                           nsIEventTarget* aTarget)
+     : mCallback(aCallback)
+@@ -87,29 +87,35 @@ public:
+       if (mStream) {
+         mCallback->OnInputStreamReady(mStream);
+       }
+       mCallback = nullptr;
+     }
+     return NS_OK;
+   }
+ 
++  NS_IMETHOD Cancel() MOZ_OVERRIDE
++  {
++    // do nothing
++    return NS_OK;
++  }
++
+ private:
+   nsCOMPtr<nsIAsyncInputStream>    mStream;
+   nsCOMPtr<nsIInputStreamCallback> mCallback;
+   nsCOMPtr<nsIEventTarget>         mTarget;
+ };
+ 
+-NS_IMPL_ISUPPORTS(nsInputStreamReadyEvent, nsIRunnable,
++NS_IMPL_ISUPPORTS(nsInputStreamReadyEvent, nsIRunnable, nsICancelableRunnable,
+                   nsIInputStreamCallback)
+ 
+ //-----------------------------------------------------------------------------
+ 
+ class nsOutputStreamReadyEvent MOZ_FINAL
+-  : public nsIRunnable
++  : public nsICancelableRunnable
+   , public nsIOutputStreamCallback
+ {
+ public:
+   NS_DECL_THREADSAFE_ISUPPORTS
+ 
+   nsOutputStreamReadyEvent(nsIOutputStreamCallback* aCallback,
+                            nsIEventTarget* aTarget)
+     : mCallback(aCallback)
+@@ -168,23 +174,29 @@ public:
+       if (mStream) {
+         mCallback->OnOutputStreamReady(mStream);
+       }
+       mCallback = nullptr;
+     }
+     return NS_OK;
+   }
+ 
++  NS_IMETHOD Cancel() MOZ_OVERRIDE
++  {
++    // do nothing
++    return NS_OK;
++  }
++
+ private:
+   nsCOMPtr<nsIAsyncOutputStream>    mStream;
+   nsCOMPtr<nsIOutputStreamCallback> mCallback;
+   nsCOMPtr<nsIEventTarget>          mTarget;
+ };
+ 
+-NS_IMPL_ISUPPORTS(nsOutputStreamReadyEvent, nsIRunnable,
++NS_IMPL_ISUPPORTS(nsOutputStreamReadyEvent, nsIRunnable, nsICancelableRunnable,
+                   nsIOutputStreamCallback)
+ 
+ //-----------------------------------------------------------------------------
+ 
+ already_AddRefed<nsIInputStreamCallback>
+ NS_NewInputStreamReadyEvent(nsIInputStreamCallback* aCallback,
+                             nsIEventTarget* aTarget)
+ {
+@@ -208,17 +220,17 @@ NS_NewOutputStreamReadyEvent(nsIOutputSt
+ 
+ //-----------------------------------------------------------------------------
+ // NS_AsyncCopy implementation
+ 
+ // abstract stream copier...
+ class nsAStreamCopier
+   : public nsIInputStreamCallback
+   , public nsIOutputStreamCallback
+-  , public nsIRunnable
++  , public nsICancelableRunnable
+ {
+ public:
+   NS_DECL_THREADSAFE_ISUPPORTS
+ 
+   nsAStreamCopier()
+     : mLock("nsAStreamCopier.mLock")
+     , mCallback(nullptr)
+     , mProgressCallback(nullptr)
+@@ -374,17 +386,17 @@ public:
+           }
+           mCallback(mClosure, status);
+         }
+         break;
+       }
+     }
+   }
+ 
+-  nsresult Cancel(nsresult aReason)
++  nsresult DoCancel(nsresult aReason)
+   {
+     MutexAutoLock lock(mLock);
+     if (mCanceled) {
+       return NS_ERROR_FAILURE;
+     }
+ 
+     if (NS_SUCCEEDED(aReason)) {
+       NS_WARNING("cancel with non-failure status code");
+@@ -419,16 +431,22 @@ public:
+     if (mEventIsPending) {
+       mEventIsPending = false;
+       PostContinuationEvent_Locked();
+     }
+ 
+     return NS_OK;
+   }
+ 
++  NS_IMETHOD Cancel() MOZ_OVERRIDE
++  {
++    DoCancel(NS_ERROR_ABORT);
++    return NS_OK;
++  }
++
+   nsresult PostContinuationEvent()
+   {
+     // we cannot post a continuation event if there is currently
+     // an event in process.  doing so could result in Process being
+     // run simultaneously on multiple threads, so we mark the event
+     // as pending, and if an event is already in process then we
+     // just let that existing event take care of posting the real
+     // continuation event.
+@@ -475,17 +493,18 @@ protected:
+   virtual ~nsAStreamCopier()
+   {
+   }
+ };
+ 
+ NS_IMPL_ISUPPORTS(nsAStreamCopier,
+                   nsIInputStreamCallback,
+                   nsIOutputStreamCallback,
+-                  nsIRunnable)
++                  nsIRunnable,
++                  nsICancelableRunnable)
+ 
+ class nsStreamCopierIB MOZ_FINAL : public nsAStreamCopier
+ {
+ public:
+   nsStreamCopierIB() : nsAStreamCopier()
+   {
+   }
+   virtual ~nsStreamCopierIB()
+@@ -626,17 +645,17 @@ NS_AsyncCopy(nsIInputStream*         aSo
+ 
+ //-----------------------------------------------------------------------------
+ 
+ nsresult
+ NS_CancelAsyncCopy(nsISupports* aCopierCtx, nsresult aReason)
+ {
+   nsAStreamCopier* copier =
+     static_cast<nsAStreamCopier*>(static_cast<nsIRunnable *>(aCopierCtx));
+-  return copier->Cancel(aReason);
++  return copier->DoCancel(aReason);
+ }
+ 
+ //-----------------------------------------------------------------------------
+ 
+ nsresult
+ NS_ConsumeStream(nsIInputStream* aStream, uint32_t aMaxCount,
+                  nsACString& aResult)
+ {
