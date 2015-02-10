@@ -1,0 +1,253 @@
+# HG changeset patch
+# Parent 73517b9b466eee982ff0f16ac28833d63982e7b1
+# User Ben Kelly <ben@wanderview.com>
+Bug 1100398 P4 interdiff 002 address review feedback
+
+
+diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
+--- a/xpcom/io/nsPipe3.cpp
++++ b/xpcom/io/nsPipe3.cpp
+@@ -123,28 +123,28 @@ public:
+   NS_DECL_NSISEEKABLESTREAM
+   NS_DECL_NSISEARCHABLEINPUTSTREAM
+   NS_DECL_NSICLONEABLEINPUTSTREAM
+   NS_DECL_NSICLASSINFO
+ 
+   explicit nsPipeInputStream(nsPipe* aPipe)
+     : mPipe(aPipe)
+     , mLogicalOffset(0)
++    , mInputStatus(NS_OK)
+     , mBlocking(true)
+-    , mStatus(NS_OK)
+     , mBlocked(false)
+     , mAvailable(0)
+     , mCallbackFlags(0)
+   { }
+ 
+   explicit nsPipeInputStream(const nsPipeInputStream& aOther)
+     : mPipe(aOther.mPipe)
+     , mLogicalOffset(aOther.mLogicalOffset)
++    , mInputStatus(aOther.mInputStatus)
+     , mBlocking(aOther.mBlocking)
+-    , mStatus(aOther.mStatus)
+     , mBlocked(false)
+     , mAvailable(aOther.mAvailable)
+     , mCallbackFlags(0)
+     , mReadState(aOther.mReadState)
+   { }
+ 
+   nsresult Fill();
+   void SetNonBlocking(bool aNonBlocking)
+@@ -178,18 +178,20 @@ public:
+   nsresult Status() const;
+ 
+ private:
+   virtual ~nsPipeInputStream();
+ 
+   nsRefPtr<nsPipe>               mPipe;
+ 
+   int64_t                        mLogicalOffset;
++  // Individual input streams can be closed without effecting the rest of the
++  // pipe.  So track individual input stream status separately.
++  nsresult                       mInputStatus;
+   bool                           mBlocking;
+-  nsresult                       mStatus;
+ 
+   // these variables can only be accessed while inside the pipe's monitor
+   bool                           mBlocked;
+   uint32_t                       mAvailable;
+   nsCOMPtr<nsIInputStreamCallback> mCallback;
+   uint32_t                       mCallbackFlags;
+ 
+   // treat as an opaque token to pass to nsPipe
+@@ -297,19 +299,19 @@ public:
+   void     OnInputStreamException(nsPipeInputStream* aStream, nsresult aReason);
+   void     OnPipeException(nsresult aReason, bool aOutputOnly = false);
+ 
+   nsresult CloneInputStream(nsPipeInputStream* aOriginal,
+                             nsIInputStream** aCloneOut);
+ 
+ protected:
+   // Only callable with mReetrantMonitor locked
+-  uint32_t CountSegmentReferences(int32_t aSegment) const;
++  uint32_t CountSegmentReferences(int32_t aSegment);
+   void SetAllNullReadCursors();
+-  bool AllReadCursorsMatchWriteCursor() const;
++  bool AllReadCursorsMatchWriteCursor();
+   void RollBackAllReadCursors(char* aWriteCursor);
+   void UpdateAllReadCursors(char* aWriteCursor);
+   void ValidateAllReadCursors();
+ 
+   // We can't inherit from both nsIInputStream and nsIOutputStream
+   // because they collide on their Close method. Consequently we nest their
+   // implementations to avoid the extra object allocation.
+   nsPipeOutputStream  mOutput;
+@@ -317,17 +319,18 @@ protected:
+   // Since the input stream can be cloned, we may have more than one.  Use
+   // a weak reference as the streams will clear their entry here in their
+   // destructor.  Using a strong reference would create a reference cycle.
+   // Only usable while mReentrantMonitor is locked.
+   nsTArray<nsPipeInputStream*> mInputList;
+ 
+   // But hold a strong ref to our original input stream.  For backward
+   // compatibility we need to be able to consistently return this same
+-  // object from GetInputStream().
++  // object from GetInputStream().  Note, mOriginalInput is also stored
++  // in mInputList as a weak ref.
+   nsRefPtr<nsPipeInputStream> mOriginalInput;
+ 
+   ReentrantMonitor    mReentrantMonitor;
+   nsSegmentedBuffer   mBuffer;
+ 
+   int32_t             mWriteSegment;
+   char*               mWriteCursor;
+   char*               mWriteLimit;
+@@ -767,81 +770,87 @@ nsPipe::CloneInputStream(nsPipeInputStre
+   ReentrantMonitorAutoEnter mon(mReentrantMonitor);
+   nsRefPtr<nsPipeInputStream> ref = new nsPipeInputStream(*aOriginal);
+   mInputList.AppendElement(ref);
+   ref.forget(aCloneOut);
+   return NS_OK;
+ }
+ 
+ uint32_t
+-nsPipe::CountSegmentReferences(int32_t aSegment) const
++nsPipe::CountSegmentReferences(int32_t aSegment)
+ {
++  mReentrantMonitor.AssertCurrentThreadIn();
+   uint32_t count = 0;
+   for (uint32_t i = 0; i < mInputList.Length(); ++i) {
+     if (aSegment >= mInputList[i]->ReadState().mSegment) {
+       count += 1;
+     }
+   }
+   return count;
+ }
+ 
+ void
+ nsPipe::SetAllNullReadCursors()
+ {
++  mReentrantMonitor.AssertCurrentThreadIn();
+   for (uint32_t i = 0; i < mInputList.Length(); ++i) {
+     nsPipeReadState& readState = mInputList[i]->ReadState();
+     if (!readState.mReadCursor) {
+       NS_ASSERTION(mWriteSegment == readState.mSegment,
+                    "unexpected null read cursor");
+       readState.mReadCursor = readState.mReadLimit = mWriteCursor;
+     }
+   }
+ }
+ 
+ bool
+-nsPipe::AllReadCursorsMatchWriteCursor() const
++nsPipe::AllReadCursorsMatchWriteCursor()
+ {
++  mReentrantMonitor.AssertCurrentThreadIn();
+   for (uint32_t i = 0; i < mInputList.Length(); ++i) {
+     const nsPipeReadState& readState = mInputList[i]->ReadState();
+     if (readState.mSegment != mWriteSegment ||
+         readState.mReadCursor != mWriteCursor) {
+       return false;
+     }
+   }
+   return true;
+ }
+ 
+ void
+ nsPipe::RollBackAllReadCursors(char* aWriteCursor)
+ {
++  mReentrantMonitor.AssertCurrentThreadIn();
+   for (uint32_t i = 0; i < mInputList.Length(); ++i) {
+     nsPipeReadState& readState = mInputList[i]->ReadState();
+     MOZ_ASSERT(mWriteSegment == readState.mSegment);
+     MOZ_ASSERT(mWriteCursor == readState.mReadCursor);
+     MOZ_ASSERT(mWriteCursor == readState.mReadLimit);
+     readState.mReadCursor = aWriteCursor;
+     readState.mReadLimit = aWriteCursor;
+   }
+ }
+ 
+ void
+ nsPipe::UpdateAllReadCursors(char* aWriteCursor)
+ {
++  mReentrantMonitor.AssertCurrentThreadIn();
+   for (uint32_t i = 0; i < mInputList.Length(); ++i) {
+     nsPipeReadState& readState = mInputList[i]->ReadState();
+     if (mWriteSegment == readState.mSegment &&
+         readState.mReadLimit == mWriteCursor) {
+       readState.mReadLimit = aWriteCursor;
+     }
+   }
+ }
+ 
+ void
+ nsPipe::ValidateAllReadCursors()
+ {
++  mReentrantMonitor.AssertCurrentThreadIn();
+   // The only way mReadCursor == mWriteCursor is if:
+   //
+   // - mReadCursor is at the start of a segment (which, based on how
+   //   nsSegmentedBuffer works, means that this segment is the "first"
+   //   segment)
+   // - mWriteCursor points at the location past the end of the current
+   //   write segment (so the current write filled the current write
+   //   segment, so we've incremented mWriteCursor to point past the end
+@@ -955,18 +964,18 @@ nsPipeInputStream::OnInputException(nsre
+ {
+   LOG(("nsPipeInputStream::OnInputException [this=%x reason=%x]\n",
+        this, aReason));
+ 
+   bool result = false;
+ 
+   NS_ASSERTION(NS_FAILED(aReason), "huh? successful exception");
+ 
+-  if (NS_SUCCEEDED(mStatus)) {
+-    mStatus = aReason;
++  if (NS_SUCCEEDED(mInputStatus)) {
++    mInputStatus = aReason;
+   }
+ 
+   // force count of available bytes to zero.
+   mAvailable = 0;
+ 
+   if (mCallback) {
+     aEvents.NotifyInputReady(this, mCallback);
+     mCallback = 0;
+@@ -978,17 +987,17 @@ nsPipeInputStream::OnInputException(nsre
+   return result;
+ }
+ 
+ NS_IMETHODIMP
+ nsPipeInputStream::CloseWithStatus(nsresult aReason)
+ {
+   LOG(("III CloseWithStatus [this=%x reason=%x]\n", this, aReason));
+ 
+-  if (NS_FAILED(mStatus)) {
++  if (NS_FAILED(mInputStatus)) {
+     return NS_OK;
+   }
+ 
+   if (NS_SUCCEEDED(aReason)) {
+     aReason = NS_BASE_STREAM_CLOSED;
+   }
+ 
+   mPipe->OnInputStreamException(this, aReason);
+@@ -1266,17 +1275,17 @@ NS_IMETHODIMP
+ nsPipeInputStream::Clone(nsIInputStream** aCloneOut)
+ {
+   return mPipe->CloneInputStream(this, aCloneOut);
+ }
+ 
+ nsresult
+ nsPipeInputStream::Status() const
+ {
+-  return NS_FAILED(mStatus) ? mStatus : mPipe->mStatus;
++  return NS_FAILED(mInputStatus) ? mInputStatus : mPipe->mStatus;
+ }
+ 
+ nsPipeInputStream::~nsPipeInputStream()
+ {
+   Close();
+ }
+ 
+ //-----------------------------------------------------------------------------
