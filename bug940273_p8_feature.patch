@@ -1,0 +1,1193 @@
+# HG changeset patch
+# Parent 77c040c2a1f2d504f8e7c7e119068708818a6c92
+# User Ben Kelly <ben@wanderview.com>
+Bug 940273 P8 Implement a WorkerFeature to avoid IPC races.
+
+diff --git a/dom/cache/ActorChild.h b/dom/cache/ActorChild.h
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/ActorChild.h
+@@ -0,0 +1,24 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_cache_ActioChild_h
++#define mozilla_dom_cache_ActioChild_h
++
++namespace mozilla {
++namespace dom {
++namespace cache {
++
++class ActorChild
++{
++public:
++  virtual void StartDestroy() = 0;
++};
++
++} // namespace cache
++} // namespace dom
++} // namespace mozilla
++
++#endif // mozilla_dom_cache_ActioChild_h
+diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
+--- a/dom/cache/Cache.cpp
++++ b/dom/cache/Cache.cpp
+@@ -79,19 +79,19 @@ using mozilla::dom::workers::WorkerPriva
+ NS_IMPL_CYCLE_COLLECTING_ADDREF(mozilla::dom::cache::Cache);
+ NS_IMPL_CYCLE_COLLECTING_RELEASE(mozilla::dom::cache::Cache);
+ NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(Cache, mGlobal, mRequestPromises)
+ 
+ NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Cache)
+   NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+ NS_INTERFACE_MAP_END
+ 
+-Cache::Cache(nsIGlobalObject* aGlobal, PCacheChild* aActor)
++Cache::Cache(nsIGlobalObject* aGlobal, CacheChild* aActor)
+   : mGlobal(aGlobal)
+-  , mActor(static_cast<CacheChild*>(aActor))
++  , mActor(aActor)
+ {
+   MOZ_ASSERT(mGlobal);
+   MOZ_ASSERT(mActor);
+   mActor->SetListener(this);
+ }
+ 
+ already_AddRefed<Promise>
+ Cache::Match(const RequestOrUSVString& aRequest,
+diff --git a/dom/cache/Cache.h b/dom/cache/Cache.h
+--- a/dom/cache/Cache.h
++++ b/dom/cache/Cache.h
+@@ -32,29 +32,28 @@ struct CacheQueryOptions;
+ class RequestOrUSVString;
+ class Response;
+ template<typename T> class Optional;
+ template<typename T> class Sequence;
+ 
+ namespace cache {
+ 
+ class CacheChild;
+-class PCacheChild;
+ class PCacheRequest;
+ class PCacheRequestOrVoid;
+ class PCacheResponse;
+ class PCacheResponseOrVoid;
+ class PCacheStreamControlChild;
+ 
+ class Cache MOZ_FINAL : public nsISupports
+                       , public nsWrapperCache
+                       , public TypeUtils
+ {
+ public:
+-  Cache(nsIGlobalObject* aGlobal, PCacheChild* aActor);
++  Cache(nsIGlobalObject* aGlobal, CacheChild* aActor);
+ 
+   // webidl interface methods
+   already_AddRefed<Promise>
+   Match(const RequestOrUSVString& aRequest, const CacheQueryOptions& aOptions,
+         ErrorResult& aRv);
+   already_AddRefed<Promise>
+   MatchAll(const Optional<RequestOrUSVString>& aRequest,
+            const CacheQueryOptions& aOptions, ErrorResult& aRv);
+diff --git a/dom/cache/CacheChild.cpp b/dom/cache/CacheChild.cpp
+--- a/dom/cache/CacheChild.cpp
++++ b/dom/cache/CacheChild.cpp
+@@ -4,16 +4,18 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/CacheChild.h"
+ 
+ #include "mozilla/unused.h"
+ #include "mozilla/dom/cache/ActorUtils.h"
+ #include "mozilla/dom/cache/Cache.h"
++#include "mozilla/dom/cache/Feature.h"
++#include "mozilla/dom/cache/StreamUtils.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ // Declared in ActorUtils.h
+ PCacheChild*
+ AllocPCacheChild()
+@@ -27,16 +29,27 @@ CacheChild::CacheChild()
+   MOZ_COUNT_CTOR(cache::CacheChild);
+ }
+ 
+ CacheChild::~CacheChild()
+ {
+   MOZ_COUNT_DTOR(cache::CacheChild);
+   NS_ASSERT_OWNINGTHREAD(CacheChild);
+   MOZ_ASSERT(!mListener);
++  MOZ_ASSERT(!mFeature);
++}
++
++void
++CacheChild::SetFeature(Feature* aFeature)
++{
++  MOZ_ASSERT(!mFeature);
++  mFeature = aFeature;
++  if (mFeature) {
++    mFeature->AddActor(this);
++  }
+ }
+ 
+ void
+ CacheChild::SetListener(Cache* aListener)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheChild);
+   MOZ_ASSERT(!mListener);
+   mListener = aListener;
+@@ -49,55 +62,76 @@ CacheChild::ClearListener()
+   NS_ASSERT_OWNINGTHREAD(CacheChild);
+   MOZ_ASSERT(mListener);
+   mListener = nullptr;
+ }
+ 
+ void
+ CacheChild::StartDestroy()
+ {
+-  MOZ_ASSERT(mListener);
++  // StartDestroy() can get called from either Cache or the Feature.
++  // Theoretically we can get double called if the right race happens.  Handle
++  // that by just ignoring the second StartDestroy() call.
++  if (!mListener) {
++    return;
++  }
++
+   mListener->ActorDestroy(this);
++
+   // Cache listener should call ClearListener() in ActorDestroy()
+   MOZ_ASSERT(!mListener);
+ 
+   // Start actor destruction from parent process
+   unused << SendTeardown();
+ }
+ 
+ void
+ CacheChild::ActorDestroy(ActorDestroyReason aReason)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheChild);
+   if (mListener) {
+     mListener->ActorDestroy(this);
+     // Cache listener should call ClearListener() in ActorDestroy()
+     MOZ_ASSERT(!mListener);
+   }
++
++  if (mFeature) {
++    mFeature->RemoveActor(this);
++    mFeature = nullptr;
++  }
+ }
+ 
+ bool
+ CacheChild::RecvMatchResponse(const RequestId& requestId, const nsresult& aRv,
+                               const PCacheResponseOrVoid& aResponse)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheChild);
+-  if (mListener) {
+-    mListener->RecvMatchResponse(requestId, aRv, aResponse);
++  if (!mListener || (mFeature && mFeature->Notified())) {
++    StartDestroyStreamActor(aResponse);
++    return true;
+   }
++
++
++  AddFeatureToStreamActor(aResponse, mFeature);
++  mListener->RecvMatchResponse(requestId, aRv, aResponse);
+   return true;
+ }
+ 
+ bool
+ CacheChild::RecvMatchAllResponse(const RequestId& requestId, const nsresult& aRv,
+-                                 nsTArray<PCacheResponse>&& responses)
++                                 nsTArray<PCacheResponse>&& aResponses)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheChild);
+-  if (mListener) {
+-    mListener->RecvMatchAllResponse(requestId, aRv, responses);
++  if (!mListener || (mFeature && mFeature->Notified())) {
++    StartDestroyStreamActors(aResponses);
++    return true;
+   }
++
++  AddFeatureToStreamActors(aResponses, mFeature);
++  mListener->RecvMatchAllResponse(requestId, aRv, aResponses);
+   return true;
+ }
+ 
+ bool
+ CacheChild::RecvAddAllResponse(const RequestId& requestId, const nsresult& aRv)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheChild);
+   if (mListener) {
+@@ -124,20 +158,24 @@ CacheChild::RecvDeleteResponse(const Req
+   if (mListener) {
+     mListener->RecvDeleteResponse(requestId, aRv, result);
+   }
+   return true;
+ }
+ 
+ bool
+ CacheChild::RecvKeysResponse(const RequestId& requestId, const nsresult& aRv,
+-                             nsTArray<PCacheRequest>&& requests)
++                             nsTArray<PCacheRequest>&& aRequests)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheChild);
+-  if (mListener) {
+-    mListener->RecvKeysResponse(requestId, aRv, requests);
++  if (!mListener || (mFeature && mFeature->Notified())) {
++    StartDestroyStreamActors(aRequests);
++    return true;
+   }
++
++  AddFeatureToStreamActors(aRequests, mFeature);
++  mListener->RecvKeysResponse(requestId, aRv, aRequests);
+   return true;
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namesapce mozilla
+diff --git a/dom/cache/CacheChild.h b/dom/cache/CacheChild.h
+--- a/dom/cache/CacheChild.h
++++ b/dom/cache/CacheChild.h
+@@ -2,40 +2,46 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_cache_CacheChild_h
+ #define mozilla_dom_cache_CacheChild_h
+ 
++#include "mozilla/dom/cache/ActorChild.h"
+ #include "mozilla/dom/cache/PCacheChild.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ class Cache;
++class Feature;
+ 
+ class CacheChild MOZ_FINAL : public PCacheChild
++                           , public ActorChild
+ {
+ public:
+   CacheChild();
+   ~CacheChild();
+ 
++  void SetFeature(Feature* aFeature);
+   void SetListener(Cache* aListener);
+ 
+   // Must be called by the associated Cache listener in its ActorDestroy()
+   // method.  Also, Cache must Send__delete__() the actor in its destructor to
+   // trigger ActorDestroy() if it has not been called yet.
+   void ClearListener();
+ 
++  // ActorChild methods
++
+   // Synchronously call ActorDestroy on our Cache listener and then start the
+   // actor destruction asynchronously from the parent-side.
+-  void StartDestroy();
++  virtual void StartDestroy() MOZ_OVERRIDE;
+ 
+   // PCacheChild methods
+   virtual void
+   ActorDestroy(ActorDestroyReason aReason) MOZ_OVERRIDE;
+ 
+   virtual bool
+   RecvMatchResponse(const RequestId& requestId, const nsresult& aRv,
+                     const PCacheResponseOrVoid& aResponse) MOZ_OVERRIDE;
+@@ -51,16 +57,18 @@ public:
+   virtual bool
+   RecvDeleteResponse(const RequestId& requestId, const nsresult& aRv,
+                      const bool& result) MOZ_OVERRIDE;
+   virtual bool
+   RecvKeysResponse(const RequestId& requestId, const nsresult& aRv,
+                    nsTArray<PCacheRequest>&& requests) MOZ_OVERRIDE;
+ 
+ private:
++  nsRefPtr<Feature> mFeature;
++
+   // Use a weak ref so actor does not hold DOM object alive past content use.
+   // The Cache object must call ClearListener() to null this before its
+   // destroyed.
+   Cache* MOZ_NON_OWNING_REF mListener;
+ 
+   NS_DECL_OWNINGTHREAD
+ };
+ 
+diff --git a/dom/cache/CacheStorage.cpp b/dom/cache/CacheStorage.cpp
+--- a/dom/cache/CacheStorage.cpp
++++ b/dom/cache/CacheStorage.cpp
+@@ -7,17 +7,19 @@
+ #include "mozilla/dom/cache/CacheStorage.h"
+ 
+ #include "mozilla/unused.h"
+ #include "mozilla/dom/CacheStorageBinding.h"
+ #include "mozilla/dom/Promise.h"
+ #include "mozilla/dom/Response.h"
+ #include "mozilla/dom/cache/AutoUtils.h"
+ #include "mozilla/dom/cache/Cache.h"
++#include "mozilla/dom/cache/CacheChild.h"
+ #include "mozilla/dom/cache/CacheStorageChild.h"
++#include "mozilla/dom/cache/Feature.h"
+ #include "mozilla/dom/cache/PCacheChild.h"
+ #include "mozilla/dom/cache/ReadStream.h"
+ #include "mozilla/dom/cache/TypeUtils.h"
+ #include "mozilla/ipc/BackgroundChild.h"
+ #include "mozilla/ipc/BackgroundUtils.h"
+ #include "mozilla/ipc/PBackgroundChild.h"
+ #include "mozilla/ipc/PBackgroundSharedTypes.h"
+ #include "nsIGlobalObject.h"
+@@ -84,54 +86,61 @@ CacheStorage::CreateOnMainThread(Namespa
+   PrincipalInfo principalInfo;
+   rv = PrincipalToPrincipalInfo(aPrincipal, &principalInfo);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     aRv.Throw(rv);
+     return nullptr;
+   }
+ 
+   nsRefPtr<CacheStorage> ref = new CacheStorage(aNamespace, aGlobal,
+-                                                principalInfo);
++                                                principalInfo, nullptr);
+   return ref.forget();
+ }
+ 
+ // static
+ already_AddRefed<CacheStorage>
+ CacheStorage::CreateOnWorker(Namespace aNamespace, nsIGlobalObject* aGlobal,
+                              WorkerPrivate* aWorkerPrivate, ErrorResult& aRv)
+ {
+   MOZ_ASSERT(aGlobal);
+   MOZ_ASSERT(aWorkerPrivate);
+   aWorkerPrivate->AssertIsOnWorkerThread();
+ 
++  nsRefPtr<Feature> feature = Feature::Create(aWorkerPrivate);
++  if (!feature) {
++    NS_WARNING("Worker thread is shutting down.");
++    return nullptr;
++  }
++
+   const PrincipalInfo& principalInfo = aWorkerPrivate->GetPrincipalInfo();
+   if (principalInfo.type() == PrincipalInfo::TNullPrincipalInfo) {
+     NS_WARNING("CacheStorage not supported on null principal.");
+     aRv.Throw(NS_ERROR_FAILURE);
+     return nullptr;
+   }
+ 
+   if (principalInfo.type() == PrincipalInfo::TContentPrincipalInfo &&
+       principalInfo.get_ContentPrincipalInfo().appId() ==
+       nsIScriptSecurityManager::UNKNOWN_APP_ID) {
+     NS_WARNING("CacheStorage not supported on principal with unknown appId.");
+     aRv.Throw(NS_ERROR_FAILURE);
+     return nullptr;
+   }
+ 
+   nsRefPtr<CacheStorage> ref = new CacheStorage(aNamespace, aGlobal,
+-                                                principalInfo);
++                                                principalInfo, feature);
+   return ref.forget();
+ }
+ 
+ CacheStorage::CacheStorage(Namespace aNamespace, nsIGlobalObject* aGlobal,
+-                           const PrincipalInfo& aPrincipalInfo)
++                           const PrincipalInfo& aPrincipalInfo, Feature* aFeature)
+   : mNamespace(aNamespace)
+   , mGlobal(aGlobal)
+   , mPrincipalInfo(MakeUnique<PrincipalInfo>(aPrincipalInfo))
++  , mFeature(aFeature)
+   , mActor(nullptr)
+   , mFailedActor(false)
+ {
+   MOZ_ASSERT(mGlobal);
+ 
+   // If the PBackground actor is already initialized then we can
+   // immediately use it
+   PBackgroundChild* actor = BackgroundChild::GetForCurrentThread();
+@@ -309,39 +318,47 @@ CacheStorage::WrapObject(JSContext* aCon
+ }
+ 
+ void
+ CacheStorage::ActorCreated(PBackgroundChild* aActor)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorage);
+   MOZ_ASSERT(aActor);
+ 
+-  CacheStorageChild* newActor = new CacheStorageChild(this);
++  if (NS_WARN_IF(mFeature && mFeature->Notified())) {
++    ActorFailed();
++    return;
++  }
++
++  CacheStorageChild* newActor = new CacheStorageChild(this, mFeature);
+   PCacheStorageChild* constructedActor =
+     aActor->SendPCacheStorageConstructor(newActor, mNamespace, *mPrincipalInfo);
+ 
+   if (NS_WARN_IF(!constructedActor)) {
+     ActorFailed();
+     return;
+   }
+ 
++  mFeature = nullptr;
++
+   MOZ_ASSERT(constructedActor == newActor);
+   mActor = newActor;
+ 
+   MaybeRunPendingRequests();
+   MOZ_ASSERT(mPendingRequests.IsEmpty());
+ }
+ 
+ void
+ CacheStorage::ActorFailed()
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorage);
+   MOZ_ASSERT(!mFailedActor);
+ 
+   mFailedActor = true;
++  mFeature = nullptr;
+ 
+   for (uint32_t i = 0; i < mPendingRequests.Length(); ++i) {
+     RequestId requestId = mPendingRequests[i].mRequestId;
+     nsRefPtr<Promise> promise = RemoveRequestPromise(requestId);
+     promise->MaybeReject(NS_ERROR_UNEXPECTED);
+   }
+   mPendingRequests.Clear();
+ }
+@@ -405,17 +422,17 @@ CacheStorage::RecvHasResponse(RequestId 
+ 
+   }
+ 
+   promise->MaybeResolve(aSuccess);
+ }
+ 
+ void
+ CacheStorage::RecvOpenResponse(RequestId aRequestId, nsresult aRv,
+-                               PCacheChild* aActor)
++                               CacheChild* aActor)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorage);
+ 
+   // Unlike most of our async callback Recv*() methods, this one gets back
+   // an actor.  We need to make sure to clean it up in case of error.
+ 
+   nsRefPtr<Promise> promise = RemoveRequestPromise(aRequestId);
+ 
+diff --git a/dom/cache/CacheStorage.h b/dom/cache/CacheStorage.h
+--- a/dom/cache/CacheStorage.h
++++ b/dom/cache/CacheStorage.h
+@@ -33,18 +33,19 @@ namespace dom {
+ class Promise;
+ 
+ namespace workers {
+   class WorkerPrivate;
+ }
+ 
+ namespace cache {
+ 
++class CacheChild;
+ class CacheStorageChild;
+-class PCacheChild;
++class Feature;
+ class PCacheRequest;
+ class PCacheResponseOrVoid;
+ 
+ class CacheStorage MOZ_FINAL : public nsIIPCBackgroundChildCreateCallback
+                              , public nsWrapperCache
+                              , public TypeUtils
+ {
+   typedef mozilla::ipc::PBackgroundChild PBackgroundChild;
+@@ -78,42 +79,43 @@ public:
+   virtual void ActorFailed() MOZ_OVERRIDE;
+ 
+   // Methods forwarded from CacheStorageChild
+   void ActorDestroy(mozilla::ipc::IProtocol* aActor);
+   void RecvMatchResponse(RequestId aRequestId, nsresult aRv,
+                          const PCacheResponseOrVoid& aResponse);
+   void RecvHasResponse(RequestId aRequestId, nsresult aRv, bool aSuccess);
+   void RecvOpenResponse(RequestId aRequestId, nsresult aRv,
+-                        PCacheChild* aActor);
++                        CacheChild* aActor);
+   void RecvDeleteResponse(RequestId aRequestId, nsresult aRv, bool aSuccess);
+   void RecvKeysResponse(RequestId aRequestId, nsresult aRv,
+                         const nsTArray<nsString>& aKeys);
+ 
+   // TypeUtils method
+   virtual nsIGlobalObject* GetGlobalObject() const MOZ_OVERRIDE;
+ #ifdef DEBUG
+   virtual void AssertOwningThread() const MOZ_OVERRIDE;
+ #endif
+ 
+ private:
+   CacheStorage(Namespace aNamespace, nsIGlobalObject* aGlobal,
+-               const mozilla::ipc::PrincipalInfo& aPrincipalInfo);
++               const mozilla::ipc::PrincipalInfo& aPrincipalInfo, Feature* aFeature);
+   ~CacheStorage();
+ 
+   void MaybeRunPendingRequests();
+ 
+   RequestId AddRequestPromise(Promise* aPromise, ErrorResult& aRv);
+   already_AddRefed<Promise> RemoveRequestPromise(RequestId aRequestId);
+ 
+   // Would like to use CacheInitData here, but we cannot because
+   // its an IPC struct which breaks webidl by including windows.h.
+   const Namespace mNamespace;
+   nsCOMPtr<nsIGlobalObject> mGlobal;
+   UniquePtr<mozilla::ipc::PrincipalInfo> mPrincipalInfo;
++  nsRefPtr<Feature> mFeature;
+   CacheStorageChild* mActor;
+   nsTArray<nsRefPtr<Promise>> mRequestPromises;
+ 
+   enum Op
+   {
+     OP_MATCH,
+     OP_HAS,
+     OP_OPEN,
+diff --git a/dom/cache/CacheStorageChild.cpp b/dom/cache/CacheStorageChild.cpp
+--- a/dom/cache/CacheStorageChild.cpp
++++ b/dom/cache/CacheStorageChild.cpp
+@@ -2,76 +2,104 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/CacheStorageChild.h"
+ 
+ #include "mozilla/unused.h"
++#include "mozilla/dom/cache/CacheChild.h"
+ #include "mozilla/dom/cache/CacheStorage.h"
++#include "mozilla/dom/cache/Feature.h"
++#include "mozilla/dom/cache/StreamUtils.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+-CacheStorageChild::CacheStorageChild(CacheStorage* aListener)
++CacheStorageChild::CacheStorageChild(CacheStorage* aListener, Feature* aFeature)
+   : mListener(aListener)
++  , mFeature(aFeature)
+ {
+   MOZ_COUNT_CTOR(cache::CacheStorageChild);
+   MOZ_ASSERT(mListener);
++
++  if (mFeature) {
++    mFeature->AddActor(this);
++  }
+ }
+ 
+ CacheStorageChild::~CacheStorageChild()
+ {
+   MOZ_COUNT_DTOR(cache::CacheStorageChild);
+   NS_ASSERT_OWNINGTHREAD(CacheStorageChild);
+   MOZ_ASSERT(!mListener);
++  MOZ_ASSERT(!mFeature);
+ }
+ 
+ void
+ CacheStorageChild::ClearListener()
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorageChild);
+   MOZ_ASSERT(mListener);
+   mListener = nullptr;
+ }
+ 
+ void
+ CacheStorageChild::StartDestroy()
+ {
+-  MOZ_ASSERT(mListener);
++  NS_ASSERT_OWNINGTHREAD(CacheStorageChild);
++
++  // StartDestroy() can get called from either CacheStorage or the Feature.
++  // Theoretically we can get double called if the right race happens.  Handle
++  // that by just ignoring the second StartDestroy() call.
++  if (!mListener) {
++    return;
++  }
++
+   mListener->ActorDestroy(this);
++
+   // CacheStorage listener should call ClearListener() in ActorDestroy()
+   MOZ_ASSERT(!mListener);
+ 
+   // Start actor destruction from parent process
+   unused << SendTeardown();
+ }
+ 
+ void
+ CacheStorageChild::ActorDestroy(ActorDestroyReason aReason)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorageChild);
+   if (mListener) {
+     mListener->ActorDestroy(this);
+     // CacheStorage listener should call ClearListener() in ActorDestroy()
+     MOZ_ASSERT(!mListener);
+   }
++
++  if (mFeature) {
++    mFeature->RemoveActor(this);
++    mFeature = nullptr;
++  }
+ }
+ 
+ bool
+ CacheStorageChild::RecvMatchResponse(const RequestId& aRequestId,
+                                      const nsresult& aRv,
+                                      const PCacheResponseOrVoid& aResponseOrVoid)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorageChild);
+-  if (mListener) {
+-    mListener->RecvMatchResponse(aRequestId, aRv, aResponseOrVoid);
++  if (!mListener || (mFeature && mFeature->Notified())) {
++    StartDestroyStreamActor(aResponseOrVoid);
++    return true;
+   }
++
++  AddFeatureToStreamActor(aResponseOrVoid, mFeature);
++  mListener->RecvMatchResponse(aRequestId, aRv, aResponseOrVoid);
++
+   return true;
+ }
+ 
+ bool
+ CacheStorageChild::RecvHasResponse(const RequestId& aRequestId,
+                                    const nsresult& aRv,
+                                    const bool& aSuccess)
+ {
+@@ -83,19 +111,32 @@ CacheStorageChild::RecvHasResponse(const
+ }
+ 
+ bool
+ CacheStorageChild::RecvOpenResponse(const RequestId& aRequestId,
+                                     const nsresult& aRv,
+                                     PCacheChild* aActor)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorageChild);
+-  if (mListener) {
+-    mListener->RecvOpenResponse(aRequestId, aRv, aActor);
++  MOZ_ASSERT(aActor);
++
++  if (!mListener || (mFeature && mFeature->Notified())) {
++    unused << aActor->SendTeardown();
++    return true;
+   }
++
++  CacheChild* cacheChild = static_cast<CacheChild*>(aActor);
++
++  // Since Feature::Notified returned false above, we are guaranteed that
++  // the feature won't try to shutdown the actor until after we create the
++  // Cache DOM object in the listener's RecvOpenResponse() method.  This
++  // is important because StartShutdown() expects a Cache object listener.
++  cacheChild->SetFeature(mFeature);
++
++  mListener->RecvOpenResponse(aRequestId, aRv, cacheChild);
+   return true;
+ }
+ 
+ bool
+ CacheStorageChild::RecvDeleteResponse(const RequestId& aRequestId,
+                                       const nsresult& aRv,
+                                       const bool& aResult)
+ {
+diff --git a/dom/cache/CacheStorageChild.h b/dom/cache/CacheStorageChild.h
+--- a/dom/cache/CacheStorageChild.h
++++ b/dom/cache/CacheStorageChild.h
+@@ -2,47 +2,52 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_cache_CacheStorageChild_h
+ #define mozilla_dom_cache_CacheStorageChild_h
+ 
++#include "mozilla/dom/cache/ActorChild.h"
+ #include "mozilla/dom/cache/Types.h"
+ #include "mozilla/dom/cache/PCacheStorageChild.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ class CacheStorage;
+ class PCacheChild;
++class Feature;
+ 
+ class CacheStorageChild MOZ_FINAL : public PCacheStorageChild
++                                  , public ActorChild
+ {
+ public:
+-  explicit CacheStorageChild(CacheStorage* aListener);
++  CacheStorageChild(CacheStorage* aListener, Feature* aFeature);
+   ~CacheStorageChild();
+ 
+   // Must be called by the associated CacheStorage listener in its
+   // ActorDestroy() method.  Also, CacheStorage must Send__delete__() the
+   // actor in its destructor to trigger ActorDestroy() if it has not been
+   // called yet.
+   void ClearListener();
+ 
++  // ActorChild methods
++
+   // Synchronously call ActorDestroy on our CacheStorage listener and then start
+   // the actor destruction asynchronously from the parent-side.
+-  void StartDestroy();
++  virtual void StartDestroy() MOZ_OVERRIDE;
+ 
+   // PCacheStorageChild methods
+   virtual void ActorDestroy(ActorDestroyReason aReason) MOZ_OVERRIDE;
+   virtual bool RecvMatchResponse(const RequestId& requestId,
+-                             const nsresult& aRv,
+-                             const PCacheResponseOrVoid& response) MOZ_OVERRIDE;
++                                 const nsresult& aRv,
++                                 const PCacheResponseOrVoid& response) MOZ_OVERRIDE;
+   virtual bool RecvHasResponse(const cache::RequestId& aRequestId,
+                                const nsresult& aRv,
+                                const bool& aSuccess) MOZ_OVERRIDE;
+   virtual bool RecvOpenResponse(const cache::RequestId& aRequestId,
+                                 const nsresult& aRv,
+                                 PCacheChild* aActor) MOZ_OVERRIDE;
+   virtual bool RecvDeleteResponse(const cache::RequestId& aRequestId,
+                                   const nsresult& aRv,
+@@ -52,16 +57,18 @@ public:
+                                 nsTArray<nsString>&& aKeys) MOZ_OVERRIDE;
+ 
+ private:
+   // Use a weak ref so actor does not hold DOM object alive past content use.
+   // The CacheStorage object must call ClearListener() to null this before its
+   // destroyed.
+   CacheStorage* MOZ_NON_OWNING_REF mListener;
+ 
++  nsRefPtr<Feature> mFeature;
++
+   NS_DECL_OWNINGTHREAD
+ };
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_cache_CacheStorageChild_h
+diff --git a/dom/cache/CacheStreamControlChild.cpp b/dom/cache/CacheStreamControlChild.cpp
+--- a/dom/cache/CacheStreamControlChild.cpp
++++ b/dom/cache/CacheStreamControlChild.cpp
+@@ -4,16 +4,17 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/CacheStreamControlChild.h"
+ 
+ #include "mozilla/DebugOnly.h"
+ #include "mozilla/unused.h"
+ #include "mozilla/dom/cache/ActorUtils.h"
++#include "mozilla/dom/cache/Feature.h"
+ #include "mozilla/dom/cache/ReadStream.h"
+ #include "nsISupportsImpl.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ // declared in ActorUtils.h
+@@ -26,16 +27,27 @@ AllocPCacheStreamControlChild()
+ CacheStreamControlChild::CacheStreamControlChild()
+ {
+   MOZ_COUNT_CTOR(cache::CacheStreamControlChild);
+ }
+ 
+ CacheStreamControlChild::~CacheStreamControlChild()
+ {
+   MOZ_COUNT_DTOR(cache::CacheStreamControlChild);
++  MOZ_ASSERT(!mFeature);
++}
++
++void
++CacheStreamControlChild::SetFeature(Feature* aFeature)
++{
++  MOZ_ASSERT(!mFeature);
++  mFeature = aFeature;
++  if (mFeature) {
++    mFeature->AddActor(this);
++  }
+ }
+ 
+ void
+ CacheStreamControlChild::AddListener(ReadStream* aListener)
+ {
+   MOZ_ASSERT(aListener);
+   MOZ_ASSERT(!mListeners.Contains(aListener));
+   mListeners.AppendElement(aListener);
+@@ -51,25 +63,38 @@ CacheStreamControlChild::RemoveListener(
+ 
+ void
+ CacheStreamControlChild::NoteClosed(const nsID& aId)
+ {
+   unused << SendNoteClosed(aId);
+ }
+ 
+ void
++CacheStreamControlChild::StartDestroy()
++{
++  // Begin shutting down all streams.  This is the same as if the parent had
++  // asked us to shutdown.  So simulate the CloseAll IPC message.
++  RecvCloseAll();
++}
++
++void
+ CacheStreamControlChild::ActorDestroy(ActorDestroyReason aReason)
+ {
+   // Note, we cannot trigger IPC traffic here.  So use
+   // CloseStreamWithoutReporting().  This also means we don't need a defensive
+   // copy.
+   for (uint32_t i = 0; i < mListeners.Length(); ++i) {
+     mListeners[i]->CloseStreamWithoutReporting();
+   }
+   mListeners.Clear();
++
++  if (mFeature) {
++    mFeature->RemoveActor(this);
++    mFeature = nullptr;
++  }
+ }
+ 
+ bool
+ CacheStreamControlChild::RecvClose(const nsID& aId)
+ {
+   DebugOnly<uint32_t> closedCount = 0;
+ 
+   // defensive copy of list since may be modified as we close streams
+diff --git a/dom/cache/CacheStreamControlChild.h b/dom/cache/CacheStreamControlChild.h
+--- a/dom/cache/CacheStreamControlChild.h
++++ b/dom/cache/CacheStreamControlChild.h
+@@ -2,42 +2,51 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_cache_CacheStreamControlChild_h
+ #define mozilla_dom_cache_CacheStreamControlChild_h
+ 
++#include "mozilla/dom/cache/ActorChild.h"
+ #include "mozilla/dom/cache/PCacheStreamControlChild.h"
+ #include "nsTArray.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
++class Feature;
+ class ReadStream;
+ 
+ class CacheStreamControlChild MOZ_FINAL : public PCacheStreamControlChild
++                                        , public ActorChild
+ {
+ public:
+   CacheStreamControlChild();
+   ~CacheStreamControlChild();
+ 
++  void SetFeature(Feature* aFeature);
++
+   void AddListener(ReadStream* aListener);
+   void RemoveListener(ReadStream* aListener);
+ 
+   void NoteClosed(const nsID& aId);
+ 
++  // ActorChild methods
++  virtual void StartDestroy() MOZ_OVERRIDE;
++
+   // PCacheStreamControlChild methods
+   virtual void ActorDestroy(ActorDestroyReason aReason) MOZ_OVERRIDE;
+   virtual bool RecvClose(const nsID& aId) MOZ_OVERRIDE;
+   virtual bool RecvCloseAll() MOZ_OVERRIDE;
+ 
+ private:
+   nsTArray<ReadStream*> mListeners;
++  nsRefPtr<Feature> mFeature;
+ };
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_cache_CacheStreamControlChild_h
+diff --git a/dom/cache/Feature.cpp b/dom/cache/Feature.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/Feature.cpp
+@@ -0,0 +1,101 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "mozilla/dom/cache/Feature.h"
++
++#include "mozilla/dom/cache/ActorChild.h"
++#include "WorkerPrivate.h"
++
++namespace mozilla {
++namespace dom {
++namespace cache {
++
++using mozilla::dom::workers::Running;
++using mozilla::dom::workers::Status;
++using mozilla::dom::workers::WorkerPrivate;
++
++// static
++already_AddRefed<Feature>
++Feature::Create(WorkerPrivate* aWorkerPrivate)
++{
++  MOZ_ASSERT(aWorkerPrivate);
++
++  nsRefPtr<Feature> feature = new Feature(aWorkerPrivate);
++
++  if (!aWorkerPrivate->AddFeature(aWorkerPrivate->GetJSContext(), feature)) {
++    return nullptr;
++  }
++
++  return feature.forget();
++}
++
++void
++Feature::AddActor(ActorChild* aActor)
++{
++  NS_ASSERT_OWNINGTHREAD(Feature);
++  MOZ_ASSERT(aActor);
++  MOZ_ASSERT(!mNotified);
++  MOZ_ASSERT(!mActorList.Contains(aActor));
++
++  mActorList.AppendElement(aActor);
++}
++
++void
++Feature::RemoveActor(ActorChild* aActor)
++{
++  NS_ASSERT_OWNINGTHREAD(Feature);
++  MOZ_ASSERT(aActor);
++
++  DebugOnly<bool> removed = mActorList.RemoveElement(aActor);
++
++  MOZ_ASSERT(removed);
++  MOZ_ASSERT(!mActorList.Contains(aActor));
++}
++
++bool
++Feature::Notified() const
++{
++  return mNotified;
++}
++
++bool
++Feature::Notify(JSContext* aCx, Status aStatus)
++{
++  NS_ASSERT_OWNINGTHREAD(Feature);
++
++  if (aStatus <= Running || mNotified) {
++    return true;
++  }
++
++  mNotified = true;
++
++  // Start the asynchronous destruction of our actors.  These will call back
++  // into RemoveActor() once the actor is destroyed.
++  for (uint32_t i = 0; i < mActorList.Length(); ++i) {
++    mActorList[i]->StartDestroy();
++  }
++
++  return true;
++}
++
++Feature::Feature(WorkerPrivate* aWorkerPrivate)
++  : mWorkerPrivate(aWorkerPrivate)
++  , mNotified(false)
++{
++  MOZ_ASSERT(mWorkerPrivate);
++}
++
++Feature::~Feature()
++{
++  NS_ASSERT_OWNINGTHREAD(Feature);
++  MOZ_ASSERT(mActorList.IsEmpty());
++
++  mWorkerPrivate->RemoveFeature(mWorkerPrivate->GetJSContext(), this);
++}
++
++} // namespace cache
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/cache/Feature.h b/dom/cache/Feature.h
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/Feature.h
+@@ -0,0 +1,54 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_cache_Feature_h
++#define mozilla_dom_cache_Feature_h
++
++#include "nsISupportsImpl.h"
++#include "nsTArray.h"
++#include "WorkerFeature.h"
++
++namespace mozilla {
++
++namespace workers {
++class WorkerPrivate;
++}
++
++namespace dom {
++namespace cache {
++
++class ActorChild;
++
++class Feature MOZ_FINAL : public workers::WorkerFeature
++{
++public:
++  static already_AddRefed<Feature> Create(workers::WorkerPrivate* aWorkerPrivate);
++
++  void AddActor(ActorChild* aActor);
++  void RemoveActor(ActorChild* aActor);
++
++  bool Notified() const;
++
++  // WorkerFeature methods
++  virtual bool Notify(JSContext* aCx, workers::Status aStatus) MOZ_OVERRIDE;
++
++private:
++  explicit Feature(workers::WorkerPrivate *aWorkerPrivate);
++  ~Feature();
++
++  workers::WorkerPrivate* mWorkerPrivate;
++  nsTArray<ActorChild*> mActorList;
++  bool mNotified;
++
++public:
++  NS_INLINE_DECL_REFCOUNTING(mozilla::dom::cache::Feature)
++};
++
++} // namespace cache
++} // namespace dom
++} // namespace mozilla
++
++#endif // mozilla_dom_cache_Feature_h
+diff --git a/dom/cache/StreamUtils.h b/dom/cache/StreamUtils.h
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/StreamUtils.h
+@@ -0,0 +1,37 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_cache_StreamUtils_h
++#define mozilla_dom_cache_StreamUtils_h
++
++#include "nsTArrayForwardDeclare.h"
++
++namespace mozilla {
++namespace dom {
++namespace cache {
++
++class Feature;
++class PCacheResponseOrVoid;
++
++void StartDestroyStreamActor(const PCacheResponseOrVoid& aResponseOrVoid);
++void StartDestroyStreamActor(const PCacheResponse& aResponse);
++void StartDestroyStreamActors(const nsTArray<PCacheResponse>& aResponses);
++void StartDestroyStreamActors(const nsTArray<PCacheRequest>& aRequests);
++
++void AddFeatureToStreamActor(const PCacheResponseOrVoid& aResponseOrVoid,
++                             Feature* aFeature);
++void AddFeatureToStreamActor(const PCacheResponse& aResponse,
++                             Feature* aFeature);
++void AddFeatureToStreamActors(const nsTArray<PCacheResponse>& aResponses,
++                              Feature* aFeature);
++void AddFeatureToStreamActors(const nsTArray<PCacheRequest>& aRequests,
++                              Feature* aFeature);
++
++} // namespace cache
++} // namespace dom
++} // namespace mozilla
++
++#endif // mozilla_dom_cache_StreamUtils_h
+diff --git a/dom/cache/moz.build b/dom/cache/moz.build
+--- a/dom/cache/moz.build
++++ b/dom/cache/moz.build
+@@ -1,58 +1,62 @@
+ # -*- Mode: python; c-basic-offset: 4; indent-tabs-mode: nil; tab-width: 40 -*-
+ # vim: set filetype=python:
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ EXPORTS.mozilla.dom.cache += [
+     'Action.h',
++    'ActorChild.h',
+     'ActorUtils.h',
+     'AutoUtils.h',
+     'Cache.h',
+     'CacheChild.h',
+     'CacheParent.h',
+     'CacheStorage.h',
+     'CacheStorageChild.h',
+     'CacheStorageParent.h',
+     'CacheStreamControlChild.h',
+     'CacheStreamControlParent.h',
+     'Context.h',
+     'DBAction.h',
+     'DBSchema.h',
++    'Feature.h',
+     'FetchPut.h',
+     'FileUtils.h',
+     'IPCUtils.h',
+     'Manager.h',
+     'ManagerId.h',
+     'PrincipalVerifier.h',
+     'QuotaClient.h',
+     'ReadStream.h',
+     'SavedTypes.h',
+     'ShutdownObserver.h',
+     'StreamList.h',
++    'StreamUtils.h',
+     'Types.h',
+     'TypeUtils.h',
+ ]
+ 
+-UNIFIED_SOURCES += [
++SOURCES += [
+     'Action.cpp',
+     'AutoUtils.cpp',
+     'Cache.cpp',
+     'CacheChild.cpp',
+     'CacheParent.cpp',
+     'CacheStorage.cpp',
+     'CacheStorageChild.cpp',
+     'CacheStorageParent.cpp',
+     'CacheStreamControlChild.cpp',
+     'CacheStreamControlParent.cpp',
+     'Context.cpp',
+     'DBAction.cpp',
+     'DBSchema.cpp',
++    'Feature.cpp',
+     'FetchPut.cpp',
+     'FileUtils.cpp',
+     'Manager.cpp',
+     'ManagerId.cpp',
+     'PrincipalVerifier.cpp',
+     'QuotaClient.cpp',
+     'ReadStream.cpp',
+     'ShutdownObserver.cpp',
