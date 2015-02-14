@@ -1,0 +1,799 @@
+
+# HG changeset patch
+# User Nikhil Marathe <nsm.nikhil@gmail.com>
+# Date 1423607603 28800
+# Node ID 4d75b2b0a99b82713e464d4641abca516fdbd76c
+# Parent fbf8eb5fa0a15f712af1362dae4da2a7986b13e2
+Bug 1130065 - ServiceWorkerManager capture "atomically" properly.
+
+Folds:
+Enable most SW tests
+Cannot rely on controllerchange firing in an already controlled window. The AbortError case is no longer relevant due to FIFO ordering
+Too bad we have to use timeouts
+
+diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
+--- a/dom/workers/ServiceWorkerManager.cpp
++++ b/dom/workers/ServiceWorkerManager.cpp
+@@ -132,17 +132,16 @@ ServiceWorkerRegistrationInfo::Clear()
+     mInstallingWorker = nullptr;
+     // FIXME(nsm): Abort any inflight requests from installing worker.
+   }
+ 
+   if (mWaitingWorker) {
+     mWaitingWorker->UpdateState(ServiceWorkerState::Redundant);
+     // Fire statechange.
+     mWaitingWorker = nullptr;
+-    mWaitingToActivate = false;
+   }
+ 
+   if (mActiveWorker) {
+     mActiveWorker->UpdateState(ServiceWorkerState::Redundant);
+     mActiveWorker = nullptr;
+   }
+ 
+   nsRefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+@@ -201,33 +200,33 @@ ServiceWorkerManager::ServiceWorkerManag
+ }
+ 
+ ServiceWorkerManager::~ServiceWorkerManager()
+ {
+   // The map will assert if it is not empty when destroyed.
+   mServiceWorkerRegistrationInfos.Clear();
+ }
+ 
+-class ServiceWorkerRegisterJob;
+-
+ class ContinueLifecycleTask : public nsISupports
+ {
+   NS_DECL_ISUPPORTS
+ 
+ protected:
+   virtual ~ContinueLifecycleTask()
+   { }
+ 
+ public:
+   virtual void ContinueAfterWorkerEvent(bool aSuccess,
+                                         bool aActivateImmediately) = 0;
+ };
+ 
+ NS_IMPL_ISUPPORTS0(ContinueLifecycleTask);
+ 
++class ServiceWorkerRegisterJob;
++
+ class ContinueInstallTask MOZ_FINAL : public ContinueLifecycleTask
+ {
+   nsRefPtr<ServiceWorkerRegisterJob> mJob;
+ 
+ public:
+   explicit ContinueInstallTask(ServiceWorkerRegisterJob* aJob)
+     : mJob(aJob)
+   { }
+@@ -240,20 +239,17 @@ class ContinueActivateTask MOZ_FINAL : p
+   nsRefPtr<ServiceWorkerRegistrationInfo> mRegistration;
+ 
+ public:
+   explicit ContinueActivateTask(ServiceWorkerRegistrationInfo* aReg)
+     : mRegistration(aReg)
+   { }
+ 
+   void
+-  ContinueAfterWorkerEvent(bool aSuccess, bool aActivateImmediately /* unused */) MOZ_OVERRIDE
+-  {
+-    mRegistration->FinishActivate(aSuccess);
+-  }
++  ContinueAfterWorkerEvent(bool aSuccess, bool aActivateImmediately /* unused */) MOZ_OVERRIDE;
+ };
+ 
+ class ContinueLifecycleRunnable MOZ_FINAL : public nsRunnable
+ {
+   nsMainThreadPtrHandle<ContinueLifecycleTask> mTask;
+   bool mSuccess;
+   bool mActivateImmediately;
+ 
+@@ -609,53 +605,61 @@ public:
+ 
+   // Public so our error handling code can continue with a successful worker.
+   void
+   ContinueInstall()
+   {
+     nsRefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+     MOZ_ASSERT(swm->mSetOfScopesBeingUpdated.Contains(mRegistration->mScope));
+     swm->mSetOfScopesBeingUpdated.Remove(mRegistration->mScope);
++    // This is effectively the end of Step 4.3 of the [[Update]] algorithm.
++    // The invocation of [[Install]] is not part of the atomic block.
++
++    // Begin [[Install]] atomic step 4.
+     if (mRegistration->mInstallingWorker) {
+       // FIXME(nsm): Terminate and stuff
+       mRegistration->mInstallingWorker->UpdateState(ServiceWorkerState::Redundant);
+     }
+ 
+     swm->InvalidateServiceWorkerRegistrationWorker(mRegistration,
+                                                    WhichServiceWorker::INSTALLING_WORKER);
+     mRegistration->mInstallingWorker = new ServiceWorkerInfo(mRegistration, mRegistration->mScriptSpec);
+     mRegistration->mInstallingWorker->UpdateState(ServiceWorkerState::Installing);
+ 
+     Succeed();
+ 
++    // Step 4.6 "Queue a task..." for updatefound.
+     nsCOMPtr<nsIRunnable> upr =
+       NS_NewRunnableMethodWithArg<ServiceWorkerRegistrationInfo*>(swm,
+                                                                   &ServiceWorkerManager::FireUpdateFound,
+                                                                   mRegistration);
+     NS_DispatchToMainThread(upr);
+ 
+-    nsMainThreadPtrHandle<ContinueLifecycleTask> handle(
+-        new nsMainThreadPtrHolder<ContinueLifecycleTask>(new ContinueInstallTask(this)));
+-
+     nsRefPtr<ServiceWorker> serviceWorker;
+     nsresult rv =
+       swm->CreateServiceWorker(mRegistration->mInstallingWorker->ScriptSpec(),
+                                mRegistration->mScope,
+                                getter_AddRefs(serviceWorker));
+ 
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+-      ContinueAfterInstallEvent(false /* success */, false /* activate immediately */);
++      ContinueAfterInstallEvent(false /* aSuccess */, false /* aActivateImmediately */);
+       return;
+     }
+ 
++    nsMainThreadPtrHandle<ContinueLifecycleTask> handle(
++        new nsMainThreadPtrHolder<ContinueLifecycleTask>(new ContinueInstallTask(this)));
++
+     nsRefPtr<LifecycleEventWorkerRunnable> r =
+       new LifecycleEventWorkerRunnable(serviceWorker->GetWorkerPrivate(), NS_LITERAL_STRING("install"), handle);
+ 
+     AutoJSAPI jsapi;
+     jsapi.Init();
++
++    // This triggers Step 4.7 "Queue a task to run the following substeps..."
++    // which sends the install event to the worker.
+     r->Dispatch(jsapi.cx());
+   }
+ 
+ private:
+   void
+   Update()
+   {
+     MOZ_ASSERT(mRegistration);
+@@ -727,17 +731,18 @@ private:
+     mCallback->UpdateSucceeded(mRegistration);
+     mCallback = nullptr;
+   }
+ 
+   void
+   FailCommon(nsresult aRv)
+   {
+     mCallback = nullptr;
+-    MaybeRemoveRegistration();
++    nsRefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
++    swm->MaybeRemoveRegistration(mRegistration);
+     // Ensures that the job can't do anything useful from this point on.
+     mRegistration = nullptr;
+     Done(aRv);
+   }
+ 
+   // This MUST only be called when the job is still performing actions related
+   // to registration or update. After the spec resolves the update promise, use
+   // Done() with the failure code instead.
+@@ -745,71 +750,56 @@ private:
+   Fail(nsresult aRv)
+   {
+     MOZ_ASSERT(mCallback);
+     mCallback->UpdateFailed(aRv);
+     FailCommon(aRv);
+   }
+ 
+   void
+-  MaybeRemoveRegistration()
++  ContinueAfterInstallEvent(bool aInstallEventSuccess, bool aActivateImmediately)
+   {
+-    MOZ_ASSERT(mRegistration);
+-    nsRefPtr<ServiceWorkerInfo> newest = mRegistration->Newest();
+-    if (!newest) {
+-      nsRefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+-      swm->RemoveRegistration(mRegistration);
+-    }
+-  }
+-
+-  void
+-  ContinueAfterInstallEvent(bool aSuccess, bool aActivateImmediately)
+-  {
+-    // By this point the callback should've been notified about success or fail
+-    // and nulled.
+-    MOZ_ASSERT(!mCallback);
+-
+     if (!mRegistration->mInstallingWorker) {
+       NS_WARNING("mInstallingWorker was null.");
+       return Done(NS_ERROR_DOM_ABORT_ERR);
+     }
+ 
+     nsRefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+ 
+     // "If installFailed is true"
+-    if (!aSuccess) {
++    if (!aInstallEventSuccess) {
+       mRegistration->mInstallingWorker->UpdateState(ServiceWorkerState::Redundant);
+       mRegistration->mInstallingWorker = nullptr;
+       swm->InvalidateServiceWorkerRegistrationWorker(mRegistration,
+                                                      WhichServiceWorker::INSTALLING_WORKER);
+-      MaybeRemoveRegistration();
++      swm->MaybeRemoveRegistration(mRegistration);
+       return Done(NS_ERROR_DOM_ABORT_ERR);
+     }
+ 
+     // "If registration's waiting worker is not null"
+     if (mRegistration->mWaitingWorker) {
+       // FIXME(nsm): Terminate
+       mRegistration->mWaitingWorker->UpdateState(ServiceWorkerState::Redundant);
+     }
+ 
+     // Although the spec first sets waiting worker and then updates its state,
+     // our ServiceWorkerInfo does not hold a list of associated ServiceWorker
+     // objects in content JS. This means if we want to fire an event on
+     // ServiceWorkerRegistration.installing, we need to do it first, before
+     // swapping it with waiting worker.
+     mRegistration->mInstallingWorker->UpdateState(ServiceWorkerState::Installed);
+     mRegistration->mWaitingWorker = mRegistration->mInstallingWorker.forget();
+-    mRegistration->mWaitingToActivate = false;
+     swm->InvalidateServiceWorkerRegistrationWorker(mRegistration,
+                                                    WhichServiceWorker::INSTALLING_WORKER | WhichServiceWorker::WAITING_WORKER);
+ 
+     // FIXME(nsm): Bug 982711 Deal with activateImmediately.
+     NS_WARN_IF_FALSE(!aActivateImmediately, "Immediate activation using replace() is not supported yet");
++    Done(NS_OK);
++    // Activate() is invoked out of band of atomic.
+     mRegistration->TryToActivate();
+-    Done(NS_OK);
+   }
+ };
+ 
+ NS_IMPL_ISUPPORTS_INHERITED(ServiceWorkerRegisterJob, ServiceWorkerJob, nsIStreamLoaderObserver);
+ 
+ NS_IMETHODIMP
+ ContinueUpdateRunnable::Run()
+ {
+@@ -818,16 +808,18 @@ ContinueUpdateRunnable::Run()
+   nsRefPtr<ServiceWorkerRegisterJob> upjob = static_cast<ServiceWorkerRegisterJob*>(job.get());
+   upjob->ContinueInstall();
+   return NS_OK;
+ }
+ 
+ void
+ ContinueInstallTask::ContinueAfterWorkerEvent(bool aSuccess, bool aActivateImmediately)
+ {
++  // This does not start the job immediately if there are other jobs in the
++  // queue, which captures the "atomic" behaviour we want.
+   mJob->ContinueAfterInstallEvent(aSuccess, aActivateImmediately);
+ }
+ 
+ // If we return an error code here, the ServiceWorkerContainer will
+ // automatically reject the Promise.
+ NS_IMETHODIMP
+ ServiceWorkerManager::Register(nsIDOMWindow* aWindow,
+                                const nsAString& aScope,
+@@ -1100,28 +1092,30 @@ LifecycleEventWorkerRunnable::DispatchLi
+     new LifecycleEventPromiseHandler(mTask, activateImmediately);
+   waitUntilPromise->AppendNativeHandler(handler);
+   return true;
+ }
+ 
+ void
+ ServiceWorkerRegistrationInfo::TryToActivate()
+ {
+-  mWaitingToActivate = true;
+   if (!IsControllingDocuments()) {
+     Activate();
+   }
+ }
+ 
+ void
++ContinueActivateTask::ContinueAfterWorkerEvent(bool aSuccess, bool aActivateImmediately /* unused */)
++{
++  mRegistration->FinishActivate(aSuccess);
++}
++
++void
+ ServiceWorkerRegistrationInfo::Activate()
+ {
+-  MOZ_ASSERT(mWaitingToActivate);
+-  mWaitingToActivate = false;
+-
+   nsRefPtr<ServiceWorkerInfo> activatingWorker = mWaitingWorker;
+   nsRefPtr<ServiceWorkerInfo> exitingWorker = mActiveWorker;
+ 
+   nsRefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+   swm->InvalidateServiceWorkerRegistrationWorker(this, WhichServiceWorker::WAITING_WORKER | WhichServiceWorker::ACTIVE_WORKER);
+   if (!activatingWorker) {
+     NS_WARNING("No activatingWorker!");
+     return;
+@@ -1132,36 +1126,40 @@ ServiceWorkerRegistrationInfo::Activate(
+     // Terminate worker
+     exitingWorker->UpdateState(ServiceWorkerState::Redundant);
+   }
+ 
+   mActiveWorker = activatingWorker.forget();
+   mWaitingWorker = nullptr;
+   mActiveWorker->UpdateState(ServiceWorkerState::Activating);
+ 
++  // FIXME(nsm): Unlink appcache if there is one.
++
+   swm->CheckPendingReadyPromises();
+   swm->StoreRegistration(mPrincipal, this);
+ 
+   // "Queue a task to fire a simple event named controllerchange..."
+   nsCOMPtr<nsIRunnable> controllerChangeRunnable =
+-    NS_NewRunnableMethodWithArg<ServiceWorkerRegistrationInfo*>(swm, &ServiceWorkerManager::FireControllerChange, this);
++    NS_NewRunnableMethodWithArg<ServiceWorkerRegistrationInfo*>(swm,
++                                                                &ServiceWorkerManager::FireControllerChange,
++                                                                this);
+   NS_DispatchToMainThread(controllerChangeRunnable);
+ 
+-  // XXXnsm I have my doubts about this. Leaving the main thread means that
+-  // subsequent calls to Activate() not from a Register() call, i.e. due to all
+-  // controlled documents going away, may lead to two or more calls being
+-  // interleaved.
+   MOZ_ASSERT(mActiveWorker);
+   nsRefPtr<ServiceWorker> serviceWorker;
+   nsresult rv =
+     swm->CreateServiceWorker(mActiveWorker->ScriptSpec(),
+                              mScope,
+                              getter_AddRefs(serviceWorker));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    FinishActivate(false /* success */);
++    nsCOMPtr<nsIRunnable> r =
++      NS_NewRunnableMethodWithArg<bool>(this,
++                                        &ServiceWorkerRegistrationInfo::FinishActivate,
++                                        false /* success */);
++    MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(r)));
+     return;
+   }
+ 
+   nsMainThreadPtrHandle<ContinueLifecycleTask> handle(
+     new nsMainThreadPtrHolder<ContinueLifecycleTask>(new ContinueActivateTask(this)));
+ 
+   nsRefPtr<LifecycleEventWorkerRunnable> r =
+     new LifecycleEventWorkerRunnable(serviceWorker->GetWorkerPrivate(), NS_LITERAL_STRING("activate"), handle);
+@@ -1662,17 +1660,20 @@ ServiceWorkerManager::HandleError(JSCont
+ 
+   regJob->Fail(init);
+   return true;
+ }
+ 
+ void
+ ServiceWorkerRegistrationInfo::FinishActivate(bool aSuccess)
+ {
+-  MOZ_ASSERT(mActiveWorker);
++  if (mPendingUninstall || !mActiveWorker) {
++    return;
++  }
++
+   if (aSuccess) {
+     mActiveWorker->UpdateState(ServiceWorkerState::Activated);
+   } else {
+     mActiveWorker->UpdateState(ServiceWorkerState::Redundant);
+     mActiveWorker = nullptr;
+   }
+ }
+ 
+@@ -1918,59 +1919,34 @@ ServiceWorkerManager::MaybeStartControll
+     MOZ_ASSERT(!mControlledDocuments.Contains(aDoc));
+     registration->StartControllingADocument();
+     // Use the already_AddRefed<> form of Put to avoid the addref-deref since
+     // we don't need the registration pointer in this function anymore.
+     mControlledDocuments.Put(aDoc, registration.forget());
+   }
+ }
+ 
+-class ServiceWorkerActivateAfterUnloadingJob MOZ_FINAL : public ServiceWorkerJob
+-{
+-  nsRefPtr<ServiceWorkerRegistrationInfo> mRegistration;
+-public:
+-  ServiceWorkerActivateAfterUnloadingJob(ServiceWorkerJobQueue* aQueue,
+-                                         ServiceWorkerRegistrationInfo* aReg)
+-    : ServiceWorkerJob(aQueue)
+-    , mRegistration(aReg)
+-  { }
+-
+-  void
+-  Start()
+-  {
+-    if (mRegistration->mPendingUninstall) {
+-      mRegistration->Clear();
+-      nsRefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+-      swm->RemoveRegistration(mRegistration);
+-    } else {
+-      mRegistration->TryToActivate();
+-    }
+-
+-    Done(NS_OK);
+-  }
+-};
+-
+ void
+ ServiceWorkerManager::MaybeStopControlling(nsIDocument* aDoc)
+ {
+   MOZ_ASSERT(aDoc);
+   nsRefPtr<ServiceWorkerRegistrationInfo> registration;
+   mControlledDocuments.Remove(aDoc, getter_AddRefs(registration));
+   // A document which was uncontrolled does not maintain that state itself, so
+   // it will always call MaybeStopControlling() even if there isn't an
+   // associated registration. So this check is required.
+   if (registration) {
+     registration->StopControllingADocument();
+     if (!registration->IsControllingDocuments()) {
+-      ServiceWorkerJobQueue* queue = GetOrCreateJobQueue(registration->mScope);
+-      // The remaining tasks touch registration->mPendingUninstall, so queue
+-      // them up in a job.
+-      nsRefPtr<ServiceWorkerActivateAfterUnloadingJob> job =
+-        new ServiceWorkerActivateAfterUnloadingJob(queue, registration);
+-      queue->Append(job);
++      if (registration->mPendingUninstall) {
++        registration->Clear();
++        RemoveRegistration(registration);
++      } else {
++        registration->TryToActivate();
++      }
+     }
+   }
+ }
+ 
+ NS_IMETHODIMP
+ ServiceWorkerManager::GetScopeForUrl(const nsAString& aUrl, nsAString& aScope)
+ {
+   nsCOMPtr<nsIURI> uri;
+@@ -2666,9 +2642,19 @@ ServiceWorkerManager::CreateNewRegistrat
+   ServiceWorkerRegistrationInfo* registration = new ServiceWorkerRegistrationInfo(aScope, aPrincipal);
+   // From now on ownership of registration is with
+   // mServiceWorkerRegistrationInfos.
+   mServiceWorkerRegistrationInfos.Put(aScope, registration);
+   AddScope(mOrderedScopes, aScope);
+   return registration;
+ }
+ 
++void
++ServiceWorkerManager::MaybeRemoveRegistration(ServiceWorkerRegistrationInfo* aRegistration)
++{
++  MOZ_ASSERT(aRegistration);
++  nsRefPtr<ServiceWorkerInfo> newest = aRegistration->Newest();
++  if (!newest) {
++    RemoveRegistration(aRegistration);
++  }
++}
++
+ END_WORKERS_NAMESPACE
+diff --git a/dom/workers/ServiceWorkerManager.h b/dom/workers/ServiceWorkerManager.h
+--- a/dom/workers/ServiceWorkerManager.h
++++ b/dom/workers/ServiceWorkerManager.h
+@@ -44,16 +44,17 @@ namespace workers {
+ 
+ class ServiceWorker;
+ class ServiceWorkerInfo;
+ 
+ class ServiceWorkerJobQueue;
+ 
+ class ServiceWorkerJob : public nsISupports
+ {
++protected:
+   // The queue keeps the jobs alive, so they can hold a rawptr back to the
+   // queue.
+   ServiceWorkerJobQueue* mQueue;
+ 
+ public:
+   NS_DECL_ISUPPORTS
+ 
+   virtual void Start() = 0;
+@@ -146,17 +147,16 @@ public:
+   nsRefPtr<ServiceWorkerInfo> mActiveWorker;
+   nsRefPtr<ServiceWorkerInfo> mWaitingWorker;
+   nsRefPtr<ServiceWorkerInfo> mInstallingWorker;
+ 
+   // When unregister() is called on a registration, it is not immediately
+   // removed since documents may be controlled. It is marked as
+   // pendingUninstall and when all controlling documents go away, removed.
+   bool mPendingUninstall;
+-  bool mWaitingToActivate;
+ 
+   explicit ServiceWorkerRegistrationInfo(const nsACString& aScope,
+                                          nsIPrincipal* aPrincipal);
+ 
+   already_AddRefed<ServiceWorkerInfo>
+   Newest()
+   {
+     nsRefPtr<ServiceWorkerInfo> newest;
+@@ -284,22 +284,19 @@ public:
+  * The ServiceWorkerManager is a per-process global that deals with the
+  * installation, querying and event dispatch of ServiceWorkers for all the
+  * origins in the process.
+  */
+ class ServiceWorkerManager MOZ_FINAL
+   : public nsIServiceWorkerManager
+   , public nsIIPCBackgroundChildCreateCallback
+ {
+-  friend class ActivationRunnable;
+   friend class GetReadyPromiseRunnable;
+   friend class GetRegistrationsRunnable;
+   friend class GetRegistrationRunnable;
+-  friend class QueueFireUpdateFoundRunnable;
+-  friend class ServiceWorkerActivateAfterUnloadingJob;
+   friend class ServiceWorkerRegisterJob;
+   friend class ServiceWorkerRegistrationInfo;
+   friend class ServiceWorkerUnregisterJob;
+ 
+ public:
+   NS_DECL_ISUPPORTS
+   NS_DECL_NSISERVICEWORKERMANAGER
+   NS_DECL_NSIIPCBACKGROUNDCHILDCREATECALLBACK
+@@ -491,16 +488,19 @@ private:
+   }
+ 
+   static PLDHashOperator
+   CheckPendingReadyPromisesEnumerator(nsISupports* aSupports,
+                                       nsAutoPtr<PendingReadyPromise>& aData,
+                                       void* aUnused);
+ 
+   nsClassHashtable<nsISupportsHashKey, PendingReadyPromise> mPendingReadyPromises;
++ 
++  void
++  MaybeRemoveRegistration(ServiceWorkerRegistrationInfo* aRegistration);
+ 
+   mozilla::ipc::PBackgroundChild* mActor;
+ 
+   struct PendingOperation;
+   nsTArray<PendingOperation> mPendingOperations;
+ };
+ 
+ NS_DEFINE_STATIC_IID_ACCESSOR(ServiceWorkerManager,
+diff --git a/dom/workers/test/serviceworkers/install_event_error_worker.js b/dom/workers/test/serviceworkers/install_event_error_worker.js
+--- a/dom/workers/test/serviceworkers/install_event_error_worker.js
++++ b/dom/workers/test/serviceworkers/install_event_error_worker.js
+@@ -1,4 +1,4 @@
+ // Worker that errors on receiving an install event.
+ oninstall = function(e) {
+   undefined.doSomething;
+-}
++};
+diff --git a/dom/workers/test/serviceworkers/mochitest.ini b/dom/workers/test/serviceworkers/mochitest.ini
+--- a/dom/workers/test/serviceworkers/mochitest.ini
++++ b/dom/workers/test/serviceworkers/mochitest.ini
+@@ -1,10 +1,10 @@
+ [DEFAULT]
+-skip-if = buildapp == 'b2g' || android_version == "10" # bug 1056702
++skip-if = buildapp == 'b2g'
+ support-files =
+   worker.js
+   worker2.js
+   worker3.js
+   fetch_event_worker.js
+   parse_error_worker.js
+   activate_event_error_worker.js
+   install_event_worker.js
+@@ -21,24 +21,19 @@ support-files =
+   worker_unregister.js
+   worker_update.js
+   message_posting_worker.js
+   fetch/index.html
+   fetch/fetch_worker_script.js
+   fetch/fetch_tests.js
+ 
+ [test_unregister.html]
+-skip-if = true # bug 1094375
+ [test_installation_simple.html]
+-skip-if = true # bug 1094375
+ [test_fetch_event.html]
+ [test_get_serviced.html]
+ [test_install_event.html]
+ [test_navigator.html]
+ [test_scopes.html]
+-skip-if = true # bug 1126470 and many others
+ [test_controller.html]
+ [test_workerUpdate.html]
+-skip-if = true # Enable after Bug 982726 postMessage is landed.
+ [test_workerUnregister.html]
+-skip-if = true # Enable after Bug 982726 postMessage is landed.
+ [test_post_message.html]
+ [test_post_message_advanced.html]
+diff --git a/dom/workers/test/serviceworkers/simpleregister/ready.html b/dom/workers/test/serviceworkers/simpleregister/ready.html
+--- a/dom/workers/test/serviceworkers/simpleregister/ready.html
++++ b/dom/workers/test/serviceworkers/simpleregister/ready.html
+@@ -1,17 +1,15 @@
+ <html>
+   <head></head>
+   <body>
+     <script type="text/javascript">
+ 
+-       window.addEventListener('message', function(evt) {
+-         navigator.serviceWorker.ready.then(function() {
+-           navigator.serviceWorker.oncontrollerchange = function(e) {
+-             evt.ports[0].postMessage("WOW!");
+-           }
+-         });
+-       }, false);
++      window.addEventListener('message', function(evt) {
++        navigator.serviceWorker.ready.then(function() {
++          evt.ports[0].postMessage("WOW!");
++        });
++      }, false);
+ 
+     </script>
+   </body>
+ </html>
+ 
+diff --git a/dom/workers/test/serviceworkers/test_install_event.html b/dom/workers/test/serviceworkers/test_install_event.html
+--- a/dom/workers/test/serviceworkers/test_install_event.html
++++ b/dom/workers/test/serviceworkers/test_install_event.html
+@@ -33,19 +33,20 @@
+       });
+     }, function(e) {
+       ok(false, "Unexpected Error in nextRegister! " + e);
+     });
+   }
+ 
+   function installError() {
+     // Silence worker errors so they don't cause the test to fail.
+-    window.onerror = function() { }
++    window.onerror = function(e) {}
+     return navigator.serviceWorker.register("install_event_error_worker.js", { scope: "./install_event" })
+       .then(function(swr) {
++        ok(swr.installing instanceof ServiceWorker, "There should be an installing worker if promise resolves.");
+         ok(swr.installing.state == "installing", "Installing worker's state should be 'installing'");
+         return new Promise(function(resolve, reject) {
+           swr.installing.onstatechange = function(e) {
+             ok(e.target.state == "redundant", "Installation of worker with error should fail.");
+             resolve();
+           }
+         });
+       }).then(function() {
+@@ -80,17 +81,18 @@
+ 
+   function unregister() {
+     return navigator.serviceWorker.getRegistration("./install_event").then(function(reg) {
+       return reg.unregister();
+     });
+   }
+ 
+   function runTest() {
+-    simpleRegister()
++    Promise.resolve()
++      .then(simpleRegister)
+       .then(nextRegister)
+       .then(installError)
+       .then(activateError)
+       .then(unregister)
+       .then(function() {
+         SimpleTest.finish();
+       }).catch(function(e) {
+         ok(false, "Some test failed with error " + e);
+diff --git a/dom/workers/test/serviceworkers/test_installation_simple.html b/dom/workers/test/serviceworkers/test_installation_simple.html
+--- a/dom/workers/test/serviceworkers/test_installation_simple.html
++++ b/dom/workers/test/serviceworkers/test_installation_simple.html
+@@ -70,35 +70,16 @@
+       ok(worker && wr.scope.match(/realworker$/) &&
+          worker.scriptURL.match(/worker.js$/), "Valid worker instance should be available.");
+     }, function(e) {
+       info("Error: " + e.name);
+       ok(false, "realWorker Registration should have succeeded!");
+     });
+   }
+ 
+-  function abortPrevious() {
+-    var p = navigator.serviceWorker.register("worker2.js", { scope: "foo/" });
+-    var q = navigator.serviceWorker.register("worker3.js", { scope: "foo/" });
+-
+-    return Promise.all([
+-      p.then(function(wr) {
+-        ok(false, "First registration should fail with AbortError");
+-      }, function(e) {
+-        ok(e.name === "AbortError", "First registration should fail with AbortError");
+-      }),
+-
+-      q.then(function(wr) {
+-        ok(wr instanceof ServiceWorkerRegistration, "Second registration should succeed");
+-      }, function(e) {
+-        ok(false, "Second registration should succeed");
+-      })
+-    ]);
+-  }
+-
+   function networkError404() {
+     return navigator.serviceWorker.register("404.js", { scope: "network_error/"}).then(function(w) {
+         ok(false, "Should fail with NetworkError");
+       }, function(e) {
+         ok(e.name === "NetworkError", "Should fail with NetworkError");
+       });
+   }
+ 
+@@ -106,17 +87,16 @@
+     var p = navigator.serviceWorker.register("parse_error_worker.js", { scope: "parse_error/" });
+     return p.then(function(wr) {
+       ok(false, "Registration should fail with parse error");
+       return navigator.serviceWorker.getRegistration("parse_error/").then(function(swr) {
+         // See https://github.com/slightlyoff/ServiceWorker/issues/547
+         is(swr, undefined, "A failed registration for a scope with no prior controllers should clear itself");
+       });
+     }, function(e) {
+-    info("NSM " + e.name);
+       ok(e instanceof Error, "Registration should fail with parse error");
+     });
+   }
+ 
+   // FIXME(nsm): test for parse error when Update step doesn't happen (directly from register).
+ 
+   function updatefound() {
+     var frame = document.createElement("iframe");
+@@ -177,17 +157,16 @@
+ 
+   function runTest() {
+     simpleRegister()
+       .then(readyPromise)
+       .then(sameOriginWorker)
+       .then(sameOriginScope)
+       .then(httpsOnly)
+       .then(realWorker)
+-      .then(abortPrevious)
+       .then(networkError404)
+       .then(parseError)
+       .then(updatefound)
+       .then(checkReadyPromise)
+       // put more tests here.
+       .then(function() {
+         SimpleTest.finish();
+       }).catch(function(e) {
+diff --git a/dom/workers/test/serviceworkers/test_scopes.html b/dom/workers/test/serviceworkers/test_scopes.html
+--- a/dom/workers/test/serviceworkers/test_scopes.html
++++ b/dom/workers/test/serviceworkers/test_scopes.html
+@@ -57,17 +57,17 @@
+       ok(getScope(p("sua.html")) === p(""), "Scope should match");
+       ok(getScope(p("sub.html")) === p("sub"), "Scope should match");
+       ok(getScope(p("sub/dir.html")) === p("sub/dir.html"), "Scope should match");
+       ok(getScope(p("sub/dir")) === p("sub/dir"), "Scope should match");
+       ok(getScope(p("sub/dir/foo")) === p("sub/dir/"), "Scope should match");
+       ok(getScope(p("sub/dir/afoo")) === p("sub/dir/a"), "Scope should match");
+       ok(getScope(p("star*wars")) === p("star*"), "Scope should match");
+       ok(getScope(p("star/a.html")) === p(""), "Scope should match");
+-      resolve(true);
++      resolve();
+     });
+   }
+ 
+   function runTest() {
+     registerWorkers()
+       .then(testScopes)
+       .then(unregisterWorkers)
+       .then(function() {
+diff --git a/dom/workers/test/serviceworkers/unregister/index.html b/dom/workers/test/serviceworkers/unregister/index.html
+--- a/dom/workers/test/serviceworkers/unregister/index.html
++++ b/dom/workers/test/serviceworkers/unregister/index.html
+@@ -14,31 +14,28 @@
+ <div id="content" style="display: none"></div>
+ <pre id="test"></pre>
+ <script class="testbody" type="text/javascript">
+ 
+   if (!parent) {
+     info("unregister/index.html should not to be launched directly!");
+   }
+ 
++  SimpleTest.requestFlakyTimeout("Unfortunately we have no way to test for a page being uncontrolled except waiting for ready to not resolve");
+   var tId = setTimeout(function() {
+-    info("tId timeout!");
+     parent.postMessage({ controlled: false }, "*");
+     tId = null;
+   }, 2000);
+ 
+   navigator.serviceWorker.ready.then(function() {
+-  info("Got ready");
+     if (tId == null) {
+-    info("tId was null");
+       parent.postMessage("FAIL!!!", "*");
+       return;
+     }
+ 
+     clearTimeout(tId);
+-    info("tId was non-null");
+     parent.postMessage({ controlled: true }, "*");
+   });
+ 
+ </script>
+ </pre>
+ </body>
+ </html>
