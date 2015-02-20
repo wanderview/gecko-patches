@@ -1,12 +1,91 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent f8377d18665b5a5f90a4570442faa7b0a9f4873c
+# Parent a7c177546ca0e33d20622208993c42398707b1a0
 Bug 1133939 P1 Free buffer resources when an nsPipeInputStream is closed. r=froydnj
 
 diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 --- a/xpcom/io/nsPipe3.cpp
 +++ b/xpcom/io/nsPipe3.cpp
-@@ -287,16 +287,19 @@ public:
+@@ -49,16 +49,32 @@ GetPipeLog()
+ #define DEFAULT_SEGMENT_SIZE  4096
+ #define DEFAULT_SEGMENT_COUNT 16
+ 
+ class nsPipe;
+ class nsPipeEvents;
+ class nsPipeInputStream;
+ class nsPipeOutputStream;
+ 
++namespace {
++
++enum MonitorAction
++{
++  DoNotNotifyMonitor,
++  NotifyMonitor
++};
++
++enum SegmentChangeResult
++{
++  SegmentNotChanged,
++  SegmentDeleted
++};
++
++} // anonymous namespace
++
+ //-----------------------------------------------------------------------------
+ 
+ // this class is used to delay notifications until the end of a particular
+ // scope.  it helps avoid the complexity of issuing callbacks while inside
+ // a critical section.
+ class nsPipeEvents
+ {
+ public:
+@@ -155,20 +171,18 @@ public:
+   uint32_t Available()
+   {
+     return mAvailable;
+   }
+ 
+   // synchronously wait for the pipe to become readable.
+   nsresult Wait();
+ 
+-  // these functions return true to indicate that the pipe's monitor should
+-  // be notified, to wake up a blocked reader if any.
+-  bool OnInputReadable(uint32_t aBytesWritten, nsPipeEvents&);
+-  bool OnInputException(nsresult, nsPipeEvents&);
++  MonitorAction OnInputReadable(uint32_t aBytesWritten, nsPipeEvents&);
++  MonitorAction OnInputException(nsresult, nsPipeEvents&);
+ 
+   nsPipeReadState& ReadState()
+   {
+     return mReadState;
+   }
+ 
+   const nsPipeReadState& ReadState() const
+   {
+@@ -234,20 +248,18 @@ public:
+   void SetWritable(bool aWritable)
+   {
+     mWritable = aWritable;
+   }
+ 
+   // synchronously wait for the pipe to become writable.
+   nsresult Wait();
+ 
+-  // these functions return true to indicate that the pipe's monitor should
+-  // be notified, to wake up a blocked writer if any.
+-  bool OnOutputWritable(nsPipeEvents&);
+-  bool OnOutputException(nsresult, nsPipeEvents&);
++  MonitorAction OnOutputWritable(nsPipeEvents&);
++  MonitorAction OnOutputException(nsresult, nsPipeEvents&);
+ 
+ private:
+   nsPipe*                         mPipe;
+ 
+   // separate refcnt so that we know when to close the producer
+   mozilla::ThreadSafeAutoRefCnt   mWriterRefCnt;
+   int64_t                         mLogicalOffset;
+   bool                            mBlocking;
+@@ -287,16 +299,19 @@ public:
    //
    // methods below may be called while outside the pipe's monitor
    //
@@ -15,7 +94,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
                            const char*& aSegment, uint32_t& aSegmentLen);
    void     AdvanceReadCursor(nsPipeReadState& aReadState, uint32_t aCount,
                               uint32_t* aAvailableOut);
-+  bool     AdvanceReadSegment(nsPipeReadState& aReadState);
++  SegmentChangeResult AdvanceReadSegment(nsPipeReadState& aReadState);
 +  void     DrainInputStream(nsPipeReadState& aReadState, nsPipeEvents& aEvents,
 +                            uint32_t* aAvailableOut);
  
@@ -26,7 +105,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
    void     OnPipeException(nsresult aReason, bool aOutputOnly = false);
  
    nsresult CloneInputStream(nsPipeInputStream* aOriginal,
-@@ -540,65 +543,95 @@ nsPipe::AdvanceReadCursor(nsPipeReadStat
+@@ -540,65 +555,99 @@ nsPipe::AdvanceReadCursor(nsPipeReadStat
  
        // if still writing in this segment then bail because we're not done
        // with the segment and have to wait for now...
@@ -36,8 +115,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
        }
  
 -      uint32_t currentSegment = aReadState.mSegment;
-+      bool modified = AdvanceReadSegment(aReadState);
- 
+-
 -      // Move to the next segment to read
 -      aReadState.mSegment += 1;
 -
@@ -77,17 +155,20 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 -      }
 -
 -      // we've free'd up a segment, so notify output stream that pipe has
-+      // if we've free'd up a segment, notify output stream that pipe has
-       // room for a new segment.
+-      // room for a new segment.
 -      if (mOutput.OnOutputWritable(events)) {
-+      if (modified && mOutput.OnOutputWritable(events)) {
-         mon.Notify();
+-        mon.Notify();
++      // Check to see if we can free up any segments.  If we can, then notify
++      // the output stream that the pipe has room for a new segment.
++      if (AdvanceReadSegment(aReadState) == SegmentDeleted &&
++          mOutput.OnOutputWritable(events) == NotifyMonitor) {
++        mon.NotifyAll();
        }
      }
    }
  }
  
-+bool
++SegmentChangeResult
 +nsPipe::AdvanceReadSegment(nsPipeReadState& aReadState)
 +{
 +  uint32_t currentSegment = aReadState.mSegment;
@@ -95,7 +176,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 +  // Move to the next segment to read
 +  aReadState.mSegment += 1;
 +
-+  bool segmentDeleted = false;
++  SegmentChangeResult result = SegmentNotChanged;
 +
 +  // If this was the last reference to the first segment, then remove it.
 +  if (currentSegment == 0 && CountSegmentReferences(currentSegment) == 0) {
@@ -111,7 +192,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 +    mBuffer.DeleteFirstSegment();
 +    LOG(("III deleting first segment\n"));
 +
-+    segmentDeleted = true;
++    result = SegmentDeleted;
 +  }
 +
 +  if (mWriteSegment < aReadState.mSegment) {
@@ -134,7 +215,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 +    }
 +  }
 +
-+  return segmentDeleted;
++  return result;
 +}
 +
 +void
@@ -143,15 +224,20 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 +{
 +  ReentrantMonitorAutoEnter mon(mReentrantMonitor);
 +
-+  bool modified = false;
-+  while(mWriteSegment > aReadState.mSegment) {
-+    modified = AdvanceReadSegment(aReadState) || modified;
++  *aAvailableOut = 0;
++
++  SegmentChangeResult result = SegmentNotChanged;
++  while(mWriteSegment >= aReadState.mSegment) {
++    if (AdvanceReadSegment(aReadState) == SegmentDeleted) {
++      result = SegmentDeleted;
++    }
 +  }
 +
 +  // if we've free'd up a segment, notify output stream that pipe has
 +  // room for a new segment.
-+  if (true && mOutput.OnOutputWritable(aEvents)) {
-+    mon.Notify();
++  if (result == SegmentDeleted &&
++      mOutput.OnOutputWritable(aEvents) == NotifyMonitor) {
++    mon.NotifyAll();
 +  }
 +}
 +
@@ -163,7 +249,116 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
    if (NS_FAILED(mStatus)) {
      return mStatus;
    }
-@@ -969,17 +1002,17 @@ nsPipeInputStream::OnInputException(nsre
+@@ -659,17 +708,17 @@ nsPipe::AdvanceWriteCursor(uint32_t aByt
+       if (mBuffer.GetSize() >= mBuffer.GetMaxSize()) {
+         mOutput.SetWritable(false);
+       }
+     }
+ 
+     // notify input stream that pipe now contains additional data
+     bool needNotify = false;
+     for (uint32_t i = 0; i < mInputList.Length(); ++i) {
+-      if (mInputList[i]->OnInputReadable(aBytesWritten, events)) {
++      if (mInputList[i]->OnInputReadable(aBytesWritten, events) == NotifyMonitor) {
+         needNotify = true;
+       }
+     }
+ 
+     if (needNotify) {
+       mon.NotifyAll();
+     }
+   }
+@@ -700,22 +749,22 @@ nsPipe::OnInputStreamException(nsPipeInp
+     }
+ 
+     // Otherwise just close the particular stream that hit an exception.
+     for (uint32_t i = 0; i < mInputList.Length(); ++i) {
+       if (mInputList[i] != aStream) {
+         continue;
+       }
+ 
+-      bool needNotify = mInputList[i]->OnInputException(aReason, events);
++      MonitorAction action = mInputList[i]->OnInputException(aReason, events);
+       mInputList.RemoveElementAt(i);
+ 
+       // Notify after element is removed in case we re-enter as a result.
+-      if (needNotify) {
+-        mon.Notify();
++      if (action == NotifyMonitor) {
++        mon.NotifyAll();
+       }
+ 
+       return;
+     }
+   }
+ }
+ 
+ void
+@@ -741,23 +790,23 @@ nsPipe::OnPipeException(nsresult aReason
+     for (uint32_t i = 0; i < mInputList.Length(); ++i) {
+       // an output-only exception applies to the input end if the pipe has
+       // zero bytes available.
+       if (aOutputOnly && mInputList[i]->Available()) {
+         tmpInputList.AppendElement(mInputList[i]);
+         continue;
+       }
+ 
+-      if (mInputList[i]->OnInputException(aReason, events)) {
++      if (mInputList[i]->OnInputException(aReason, events) == NotifyMonitor) {
+         needNotify = true;
+       }
+     }
+     mInputList = tmpInputList;
+ 
+-    if (mOutput.OnOutputException(aReason, events)) {
++    if (mOutput.OnOutputException(aReason, events) == NotifyMonitor) {
+       needNotify = true;
+     }
+ 
+     // Notify after we have removed any input streams from mInputList
+     if (needNotify) {
+       mon.NotifyAll();
+     }
+   }
+@@ -936,57 +985,57 @@ nsPipeInputStream::Wait()
+ 
+     LOG(("III pipe input: woke up [status=%x available=%u]\n",
+          Status(), mAvailable));
+   }
+ 
+   return Status() == NS_BASE_STREAM_CLOSED ? NS_OK : Status();
+ }
+ 
+-bool
++MonitorAction
+ nsPipeInputStream::OnInputReadable(uint32_t aBytesWritten, nsPipeEvents& aEvents)
+ {
+-  bool result = false;
++  MonitorAction result = DoNotNotifyMonitor;
+ 
+   mAvailable += aBytesWritten;
+ 
+   if (mCallback && !(mCallbackFlags & WAIT_CLOSURE_ONLY)) {
+     aEvents.NotifyInputReady(this, mCallback);
+     mCallback = 0;
+     mCallbackFlags = 0;
+   } else if (mBlocked) {
+-    result = true;
++    result = NotifyMonitor;
+   }
+ 
+   return result;
+ }
+ 
+-bool
++MonitorAction
+ nsPipeInputStream::OnInputException(nsresult aReason, nsPipeEvents& aEvents)
+ {
+   LOG(("nsPipeInputStream::OnInputException [this=%x reason=%x]\n",
+        this, aReason));
+ 
+-  bool result = false;
++  MonitorAction result = DoNotNotifyMonitor;
  
    NS_ASSERTION(NS_FAILED(aReason), "huh? successful exception");
  
@@ -180,5 +375,71 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
      mCallback = 0;
      mCallbackFlags = 0;
    } else if (mBlocked) {
-     result = true;
+-    result = true;
++    result = NotifyMonitor;
    }
+ 
+   return result;
+ }
+ 
+ NS_IMETHODIMP
+ nsPipeInputStream::CloseWithStatus(nsresult aReason)
+ {
+@@ -1317,51 +1366,51 @@ nsPipeOutputStream::Wait()
+     mBlocked = false;
+     LOG(("OOO pipe output: woke up [pipe-status=%x writable=%u]\n",
+          mPipe->mStatus, mWritable));
+   }
+ 
+   return mPipe->mStatus == NS_BASE_STREAM_CLOSED ? NS_OK : mPipe->mStatus;
+ }
+ 
+-bool
++MonitorAction
+ nsPipeOutputStream::OnOutputWritable(nsPipeEvents& aEvents)
+ {
+-  bool result = false;
++  MonitorAction result = DoNotNotifyMonitor;
+ 
+   mWritable = true;
+ 
+   if (mCallback && !(mCallbackFlags & WAIT_CLOSURE_ONLY)) {
+     aEvents.NotifyOutputReady(this, mCallback);
+     mCallback = 0;
+     mCallbackFlags = 0;
+   } else if (mBlocked) {
+-    result = true;
++    result = NotifyMonitor;
+   }
+ 
+   return result;
+ }
+ 
+-bool
++MonitorAction
+ nsPipeOutputStream::OnOutputException(nsresult aReason, nsPipeEvents& aEvents)
+ {
+   LOG(("nsPipeOutputStream::OnOutputException [this=%x reason=%x]\n",
+        this, aReason));
+ 
+-  bool result = false;
++  MonitorAction result = DoNotNotifyMonitor;
+ 
+   NS_ASSERTION(NS_FAILED(aReason), "huh? successful exception");
+   mWritable = false;
+ 
+   if (mCallback) {
+     aEvents.NotifyOutputReady(this, mCallback);
+     mCallback = 0;
+     mCallbackFlags = 0;
+   } else if (mBlocked) {
+-    result = true;
++    result = NotifyMonitor;
+   }
+ 
+   return result;
+ }
+ 
+ 
+ NS_IMETHODIMP_(MozExternalRefCountType)
+ nsPipeOutputStream::AddRef()
