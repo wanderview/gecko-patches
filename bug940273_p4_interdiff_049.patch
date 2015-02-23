@@ -1,0 +1,1219 @@
+# HG changeset patch
+# Parent b64ee53cfb806f548b89a0875bb59e7c8d6a852e
+# User Ben Kelly <ben@wanderview.com>
+Bug 940273 P4 interdiff 049 rewrite Action cancelation
+
+diff --git a/dom/cache/Action.cpp b/dom/cache/Action.cpp
+--- a/dom/cache/Action.cpp
++++ b/dom/cache/Action.cpp
+@@ -7,11 +7,34 @@
+ #include "mozilla/dom/cache/Action.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ NS_IMPL_ISUPPORTS0(mozilla::dom::cache::Action::Resolver);
+ 
++void
++Action::CancelOnInitiatingThread()
++{
++  NS_ASSERT_OWNINGTHREAD(Action);
++  MOZ_ASSERT(!mCanceled);
++  mCanceled = true;
++}
++
++Action::Action()
++  : mCanceled(false)
++{
++}
++
++Action::~Action()
++{
++}
++
++bool
++Action::IsCanceled()
++{
++  return mCanceled;
++}
++
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/Action.h b/dom/cache/Action.h
+--- a/dom/cache/Action.h
++++ b/dom/cache/Action.h
+@@ -2,29 +2,26 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_cache_Action_h
+ #define mozilla_dom_cache_Action_h
+ 
++#include "mozilla/Atomics.h"
+ #include "mozilla/dom/cache/Types.h"
+ #include "nsISupportsImpl.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ class Action
+ {
+-protected:
+-  // virtual because deleted through base class pointer
+-  virtual ~Action() { }
+-
+ public:
+   class Resolver : public nsISupports
+   {
+   protected:
+     // virtual because deleted through base class pointer
+     virtual ~Resolver() { }
+ 
+   public:
+@@ -40,30 +37,52 @@ public:
+ 
+   // Execute operations on the target thread.  Once complete call
+   // Resolver::Resolve().  This can be done sync or async.
+   // Note: Action should hold Resolver ref until its ready to call Resolve().
+   // Note: The "target" thread is determined when the Action is scheduled on
+   //       Context.  The Action should not assume any particular thread is used.
+   virtual void RunOnTarget(Resolver* aResolver, const QuotaInfo& aQuotaInfo) = 0;
+ 
+-  // Called on target thread if the Action is being canceled.  Simply
+-  // clean up and do not call Resolver::Resolve() in this case.
+-  // Note: Action must drop Resolver ref if CancelOnTarget() is called!
+-  virtual void CancelOnTarget() = 0;
++  // Called on initiating thread when the Action is canceled.  The Action is
++  // responsible for calling Resolver::Resolve() as normal; either with a
++  // normal error code or NS_ERROR_ABORT.  If CancelOnInitiatingThread() is
++  // called after Resolve() has already occurred, then the cancel can be
++  // ignored.
++  //
++  // Cancelation is a best effort to stop processing as soon as possible, but
++  // does not guarantee the Action will not run.
++  //
++  // Default implementation sets an internal cancelation flag that can be
++  // queried with IsCanceled().
++  virtual void CancelOnInitiatingThread();
+ 
+   // Executed on the initiating thread and is passed the nsresult given to
+   // Resolver::Resolve().
+   virtual void CompleteOnInitiatingThread(nsresult aRv) { }
+ 
+   // Executed on the initiating thread.  If this Action will operate on the
+   // given cache ID then override this to return true.
+   virtual bool MatchesCacheId(CacheId aCacheId) const { return false; }
+ 
+   NS_INLINE_DECL_THREADSAFE_REFCOUNTING(cache::Action)
+   NS_DECL_OWNINGTHREAD
++
++protected:
++  Action();
++
++  // virtual because deleted through base class pointer
++  virtual ~Action();
++
++  // Check if this Action has been canceled.  May be called from any thread,
++  // but typically used from the target thread.
++  bool IsCanceled();
++
++private:
++  // Accessible from any thread.
++  Atomic<bool> mCanceled;
+ };
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_cache_Action_h
+diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
+--- a/dom/cache/Context.cpp
++++ b/dom/cache/Context.cpp
+@@ -326,37 +326,30 @@ public:
+   ActionRunnable(Context* aContext, nsIEventTarget* aTarget, Action* aAction,
+                  const QuotaInfo& aQuotaInfo)
+     : mContext(aContext)
+     , mTarget(aTarget)
+     , mAction(aAction)
+     , mQuotaInfo(aQuotaInfo)
+     , mInitiatingThread(NS_GetCurrentThread())
+     , mState(STATE_INIT)
+-    , mCanceled(false)
+     , mResult(NS_OK)
+   {
+     MOZ_ASSERT(mContext);
+     MOZ_ASSERT(mTarget);
+     MOZ_ASSERT(mAction);
+     MOZ_ASSERT(mQuotaInfo.mDir);
+     MOZ_ASSERT(mInitiatingThread);
+   }
+ 
+   nsresult Dispatch()
+   {
+     NS_ASSERT_OWNINGTHREAD(Action::Resolver);
+     MOZ_ASSERT(mState == STATE_INIT);
+ 
+-    if (mCanceled) {
+-      mState = STATE_COMPLETE;
+-      Clear();
+-      return NS_OK;
+-    }
+-
+     mState = STATE_RUN_ON_TARGET;
+     nsresult rv = mTarget->Dispatch(this, nsIEventTarget::DISPATCH_NORMAL);
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       mState = STATE_COMPLETE;
+       Clear();
+     }
+     return rv;
+   }
+@@ -364,38 +357,17 @@ public:
+   bool MatchesCacheId(CacheId aCacheId) {
+     NS_ASSERT_OWNINGTHREAD(Action::Resolver);
+     return mAction->MatchesCacheId(aCacheId);
+   }
+ 
+   void Cancel()
+   {
+     NS_ASSERT_OWNINGTHREAD(Action::Resolver);
+-    mCanceled = true;
+-    mResult = NS_ERROR_FAILURE;
+-    nsresult rv;
+-    switch(mState) {
+-      case STATE_RUNNING:
+-        // Re-dispatch if we are currently running
+-        rv = mTarget->Dispatch(this, nsIEventTarget::DISPATCH_NORMAL);
+-        if (NS_WARN_IF(NS_FAILED(rv))) {
+-          // Shutdown must be delayed until all Contexts are destroyed.  Crash
+-          // for this invariant violation.
+-          MOZ_CRASH("Failed to dispatch ActionRunnable to target thread.");
+-        }
+-        break;
+-      case STATE_INIT:
+-      case STATE_RUN_ON_TARGET:
+-      case STATE_COMPLETING:
+-      case STATE_COMPLETE:
+-        break;
+-      default:
+-        MOZ_CRASH("unexpected state");
+-        break;
+-    }
++    mAction->CancelOnInitiatingThread();
+   }
+ 
+   virtual void Resolve(nsresult aRv) MOZ_OVERRIDE
+   {
+     MOZ_ASSERT(mState == STATE_RUNNING);
+     mResult = aRv;
+     mState = STATE_COMPLETING;
+     nsresult rv = mInitiatingThread->Dispatch(this, nsIThread::DISPATCH_NORMAL);
+@@ -434,17 +406,16 @@ private:
+   };
+ 
+   nsRefPtr<Context> mContext;
+   nsCOMPtr<nsIEventTarget> mTarget;
+   nsRefPtr<Action> mAction;
+   const QuotaInfo mQuotaInfo;
+   nsCOMPtr<nsIThread> mInitiatingThread;
+   State mState;
+-  bool mCanceled;
+   nsresult mResult;
+ 
+ public:
+   NS_DECL_ISUPPORTS_INHERITED
+   NS_DECL_NSIRUNNABLE
+ };
+ 
+ NS_IMPL_ISUPPORTS_INHERITED(mozilla::dom::cache::Context::ActionRunnable,
+@@ -483,76 +454,37 @@ NS_IMPL_ISUPPORTS_INHERITED(mozilla::dom
+ // Cancel() simply sets a flag to be processed in the normal state machine.
+ // In the case of an async Running state, however, it must reschedule the
+ // ActionRunnable to execute again.  The flag then causes
+ // Action::CancelOnTarget() to be executed which should halt any Action
+ // processing.
+ NS_IMETHODIMP
+ Context::ActionRunnable::Run()
+ {
+-  nsresult rv;
+   switch(mState) {
+     // ----------------------
+     case STATE_RUN_ON_TARGET:
+     {
+       MOZ_ASSERT(NS_GetCurrentThread() == mTarget);
+-      if (mCanceled) {
+-        mState = STATE_COMPLETING;
+-        rv = mInitiatingThread->Dispatch(this, nsIThread::DISPATCH_NORMAL);
+-        if (NS_FAILED(rv)) {
+-          // Shutdown must be delayed until all Contexts are destroyed.  Crash
+-          // for this invariant violation.
+-          MOZ_CRASH("Failed to dispatch ActionRunnable to initiating thread.");
+-        }
+-        break;
+-      }
+       mState = STATE_RUNNING;
+       mAction->RunOnTarget(this, mQuotaInfo);
+       break;
+     }
+-    // ----------------
+-    case STATE_RUNNING:
+-    {
+-      MOZ_ASSERT(NS_GetCurrentThread() == mTarget);
+-      // We only re-enter the RUNNING state if we are canceling.  Normally we
+-      // should transition out of RUNNING via Resolve() instead.
+-      MOZ_ASSERT(mCanceled);
+-      mState = STATE_COMPLETING;
+-      mAction->CancelOnTarget();
+-      mResult = NS_FAILED(mResult) ? mResult : NS_ERROR_FAILURE;
+-      rv = mInitiatingThread->Dispatch(this, nsIThread::DISPATCH_NORMAL);
+-      if (NS_FAILED(rv)) {
+-        // Shutdown must be delayed until all Contexts are destroyed.  Crash
+-        // for this invariant violation.
+-        MOZ_CRASH("Failed to dispatch ActionRunnable to initiating thread.");
+-      }
+-      break;
+-    }
+     // -------------------
+     case STATE_COMPLETING:
+     {
+       NS_ASSERT_OWNINGTHREAD(Action::Resolver);
+       mAction->CompleteOnInitiatingThread(mResult);
+       mState = STATE_COMPLETE;
+       // Explicitly cleanup here as the destructor could fire on any of
+       // the threads we have bounced through.
+       Clear();
+       break;
+     }
+     // -----------------
+-    case STATE_COMPLETE:
+-    {
+-      // We can end up running in the complete state if we cancel on the
+-      // original thread while simultaneously starting to run the action on the
+-      // target thread.
+-      NS_ASSERT_OWNINGTHREAD(Action::Resolver);
+-      MOZ_ASSERT(mCanceled);
+-      break;
+-    }
+-    // -----
+     default:
+     {
+       MOZ_CRASH("unexpected state in ActionRunnable");
+       break;
+     }
+   }
+   return NS_OK;
+ }
+diff --git a/dom/cache/DBAction.cpp b/dom/cache/DBAction.cpp
+--- a/dom/cache/DBAction.cpp
++++ b/dom/cache/DBAction.cpp
+@@ -33,16 +33,21 @@ DBAction::~DBAction()
+ 
+ void
+ DBAction::RunOnTarget(Resolver* aResolver, const QuotaInfo& aQuotaInfo)
+ {
+   MOZ_ASSERT(!NS_IsMainThread());
+   MOZ_ASSERT(aResolver);
+   MOZ_ASSERT(aQuotaInfo.mDir);
+ 
++  if (IsCanceled()) {
++    aResolver->Resolve(NS_ERROR_ABORT);
++    return;
++  }
++
+   nsCOMPtr<nsIFile> dbDir;
+   nsresult rv = aQuotaInfo.mDir->Clone(getter_AddRefs(dbDir));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     aResolver->Resolve(rv);
+     return;
+   }
+ 
+   rv = dbDir->Append(NS_LITERAL_STRING("cache"));
+@@ -154,17 +159,11 @@ SyncDBAction::RunWithDBOnTarget(Resolver
+   MOZ_ASSERT(aResolver);
+   MOZ_ASSERT(aDBDir);
+   MOZ_ASSERT(aConn);
+ 
+   nsresult rv = RunSyncWithDBOnTarget(aQuotaInfo, aDBDir, aConn);
+   aResolver->Resolve(rv);
+ }
+ 
+-void
+-SyncDBAction::CancelOnTarget()
+-{
+-  // This action runs synchronously.  Nothing to cancel here.
+-}
+-
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/DBAction.h b/dom/cache/DBAction.h
+--- a/dom/cache/DBAction.h
++++ b/dom/cache/DBAction.h
+@@ -17,34 +17,37 @@ class nsIFile;
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ class DBAction : public Action
+ {
+ protected:
++  // The mode specifies whether the database should already exist or if its
++  // ok to create a new database.
+   enum Mode
+   {
+     Existing,
+     Create
+   };
+ 
+   explicit DBAction(Mode aMode);
+ 
+   // Action objects are deleted through their base pointer
+   virtual ~DBAction();
+ 
+-  // Just as the resolver must be ref'd until cancel or resolve, you may also
++  // Just as the resolver must be ref'd until resolve, you may also
+   // ref the DB connection.  The connection can only be referenced from the
+-  // target thread and must be released upon cancel or resolve.
++  // target thread and must be released upon resolve.
+   virtual void
+   RunWithDBOnTarget(Resolver* aResolver, const QuotaInfo& aQuotaInfo,
+                     nsIFile* aDBDir, mozIStorageConnection* aConn) = 0;
+ 
++private:
+   virtual void
+   RunOnTarget(Resolver* aResolver, const QuotaInfo& aQuotaInfo) MOZ_OVERRIDE;
+ 
+   nsresult OpenConnection(const QuotaInfo& aQuotaInfo, nsIFile* aQuotaDir,
+                           mozIStorageConnection** aConnOut);
+ 
+   const Mode mMode;
+ };
+@@ -56,20 +59,19 @@ protected:
+ 
+   // Action objects are deleted through their base pointer
+   virtual ~SyncDBAction();
+ 
+   virtual nsresult
+   RunSyncWithDBOnTarget(const QuotaInfo& aQuotaInfo, nsIFile* aDBDir,
+                         mozIStorageConnection* aConn) = 0;
+ 
++private:
+   virtual void
+   RunWithDBOnTarget(Resolver* aResolver, const QuotaInfo& aQuotaInfo,
+                     nsIFile* aDBDir, mozIStorageConnection* aConn) MOZ_OVERRIDE;
+-
+-  virtual void CancelOnTarget() MOZ_OVERRIDE;
+ };
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_cache_DBAction_h
+diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
+--- a/dom/cache/FileUtils.cpp
++++ b/dom/cache/FileUtils.cpp
+@@ -126,44 +126,40 @@ FileUtils::BodyStartWriteStream(const Qu
+   nsCOMPtr<nsIOutputStream> fileStream =
+     FileOutputStream::Create(PERSISTENCE_TYPE_DEFAULT, aQuotaInfo.mGroup,
+                              aQuotaInfo.mOrigin, tmpFile);
+   if (NS_WARN_IF(!fileStream)) { return NS_ERROR_UNEXPECTED; }
+ 
+   nsRefPtr<SnappyCompressOutputStream> compressed =
+     new SnappyCompressOutputStream(fileStream);
+ 
+-  rv = NS_AsyncCopy(aSource, compressed, NS_GetCurrentThread(),
+-                    NS_ASYNCCOPY_VIA_WRITESEGMENTS,
+-                    compressed->BlockSize(),
+-                    aCallback, aClosure,
++  nsCOMPtr<nsIEventTarget> target =
++    do_GetService(NS_STREAMTRANSPORTSERVICE_CONTRACTID);
++
++  rv = NS_AsyncCopy(aSource, compressed, target, NS_ASYNCCOPY_VIA_WRITESEGMENTS,
++                    compressed->BlockSize(), aCallback, aClosure,
+                     true, true, // close streams
+                     aCopyContextOut);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   return rv;
+ }
+ 
+ // static
+ void
+-FileUtils::BodyCancelWrite(nsIFile* aBaseDir, const nsID& aId,
+-                           nsISupports* aCopyContext)
++FileUtils::BodyCancelWrite(nsIFile* aBaseDir, nsISupports* aCopyContext)
+ {
+   MOZ_ASSERT(aBaseDir);
+   MOZ_ASSERT(aCopyContext);
+ 
+   nsresult rv = NS_CancelAsyncCopy(aCopyContext, NS_ERROR_ABORT);
+   unused << NS_WARN_IF(NS_FAILED(rv));
+ 
+-  nsCOMPtr<nsIFile> tmpFile;
+-  rv = BodyIdToFile(aBaseDir, aId, BODY_FILE_TMP, getter_AddRefs(tmpFile));
+-  if (NS_WARN_IF(NS_FAILED(rv))) { return; }
+-
+-  rv = tmpFile->Remove(false /* recursive */);
+-  unused << NS_WARN_IF(NS_FAILED(rv));
++  // The partially written file must be cleaned up after the async copy
++  // makes its callback.
+ }
+ 
+ // static
+ nsresult
+ FileUtils::BodyFinalizeWrite(nsIFile* aBaseDir, const nsID& aId)
+ {
+   MOZ_ASSERT(aBaseDir);
+ 
+@@ -219,32 +215,43 @@ FileUtils::BodyOpen(const QuotaInfo& aQu
+ 
+ // static
+ nsresult
+ FileUtils::BodyDeleteFiles(nsIFile* aBaseDir, const nsTArray<nsID>& aIdList)
+ {
+   nsresult rv = NS_OK;
+ 
+   for (uint32_t i = 0; i < aIdList.Length(); ++i) {
++    nsCOMPtr<nsIFile> tmpFile;
++    rv = BodyIdToFile(aBaseDir, aIdList[i], BODY_FILE_TMP,
++                      getter_AddRefs(tmpFile));
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    rv = tmpFile->Remove(false /* recursive */);
++    if (rv == NS_ERROR_FILE_TARGET_DOES_NOT_EXIST) {
++      rv = NS_OK;
++    }
++
++    // Only treat file deletion as a hard failure in DEBUG builds.  Users
++    // can unfortunately hit this on windows if anti-virus is scanning files,
++    // etc.
++    MOZ_ASSERT(NS_SUCCEEDED(rv));
++
+     nsCOMPtr<nsIFile> finalFile;
+     rv = BodyIdToFile(aBaseDir, aIdList[i], BODY_FILE_FINAL,
+                       getter_AddRefs(finalFile));
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+     rv = finalFile->Remove(false /* recursive */);
+-    if (rv == NS_ERROR_FILE_NOT_FOUND) {
+-      NS_WARNING("Cache body file already deleted. Ignoring.");
+-      continue;
++    if (rv == NS_ERROR_FILE_TARGET_DOES_NOT_EXIST) {
++      rv = NS_OK;
+     }
+-#if DEBUG
+-    // Only treat file deletion as a hard failure in DEBUG builds.  Users
+-    // can unfortunately hit this on windows if anti-virus is scanning files,
+-    // etc.
+-    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+-#endif
++
++    // Again, only treat removal as hard failure in debug build.
++    MOZ_ASSERT(NS_SUCCEEDED(rv));
+   }
+ 
+   return NS_OK;
+ }
+ 
+ // static
+ nsresult
+ FileUtils::BodyIdToFile(nsIFile* aBaseDir, const nsID& aId,
+diff --git a/dom/cache/FileUtils.h b/dom/cache/FileUtils.h
+--- a/dom/cache/FileUtils.h
++++ b/dom/cache/FileUtils.h
+@@ -35,18 +35,17 @@ public:
+ 
+   static nsresult
+   BodyStartWriteStream(const QuotaInfo& aQuotaInfo, nsIFile* aBaseDir,
+                        nsIInputStream* aSource, void* aClosure,
+                        nsAsyncCopyCallbackFun aCallback, nsID* aIdOut,
+                        nsISupports** aCopyContextOut);
+ 
+   static void
+-  BodyCancelWrite(nsIFile* aBaseDir, const nsID& aId,
+-                  nsISupports* aCopyContext);
++  BodyCancelWrite(nsIFile* aBaseDir, nsISupports* aCopyContext);
+ 
+   static nsresult
+   BodyFinalizeWrite(nsIFile* aBaseDir, const nsID& aId);
+ 
+   static nsresult
+   BodyOpen(const QuotaInfo& aQuotaInfo, nsIFile* aBaseDir, const nsID& aId,
+            nsIInputStream** aStreamOut);
+ 
+diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
+--- a/dom/cache/Manager.cpp
++++ b/dom/cache/Manager.cpp
+@@ -1,17 +1,17 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/Manager.h"
+ 
+-#include "mozilla/ClearOnShutdown.h"
++#include "mozilla/Mutex.h"
+ #include "mozilla/StaticMutex.h"
+ #include "mozilla/StaticPtr.h"
+ #include "mozilla/unused.h"
+ #include "mozilla/dom/cache/Context.h"
+ #include "mozilla/dom/cache/DBAction.h"
+ #include "mozilla/dom/cache/DBSchema.h"
+ #include "mozilla/dom/cache/FileUtils.h"
+ #include "mozilla/dom/cache/ManagerId.h"
+@@ -91,16 +91,22 @@ public:
+   }
+ 
+   virtual void
+   RunOnTarget(Resolver* aResolver, const QuotaInfo& aQuotaInfo) MOZ_OVERRIDE
+   {
+     MOZ_ASSERT(aResolver);
+     MOZ_ASSERT(aQuotaInfo.mDir);
+ 
++    if (IsCanceled()) {
++      // TODO: handle orphaned files (bug 1110446)
++      aResolver->Resolve(NS_ERROR_ABORT);
++      return;
++    }
++
+     nsCOMPtr<nsIFile> dbDir;
+     nsresult rv = aQuotaInfo.mDir->Clone(getter_AddRefs(dbDir));
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       aResolver->Resolve(rv);
+       return;
+     }
+ 
+     rv = dbDir->Append(NS_LITERAL_STRING("cache"));
+@@ -110,19 +116,16 @@ public:
+     }
+ 
+     rv = FileUtils::BodyDeleteFiles(dbDir, mDeletedBodyIdList);
+     unused << NS_WARN_IF(NS_FAILED(rv));
+ 
+     aResolver->Resolve(rv);
+   }
+ 
+-  // We run synchronously, so there is nothing to do when canceled.
+-  virtual void CancelOnTarget() { }
+-
+ private:
+   nsTArray<nsID> mDeletedBodyIdList;
+ };
+ 
+ } // anonymous namespace
+ 
+ namespace mozilla {
+ namespace dom {
+@@ -206,17 +209,17 @@ public:
+   }
+ 
+   static void StartShutdownAllOnMainThread()
+   {
+     MOZ_ASSERT(NS_IsMainThread());
+ 
+     // Lock for sFactoryShutdown, sFactoryShutdownComplete, and
+     // sBackgroundThread.
+-    StaticMutexAutoLock lock(sLock);
++    StaticMutexAutoLock lock(sMutex);
+ 
+     sFactoryShutdown = true;
+ 
+     if (!sBackgroundThread) {
+       sFactoryShutdownComplete = true;
+       return;
+     }
+ 
+@@ -226,17 +229,17 @@ public:
+     nsresult rv = sBackgroundThread->Dispatch(runnable,
+                                               nsIThread::DISPATCH_NORMAL);
+     MOZ_ALWAYS_TRUE(NS_SUCCEEDED(rv));
+   }
+ 
+   static bool IsShutdownAllCompleteOnMainThread()
+   {
+     MOZ_ASSERT(NS_IsMainThread());
+-    StaticMutexAutoLock lock(sLock);
++    StaticMutexAutoLock lock(sMutex);
+     return sFactoryShutdownComplete;
+   }
+ 
+ private:
+   Factory()
+   {
+     MOZ_COUNT_CTOR(cache::Manager::Factory);
+   }
+@@ -251,17 +254,17 @@ private:
+   {
+     mozilla::ipc::AssertIsOnBackgroundThread();
+ 
+     if (!sFactory) {
+       // Be clear about what we are locking.  sFactory is bg thread only, so
+       // we don't need to lock it here.  Just protect sFactoryShutdown and
+       // sBackgroundThread.
+       {
+-        StaticMutexAutoLock lock(sLock);
++        StaticMutexAutoLock lock(sMutex);
+ 
+         if (sFactoryShutdown) {
+           return NS_ERROR_ILLEGAL_DURING_SHUTDOWN;
+         }
+         MOZ_ASSERT(!sFactoryShutdownComplete);
+ 
+         // Cannot use ClearOnShutdown() because we're on the background thread.
+         // This is automatically cleared when Factory::Remove() calls
+@@ -288,17 +291,17 @@ private:
+   {
+     mozilla::ipc::AssertIsOnBackgroundThread();
+     MOZ_ASSERT(sFactory);
+ 
+     // Be clear about what we are locking.  sFactory is bg thread only, so
+     // we don't need to lock it here.  Just protect sFactoryShutdown,
+     // sFactoryShutdownComplete, and sBackgroundThread.
+     {
+-      StaticMutexAutoLock lock(sLock);
++      StaticMutexAutoLock lock(sMutex);
+       MOZ_ASSERT(!sFactoryShutdownComplete);
+ 
+       if (sFactoryShutdown) {
+         sFactoryShutdownComplete = true;
+       }
+ 
+       sBackgroundThread = nullptr;
+     }
+@@ -310,17 +313,17 @@ private:
+   {
+     mozilla::ipc::AssertIsOnBackgroundThread();
+ 
+     // The factory shutdown between when shutdown started on main thread and
+     // when we could start shutdown on the worker thread.  Just declare
+     // shutdown complete.  The sFactoryShutdown flag prevents the factory
+     // from racing to restart here.
+     if (!sFactory) {
+-      StaticMutexAutoLock lock(sLock);
++      StaticMutexAutoLock lock(sMutex);
+       sFactoryShutdownComplete = true;
+       return;
+     }
+ 
+     MOZ_ASSERT(!sFactory->mManagerList.IsEmpty());
+ 
+     ManagerList::ForwardIterator iter(sFactory->mManagerList);
+     while (iter.HasMore()) {
+@@ -342,44 +345,44 @@ private:
+   };
+ 
+   // Singleton created on demand and deleted when last Manager is cleared
+   // in Remove().
+   // PBackground thread only.
+   static StaticAutoPtr<Factory> sFactory;
+ 
+   // protects following static attributes
+-  static StaticMutex sLock;
++  static StaticMutex sMutex;
+ 
+   // Indicate if shutdown has occurred to block re-creation of sFactory.
+-  // Must hold sLock to access.
++  // Must hold sMutex to access.
+   static bool sFactoryShutdown;
+ 
+   // Set after ShutdownAll() and after all Manager objects have removed
+   // themselves.
+-  // Must hold sLock to access.
++  // Must hold sMutex to access.
+   static bool sFactoryShutdownComplete;
+ 
+   // Background thread owning all Manager objects.  Only set while sFactory is
+   // set.
+-  // Must hold sLock to access.
++  // Must hold sMutex to access.
+   static StaticRefPtr<nsIThread> sBackgroundThread;
+ 
+   // Weak references as we don't want to keep Manager objects alive forever.
+   // When a Manager is destroyed it calls Factory::Remove() to clear itself.
+   // PBackground thread only.
+   typedef nsTObserverArray<Manager*> ManagerList;
+   ManagerList mManagerList;
+ };
+ 
+ // static
+ StaticAutoPtr<Manager::Factory> Manager::Factory::sFactory;
+ 
+ // static
+-StaticMutex Manager::Factory::sLock;
++StaticMutex Manager::Factory::sMutex;
+ 
+ // static
+ bool Manager::Factory::sFactoryShutdown = false;
+ 
+ // static
+ bool Manager::Factory::sFactoryShutdownComplete = false;
+ 
+ // static
+@@ -611,114 +614,157 @@ public:
+                     const nsTArray<nsCOMPtr<nsIInputStream>>& aRequestStreamList,
+                     const nsTArray<nsCOMPtr<nsIInputStream>>& aResponseStreamList)
+     : DBAction(DBAction::Existing)
+     , mManager(aManager)
+     , mListenerId(aListenerId)
+     , mRequestId(aRequestId)
+     , mCacheId(aCacheId)
+     , mList(aPutList.Length())
+-    , mExpectedAsyncCopyCompletions(0)
++    , mExpectedAsyncCopyCompletions(1)
++    , mAsyncResult(NS_OK)
++    , mMutex("cache::Manager::CachePutAllAction")
+   {
+     MOZ_ASSERT(aPutList.Length() == aRequestStreamList.Length());
+     MOZ_ASSERT(aPutList.Length() == aResponseStreamList.Length());
+ 
+     for (uint32_t i = 0; i < aPutList.Length(); ++i) {
+       Entry* entry = mList.AppendElement();
+       entry->mRequest = aPutList[i].request();
+       entry->mRequestStream = aRequestStreamList[i];
+       entry->mResponse = aPutList[i].response();
+       entry->mResponseStream = aResponseStreamList[i];
+-
+-      mExpectedAsyncCopyCompletions += entry->mRequestStream ? 1 : 0;
+-      mExpectedAsyncCopyCompletions += entry->mResponseStream ? 1 : 0;
+     }
+   }
+ 
++private:
++  ~CachePutAllAction() { }
++
+   virtual void
+   RunWithDBOnTarget(Resolver* aResolver, const QuotaInfo& aQuotaInfo,
+                     nsIFile* aDBDir, mozIStorageConnection* aConn) MOZ_OVERRIDE
+   {
+     MOZ_ASSERT(aResolver);
+     MOZ_ASSERT(aDBDir);
+     MOZ_ASSERT(aConn);
+     MOZ_ASSERT(!mResolver);
+     MOZ_ASSERT(!mDBDir);
+     MOZ_ASSERT(!mConn);
+ 
++    MOZ_ASSERT(!mTargetThread);
++    mTargetThread = NS_GetCurrentThread();
++    MOZ_ASSERT(mTargetThread);
++
++    // We should be pre-initialized to expect one async completion.  This is
++    // the "manual" completion we call at the end of this method in all
++    // cases.
++    MOZ_ASSERT(mExpectedAsyncCopyCompletions == 1);
++
+     mResolver = aResolver;
+     mDBDir = aDBDir;
+     mConn = aConn;
+ 
+-    if (mExpectedAsyncCopyCompletions < 1) {
+-      mExpectedAsyncCopyCompletions = 1;
+-      OnAsyncCopyComplete(NS_OK);
+-      return;
++    // File bodies are streamed to disk via asynchronous copying.  Start
++    // this copying now.  Each copy will eventually result in a call
++    // to OnAsyncCopyComplete().
++    nsresult rv = NS_OK;
++    for (uint32_t i = 0; i < mList.Length(); ++i) {
++      rv = StartStreamCopy(aQuotaInfo, mList[i], RequestStream,
++                           &mExpectedAsyncCopyCompletions);
++      if (NS_WARN_IF(NS_FAILED(rv))) {
++        break;
++      }
++
++      rv = StartStreamCopy(aQuotaInfo, mList[i], ResponseStream,
++                           &mExpectedAsyncCopyCompletions);
++      if (NS_WARN_IF(NS_FAILED(rv))) {
++        break;
++      }
+     }
+ 
+-    nsresult rv = NS_OK;
+-    for (uint32_t i = 0; i < mList.Length(); ++i) {
+-      rv = StartStreamCopy(aQuotaInfo, mList[i].mRequestStream,
+-                           &mList[i].mRequestBodyId,
+-                           getter_AddRefs(mList[i].mRequestCopyContext));
+-      if (NS_WARN_IF(NS_FAILED(rv))) {
+-        CancelAllStreamCopying();
+-        DoResolve(rv);
+-        return;
+-      }
++    // While StartStreamCopy() will return NS_ERROR_ABORT if IsCanceled() is
++    // true, there is still a race to deal with.  Consider:
++    //
++    // 1) StartStreamCopy() begins NS_AsyncCopy(), but has not locked mMutex
++    //    yet to store the resulting handle in mCopyContextList.
++    // 2) CancelOnInitiatingThread() is called.  This locks mMutex, cancels
++    //    all know copyContexts, and then clears the mCopyContextList.
++    // 3) The target thread in (1) finishes its StartStreamCopy() by saving
++    //    its copy context in mCopyContextList.
++    //
++    // In this case we could have an outstanding copy still running.  To catch
++    // this condition, check for cancelation again after all streams have been
++    // started.  If canceled, then simulator an error code so that any
++    // outstanding copies are stopped below in our manual call to
++    // OnAsyncCopyComplete()
++    if (IsCanceled()) {
++      rv = NS_ERROR_ABORT;
++    }
+ 
+-      rv = StartStreamCopy(aQuotaInfo, mList[i].mResponseStream,
+-                           &mList[i].mResponseBodyId,
+-                           getter_AddRefs(mList[i].mResponseCopyContext));
+-      if (NS_WARN_IF(NS_FAILED(rv))) {
+-        CancelAllStreamCopying();
+-        DoResolve(rv);
+-        return;
+-      }
+-    }
++    // Always call OnAsyncCopyComplete() manually here.  This covers the
++    // case where there is no async copying and also reports any startup
++    // errors correctly.  If we hit an error, then OnAsyncCopyComplete()
++    // will cancel any async copying.
++    OnAsyncCopyComplete(rv);
+   }
+ 
++  // Called once for each asynchronous file copy whether it succeeds or
++  // fails.  If a file copy is canceled, it still calls this method with
++  // an error code.
+   void
+   OnAsyncCopyComplete(nsresult aRv)
+   {
++    MOZ_ASSERT(mTargetThread == NS_GetCurrentThread());
+     MOZ_ASSERT(mConn);
+     MOZ_ASSERT(mResolver);
+     MOZ_ASSERT(mExpectedAsyncCopyCompletions > 0);
+ 
+-    // When DoResolve() is called below the "this" object can get destructed
+-    // out from under us on the initiating thread.  Ensure that we cleanly
+-    // run to completion in this scope before destruction.
+-    nsRefPtr<Action> kungFuDeathGrip = this;
++    // If any of the async copies fail, we need to still wait for them all to
++    // complete.  Cancel any other streams still working and remember the
++    // error.  All canceled streams will call OnAsyncCopyComplete().
++    if (NS_FAILED(aRv) && NS_SUCCEEDED(mAsyncResult)) {
++      CancelAllStreamCopying();
++      mAsyncResult = aRv;
++    }
+ 
+-    if (NS_FAILED(aRv)) {
+-      DoResolve(aRv);
++    // Check to see if async copying is still on-going.  If so, then simply
++    // return for now.  We must wait for a later OnAsyncCopyComplete() call.
++    mExpectedAsyncCopyCompletions -= 1;
++    if (mExpectedAsyncCopyCompletions > 0) {
+       return;
+     }
+ 
+-    mExpectedAsyncCopyCompletions -= 1;
+-    if (mExpectedAsyncCopyCompletions > 0) {
++    // We have finished with all async copying.  Indicate this by clearing all
++    // our copy contexts.
++    {
++      MutexAutoLock lock(mMutex);
++      mCopyContextList.Clear();
++    }
++
++    // An error occurred while async copying.  Terminate the Action.
++    // DoResolve() will clean up any files we may have written.
++    if (NS_FAILED(mAsyncResult)) {
++      DoResolve(mAsyncResult);
+       return;
+     }
+ 
+     mozStorageTransaction trans(mConn, false,
+                                 mozIStorageConnection::TRANSACTION_IMMEDIATE);
+ 
+     nsresult rv = NS_OK;
+     for (uint32_t i = 0; i < mList.Length(); ++i) {
+       Entry& e = mList[i];
+       if (e.mRequestStream) {
+-        e.mRequestCopyContext = nullptr;
+         rv = FileUtils::BodyFinalizeWrite(mDBDir, e.mRequestBodyId);
+         if (NS_WARN_IF(NS_FAILED(rv))) {
+           DoResolve(rv);
+           return;
+         }
+       }
+       if (e.mResponseStream) {
+-        e.mResponseCopyContext = nullptr;
+         rv = FileUtils::BodyFinalizeWrite(mDBDir, e.mResponseBodyId);
+         if (NS_WARN_IF(NS_FAILED(rv))) {
+           DoResolve(rv);
+           return;
+         }
+       }
+ 
+       rv = DBSchema::CachePut(mConn, mCacheId, e.mRequest,
+@@ -753,127 +799,183 @@ public:
+     Listener* listener = mManager->GetListener(mListenerId);
+     mManager = nullptr;
+     if (listener) {
+       listener->OnCachePutAll(mRequestId, aRv);
+     }
+   }
+ 
+   virtual void
+-  CancelOnTarget() MOZ_OVERRIDE
++  CancelOnInitiatingThread() MOZ_OVERRIDE
+   {
++    NS_ASSERT_OWNINGTHREAD(Action);
++    Action::CancelOnInitiatingThread();
+     CancelAllStreamCopying();
+-    mConn = nullptr;
+-    mResolver = nullptr;
+   }
+ 
+   virtual bool MatchesCacheId(CacheId aCacheId) const MOZ_OVERRIDE
+   {
++    NS_ASSERT_OWNINGTHREAD(Action);
+     return aCacheId == mCacheId;
+   }
+ 
+-private:
+-  nsresult
+-  StartStreamCopy(const QuotaInfo& aQuotaInfo, nsIInputStream* aSource,
+-                  nsID* aIdOut, nsISupports** aCopyContextOut)
+-  {
+-    MOZ_ASSERT(aIdOut);
+-    MOZ_ASSERT(aCopyContextOut);
+-    MOZ_ASSERT(mDBDir);
+-
+-    if (!aSource) {
+-      return NS_OK;
+-    }
+-
+-    nsresult rv = FileUtils::BodyStartWriteStream(aQuotaInfo, mDBDir, aSource,
+-                                                  this, AsyncCopyCompleteFunc,
+-                                                  aIdOut, aCopyContextOut);
+-    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+-
+-    return rv;
+-  }
+-
+-  void
+-  CancelAllStreamCopying()
+-  {
+-    for (uint32_t i = 0; i < mList.Length(); ++i) {
+-      Entry& e = mList[i];
+-      if (e.mRequestStream && e.mRequestCopyContext) {
+-        CancelStreamCopy(e.mRequestStream, e.mRequestCopyContext,
+-                         e.mRequestBodyId);
+-        e.mRequestCopyContext = nullptr;
+-      }
+-      if (e.mResponseStream && e.mResponseCopyContext) {
+-        CancelStreamCopy(e.mResponseStream, e.mResponseCopyContext,
+-                         e.mResponseBodyId);
+-        e.mResponseCopyContext = nullptr;
+-      }
+-    }
+-  }
+-
+-  void
+-  CancelStreamCopy(nsIInputStream* aSource, nsISupports* aCopyContext,
+-                   const nsID& aId)
+-  {
+-    if (!aSource || !aCopyContext) {
+-      return;
+-    }
+-    FileUtils::BodyCancelWrite(mDBDir, aId, aCopyContext);
+-  }
+-
+-  static void
+-  AsyncCopyCompleteFunc(void* aClosure, nsresult aRv)
+-  {
+-    MOZ_ASSERT(aClosure);
+-    CachePutAllAction* action = static_cast<CachePutAllAction*>(aClosure);
+-    action->OnAsyncCopyComplete(aRv);
+-  }
+-
+-  void
+-  DoResolve(nsresult aRv)
+-  {
+-    if (NS_FAILED(aRv)) {
+-      CancelAllStreamCopying();
+-    }
+-
+-    mConn = nullptr;
+-
+-    nsRefPtr<Resolver> resolver;
+-    mResolver.swap(resolver);
+-
+-    if (resolver) {
+-      // This can trigger self destruction if a self-ref is not held by the
+-      // caller.
+-      resolver->Resolve(aRv);
+-    }
+-  }
+-
+   struct Entry
+   {
+     PCacheRequest mRequest;
+     nsCOMPtr<nsIInputStream> mRequestStream;
+     nsID mRequestBodyId;
+     nsCOMPtr<nsISupports> mRequestCopyContext;
+ 
+     PCacheResponse mResponse;
+     nsCOMPtr<nsIInputStream> mResponseStream;
+     nsID mResponseBodyId;
+     nsCOMPtr<nsISupports> mResponseCopyContext;
+   };
+ 
++  enum StreamId
++  {
++    RequestStream,
++    ResponseStream
++  };
++
++  nsresult
++  StartStreamCopy(const QuotaInfo& aQuotaInfo, Entry& aEntry,
++                  StreamId aStreamId, uint32_t* aCopyCountOut)
++  {
++    MOZ_ASSERT(mTargetThread == NS_GetCurrentThread());
++    MOZ_ASSERT(aCopyCountOut);
++
++    if (IsCanceled()) {
++      return NS_ERROR_ABORT;
++    }
++
++    nsCOMPtr<nsIInputStream> source;
++    nsID* bodyId;
++
++    if (aStreamId == RequestStream) {
++      source = aEntry.mRequestStream;
++      bodyId = &aEntry.mRequestBodyId;
++    } else {
++      MOZ_ASSERT(aStreamId == ResponseStream);
++      source = aEntry.mResponseStream;
++      bodyId = &aEntry.mResponseBodyId;
++    }
++
++    if (!source) {
++      return NS_OK;
++    }
++
++    nsCOMPtr<nsISupports> copyContext;
++
++    nsresult rv = FileUtils::BodyStartWriteStream(aQuotaInfo, mDBDir, source,
++                                                  this, AsyncCopyCompleteFunc,
++                                                  bodyId,
++                                                  getter_AddRefs(copyContext));
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    mBodyIdWrittenList.AppendElement(*bodyId);
++
++    if (copyContext) {
++      MutexAutoLock lock(mMutex);
++      mCopyContextList.AppendElement(copyContext);
++    }
++
++    *aCopyCountOut += 1;
++
++    return rv;
++  }
++
++  void
++  CancelAllStreamCopying()
++  {
++    // May occur on either owning thread or target thread
++    MutexAutoLock lock(mMutex);
++    for (uint32_t i = 0; i < mCopyContextList.Length(); ++i) {
++      FileUtils::BodyCancelWrite(mDBDir, mCopyContextList[i]);
++    }
++    mCopyContextList.Clear();
++  }
++
++  static void
++  AsyncCopyCompleteFunc(void* aClosure, nsresult aRv)
++  {
++    // May be on any thread, including STS event target.
++    MOZ_ASSERT(aClosure);
++    nsRefPtr<CachePutAllAction> action = static_cast<CachePutAllAction*>(aClosure);
++    action->CallOnAsyncCopyCompleteOnTargetThread(aRv);
++  }
++
++  void
++  CallOnAsyncCopyCompleteOnTargetThread(nsresult aRv)
++  {
++    // May be on any thread, including STS event target.
++    nsCOMPtr<nsIRunnable> runnable = NS_NewRunnableMethodWithArg<nsresult>(
++      this, &CachePutAllAction::OnAsyncCopyComplete, aRv);
++    MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
++      mTargetThread->Dispatch(runnable, nsIThread::DISPATCH_NORMAL)));
++  }
++
++  void
++  DoResolve(nsresult aRv)
++  {
++    MOZ_ASSERT(mTargetThread == NS_GetCurrentThread());
++
++    // DoResolve() must not be called until all async copying has completed.
++#ifdef DEBUG
++    {
++      MutexAutoLock lock(mMutex);
++      MOZ_ASSERT(mCopyContextList.IsEmpty());
++    }
++#endif
++
++    // Clean up any files we might have written before hitting the error.
++    if (NS_FAILED(aRv)) {
++      FileUtils::BodyDeleteFiles(mDBDir, mBodyIdWrittenList);
++    }
++
++    // Must be released on the target thread where it was opened.
++    mConn = nullptr;
++
++    // Drop our ref to the target thread as we are done with this thread.
++    // Also makes our thread assertions catch any incorrect method calls
++    // after resolve.
++    mTargetThread = nullptr;
++
++    // Make sure to de-ref the resolver per the Action API contract.
++    nsRefPtr<Action::Resolver> resolver;
++    mResolver.swap(resolver);
++    resolver->Resolve(aRv);
++  }
++
++  // initiating thread only
+   nsRefPtr<Manager> mManager;
+   const ListenerId mListenerId;
+   const RequestId mRequestId;
++
++  // Set on initiating thread, read on target thread.  State machine guarantees
++  // these are not modified while being read by the target thread.
+   const CacheId mCacheId;
+   nsTArray<Entry> mList;
++  uint32_t mExpectedAsyncCopyCompletions;
++
++  // target thread only
+   nsRefPtr<Resolver> mResolver;
+   nsCOMPtr<nsIFile> mDBDir;
+   nsCOMPtr<mozIStorageConnection> mConn;
+-  uint32_t mExpectedAsyncCopyCompletions;
++  nsCOMPtr<nsIThread> mTargetThread;
++  nsresult mAsyncResult;
++  nsTArray<nsID> mBodyIdWrittenList;
++
++  // Written to on target thread, accessed on initiating thread after target
++  // thread activity is guaranteed complete
+   nsTArray<nsID> mDeletedBodyIdList;
++
++  // accessed from any thread while mMutex locked
++  Mutex mMutex;
++  nsTArray<nsCOMPtr<nsISupports>> mCopyContextList;
+ };
+ 
+ // ----------------------------------------------------------------------------
+ 
+ class Manager::CacheDeleteAction MOZ_FINAL : public Manager::BaseAction
+ {
+ public:
+   CacheDeleteAction(Manager* aManager, ListenerId aListenerId,

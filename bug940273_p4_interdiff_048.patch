@@ -1,0 +1,921 @@
+# HG changeset patch
+# Parent 9fda2f3ea00e739a4601e83e298a162765c72809
+# User Ben Kelly <ben@wanderview.com>
+Bug 940273 P4 interdiff 048 rewrite shutdown code
+
+diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
+--- a/dom/cache/Manager.cpp
++++ b/dom/cache/Manager.cpp
+@@ -2,35 +2,37 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/Manager.h"
+ 
+ #include "mozilla/ClearOnShutdown.h"
++#include "mozilla/StaticMutex.h"
+ #include "mozilla/StaticPtr.h"
+ #include "mozilla/unused.h"
+ #include "mozilla/dom/cache/Context.h"
+ #include "mozilla/dom/cache/DBAction.h"
+ #include "mozilla/dom/cache/DBSchema.h"
+ #include "mozilla/dom/cache/FileUtils.h"
+ #include "mozilla/dom/cache/ManagerId.h"
+ #include "mozilla/dom/cache/PCacheTypes.h"
+ #include "mozilla/dom/cache/SavedTypes.h"
+ #include "mozilla/dom/cache/StreamList.h"
+-#include "mozilla/dom/cache/ShutdownObserver.h"
+ #include "mozilla/dom/cache/Types.h"
+ #include "mozilla/ipc/BackgroundParent.h"
+ #include "mozStorageHelper.h"
+ #include "nsAutoPtr.h"
+ #include "nsIInputStream.h"
+ #include "nsID.h"
+ #include "nsIFile.h"
+ #include "nsIThread.h"
++#include "nsThreadUtils.h"
++#include "nsTObserverArray.h"
+ 
+ namespace {
+ 
+ using mozilla::unused;
+ using mozilla::dom::cache::Action;
+ using mozilla::dom::cache::DBSchema;
+ using mozilla::dom::cache::FileUtils;
+ using mozilla::dom::cache::QuotaInfo;
+@@ -136,131 +138,258 @@ public:
+   friend class StaticAutoPtr<Manager::Factory>;
+ 
+   static nsresult GetOrCreate(ManagerId* aManagerId, Manager** aManagerOut)
+   {
+     mozilla::ipc::AssertIsOnBackgroundThread();
+ 
+     // Ensure there is a factory instance.  This forces the Get() call
+     // below to use the same factory.
+-    MaybeCreateInstance();
++    nsresult rv = MaybeCreateInstance();
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+     nsRefPtr<Manager> ref = Get(aManagerId);
+     if (!ref) {
+-      nsresult rv = shutdown::AddManagerId(aManagerId);
+-      if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+-
+       // TODO: replace this with a thread pool (bug 1119864)
+       nsCOMPtr<nsIThread> ioThread;
+       rv = NS_NewNamedThread("DOMCacheThread", getter_AddRefs(ioThread));
+       if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+       ref = new Manager(aManagerId, ioThread);
++
++      MOZ_ASSERT(!sFactory->mManagerList.Contains(ref.get()));
+       sFactory->mManagerList.AppendElement(ref);
+     }
+ 
+     ref.forget(aManagerOut);
+ 
+     return NS_OK;
+   }
+ 
+   static already_AddRefed<Manager> Get(ManagerId* aManagerId)
+   {
+     mozilla::ipc::AssertIsOnBackgroundThread();
+ 
+-    MaybeCreateInstance();
++    nsresult rv = MaybeCreateInstance();
++    if (NS_WARN_IF(NS_FAILED(rv))) { return nullptr; }
+ 
+-    for (uint32_t i = 0; i < sFactory->mManagerList.Length(); ++i) {
+-      if (*sFactory->mManagerList[i]->mManagerId == *aManagerId) {
+-        nsRefPtr<Manager> ref = sFactory->mManagerList[i];
++    ManagerList::ForwardIterator iter(sFactory->mManagerList);
++    while (iter.HasMore()) {
++      // Weak ref to avoid a ton of AddRef calls on iteration.  We are
++      // guaranteed won't be deleted since the manager list can only be
++      // accessed on the background thread.
++      Manager* manager = iter.GetNext();
++      MOZ_ASSERT(manager);
++      if (*manager->mManagerId == *aManagerId) {
++        nsRefPtr<Manager> ref = manager;
+         return ref.forget();
+       }
+     }
+ 
+     return nullptr;
+   }
+ 
+   static void Remove(Manager* aManager)
+   {
+     mozilla::ipc::AssertIsOnBackgroundThread();
+     MOZ_ASSERT(aManager);
+ 
+-    MaybeCreateInstance();
+-
+-    for (uint32_t i = 0; i < sFactory->mManagerList.Length(); ++i) {
+-      if (sFactory->mManagerList[i] == aManager) {
+-        sFactory->mManagerList.RemoveElementAt(i);
+-
+-        // clean up the factory singleton if there are no more managers
+-        if (sFactory->mManagerList.IsEmpty()) {
+-          sFactory = nullptr;
+-        }
+-
+-        return;
+-      }
++    nsresult rv = MaybeCreateInstance();
++    if (NS_FAILED(rv)) {
++      MOZ_CRASH("Removing Manager after Manager::Factory fully shutdown!");
+     }
+ 
+-    MOZ_ASSERT_UNREACHABLE("Factory does not know about this Manager!");
++    MOZ_ALWAYS_TRUE(sFactory->mManagerList.RemoveElement(aManager));
++
++    // clean up the factory singleton if there are no more managers
++    if (sFactory->mManagerList.IsEmpty()) {
++      DestroyInstance();
++    }
+   }
+ 
+-  static void ShutdownAll()
++  static void StartShutdownAllOnMainThread()
+   {
+-    mozilla::ipc::AssertIsOnBackgroundThread();
++    MOZ_ASSERT(NS_IsMainThread());
+ 
+-    if (!sFactory) {
++    // Lock for sFactoryShutdown, sFactoryShutdownComplete, and
++    // sBackgroundThread.
++    StaticMutexAutoLock lock(sLock);
++
++    sFactoryShutdown = true;
++
++    if (!sBackgroundThread) {
++      sFactoryShutdownComplete = true;
+       return;
+     }
+ 
+-    for (uint32_t i = 0; i < sFactory->mManagerList.Length(); ++i) {
+-      sFactory->mManagerList[i]->Shutdown();
+-    }
++    // Guaranteed to succeed because we should be shutdown before the
++    // background thread is destroyed.
++    nsCOMPtr<nsIRunnable> runnable = new ShutdownAllRunnable();
++    nsresult rv = sBackgroundThread->Dispatch(runnable,
++                                              nsIThread::DISPATCH_NORMAL);
++    MOZ_ALWAYS_TRUE(NS_SUCCEEDED(rv));
++  }
++
++  static bool IsShutdownAllCompleteOnMainThread()
++  {
++    MOZ_ASSERT(NS_IsMainThread());
++    StaticMutexAutoLock lock(sLock);
++    return sFactoryShutdownComplete;
+   }
+ 
+ private:
+   Factory()
+   {
+     MOZ_COUNT_CTOR(cache::Manager::Factory);
+   }
+ 
+   ~Factory()
+   {
+     MOZ_COUNT_DTOR(cache::Manager::Factory);
+     MOZ_ASSERT(mManagerList.IsEmpty());
+   }
+ 
+-  static void MaybeCreateInstance()
++  static nsresult MaybeCreateInstance()
+   {
+     mozilla::ipc::AssertIsOnBackgroundThread();
+ 
+     if (!sFactory) {
++      // Be clear about what we are locking.  sFactory is bg thread only, so
++      // we don't need to lock it here.  Just protect sFactoryShutdown and
++      // sBackgroundThread.
++      {
++        StaticMutexAutoLock lock(sLock);
++
++        if (sFactoryShutdown) {
++          return NS_ERROR_ILLEGAL_DURING_SHUTDOWN;
++        }
++        MOZ_ASSERT(!sFactoryShutdownComplete);
++
++        // Cannot use ClearOnShutdown() because we're on the background thread.
++        // This is automatically cleared when Factory::Remove() calls
++        // DestroyInstance().
++        sBackgroundThread = NS_GetCurrentThread();
++      }
++
+       // We cannot use ClearOnShutdown() here because we're not on the main
+       // thread.  Instead, we delete sFactory in Factory::Remove() after the
+       // last manager is removed.  ShutdownObserver ensures this happens
+       // before shutdown.
+       sFactory = new Factory();
+     }
+ 
+     // Never return sFactory to code outside Factory.  We need to delete it
+     // out from under ourselves just before we return from Remove().  This
+     // would be (even more) dangerous if other code had a pointer to the
+     // factory itself.
++
++    return NS_OK;
+   }
+ 
++  static void DestroyInstance()
++  {
++    mozilla::ipc::AssertIsOnBackgroundThread();
++    MOZ_ASSERT(sFactory);
++
++    // Be clear about what we are locking.  sFactory is bg thread only, so
++    // we don't need to lock it here.  Just protect sFactoryShutdown,
++    // sFactoryShutdownComplete, and sBackgroundThread.
++    {
++      StaticMutexAutoLock lock(sLock);
++      MOZ_ASSERT(!sFactoryShutdownComplete);
++
++      if (sFactoryShutdown) {
++        sFactoryShutdownComplete = true;
++      }
++
++      sBackgroundThread = nullptr;
++    }
++
++    sFactory = nullptr;
++  }
++
++  static void ShutdownAllOnBackgroundThread()
++  {
++    mozilla::ipc::AssertIsOnBackgroundThread();
++
++    // The factory shutdown between when shutdown started on main thread and
++    // when we could start shutdown on the worker thread.  Just declare
++    // shutdown complete.  The sFactoryShutdown flag prevents the factory
++    // from racing to restart here.
++    if (!sFactory) {
++      StaticMutexAutoLock lock(sLock);
++      sFactoryShutdownComplete = true;
++      return;
++    }
++
++    MOZ_ASSERT(!sFactory->mManagerList.IsEmpty());
++
++    ManagerList::ForwardIterator iter(sFactory->mManagerList);
++    while (iter.HasMore()) {
++      iter.GetNext()->Shutdown();
++    }
++  }
++
++  class ShutdownAllRunnable : public nsRunnable
++  {
++  public:
++    NS_IMETHOD Run()
++    {
++      mozilla::ipc::AssertIsOnBackgroundThread();
++      ShutdownAllOnBackgroundThread();
++      return NS_OK;
++    }
++  private:
++    ~ShutdownAllRunnable() { }
++  };
++
+   // Singleton created on demand and deleted when last Manager is cleared
+   // in Remove().
++  // PBackground thread only.
+   static StaticAutoPtr<Factory> sFactory;
+ 
++  // protects following static attributes
++  static StaticMutex sLock;
++
++  // Indicate if shutdown has occurred to block re-creation of sFactory.
++  // Must hold sLock to access.
++  static bool sFactoryShutdown;
++
++  // Set after ShutdownAll() and after all Manager objects have removed
++  // themselves.
++  // Must hold sLock to access.
++  static bool sFactoryShutdownComplete;
++
++  // Background thread owning all Manager objects.  Only set while sFactory is
++  // set.
++  // Must hold sLock to access.
++  static StaticRefPtr<nsIThread> sBackgroundThread;
++
+   // Weak references as we don't want to keep Manager objects alive forever.
+   // When a Manager is destroyed it calls Factory::Remove() to clear itself.
+-  nsTArray<Manager*> mManagerList;
++  // PBackground thread only.
++  typedef nsTObserverArray<Manager*> ManagerList;
++  ManagerList mManagerList;
+ };
+ 
+ // static
+ StaticAutoPtr<Manager::Factory> Manager::Factory::sFactory;
+ 
++// static
++StaticMutex Manager::Factory::sLock;
++
++// static
++bool Manager::Factory::sFactoryShutdown = false;
++
++// static
++bool Manager::Factory::sFactoryShutdownComplete = false;
++
++// static
++StaticRefPtr<nsIThread> Manager::Factory::sBackgroundThread;
++
+ // ----------------------------------------------------------------------------
+ 
+ // Abstract class to help implement the various Actions.  The vast majority
+ // of Actions are synchronous and need to report back to a Listener on the
+ // Manager.
+ class Manager::BaseAction : public SyncDBAction
+ {
+ protected:
+@@ -1129,20 +1258,28 @@ already_AddRefed<Manager>
+ Manager::Get(ManagerId* aManagerId)
+ {
+   mozilla::ipc::AssertIsOnBackgroundThread();
+   return Factory::Get(aManagerId);
+ }
+ 
+ // static
+ void
+-Manager::ShutdownAll()
++Manager::ShutdownAllOnMainThread()
+ {
+-  mozilla::ipc::AssertIsOnBackgroundThread();
+-  return Factory::ShutdownAll();
++  MOZ_ASSERT(NS_IsMainThread());
++
++  Factory::StartShutdownAllOnMainThread();
++
++  while (!Factory::IsShutdownAllCompleteOnMainThread()) {
++    if (!NS_ProcessNextEvent()) {
++      NS_WARNING("Something bad happened!");
++      break;
++    }
++  }
+ }
+ 
+ void
+ Manager::RemoveListener(Listener* aListener)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   mListeners.RemoveElement(aListener);
+   MOZ_ASSERT(!mListeners.Contains(aListener));
+@@ -1154,17 +1291,17 @@ Manager::RemoveContext(Context* aContext
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(mContext);
+   MOZ_ASSERT(mContext == aContext);
+   mContext = nullptr;
+ 
+   // If we're trying to shutdown, then note that we're done.  This is the
+   // delayed case from Manager::Shutdown().
+   if (mShuttingDown) {
+-    shutdown::RemoveManagerId(mManagerId);
++    Factory::Remove(this);
+   }
+ }
+ 
+ void
+ Manager::AddRefCacheId(CacheId aCacheId)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   for (uint32_t i = 0; i < mCacheIdRefs.Length(); ++i) {
+@@ -1462,17 +1599,16 @@ Manager::Manager(ManagerId* aManagerId, 
+   MOZ_ASSERT(mIOThread);
+ }
+ 
+ Manager::~Manager()
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(!mContext);
+   Shutdown();
+-  Factory::Remove(this);
+   mIOThread->Shutdown();
+ }
+ 
+ void
+ Manager::Shutdown()
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+ 
+@@ -1495,17 +1631,17 @@ Manager::Shutdown()
+   // If there is a context, then we must wait for it to complete.  Cancel and
+   // only note that we are done after its cleaned up.
+   if (mContext) {
+     mContext->CancelAll();
+     return;
+   }
+ 
+   // Otherwise, note that we are complete immediately
+-  shutdown::RemoveManagerId(mManagerId);
++  Factory::Remove(this);
+ }
+ 
+ Context*
+ Manager::CurrentContext()
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   if (!mContext) {
+     MOZ_ASSERT(!mShuttingDown);
+diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
+--- a/dom/cache/Manager.h
++++ b/dom/cache/Manager.h
+@@ -112,17 +112,19 @@ public:
+                                const nsTArray<nsString>& aKeys) { }
+ 
+   protected:
+     ~Listener() { }
+   };
+ 
+   static nsresult GetOrCreate(ManagerId* aManagerId, Manager** aManagerOut);
+   static already_AddRefed<Manager> Get(ManagerId* aManagerId);
+-  static void ShutdownAll();
++
++  // Synchronously shutdown from main thread.  This spins the event loop.
++  static void ShutdownAllOnMainThread();
+ 
+   // Must be called by Listener objects before they are destroyed.
+   void RemoveListener(Listener* aListener);
+ 
+   // Must be called by Context objects before they are destroyed.
+   void RemoveContext(Context* aContext);
+ 
+   // If an actor represents a long term reference to a cache or body stream,
+diff --git a/dom/cache/QuotaClient.cpp b/dom/cache/QuotaClient.cpp
+--- a/dom/cache/QuotaClient.cpp
++++ b/dom/cache/QuotaClient.cpp
+@@ -2,28 +2,27 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/QuotaClient.h"
+ 
+ #include "mozilla/DebugOnly.h"
+-#include "mozilla/dom/cache/ShutdownObserver.h"
++#include "mozilla/dom/cache/Manager.h"
+ #include "mozilla/dom/quota/QuotaManager.h"
+ #include "mozilla/dom/quota/UsageInfo.h"
+ #include "nsIFile.h"
+ #include "nsISimpleEnumerator.h"
+ #include "nsThreadUtils.h"
+ 
+ namespace {
+ 
+ using mozilla::DebugOnly;
+-using mozilla::dom::cache::shutdown::ExecuteShutdown;
+-using mozilla::dom::cache::shutdown::ManagersAreActive;
++using mozilla::dom::cache::Manager;
+ using mozilla::dom::quota::Client;
+ using mozilla::dom::quota::PersistenceType;
+ using mozilla::dom::quota::QuotaManager;
+ using mozilla::dom::quota::UsageInfo;
+ 
+ static nsresult
+ GetBodyUsage(nsIFile* aDir, UsageInfo* aUsageInfo)
+ {
+@@ -170,34 +169,35 @@ public:
+   IsFileServiceUtilized() MOZ_OVERRIDE
+   {
+     return false;
+   }
+ 
+   virtual bool
+   IsTransactionServiceActivated() MOZ_OVERRIDE
+   {
+-    return ManagersAreActive();
++    // TODO: implement nsIOfflineStorage interface (bug 1110487)
++    return false;
+   }
+ 
+   virtual void
+   WaitForStoragesToComplete(nsTArray<nsIOfflineStorage*>& aStorages,
+                             nsIRunnable* aCallback) MOZ_OVERRIDE
+   {
+     // TODO: implement nsIOfflineStorage interface (bug 1110487)
+   }
+ 
+ 
+   virtual void
+   ShutdownTransactionService() MOZ_OVERRIDE
+   {
+     MOZ_ASSERT(NS_IsMainThread());
+ 
+-    // spins event loop until Cache is shutdown
+-    ExecuteShutdown();
++    // spins the event loop and synchronously shuts down all Managers
++    Manager::ShutdownAllOnMainThread();
+   }
+ 
+ private:
+   ~CacheQuotaClient() { }
+ 
+ public:
+   NS_INLINE_DECL_REFCOUNTING(CacheQuotaClient)
+ };
+diff --git a/dom/cache/ShutdownObserver.cpp b/dom/cache/ShutdownObserver.cpp
+deleted file mode 100644
+--- a/dom/cache/ShutdownObserver.cpp
++++ /dev/null
+@@ -1,309 +0,0 @@
+-/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+-/* vim: set ts=8 sts=2 et sw=2 tw=80: */
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-#include "mozilla/dom/cache/ShutdownObserver.h"
+-
+-#include "mozilla/Attributes.h"
+-#include "mozilla/StaticPtr.h"
+-#include "mozilla/dom/cache/Manager.h"
+-#include "mozilla/dom/cache/ManagerId.h"
+-#include "mozilla/ipc/BackgroundParent.h"
+-#include "nsCOMPtr.h"
+-#include "nsIThread.h"
+-#include "nsString.h"
+-#include "nsTArray.h"
+-#include "nsThreadUtils.h"
+-
+-namespace {
+-
+-using mozilla::DebugOnly;
+-using mozilla::StaticRefPtr;
+-using mozilla::dom::cache::Manager;
+-using mozilla::dom::cache::ManagerId;
+-
+-// A singleton that tracks active Cache Managers and provides a main thread
+-// shutdown mechanism.  When called, the singleton cancels the Managers and
+-// waits for them to exit.  This is somewhat complex because shutdown
+-// occurs on the main thread while Cache Managers work on background threads.
+-//
+-// The basic implementation is to hold an array of known ManagerIds on
+-// the main thread.  New Manager objects register their ManagerId when
+-// created by proxying to the main thread.  At shutdown, we proxy to
+-// the PBackground worker thread and call Manager::ShutdownAll().  We
+-// then spin the main thread event loop until all known ManagerIds are
+-// gone.
+-class CacheShutdownObserver MOZ_FINAL
+-{
+-public:
+-  static already_AddRefed<CacheShutdownObserver> Instance();
+-
+-  nsresult AddManagerId(ManagerId* aManagerId);
+-  void RemoveManagerId(ManagerId* aManagerId);
+-
+-  void DoShutdown();
+-
+-private:
+-  CacheShutdownObserver();
+-  ~CacheShutdownObserver();
+-
+-  void AddManagerIdOnMainThread(ManagerId* aManagerId);
+-  void RemoveManagerIdOnMainThread(ManagerId* aManagerId);
+-
+-  void StartShutdownOnBgThread();
+-
+-  void ReleaseInstance();
+-
+-  nsCOMPtr<nsIThread> mBackgroundThread;
+-
+-  // Main thread only
+-  nsTArray<nsRefPtr<ManagerId>> mManagerIds;
+-
+-  // PBackground worker thread only
+-  uint32_t mManagerCount;
+-
+-public:
+-  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(CacheShutdownObserver)
+-};
+-
+-// PBackground worker thread only
+-static bool gShuttingDown = false;
+-static StaticRefPtr<CacheShutdownObserver> gInstance;
+-
+-// Main thread only
+-static bool gActive = false;
+-
+-// static
+-already_AddRefed<CacheShutdownObserver>
+-CacheShutdownObserver::Instance()
+-{
+-  mozilla::ipc::AssertIsOnBackgroundThread();
+-
+-  // Lazily create the singleton unless we have already started shutdown.
+-  if (!gInstance && !gShuttingDown) {
+-
+-    // We cannot use ClearOnShutdown() because we are not on the main
+-    // thread.  Of course, we are implementing a shutdown handler,
+-    // so its not a problem to clear it manually.  This is done in
+-    // ReleaseInstance().
+-    gInstance = new CacheShutdownObserver();
+-  }
+-
+-  // can be null if we've already shutdown!
+-  nsRefPtr<CacheShutdownObserver> ref = gInstance.get();
+-  return ref.forget();
+-}
+-
+-nsresult
+-CacheShutdownObserver::AddManagerId(ManagerId* aManagerId)
+-{
+-  mozilla::ipc::AssertIsOnBackgroundThread();
+-
+-  if (gShuttingDown) {
+-    return NS_ERROR_ILLEGAL_DURING_SHUTDOWN;
+-  }
+-
+-  MOZ_ASSERT(mManagerCount < UINT32_MAX);
+-  mManagerCount += 1;
+-
+-  nsCOMPtr<nsIRunnable> runnable =
+-    NS_NewRunnableMethodWithArg<nsRefPtr<ManagerId>>(
+-      this, &CacheShutdownObserver::AddManagerIdOnMainThread, aManagerId);
+-
+-  DebugOnly<nsresult> rv =
+-    NS_DispatchToMainThread(runnable, nsIThread::DISPATCH_NORMAL);
+-
+-  MOZ_ASSERT(NS_SUCCEEDED(rv));
+-
+-  return NS_OK;
+-}
+-
+-void
+-CacheShutdownObserver::RemoveManagerId(ManagerId* aManagerId)
+-{
+-  mozilla::ipc::AssertIsOnBackgroundThread();
+-
+-  MOZ_ASSERT(mManagerCount != 0);
+-  mManagerCount -= 1;
+-
+-  nsCOMPtr<nsIRunnable> runnable =
+-    NS_NewRunnableMethodWithArg<nsRefPtr<ManagerId>>(
+-      this, &CacheShutdownObserver::RemoveManagerIdOnMainThread, aManagerId);
+-
+-  DebugOnly<nsresult> rv =
+-    NS_DispatchToMainThread(runnable, nsIThread::DISPATCH_NORMAL);
+-
+-  MOZ_ASSERT(NS_SUCCEEDED(rv));
+-}
+-
+-CacheShutdownObserver::CacheShutdownObserver()
+-  : mBackgroundThread(NS_GetCurrentThread())
+-  , mManagerCount(0)
+-{
+-  mozilla::ipc::AssertIsOnBackgroundThread();
+-  MOZ_ASSERT(!gActive);
+-}
+-
+-CacheShutdownObserver::~CacheShutdownObserver()
+-{
+-  // This can happen on either main thread or background thread.
+-
+-  // While under normal circumstances these fields should only be touched
+-  // on certain threads, once we hit the destructor they must be guaranteed
+-  // to be in these states regardless of thread.
+-  MOZ_ASSERT(!gActive);
+-  MOZ_ASSERT(mManagerIds.IsEmpty());
+-  MOZ_ASSERT(!mManagerCount);
+-}
+-
+-void
+-CacheShutdownObserver::AddManagerIdOnMainThread(ManagerId* aManagerId)
+-{
+-  MOZ_ASSERT(NS_IsMainThread());
+-  MOZ_ASSERT(!mManagerIds.Contains(aManagerId, ManagerId::Comparator()));
+-  MOZ_ASSERT_IF(!gActive, mManagerIds.IsEmpty());
+-
+-  mManagerIds.AppendElement(aManagerId);
+-  gActive = true;
+-}
+-
+-void
+-CacheShutdownObserver::RemoveManagerIdOnMainThread(ManagerId* aManagerId)
+-{
+-  MOZ_ASSERT(NS_IsMainThread());
+-  MOZ_ASSERT(!mManagerIds.IsEmpty());
+-
+-  mManagerIds.RemoveElement(aManagerId, ManagerId::Comparator());
+-
+-  gActive = !mManagerIds.IsEmpty();
+-  if (gActive) {
+-    return;
+-  }
+-
+-  // If there are no active Manager objects then schedule runnable to clear
+-  // the singleton ref on the background thread.  The mManagerCount is used
+-  // to detect any races with this delayed release.
+-  nsCOMPtr<nsIRunnable> runnable =
+-    NS_NewRunnableMethod(this, &CacheShutdownObserver::ReleaseInstance);
+-  DebugOnly<nsresult> rv =
+-    mBackgroundThread->Dispatch(runnable, nsIThread::DISPATCH_NORMAL);
+-  MOZ_ASSERT(NS_SUCCEEDED(rv));
+-}
+-
+-void
+-CacheShutdownObserver::StartShutdownOnBgThread()
+-{
+-  mozilla::ipc::AssertIsOnBackgroundThread();
+-  MOZ_ASSERT(!gShuttingDown);
+-
+-  // prevent any further AddManagerId() or Instance() calls
+-  gShuttingDown = true;
+-
+-  Manager::ShutdownAll();
+-}
+-
+-void
+-CacheShutdownObserver::ReleaseInstance()
+-{
+-  mozilla::ipc::AssertIsOnBackgroundThread();
+-
+-  // Detect if a new ManagerId has been added in the time between
+-  // removing the last ManagerId on the main thread and running this
+-  // method on the background thread.  If so, then ignore the attempt
+-  // to release this singleton.
+-  if (mManagerCount != 0) {
+-    return;
+-  }
+-
+-  MOZ_ASSERT(gInstance);
+-  gInstance = nullptr;
+-}
+-
+-void
+-CacheShutdownObserver::DoShutdown()
+-{
+-  MOZ_ASSERT(NS_IsMainThread());
+-  MOZ_ASSERT(gActive);
+-
+-  // Send shutdown notification to origin managers.
+-  nsCOMPtr<nsIRunnable> runnable =
+-    NS_NewRunnableMethod(this, &CacheShutdownObserver::StartShutdownOnBgThread);
+-  DebugOnly<nsresult> rv =
+-    mBackgroundThread->Dispatch(runnable, nsIThread::DISPATCH_NORMAL);
+-  MOZ_ASSERT(NS_SUCCEEDED(rv));
+-
+-  runnable = nullptr;
+-
+-  // Spin the main thread event loop until all Cache Managers have shutdown.
+-  while (!mManagerIds.IsEmpty()) {
+-    if (!NS_ProcessNextEvent()) {
+-      NS_WARNING("Something bad happened!");
+-      break;
+-    }
+-  }
+-
+-  // The gInstance reference release is automatically initiated when the
+-  // last ManagerId is removed.  Once our callers reference is dropped,
+-  // then the CacheShutdownObserver is destroyed.  Nothing else to do here.
+-}
+-
+-} // anonymous namespace
+-
+-namespace mozilla {
+-namespace dom {
+-namespace cache {
+-namespace shutdown {
+-
+-nsresult AddManagerId(ManagerId* aManagerId)
+-{
+-  mozilla::ipc::AssertIsOnBackgroundThread();
+-
+-  nsRefPtr<CacheShutdownObserver> so = CacheShutdownObserver::Instance();
+-  if (!so) {
+-    return NS_ERROR_ILLEGAL_DURING_SHUTDOWN;
+-  }
+-
+-  so->AddManagerId(aManagerId);
+-
+-  return NS_OK;
+-}
+-
+-void RemoveManagerId(ManagerId* aManagerId)
+-{
+-  mozilla::ipc::AssertIsOnBackgroundThread();
+-
+-  // We should never get a nullptr while a Manager is still running.
+-  nsRefPtr<CacheShutdownObserver> so = CacheShutdownObserver::Instance();
+-  so->RemoveManagerId(aManagerId);
+-}
+-
+-bool ManagersAreActive()
+-{
+-  MOZ_ASSERT(NS_IsMainThread());
+-  return gActive;
+-}
+-
+-void ExecuteShutdown()
+-{
+-  MOZ_ASSERT(NS_IsMainThread());
+-
+-  if (!gActive) {
+-    return;
+-  }
+-
+-  // If gActive is true, then we are guaranteed for there to be an observer
+-  // instance available.  This is helpful since the Instance() method is worker
+-  // thread only and we're on the main thread here.
+-
+-  // Hold a ref on the stack as DoShutdown() will result in gInstance being
+-  // nulled out.
+-  nsRefPtr<CacheShutdownObserver> so = gInstance.get();
+-  so->DoShutdown();
+-}
+-
+-} // namespace shutdown
+-} // namespace cache
+-} // namespace dom
+-} // namespace mozilla
+diff --git a/dom/cache/ShutdownObserver.h b/dom/cache/ShutdownObserver.h
+deleted file mode 100644
+--- a/dom/cache/ShutdownObserver.h
++++ /dev/null
+@@ -1,42 +0,0 @@
+-/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+-/* vim: set ts=8 sts=2 et sw=2 tw=80: */
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-#ifndef mozilla_dom_cache_ShutdownObserver_h
+-#define mozilla_dom_cache_ShutdownObserver_h
+-
+-#include "nsError.h"
+-
+-namespace mozilla {
+-namespace dom {
+-namespace cache {
+-
+-class ManagerId;
+-
+-namespace shutdown {
+-
+-// Attempt to register a Manager with the ShutdownObserver.  If successful,
+-// this will block shutdown until the RemoveManagerId is called.  PBackground
+-// worker thread only.
+-nsresult AddManagerId(ManagerId* aManagerId);
+-
+-// Remove the given Manager from the ShutdownObserver.  This must be called
+-// exactly once for each AddManagerId() call. PBackground worker thread only.
+-void RemoveManagerId(ManagerId* aManagerId);
+-
+-// Determine if there are any managers active.  Main thread only.
+-bool ManagersAreActive();
+-
+-// Begin the shutdown sequence immediately instead of waiting for the observer
+-// service to start it.  Spins the event loop until Cache Managers have
+-// stopped.  Main thread only.
+-void ExecuteShutdown();
+-
+-} // namespace shutdown
+-} // namespace cache
+-} // namespace dom
+-} // namespace mozilla
+-
+-#endif // mozilla_dom_cache_ShutdownObserver_h
+diff --git a/dom/cache/moz.build b/dom/cache/moz.build
+--- a/dom/cache/moz.build
++++ b/dom/cache/moz.build
+@@ -25,17 +25,16 @@ EXPORTS.mozilla.dom.cache += [
+     'FileUtils.h',
+     'IPCUtils.h',
+     'Manager.h',
+     'ManagerId.h',
+     'PrincipalVerifier.h',
+     'QuotaClient.h',
+     'ReadStream.h',
+     'SavedTypes.h',
+-    'ShutdownObserver.h',
+     'StreamList.h',
+     'StreamUtils.h',
+     'Types.h',
+     'TypeUtils.h',
+ ]
+ 
+ UNIFIED_SOURCES += [
+     'Action.cpp',
+@@ -54,17 +53,16 @@ UNIFIED_SOURCES += [
+     'Feature.cpp',
+     'FetchPut.cpp',
+     'FileUtils.cpp',
+     'Manager.cpp',
+     'ManagerId.cpp',
+     'PrincipalVerifier.cpp',
+     'QuotaClient.cpp',
+     'ReadStream.cpp',
+-    'ShutdownObserver.cpp',
+     'StreamList.cpp',
+     'StreamUtils.cpp',
+     'TypeUtils.cpp',
+ ]
+ 
+ IPDL_SOURCES += [
+     'CacheInitData.ipdlh',
+     'PCache.ipdl',
