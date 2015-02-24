@@ -1,9 +1,81 @@
 # HG changeset patch
-# Parent 243019c47e63acb95f1a44e424ab6202c1fc5a1b
+# Parent 57541aa9bdf671e42c4f8645046e6167d5c0c845
 # User Ben Kelly <ben@wanderview.com>
 Bug 940273 P1 interdiff 051 remaining review comments
 
-
+diff --git a/dom/cache/AutoUtils.cpp b/dom/cache/AutoUtils.cpp
+--- a/dom/cache/AutoUtils.cpp
++++ b/dom/cache/AutoUtils.cpp
+@@ -46,17 +46,18 @@ CleanupChildFds(PCacheReadStream& aReadS
+     static_cast<FileDescriptorSetChild*>(aReadStream.fds().get_PFileDescriptorSetChild());
+   MOZ_ASSERT(fdSetActor);
+ 
+   if (aAction == DeleteFds) {
+     unused << fdSetActor->Send__delete__(fdSetActor);
+   }
+ 
+   // FileDescriptorSet doesn't clear its fds in its ActorDestroy, so we
+-  // unconditionally forget them here.
++  // unconditionally forget them here.  The fds themselves are auto-closed in
++  // ~FileDescriptor since they originated in this process.
+   fdSetActor->ForgetFileDescriptors(fds);
+ }
+ 
+ void
+ CleanupChildFds(PCacheReadStreamOrVoid& aReadStreamOrVoid, CleanupAction aAction)
+ {
+   if (aReadStreamOrVoid.type() == PCacheReadStreamOrVoid::Tvoid_t) {
+     return;
+@@ -79,17 +80,18 @@ CleanupParentFds(PCacheReadStream& aRead
+     static_cast<FileDescriptorSetParent*>(aReadStream.fds().get_PFileDescriptorSetParent());
+   MOZ_ASSERT(fdSetActor);
+ 
+   if (aAction == DeleteFds) {
+     unused << fdSetActor->Send__delete__(fdSetActor);
+   }
+ 
+   // FileDescriptorSet doesn't clear its fds in its ActorDestroy, so we
+-  // unconditionally forget them here.
++  // unconditionally forget them here.  The fds themselves are auto-closed in
++  // ~FileDescriptor since they originated in this process.
+   fdSetActor->ForgetFileDescriptors(fds);
+ }
+ 
+ void
+ CleanupParentFds(PCacheReadStreamOrVoid& aReadStreamOrVoid, CleanupAction aAction)
+ {
+   if (aReadStreamOrVoid.type() == PCacheReadStreamOrVoid::Tvoid_t) {
+     return;
+@@ -275,20 +277,25 @@ AutoParentBase::SerializeReadStream(cons
+   MOZ_ASSERT(aStreamList);
+   MOZ_ASSERT(aReadStreamOut);
+   MOZ_ASSERT(!mSent);
+ 
+   nsCOMPtr<nsIInputStream> stream = aStreamList->Extract(aId);
+   MOZ_ASSERT(stream);
+ 
+   if (!mStreamControl) {
+-    mStreamControl = new CacheStreamControlParent();
+-    DebugOnly<PCacheStreamControlParent*> actor =
+-      mManager->SendPCacheStreamControlConstructor(mStreamControl);
+-    MOZ_ASSERT(mStreamControl == actor);
++    mStreamControl = static_cast<CacheStreamControlParent*>(
++      mManager->SendPCacheStreamControlConstructor(new CacheStreamControlParent()));
++
++    // If this failed, then the child process is gone.  Warn and allow actor
++    // cleanup to proceed as normal.
++    if (!mStreamControl) {
++      NS_WARNING("Cache failed to create stream control actor.");
++      return;
++    }
+   }
+ 
+   aStreamList->SetStreamControl(mStreamControl);
+ 
+   nsRefPtr<ReadStream> readStream = ReadStream::Create(mStreamControl,
+                                                        aId, stream);
+   readStream->Serialize(aReadStreamOut);
+ }
 diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
 --- a/dom/cache/Cache.cpp
 +++ b/dom/cache/Cache.cpp
@@ -168,6 +240,213 @@ diff --git a/dom/cache/CacheChild.h b/dom/cache/CacheChild.h
    Cache* MOZ_NON_OWNING_REF mListener;
  
    NS_DECL_OWNINGTHREAD
+diff --git a/dom/cache/CacheParent.cpp b/dom/cache/CacheParent.cpp
+--- a/dom/cache/CacheParent.cpp
++++ b/dom/cache/CacheParent.cpp
+@@ -2,34 +2,31 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/CacheParent.h"
+ 
+ #include "mozilla/DebugOnly.h"
+-#include "mozilla/unused.h"
+ #include "mozilla/dom/cache/AutoUtils.h"
+ #include "mozilla/dom/cache/CacheStreamControlParent.h"
+ #include "mozilla/dom/cache/ReadStream.h"
+ #include "mozilla/dom/cache/SavedTypes.h"
+ #include "mozilla/dom/cache/StreamList.h"
+ #include "mozilla/ipc/InputStreamUtils.h"
+ #include "mozilla/ipc/PBackgroundParent.h"
+ #include "mozilla/ipc/FileDescriptorSetParent.h"
+ #include "mozilla/ipc/PFileDescriptorSetParent.h"
+ #include "nsCOMPtr.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+-using mozilla::unused;
+-using mozilla::void_t;
+ using mozilla::ipc::FileDescriptorSetParent;
+ using mozilla::ipc::PFileDescriptorSetParent;
+ 
+ CacheParent::CacheParent(cache::Manager* aManager, CacheId aCacheId)
+   : mManager(aManager)
+   , mCacheId(aCacheId)
+ {
+   MOZ_COUNT_CTOR(cache::CacheParent);
+@@ -55,17 +52,20 @@ CacheParent::ActorDestroy(ActorDestroyRe
+   mManager->RemoveListener(this);
+   mManager->ReleaseCacheId(mCacheId);
+   mManager = nullptr;
+ }
+ 
+ bool
+ CacheParent::RecvTeardown()
+ {
+-  unused << Send__delete__(this);
++  if (!Send__delete__(this)) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("Cache failed to send delete.");
++  }
+   return true;
+ }
+ 
+ bool
+ CacheParent::RecvMatch(const RequestId& aRequestId, const PCacheRequest& aRequest,
+                        const PCacheQueryParams& aParams)
+ {
+   MOZ_ASSERT(mManager);
+@@ -95,17 +95,20 @@ CacheParent::RecvAddAll(const RequestId&
+     requestStreams.AppendElement(DeserializeCacheStream(aRequests[i].body()));
+   }
+ 
+   nsRefPtr<FetchPut> fetchPut;
+   nsresult rv = FetchPut::Create(this, mManager, aRequestId, mCacheId,
+                                  aRequests, requestStreams,
+                                  getter_AddRefs(fetchPut));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    unused << SendAddAllResponse(aRequestId, rv);
++    if (!SendAddAllResponse(aRequestId, rv)) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("Cache failed to send AddAll response.");
++    }
+     return true;
+   }
+ 
+   mFetchPutList.AppendElement(fetchPut.forget());
+ 
+   return true;
+ }
+ 
+@@ -157,74 +160,94 @@ void
+ CacheParent::OnCacheMatch(RequestId aRequestId, nsresult aRv,
+                           const SavedResponse* aSavedResponse,
+                           StreamList* aStreamList)
+ {
+   AutoParentResponseOrVoid response(Manager());
+ 
+   // no match
+   if (NS_FAILED(aRv) || !aSavedResponse || !aStreamList) {
+-    unused << SendMatchResponse(aRequestId, aRv,
+-                                response.SendAsResponseOrVoid());
++    if (!SendMatchResponse(aRequestId, aRv, response.SendAsResponseOrVoid())) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("Cache failed to send Match response.");
++    }
+     return;
+   }
+ 
+   if (aSavedResponse) {
+     response.Add(*aSavedResponse, aStreamList);
+   }
+ 
+-  unused << SendMatchResponse(aRequestId, aRv, response.SendAsResponseOrVoid());
++  if (!SendMatchResponse(aRequestId, aRv, response.SendAsResponseOrVoid())) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("Cache failed to send Match response.");
++  }
+ }
+ 
+ void
+ CacheParent::OnCacheMatchAll(RequestId aRequestId, nsresult aRv,
+                              const nsTArray<SavedResponse>& aSavedResponses,
+                              StreamList* aStreamList)
+ {
+   AutoParentResponseList responses(Manager(), aSavedResponses.Length());
+ 
+   for (uint32_t i = 0; i < aSavedResponses.Length(); ++i) {
+     responses.Add(aSavedResponses[i], aStreamList);
+   }
+ 
+-  unused << SendMatchAllResponse(aRequestId, aRv, responses.SendAsResponseList());
++  if (!SendMatchAllResponse(aRequestId, aRv, responses.SendAsResponseList())) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("Cache failed to send MatchAll response.");
++  }
+ }
+ 
+ void
+ CacheParent::OnCachePutAll(RequestId aRequestId, nsresult aRv)
+ {
+-  unused << SendPutResponse(aRequestId, aRv);
++  if (!SendPutResponse(aRequestId, aRv)) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("Cache failed to send Put response.");
++  }
+ }
+ 
+ void
+ CacheParent::OnCacheDelete(RequestId aRequestId, nsresult aRv, bool aSuccess)
+ {
+-  unused << SendDeleteResponse(aRequestId, aRv, aSuccess);
++  if (!SendDeleteResponse(aRequestId, aRv, aSuccess)) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("Cache failed to send Delete response.");
++  }
+ }
+ 
+ void
+ CacheParent::OnCacheKeys(RequestId aRequestId, nsresult aRv,
+                          const nsTArray<SavedRequest>& aSavedRequests,
+                          StreamList* aStreamList)
+ {
+   AutoParentRequestList requests(Manager(), aSavedRequests.Length());
+ 
+   for (uint32_t i = 0; i < aSavedRequests.Length(); ++i) {
+     requests.Add(aSavedRequests[i], aStreamList);
+   }
+ 
+-  unused << SendKeysResponse(aRequestId, aRv, requests.SendAsRequestList());
++  if (!SendKeysResponse(aRequestId, aRv, requests.SendAsRequestList())) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("Cache failed to send Keys response.");
++  }
+ }
+ 
+ void
+ CacheParent::OnFetchPut(FetchPut* aFetchPut, RequestId aRequestId, nsresult aRv)
+ {
+   aFetchPut->ClearListener();
+   mFetchPutList.RemoveElement(aFetchPut);
+-  unused << SendAddAllResponse(aRequestId, aRv);
++  if (!SendAddAllResponse(aRequestId, aRv)) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("Cache failed to send AddAll response.");
++  }
+ }
+ 
+ already_AddRefed<nsIInputStream>
+ CacheParent::DeserializeCacheStream(const PCacheReadStreamOrVoid& aStreamOrVoid)
+ {
+   if (aStreamOrVoid.type() == PCacheReadStreamOrVoid::Tvoid_t) {
+     return nullptr;
+   }
+@@ -242,17 +265,20 @@ CacheParent::DeserializeCacheStream(cons
+ 
+     FileDescriptorSetParent* fdSetActor =
+       static_cast<FileDescriptorSetParent*>(readStream.fds().get_PFileDescriptorSetParent());
+     MOZ_ASSERT(fdSetActor);
+ 
+     fdSetActor->ForgetFileDescriptors(fds);
+     MOZ_ASSERT(!fds.IsEmpty());
+ 
+-    unused << fdSetActor->Send__delete__(fdSetActor);
++    if (!fdSetActor->Send__delete__(fdSetActor)) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("Cache failed to delete fd set actor.");
++    }
+   }
+ 
+   return DeserializeInputStream(readStream.params(), fds);
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namesapce mozilla
 diff --git a/dom/cache/CacheParent.h b/dom/cache/CacheParent.h
 --- a/dom/cache/CacheParent.h
 +++ b/dom/cache/CacheParent.h
@@ -210,7 +489,25 @@ diff --git a/dom/cache/CacheParent.h b/dom/cache/CacheParent.h
 diff --git a/dom/cache/CacheStorage.cpp b/dom/cache/CacheStorage.cpp
 --- a/dom/cache/CacheStorage.cpp
 +++ b/dom/cache/CacheStorage.cpp
-@@ -359,17 +359,17 @@ CacheStorage::ActorFailed()
+@@ -146,16 +146,17 @@ CacheStorage::CacheStorage(Namespace aNa
+   PBackgroundChild* actor = BackgroundChild::GetForCurrentThread();
+   if (actor) {
+     ActorCreated(actor);
+     return;
+   }
+ 
+   // Otherwise we must begin the PBackground initialization process and
+   // wait for the async ActorCreated() callback.
++  MOZ_ASSERT(NS_IsMainThread());
+   bool ok = BackgroundChild::GetOrCreateForCurrentThread(this);
+   if (!ok) {
+     ActorFailed();
+   }
+ }
+ 
+ already_AddRefed<Promise>
+ CacheStorage::Match(const RequestOrUSVString& aRequest,
+@@ -359,17 +360,17 @@ CacheStorage::ActorFailed()
      RequestId requestId = mPendingRequests[i].mRequestId;
      nsRefPtr<Promise> promise = RemoveRequestPromise(requestId);
      promise->MaybeReject(NS_ERROR_UNEXPECTED);
@@ -229,7 +526,7 @@ diff --git a/dom/cache/CacheStorage.cpp b/dom/cache/CacheStorage.cpp
    mActor = nullptr;
  
    // Note that we will never get an actor again in case another request is
-@@ -503,17 +503,17 @@ CacheStorage::AssertOwningThread() const
+@@ -503,17 +504,17 @@ CacheStorage::AssertOwningThread() const
  #endif
  
  CacheStorage::~CacheStorage()
@@ -247,6 +544,44 @@ diff --git a/dom/cache/CacheStorage.cpp b/dom/cache/CacheStorage.cpp
  
  void
  CacheStorage::MaybeRunPendingRequests()
+ {
+@@ -531,17 +532,17 @@ CacheStorage::MaybeRunPendingRequests()
+       {
+         AutoChildRequest request(this);
+         ErrorResult rv;
+         request.Add(entry.mRequest, IgnoreBody, PassThroughReferrer,
+                     IgnoreInvalidScheme, rv);
+         if (NS_WARN_IF(rv.Failed())) {
+           nsRefPtr<Promise> promise = RemoveRequestPromise(requestId);
+           promise->MaybeReject(rv);
+-          return;
++          break;
+         }
+ 
+         PCacheQueryParams params;
+         ToPCacheQueryParams(params, entry.mOptions);
+ 
+         unused << mActor->SendMatch(requestId, request.SendAsRequest(), params);
+         break;
+       }
+@@ -552,16 +553,18 @@ CacheStorage::MaybeRunPendingRequests()
+         unused << mActor->SendOpen(requestId, entry.mKey);
+         break;
+       case OP_DELETE:
+         unused << mActor->SendDelete(requestId, entry.mKey);
+         break;
+       case OP_KEYS:
+         unused << mActor->SendKeys(requestId);
+         break;
++      default:
++        MOZ_ASSERT_UNREACHABLE("Unknown pending CacheStorage op.");
+     }
+   }
+   mPendingRequests.Clear();
+ }
+ 
+ RequestId
+ CacheStorage::AddRequestPromise(Promise* aPromise, ErrorResult& aRv)
  {
 diff --git a/dom/cache/CacheStorage.h b/dom/cache/CacheStorage.h
 --- a/dom/cache/CacheStorage.h
@@ -352,6 +687,442 @@ diff --git a/dom/cache/CacheStorageChild.h b/dom/cache/CacheStorageChild.h
    nsRefPtr<Feature> mFeature;
  
    NS_DECL_OWNINGTHREAD
+diff --git a/dom/cache/CacheStorageParent.cpp b/dom/cache/CacheStorageParent.cpp
+--- a/dom/cache/CacheStorageParent.cpp
++++ b/dom/cache/CacheStorageParent.cpp
+@@ -15,17 +15,16 @@
+ #include "mozilla/dom/cache/ManagerId.h"
+ #include "mozilla/dom/cache/ReadStream.h"
+ #include "mozilla/dom/cache/SavedTypes.h"
+ #include "mozilla/dom/cache/StreamList.h"
+ #include "mozilla/ipc/PBackgroundParent.h"
+ #include "mozilla/ipc/InputStreamUtils.h"
+ #include "mozilla/ipc/PFileDescriptorSetParent.h"
+ #include "mozilla/DebugOnly.h"
+-#include "mozilla/unused.h"
+ #include "nsCOMPtr.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ using mozilla::ipc::PBackgroundParent;
+ using mozilla::ipc::PFileDescriptorSetParent;
+@@ -39,16 +38,17 @@ AllocPCacheStorageParent(PBackgroundPare
+ {
+   return new CacheStorageParent(aManagingActor, aNamespace, aPrincipalInfo);
+ }
+ 
+ CacheStorageParent::CacheStorageParent(PBackgroundParent* aManagingActor,
+                                        Namespace aNamespace,
+                                        const PrincipalInfo& aPrincipalInfo)
+   : mNamespace(aNamespace)
++  , mVerifiedStatus(NS_OK)
+ {
+   MOZ_COUNT_CTOR(cache::CacheStorageParent);
+   MOZ_ASSERT(aManagingActor);
+ 
+   // Start the async principal verification process immediately.  If an
+   // error occurs here, just delete the actor causing all operations on
+   // the DOM object to reject.  This will be short lived since a failure
+   // here means we are shutting down.
+@@ -56,17 +56,17 @@ CacheStorageParent::CacheStorageParent(P
+   // While we could delay starting verification until the first request,
+   // and therefore return the error code, this would also introduce
+   // latency in the first request.  Lets not pessimize typical operations
+   // for the handling of one rare corner condition.
+   nsresult rv = PrincipalVerifier::CreateAndDispatch(this, aManagingActor,
+                                                      aPrincipalInfo,
+                                                      getter_AddRefs(mVerifier));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    unused << Send__delete__(this);
++    mVerifiedStatus = rv;
+   }
+ }
+ 
+ CacheStorageParent::~CacheStorageParent()
+ {
+   MOZ_COUNT_DTOR(cache::CacheStorageParent);
+   MOZ_ASSERT(!mVerifier);
+   MOZ_ASSERT(!mManager);
+@@ -85,157 +85,212 @@ CacheStorageParent::ActorDestroy(ActorDe
+     mManager->RemoveListener(this);
+     mManager = nullptr;
+   }
+ }
+ 
+ bool
+ CacheStorageParent::RecvTeardown()
+ {
+-  unused << Send__delete__(this);
++  if (!Send__delete__(this)) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("CacheStorage failed to delete actor.");
++  }
+   return true;
+ }
+ 
+ bool
+ CacheStorageParent::RecvMatch(const RequestId& aRequestId,
+                               const PCacheRequest& aRequest,
+                               const PCacheQueryParams& aParams)
+ {
++  if (NS_WARN_IF(NS_FAILED(mVerifiedStatus))) {
++    if (!SendMatchResponse(aRequestId, mVerifiedStatus, void_t())) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("CacheStorage failed to send Match response.");
++    }
++    return true;
++  }
++
+   // queue requests if we are still waiting for principal verification
+   if (!mManagerId) {
+     Entry* entry = mPendingRequests.AppendElement();
+     entry->mOp = OP_MATCH;
+     entry->mRequestId = aRequestId;
+     entry->mRequest = aRequest;
+     entry->mParams = aParams;
+     return true;
+   }
+ 
+   nsRefPtr<cache::Manager> manager;
+   nsresult rv = RequestManager(aRequestId, getter_AddRefs(manager));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    PCacheResponseOrVoid response = void_t();
+-    unused << SendMatchResponse(aRequestId, rv, response);
++    if (!SendMatchResponse(aRequestId, rv, void_t())) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("CacheStorage failed to send Match response.");
++    }
+     return true;
+   }
+ 
+   manager->StorageMatch(this, aRequestId, mNamespace, aRequest,
+                         aParams);
+ 
+   return true;
+ }
+ 
+ bool
+ CacheStorageParent::RecvHas(const RequestId& aRequestId, const nsString& aKey)
+ {
++  if (NS_WARN_IF(NS_FAILED(mVerifiedStatus))) {
++    if (!SendHasResponse(aRequestId, mVerifiedStatus, false)) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("CacheStorage failed to send Has response.");
++    }
++    return true;
++  }
++
+   // queue requests if we are still waiting for principal verification
+   if (!mManagerId) {
+     Entry* entry = mPendingRequests.AppendElement();
+     entry->mOp = OP_HAS;
+     entry->mRequestId = aRequestId;
+     entry->mKey = aKey;
+     return true;
+   }
+ 
+   nsRefPtr<cache::Manager> manager;
+   nsresult rv = RequestManager(aRequestId, getter_AddRefs(manager));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    unused << SendHasResponse(aRequestId, rv, false);
++    if (!SendHasResponse(aRequestId, rv, false)) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("CacheStorage failed to send Has response.");
++    }
+     return true;
+   }
+ 
+   manager->StorageHas(this, aRequestId, mNamespace, aKey);
+ 
+   return true;
+ }
+ 
+ bool
+ CacheStorageParent::RecvOpen(const RequestId& aRequestId, const nsString& aKey)
+ {
++  if (NS_WARN_IF(NS_FAILED(mVerifiedStatus))) {
++    if (!SendOpenResponse(aRequestId, mVerifiedStatus, nullptr)) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("CacheStorage failed to send Open response.");
++    }
++    return true;
++  }
++
+   // queue requests if we are still waiting for principal verification
+   if (!mManagerId) {
+     Entry* entry = mPendingRequests.AppendElement();
+     entry->mOp = OP_OPEN;
+     entry->mRequestId = aRequestId;
+     entry->mKey = aKey;
+     return true;
+   }
+ 
+   nsRefPtr<cache::Manager> manager;
+   nsresult rv = RequestManager(aRequestId, getter_AddRefs(manager));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    unused << SendOpenResponse(aRequestId, rv, nullptr);
++    if (!SendOpenResponse(aRequestId, rv, nullptr)) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("CacheStorage failed to send Open response.");
++    }
+     return true;
+   }
+ 
+   manager->StorageOpen(this, aRequestId, mNamespace, aKey);
+ 
+   return true;
+ }
+ 
+ bool
+ CacheStorageParent::RecvDelete(const RequestId& aRequestId,
+                                const nsString& aKey)
+ {
++  if (NS_WARN_IF(NS_FAILED(mVerifiedStatus))) {
++    if (!SendDeleteResponse(aRequestId, mVerifiedStatus, false)) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("CacheStorage failed to send Delete response.");
++    }
++    return true;
++  }
++
+   // queue requests if we are still waiting for principal verification
+   if (!mManagerId) {
+     Entry* entry = mPendingRequests.AppendElement();
+     entry->mOp = OP_DELETE;
+     entry->mRequestId = aRequestId;
+     entry->mKey = aKey;
+     return true;
+   }
+ 
+   nsRefPtr<cache::Manager> manager;
+   nsresult rv = RequestManager(aRequestId, getter_AddRefs(manager));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    unused << SendDeleteResponse(aRequestId, rv, false);
++    if (!SendDeleteResponse(aRequestId, rv, false)) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("CacheStorage failed to send Delete response.");
++    }
+     return true;
+   }
+ 
+   manager->StorageDelete(this, aRequestId, mNamespace, aKey);
+ 
+   return true;
+ }
+ 
+ bool
+ CacheStorageParent::RecvKeys(const RequestId& aRequestId)
+ {
++  if (NS_WARN_IF(NS_FAILED(mVerifiedStatus))) {
++    if (!SendKeysResponse(aRequestId, mVerifiedStatus, nsTArray<nsString>())) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("CacheStorage failed to send Keys response.");
++    }
++  }
++
+   // queue requests if we are still waiting for principal verification
+   if (!mManagerId) {
+     Entry* entry = mPendingRequests.AppendElement();
+     entry->mOp = OP_DELETE;
+     entry->mRequestId = aRequestId;
+     return true;
+   }
+ 
+   nsRefPtr<cache::Manager> manager;
+   nsresult rv = RequestManager(aRequestId, getter_AddRefs(manager));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    unused << SendKeysResponse(aRequestId, rv, nsTArray<nsString>());
++    if (!SendKeysResponse(aRequestId, rv, nsTArray<nsString>())) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("CacheStorage failed to send Keys response.");
++    }
+     return true;
+   }
+ 
+   manager->StorageKeys(this, aRequestId, mNamespace);
+ 
+   return true;
+ }
+ 
+ void
+ CacheStorageParent::OnPrincipalVerified(nsresult aRv, ManagerId* aManagerId)
+ {
+-  if (NS_WARN_IF(NS_FAILED(aRv))) {
+-    FailPendingRequests(aRv);
+-    unused << Send__delete__(this);
+-    return;
+-  }
+-
+   MOZ_ASSERT(mVerifier);
+   MOZ_ASSERT(!mManagerId);
+   MOZ_ASSERT(!mManager);
++  MOZ_ASSERT(NS_SUCCEEDED(mVerifiedStatus));
++
++  if (NS_WARN_IF(NS_FAILED(aRv))) {
++    mVerifiedStatus = aRv;
++  }
+ 
+   mManagerId = aManagerId;
+   mVerifier->ClearListener();
+   mVerifier = nullptr;
+ 
+   RetryPendingRequests();
+ }
+ 
+@@ -247,69 +302,90 @@ CacheStorageParent::OnStorageMatch(Reque
+   PCacheResponseOrVoid responseOrVoid;
+ 
+   ReleaseManager(aRequestId);
+ 
+   AutoParentResponseOrVoid response(Manager());
+ 
+   // no match
+   if (NS_FAILED(aRv) || !aSavedResponse) {
+-    unused << SendMatchResponse(aRequestId, aRv, response.SendAsResponseOrVoid());
++    if (!SendMatchResponse(aRequestId, aRv, response.SendAsResponseOrVoid())) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("CacheStorage failed to send Match response.");
++    }
+     return;
+   }
+ 
+   if (aSavedResponse) {
+     response.Add(*aSavedResponse, aStreamList);
+   }
+ 
+-  unused << SendMatchResponse(aRequestId, aRv, response.SendAsResponseOrVoid());
++  if (!SendMatchResponse(aRequestId, aRv, response.SendAsResponseOrVoid())) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("CacheStorage failed to send Match response.");
++  }
+ }
+ 
+ void
+ CacheStorageParent::OnStorageHas(RequestId aRequestId, nsresult aRv,
+                                  bool aCacheFound)
+ {
+   ReleaseManager(aRequestId);
+-  unused << SendHasResponse(aRequestId, aRv, aCacheFound);
++  if (!SendHasResponse(aRequestId, aRv, aCacheFound)) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("CacheStorage failed to send Has response.");
++  }
+ }
+ 
+ void
+ CacheStorageParent::OnStorageOpen(RequestId aRequestId, nsresult aRv,
+                                   CacheId aCacheId)
+ {
+   if (NS_FAILED(aRv)) {
+     ReleaseManager(aRequestId);
+-    unused << SendOpenResponse(aRequestId, aRv, nullptr);
++    if (!SendOpenResponse(aRequestId, aRv, nullptr)) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("CacheStorage failed to send Open response.");
++    }
+     return;
+   }
+ 
+   MOZ_ASSERT(mManager);
+   CacheParent* actor = new CacheParent(mManager, aCacheId);
+ 
+   ReleaseManager(aRequestId);
+ 
+   PCacheParent* base = Manager()->SendPCacheConstructor(actor);
+   actor = static_cast<CacheParent*>(base);
+-  unused << SendOpenResponse(aRequestId, aRv, actor);
++  if (!SendOpenResponse(aRequestId, aRv, actor)) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("CacheStorage failed to send Open response.");
++  }
+ }
+ 
+ void
+ CacheStorageParent::OnStorageDelete(RequestId aRequestId, nsresult aRv,
+                                     bool aCacheDeleted)
+ {
+   ReleaseManager(aRequestId);
+-  unused << SendDeleteResponse(aRequestId, aRv, aCacheDeleted);
++  if (!SendDeleteResponse(aRequestId, aRv, aCacheDeleted)) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("CacheStorage failed to send Delete response.");
++  }
+ }
+ 
+ void
+ CacheStorageParent::OnStorageKeys(RequestId aRequestId, nsresult aRv,
+                                   const nsTArray<nsString>& aKeys)
+ {
+   ReleaseManager(aRequestId);
+-  unused << SendKeysResponse(aRequestId, aRv, aKeys);
++  if (!SendKeysResponse(aRequestId, aRv, aKeys)) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("CacheStorage failed to send Keys response.");
++  }
+ }
+ 
+ void
+ CacheStorageParent::RetryPendingRequests()
+ {
+   for (uint32_t i = 0; i < mPendingRequests.Length(); ++i) {
+     const Entry& entry = mPendingRequests[i];
+     switch(entry.mOp) {
+@@ -330,53 +406,16 @@ CacheStorageParent::RetryPendingRequests
+         break;
+       default:
+         MOZ_ASSERT_UNREACHABLE("Pending request within unknown op");
+     }
+   }
+   mPendingRequests.Clear();
+ }
+ 
+-void
+-CacheStorageParent::FailPendingRequests(nsresult aRv)
+-{
+-  MOZ_ASSERT(NS_FAILED(aRv));
+-
+-  for (uint32_t i = 0; i < mPendingRequests.Length(); ++i) {
+-    const Entry& entry = mPendingRequests[i];
+-    switch(entry.mOp) {
+-      case OP_MATCH:
+-      {
+-        PCacheResponseOrVoid responseOrVoid;
+-        responseOrVoid = void_t();
+-        unused << SendMatchResponse(entry.mRequestId, aRv, responseOrVoid);
+-        break;
+-      }
+-      case OP_HAS:
+-        unused << SendHasResponse(entry.mRequestId, aRv, false);
+-        break;
+-      case OP_OPEN:
+-        unused << SendOpenResponse(entry.mRequestId, aRv, nullptr);
+-        break;
+-      case OP_DELETE:
+-        unused << SendDeleteResponse(entry.mRequestId, aRv, false);
+-        break;
+-      case OP_KEYS:
+-      {
+-        const nsTArray<nsString> emptyKeys;
+-        unused << SendKeysResponse(entry.mRequestId, aRv, emptyKeys);
+-        break;
+-      }
+-      default:
+-        MOZ_ASSERT_UNREACHABLE("Pending request within unknown op");
+-    }
+-  }
+-  mPendingRequests.Clear();
+-}
+-
+ nsresult
+ CacheStorageParent::RequestManager(RequestId aRequestId,
+                                    cache::Manager** aManagerOut)
+ {
+   MOZ_ASSERT(!mActiveRequests.Contains(aRequestId));
+   nsRefPtr<cache::Manager> ref = mManager;
+   if (!ref) {
+     MOZ_ASSERT(mActiveRequests.IsEmpty());
 diff --git a/dom/cache/CacheStorageParent.h b/dom/cache/CacheStorageParent.h
 --- a/dom/cache/CacheStorageParent.h
 +++ b/dom/cache/CacheStorageParent.h
@@ -373,7 +1144,7 @@ diff --git a/dom/cache/CacheStorageParent.h b/dom/cache/CacheStorageParent.h
                           const PCacheQueryParams& aParams) MOZ_OVERRIDE;
    virtual bool RecvHas(const RequestId& aRequestId,
                         const nsString& aKey) MOZ_OVERRIDE;
-@@ -57,17 +58,16 @@ public:
+@@ -57,30 +58,29 @@ public:
                              bool aCacheFound) MOZ_OVERRIDE;
    virtual void OnStorageOpen(RequestId aRequestId, nsresult aRv,
                               CacheId aCacheId) MOZ_OVERRIDE;
@@ -389,8 +1160,22 @@ diff --git a/dom/cache/CacheStorageParent.h b/dom/cache/CacheStorageParent.h
                        PCacheReadStream* aReadStreamOut);
  
    void RetryPendingRequests();
-   void FailPendingRequests(nsresult aRv);
+-  void FailPendingRequests(nsresult aRv);
  
+   nsresult RequestManager(RequestId aRequestId, cache::Manager** aManagerOut);
+   void ReleaseManager(RequestId aRequestId);
+ 
+   const Namespace mNamespace;
+   nsRefPtr<PrincipalVerifier> mVerifier;
++  nsresult mVerifiedStatus;
+   nsRefPtr<ManagerId> mManagerId;
+   nsRefPtr<cache::Manager> mManager;
+ 
+   enum Op
+   {
+     OP_MATCH,
+     OP_HAS,
+     OP_OPEN,
 diff --git a/dom/cache/CacheStreamControlChild.h b/dom/cache/CacheStreamControlChild.h
 --- a/dom/cache/CacheStreamControlChild.h
 +++ b/dom/cache/CacheStreamControlChild.h
@@ -440,3 +1225,57 @@ diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
    }
  
    rv = (*aBodyFileOut)->Append(fileName);
+diff --git a/dom/cache/ReadStream.cpp b/dom/cache/ReadStream.cpp
+--- a/dom/cache/ReadStream.cpp
++++ b/dom/cache/ReadStream.cpp
+@@ -288,16 +288,19 @@ ReadStream::Create(const PCacheReadStrea
+ 
+   return Create(aReadStreamOrVoid.get_PCacheReadStream());
+ }
+ 
+ // static
+ already_AddRefed<ReadStream>
+ ReadStream::Create(const PCacheReadStream& aReadStream)
+ {
++  // The parameter may or may not be for a Cache created stream.  The way we
++  // tell is by looking at the stream control actor.  If the actor exists,
++  // then we know the Cache created it.
+   if (!aReadStream.controlChild() && !aReadStream.controlParent()) {
+     return nullptr;
+   }
+ 
+   nsAutoTArray<FileDescriptor, 4> fds;
+   if (aReadStream.fds().type() ==
+       OptionalFileDescriptorSet::TPFileDescriptorSetChild) {
+ 
+@@ -314,25 +317,25 @@ ReadStream::Create(const PCacheReadStrea
+ 
+     FileDescriptorSetParent* fdSetActor =
+       static_cast<FileDescriptorSetParent*>(aReadStream.fds().get_PFileDescriptorSetParent());
+     MOZ_ASSERT(fdSetActor);
+ 
+     fdSetActor->ForgetFileDescriptors(fds);
+     MOZ_ASSERT(!fds.IsEmpty());
+ 
+-    unused << fdSetActor->Send__delete__(fdSetActor);
++    if (!fdSetActor->Send__delete__(fdSetActor)) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("Cache failed to delete fd set actor.");
++    }
+   }
+ 
+   nsCOMPtr<nsIInputStream> stream =
+     DeserializeInputStream(aReadStream.params(), fds);
+-
+-  if (!stream) {
+-    return nullptr;
+-  }
++  MOZ_ASSERT(stream);
+ 
+   // Currently we expect all cache read streams to be blocking file streams.
+ #ifdef DEBUG
+   nsCOMPtr<nsIAsyncInputStream> asyncStream = do_QueryInterface(stream);
+   MOZ_ASSERT(!asyncStream);
+ #endif
+ 
+   nsRefPtr<ReadStream> ref;
