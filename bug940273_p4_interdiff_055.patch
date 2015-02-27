@@ -1,0 +1,229 @@
+# HG changeset patch
+# Parent 31d7e7ed3b591268b1e979067496f31ddb5682db
+# User Ben Kelly <ben@wanderview.com>
+Bug 940273 P4 interdiff 055 address cancel review feedback
+
+
+diff --git a/dom/cache/Action.cpp b/dom/cache/Action.cpp
+--- a/dom/cache/Action.cpp
++++ b/dom/cache/Action.cpp
+@@ -25,16 +25,16 @@ Action::Action()
+ {
+ }
+ 
+ Action::~Action()
+ {
+ }
+ 
+ bool
+-Action::IsCanceled()
++Action::IsCanceled() const
+ {
+   return mCanceled;
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/Action.h b/dom/cache/Action.h
+--- a/dom/cache/Action.h
++++ b/dom/cache/Action.h
+@@ -43,20 +43,20 @@ public:
+   virtual void RunOnTarget(Resolver* aResolver, const QuotaInfo& aQuotaInfo) = 0;
+ 
+   // Called on initiating thread when the Action is canceled.  The Action is
+   // responsible for calling Resolver::Resolve() as normal; either with a
+   // normal error code or NS_ERROR_ABORT.  If CancelOnInitiatingThread() is
+   // called after Resolve() has already occurred, then the cancel can be
+   // ignored.
+   //
+-  // Cancelation is a best effort to stop processing as soon as possible, but
++  // Cancellation is a best effort to stop processing as soon as possible, but
+   // does not guarantee the Action will not run.
+   //
+-  // Default implementation sets an internal cancelation flag that can be
++  // Default implementation sets an internal cancellation flag that can be
+   // queried with IsCanceled().
+   virtual void CancelOnInitiatingThread();
+ 
+   // Executed on the initiating thread and is passed the nsresult given to
+   // Resolver::Resolve().
+   virtual void CompleteOnInitiatingThread(nsresult aRv) { }
+ 
+   // Executed on the initiating thread.  If this Action will operate on the
+@@ -69,17 +69,17 @@ public:
+ protected:
+   Action();
+ 
+   // virtual because deleted through base class pointer
+   virtual ~Action();
+ 
+   // Check if this Action has been canceled.  May be called from any thread,
+   // but typically used from the target thread.
+-  bool IsCanceled();
++  bool IsCanceled() const;
+ 
+ private:
+   // Accessible from any thread.
+   Atomic<bool> mCanceled;
+ };
+ 
+ } // namespace cache
+ } // namespace dom
+diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
+--- a/dom/cache/Context.cpp
++++ b/dom/cache/Context.cpp
+@@ -194,19 +194,19 @@ NS_IMPL_ISUPPORTS_INHERITED(mozilla::dom
+ //  |      Running      |  Resolve() |  Completing |
+ //  | (Quota IO Thread) +------------>(Orig Thread)|
+ //  +-------------------+            +------+------+
+ //                                          |
+ //                                    +-----v----+
+ //                                    | Complete |
+ //                                    +----------+
+ //
+-// The initialization process proceeds through the main states.  Cancelation is
+-// not permitted.  If an error occurs, then we transition back to Completing
+-// state back on the original thread.
++// The initialization process proceeds through the main states.  If an error
++// occurs, then we transition back to Completing state back on the original
++// thread.
+ NS_IMETHODIMP
+ Context::QuotaInitRunnable::Run()
+ {
+   // May run on different threads depending on the state.  See individual
+   // state cases for thread assertions.
+ 
+   switch(mState) {
+     // -----------------------------------
+@@ -419,49 +419,41 @@ public:
+   NS_DECL_NSIRUNNABLE
+ };
+ 
+ NS_IMPL_ISUPPORTS_INHERITED(mozilla::dom::cache::Context::ActionRunnable,
+                             Action::Resolver, nsIRunnable);
+ 
+ // The ActionRunnable has a simpler state machine.  It basically needs to run
+ // the action on the target thread and then complete on the original thread.
+-// The main complication here is that we also support Cancel().
+ //
+ //   +-------------+
+ //   |    Start    |
+ //   |(Orig Thread)|
+ //   +-----+-------+
+ //         |
+ // +-------v---------+
+-// |  RunOnTarget    |         Cancel()
++// |  RunOnTarget    |
+ // |Target IO Thread)+-------------------------------+
+ // +-------+---------+                               |
+ //         |                                         |
+-// +-------v----------+ Resolve() or Cancel()+-------v-----+
++// +-------v----------+ Resolve()            +-------v-----+
+ // |     Running      |                      |  Completing |
+ // |(Target IO Thread)+---------------------->(Orig Thread)|
+-// +---+--------^-----+                      +-------+-----+
+-//     |        |                                    |
+-//     |        |                                    |
+-//     +--------+                               +----v---+
+-//      Cancel()                                |Complete|
++// +------------------+                      +-------+-----+
++//                                                   |
++//                                                   |
++//                                              +----v---+
++//                                              |Complete|
+ //                                              +--------+
+ //
+ // Its important to note that synchronous actions will effectively Resolve()
+ // out of the Running state immediately.  Asynchronous Actions may remain
+ // in the Running state for some time, but normally the ActionRunnable itself
+ // does not see any execution there.  Its all handled internal to the Action.
+-//
+-// The main exception to this is when Cancel() is called.  To avoid races,
+-// Cancel() simply sets a flag to be processed in the normal state machine.
+-// In the case of an async Running state, however, it must reschedule the
+-// ActionRunnable to execute again.  The flag then causes
+-// Action::CancelOnTarget() to be executed which should halt any Action
+-// processing.
+ NS_IMETHODIMP
+ Context::ActionRunnable::Run()
+ {
+   switch(mState) {
+     // ----------------------
+     case STATE_RUN_ON_TARGET:
+     {
+       MOZ_ASSERT(NS_GetCurrentThread() == mTarget);
+diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
+--- a/dom/cache/Manager.cpp
++++ b/dom/cache/Manager.cpp
+@@ -665,34 +665,16 @@ private:
+ 
+       rv = StartStreamCopy(aQuotaInfo, mList[i], ResponseStream,
+                            &mExpectedAsyncCopyCompletions);
+       if (NS_WARN_IF(NS_FAILED(rv))) {
+         break;
+       }
+     }
+ 
+-    // While StartStreamCopy() will return NS_ERROR_ABORT if IsCanceled() is
+-    // true, there is still a race to deal with.  Consider:
+-    //
+-    // 1) StartStreamCopy() begins NS_AsyncCopy(), but has not locked mMutex
+-    //    yet to store the resulting handle in mCopyContextList.
+-    // 2) CancelOnInitiatingThread() is called.  This locks mMutex, cancels
+-    //    all know copyContexts, and then clears the mCopyContextList.
+-    // 3) The target thread in (1) finishes its StartStreamCopy() by saving
+-    //    its copy context in mCopyContextList.
+-    //
+-    // In this case we could have an outstanding copy still running.  To catch
+-    // this condition, check for cancelation again after all streams have been
+-    // started.  If canceled, then simulator an error code so that any
+-    // outstanding copies are stopped below in our manual call to
+-    // OnAsyncCopyComplete()
+-    if (IsCanceled()) {
+-      rv = NS_ERROR_ABORT;
+-    }
+ 
+     // Always call OnAsyncCopyComplete() manually here.  This covers the
+     // case where there is no async copying and also reports any startup
+     // errors correctly.  If we hit an error, then OnAsyncCopyComplete()
+     // will cancel any async copying.
+     OnAsyncCopyComplete(rv);
+   }
+ 
+@@ -702,16 +684,35 @@ private:
+   void
+   OnAsyncCopyComplete(nsresult aRv)
+   {
+     MOZ_ASSERT(mTargetThread == NS_GetCurrentThread());
+     MOZ_ASSERT(mConn);
+     MOZ_ASSERT(mResolver);
+     MOZ_ASSERT(mExpectedAsyncCopyCompletions > 0);
+ 
++    // Explicitly check for cancellation here to catch a race condition.
++    // Consider:
++    //
++    // 1) NS_AsyncCopy() executes on IO thread, but has not saved its
++    //    copy context yet.
++    // 2) CancelAllStreamCopying() occurs on PBackground thread
++    // 3) Copy context from (1) is saved on IO thread.
++    //
++    // Checking for cancellation here catches this condition when we
++    // first call OnAsyncCopyComplete() manually from RunWithDBOnTarget().
++    //
++    // This explicit cancellation check also handles the case where we
++    // are canceled just after all stream copying completes.  We should
++    // abort the synchronous DB operations in this case if we have not
++    // started them yet.
++    if (NS_SUCCEEDED(aRv) && IsCanceled()) {
++      aRv = NS_ERROR_ABORT;
++    }
++
+     // If any of the async copies fail, we need to still wait for them all to
+     // complete.  Cancel any other streams still working and remember the
+     // error.  All canceled streams will call OnAsyncCopyComplete().
+     if (NS_FAILED(aRv) && NS_SUCCEEDED(mAsyncResult)) {
+       CancelAllStreamCopying();
+       mAsyncResult = aRv;
+     }
+ 
