@@ -1,0 +1,3778 @@
+# HG changeset patch
+# Parent 57541aa9bdf671e42c4f8645046e6167d5c0c845
+# User Ben Kelly <ben@wanderview.com>
+Bug 940273 P4 interdiff 051 remaining review comments
+
+diff --git a/dom/cache/ActorUtils.h b/dom/cache/ActorUtils.h
+--- a/dom/cache/ActorUtils.h
++++ b/dom/cache/ActorUtils.h
+@@ -15,30 +15,51 @@ namespace ipc {
+ class PBackgroundParent;
+ class PrincipalInfo;
+ }
+ 
+ namespace dom {
+ namespace cache {
+ 
+ class PCacheChild;
++class PCacheParent;
+ class PCacheStreamControlChild;
++class PCacheStreamControlParent;
++class PCacheStorageChild;
+ class PCacheStorageParent;
+ 
+ // Factory methods for use in ipc/glue methods.  Implemented in individual actor
+ // cpp files.
+ 
+ PCacheChild*
+ AllocPCacheChild();
+ 
++void
++DeallocPCacheChild(PCacheChild* aActor);
++
++void
++DeallocPCacheParent(PCacheParent* aActor);
++
+ PCacheStreamControlChild*
+ AllocPCacheStreamControlChild();
+ 
++void
++DeallocPCacheStreamControlChild(PCacheStreamControlChild* aActor);
++
++void
++DeallocPCacheStreamControlParent(PCacheStreamControlParent* aActor);
++
+ PCacheStorageParent*
+ AllocPCacheStorageParent(mozilla::ipc::PBackgroundParent* aManagingActor,
+                          Namespace aNamespace,
+                          const mozilla::ipc::PrincipalInfo& aPrincipalInfo);
+ 
++void
++DeallocPCacheStorageChild(PCacheStorageChild* aActor);
++
++void
++DeallocPCacheStorageParent(PCacheStorageParent* aActor);
++
+ } // namesapce cache
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_cache_ActorUtils_h
+diff --git a/dom/cache/AutoUtils.cpp b/dom/cache/AutoUtils.cpp
+--- a/dom/cache/AutoUtils.cpp
++++ b/dom/cache/AutoUtils.cpp
+@@ -46,17 +46,18 @@ CleanupChildFds(PCacheReadStream& aReadS
+     static_cast<FileDescriptorSetChild*>(aReadStream.fds().get_PFileDescriptorSetChild());
+   MOZ_ASSERT(fdSetActor);
+ 
+   if (aAction == DeleteFds) {
+     unused << fdSetActor->Send__delete__(fdSetActor);
+   }
+ 
+   // FileDescriptorSet doesn't clear its fds in its ActorDestroy, so we
+-  // unconditionally forget them here.
++  // unconditionally forget them here.  The fds themselves are auto-closed in
++  // ~FileDescriptor since they originated in this process.
+   fdSetActor->ForgetFileDescriptors(fds);
+ }
+ 
+ void
+ CleanupChildFds(PCacheReadStreamOrVoid& aReadStreamOrVoid, CleanupAction aAction)
+ {
+   if (aReadStreamOrVoid.type() == PCacheReadStreamOrVoid::Tvoid_t) {
+     return;
+@@ -79,17 +80,18 @@ CleanupParentFds(PCacheReadStream& aRead
+     static_cast<FileDescriptorSetParent*>(aReadStream.fds().get_PFileDescriptorSetParent());
+   MOZ_ASSERT(fdSetActor);
+ 
+   if (aAction == DeleteFds) {
+     unused << fdSetActor->Send__delete__(fdSetActor);
+   }
+ 
+   // FileDescriptorSet doesn't clear its fds in its ActorDestroy, so we
+-  // unconditionally forget them here.
++  // unconditionally forget them here.  The fds themselves are auto-closed in
++  // ~FileDescriptor since they originated in this process.
+   fdSetActor->ForgetFileDescriptors(fds);
+ }
+ 
+ void
+ CleanupParentFds(PCacheReadStreamOrVoid& aReadStreamOrVoid, CleanupAction aAction)
+ {
+   if (aReadStreamOrVoid.type() == PCacheReadStreamOrVoid::Tvoid_t) {
+     return;
+@@ -275,20 +277,25 @@ AutoParentBase::SerializeReadStream(cons
+   MOZ_ASSERT(aStreamList);
+   MOZ_ASSERT(aReadStreamOut);
+   MOZ_ASSERT(!mSent);
+ 
+   nsCOMPtr<nsIInputStream> stream = aStreamList->Extract(aId);
+   MOZ_ASSERT(stream);
+ 
+   if (!mStreamControl) {
+-    mStreamControl = new CacheStreamControlParent();
+-    DebugOnly<PCacheStreamControlParent*> actor =
+-      mManager->SendPCacheStreamControlConstructor(mStreamControl);
+-    MOZ_ASSERT(mStreamControl == actor);
++    mStreamControl = static_cast<CacheStreamControlParent*>(
++      mManager->SendPCacheStreamControlConstructor(new CacheStreamControlParent()));
++
++    // If this failed, then the child process is gone.  Warn and allow actor
++    // cleanup to proceed as normal.
++    if (!mStreamControl) {
++      NS_WARNING("Cache failed to create stream control actor.");
++      return;
++    }
+   }
+ 
+   aStreamList->SetStreamControl(mStreamControl);
+ 
+   nsRefPtr<ReadStream> readStream = ReadStream::Create(mStreamControl,
+                                                        aId, stream);
+   readStream->Serialize(aReadStreamOut);
+ }
+diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
+--- a/dom/cache/Cache.cpp
++++ b/dom/cache/Cache.cpp
+@@ -32,17 +32,17 @@ using mozilla::dom::RequestOrUSVString;
+ 
+ static bool
+ IsValidPutRequestMethod(const Request& aRequest, ErrorResult& aRv)
+ {
+   nsAutoCString method;
+   aRequest.GetMethod(method);
+   bool valid = method.LowerCaseEqualsLiteral("get");
+   if (!valid) {
+-    NS_ConvertUTF8toUTF16 label(method);
++    NS_ConvertASCIItoUTF16 label(method);
+     aRv.ThrowTypeError(MSG_INVALID_REQUEST_METHOD, &label);
+   }
+   return valid;
+ }
+ 
+ static bool
+ IsValidPutRequestMethod(const RequestOrUSVString& aRequest,
+                         ErrorResult& aRv)
+@@ -376,17 +376,17 @@ Cache::GetParentObject() const
+ 
+ JSObject*
+ Cache::WrapObject(JSContext* aContext)
+ {
+   return CacheBinding::Wrap(aContext, this);
+ }
+ 
+ void
+-Cache::ActorDestroy(mozilla::ipc::IProtocol* aActor)
++Cache::DestroyInternal(CacheChild* aActor)
+ {
+   MOZ_ASSERT(mActor);
+   MOZ_ASSERT(mActor == aActor);
+   mActor->ClearListener();
+   mActor = nullptr;
+ }
+ 
+ void
+@@ -515,17 +515,17 @@ Cache::AssertOwningThread() const
+   NS_ASSERT_OWNINGTHREAD(Cache);
+ }
+ #endif
+ 
+ Cache::~Cache()
+ {
+   if (mActor) {
+     mActor->StartDestroy();
+-    // ActorDestroy() is called synchronously by StartDestroy().  So we
++    // DestroyInternal() is called synchronously by StartDestroy().  So we
+     // should have already cleared the mActor.
+     MOZ_ASSERT(!mActor);
+   }
+ }
+ 
+ RequestId
+ Cache::AddRequestPromise(Promise* aPromise, ErrorResult& aRv)
+ {
+diff --git a/dom/cache/Cache.h b/dom/cache/Cache.h
+--- a/dom/cache/Cache.h
++++ b/dom/cache/Cache.h
+@@ -73,18 +73,20 @@ public:
+        const CacheQueryOptions& aParams, ErrorResult& aRv);
+ 
+   // binding methods
+   static bool PrefEnabled(JSContext* aCx, JSObject* aObj);
+ 
+   nsISupports* GetParentObject() const;
+   virtual JSObject* WrapObject(JSContext* aContext) MOZ_OVERRIDE;
+ 
++  // Called when CacheChild actor is being destroyed
++  void DestroyInternal(CacheChild* aActor);
++
+   // methods forwarded from CacheChild
+-  void ActorDestroy(mozilla::ipc::IProtocol* aActor);
+   void RecvMatchResponse(RequestId aRequestId, nsresult aRv,
+                          const PCacheResponseOrVoid& aResponse);
+   void RecvMatchAllResponse(RequestId aRequestId, nsresult aRv,
+                             const nsTArray<PCacheResponse>& aResponses);
+   void RecvAddAllResponse(RequestId aRequestId, nsresult aRv);
+   void RecvPutResponse(RequestId aRequestId, nsresult aRv);
+ 
+   void RecvDeleteResponse(RequestId aRequestId, nsresult aRv,
+diff --git a/dom/cache/CacheChild.cpp b/dom/cache/CacheChild.cpp
+--- a/dom/cache/CacheChild.cpp
++++ b/dom/cache/CacheChild.cpp
+@@ -18,16 +18,23 @@ namespace cache {
+ 
+ // Declared in ActorUtils.h
+ PCacheChild*
+ AllocPCacheChild()
+ {
+   return new CacheChild();
+ }
+ 
++// Declared in ActorUtils.h
++void
++DeallocPCacheChild(PCacheChild* aActor)
++{
++  delete aActor;
++}
++
+ CacheChild::CacheChild()
+   : mListener(nullptr)
+ {
+   MOZ_COUNT_CTOR(cache::CacheChild);
+ }
+ 
+ CacheChild::~CacheChild()
+ {
+@@ -62,39 +69,42 @@ CacheChild::ClearListener()
+   NS_ASSERT_OWNINGTHREAD(CacheChild);
+   MOZ_ASSERT(mListener);
+   mListener = nullptr;
+ }
+ 
+ void
+ CacheChild::StartDestroy()
+ {
++  nsRefPtr<Cache> listener = mListener;
++
+   // StartDestroy() can get called from either Cache or the Feature.
+   // Theoretically we can get double called if the right race happens.  Handle
+   // that by just ignoring the second StartDestroy() call.
+-  if (!mListener) {
++  if (!listener) {
+     return;
+   }
+ 
+-  mListener->ActorDestroy(this);
++  listener->DestroyInternal(this);
+ 
+-  // Cache listener should call ClearListener() in ActorDestroy()
++  // Cache listener should call ClearListener() in DestroyInternal()
+   MOZ_ASSERT(!mListener);
+ 
+   // Start actor destruction from parent process
+   unused << SendTeardown();
+ }
+ 
+ void
+ CacheChild::ActorDestroy(ActorDestroyReason aReason)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheChild);
+-  if (mListener) {
+-    mListener->ActorDestroy(this);
+-    // Cache listener should call ClearListener() in ActorDestroy()
++  nsRefPtr<Cache> listener = mListener;
++  if (listener) {
++    listener->DestroyInternal(this);
++    // Cache listener should call ClearListener() in DestroyInternal()
+     MOZ_ASSERT(!mListener);
+   }
+ 
+   if (mFeature) {
+     mFeature->RemoveActor(this);
+     mFeature = nullptr;
+   }
+ }
+@@ -102,85 +112,91 @@ CacheChild::ActorDestroy(ActorDestroyRea
+ bool
+ CacheChild::RecvMatchResponse(const RequestId& requestId, const nsresult& aRv,
+                               const PCacheResponseOrVoid& aResponse)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheChild);
+ 
+   AddFeatureToStreamChild(aResponse, mFeature);
+ 
+-  if (!mListener) {
++  nsRefPtr<Cache> listener = mListener;
++  if (!listener) {
+     StartDestroyStreamChild(aResponse);
+     return true;
+   }
+ 
+-  mListener->RecvMatchResponse(requestId, aRv, aResponse);
++  listener->RecvMatchResponse(requestId, aRv, aResponse);
+   return true;
+ }
+ 
+ bool
+ CacheChild::RecvMatchAllResponse(const RequestId& requestId, const nsresult& aRv,
+                                  nsTArray<PCacheResponse>&& aResponses)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheChild);
+ 
+   AddFeatureToStreamChild(aResponses, mFeature);
+ 
+-  if (!mListener) {
++  nsRefPtr<Cache> listener = mListener;
++  if (!listener) {
+     StartDestroyStreamChild(aResponses);
+     return true;
+   }
+ 
+-  mListener->RecvMatchAllResponse(requestId, aRv, aResponses);
++  listener->RecvMatchAllResponse(requestId, aRv, aResponses);
+   return true;
+ }
+ 
+ bool
+ CacheChild::RecvAddAllResponse(const RequestId& requestId, const nsresult& aRv)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheChild);
+-  if (mListener) {
+-    mListener->RecvAddAllResponse(requestId, aRv);
++  nsRefPtr<Cache> listener = mListener;
++  if (listener) {
++    listener->RecvAddAllResponse(requestId, aRv);
+   }
+   return true;
+ }
+ 
+ bool
+ CacheChild::RecvPutResponse(const RequestId& aRequestId, const nsresult& aRv)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheChild);
+-  if (mListener) {
+-    mListener->RecvPutResponse(aRequestId, aRv);
++  nsRefPtr<Cache> listener = mListener;
++  if (listener) {
++    listener->RecvPutResponse(aRequestId, aRv);
+   }
+   return true;
+ }
+ 
+ bool
+ CacheChild::RecvDeleteResponse(const RequestId& requestId, const nsresult& aRv,
+                                const bool& result)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheChild);
+-  if (mListener) {
+-    mListener->RecvDeleteResponse(requestId, aRv, result);
++  nsRefPtr<Cache> listener = mListener;
++  if (listener) {
++    listener->RecvDeleteResponse(requestId, aRv, result);
+   }
+   return true;
+ }
+ 
+ bool
+ CacheChild::RecvKeysResponse(const RequestId& requestId, const nsresult& aRv,
+                              nsTArray<PCacheRequest>&& aRequests)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheChild);
+ 
+   AddFeatureToStreamChild(aRequests, mFeature);
+ 
+-  if (!mListener) {
++  nsRefPtr<Cache> listener = mListener;
++  if (!listener) {
+     StartDestroyStreamChild(aRequests);
+     return true;
+   }
+ 
+-  mListener->RecvKeysResponse(requestId, aRv, aRequests);
++  listener->RecvKeysResponse(requestId, aRv, aRequests);
+   return true;
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namesapce mozilla
+diff --git a/dom/cache/CacheChild.h b/dom/cache/CacheChild.h
+--- a/dom/cache/CacheChild.h
++++ b/dom/cache/CacheChild.h
+@@ -33,16 +33,17 @@ public:
+   void ClearListener();
+ 
+   // ActorChild methods
+ 
+   // Synchronously call ActorDestroy on our Cache listener and then start the
+   // actor destruction asynchronously from the parent-side.
+   virtual void StartDestroy() MOZ_OVERRIDE;
+ 
++private:
+   // PCacheChild methods
+   virtual void
+   ActorDestroy(ActorDestroyReason aReason) MOZ_OVERRIDE;
+ 
+   virtual bool
+   RecvMatchResponse(const RequestId& requestId, const nsresult& aRv,
+                     const PCacheResponseOrVoid& aResponse) MOZ_OVERRIDE;
+   virtual bool
+@@ -56,17 +57,16 @@ public:
+                   const nsresult& aRv) MOZ_OVERRIDE;
+   virtual bool
+   RecvDeleteResponse(const RequestId& requestId, const nsresult& aRv,
+                      const bool& result) MOZ_OVERRIDE;
+   virtual bool
+   RecvKeysResponse(const RequestId& requestId, const nsresult& aRv,
+                    nsTArray<PCacheRequest>&& requests) MOZ_OVERRIDE;
+ 
+-private:
+   nsRefPtr<Feature> mFeature;
+ 
+   // Use a weak ref so actor does not hold DOM object alive past content use.
+   // The Cache object must call ClearListener() to null this before its
+   // destroyed.
+   Cache* MOZ_NON_OWNING_REF mListener;
+ 
+   NS_DECL_OWNINGTHREAD
+diff --git a/dom/cache/CacheParent.cpp b/dom/cache/CacheParent.cpp
+--- a/dom/cache/CacheParent.cpp
++++ b/dom/cache/CacheParent.cpp
+@@ -2,37 +2,41 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/CacheParent.h"
+ 
+ #include "mozilla/DebugOnly.h"
+-#include "mozilla/unused.h"
+ #include "mozilla/dom/cache/AutoUtils.h"
+ #include "mozilla/dom/cache/CacheStreamControlParent.h"
+ #include "mozilla/dom/cache/ReadStream.h"
+ #include "mozilla/dom/cache/SavedTypes.h"
+ #include "mozilla/dom/cache/StreamList.h"
+ #include "mozilla/ipc/InputStreamUtils.h"
+ #include "mozilla/ipc/PBackgroundParent.h"
+ #include "mozilla/ipc/FileDescriptorSetParent.h"
+ #include "mozilla/ipc/PFileDescriptorSetParent.h"
+ #include "nsCOMPtr.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+-using mozilla::unused;
+-using mozilla::void_t;
+ using mozilla::ipc::FileDescriptorSetParent;
+ using mozilla::ipc::PFileDescriptorSetParent;
+ 
++// Declared in ActorUtils.h
++void
++DeallocPCacheParent(PCacheParent* aActor)
++{
++  delete aActor;
++}
++
+ CacheParent::CacheParent(cache::Manager* aManager, CacheId aCacheId)
+   : mManager(aManager)
+   , mCacheId(aCacheId)
+ {
+   MOZ_COUNT_CTOR(cache::CacheParent);
+   MOZ_ASSERT(mManager);
+   mManager->AddRefCacheId(mCacheId);
+ }
+@@ -55,17 +59,20 @@ CacheParent::ActorDestroy(ActorDestroyRe
+   mManager->RemoveListener(this);
+   mManager->ReleaseCacheId(mCacheId);
+   mManager = nullptr;
+ }
+ 
+ bool
+ CacheParent::RecvTeardown()
+ {
+-  unused << Send__delete__(this);
++  if (!Send__delete__(this)) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("Cache failed to send delete.");
++  }
+   return true;
+ }
+ 
+ bool
+ CacheParent::RecvMatch(const RequestId& aRequestId, const PCacheRequest& aRequest,
+                        const PCacheQueryParams& aParams)
+ {
+   MOZ_ASSERT(mManager);
+@@ -95,17 +102,20 @@ CacheParent::RecvAddAll(const RequestId&
+     requestStreams.AppendElement(DeserializeCacheStream(aRequests[i].body()));
+   }
+ 
+   nsRefPtr<FetchPut> fetchPut;
+   nsresult rv = FetchPut::Create(this, mManager, aRequestId, mCacheId,
+                                  aRequests, requestStreams,
+                                  getter_AddRefs(fetchPut));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    unused << SendAddAllResponse(aRequestId, rv);
++    if (!SendAddAllResponse(aRequestId, rv)) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("Cache failed to send AddAll response.");
++    }
+     return true;
+   }
+ 
+   mFetchPutList.AppendElement(fetchPut.forget());
+ 
+   return true;
+ }
+ 
+@@ -157,74 +167,94 @@ void
+ CacheParent::OnCacheMatch(RequestId aRequestId, nsresult aRv,
+                           const SavedResponse* aSavedResponse,
+                           StreamList* aStreamList)
+ {
+   AutoParentResponseOrVoid response(Manager());
+ 
+   // no match
+   if (NS_FAILED(aRv) || !aSavedResponse || !aStreamList) {
+-    unused << SendMatchResponse(aRequestId, aRv,
+-                                response.SendAsResponseOrVoid());
++    if (!SendMatchResponse(aRequestId, aRv, response.SendAsResponseOrVoid())) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("Cache failed to send Match response.");
++    }
+     return;
+   }
+ 
+   if (aSavedResponse) {
+     response.Add(*aSavedResponse, aStreamList);
+   }
+ 
+-  unused << SendMatchResponse(aRequestId, aRv, response.SendAsResponseOrVoid());
++  if (!SendMatchResponse(aRequestId, aRv, response.SendAsResponseOrVoid())) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("Cache failed to send Match response.");
++  }
+ }
+ 
+ void
+ CacheParent::OnCacheMatchAll(RequestId aRequestId, nsresult aRv,
+                              const nsTArray<SavedResponse>& aSavedResponses,
+                              StreamList* aStreamList)
+ {
+   AutoParentResponseList responses(Manager(), aSavedResponses.Length());
+ 
+   for (uint32_t i = 0; i < aSavedResponses.Length(); ++i) {
+     responses.Add(aSavedResponses[i], aStreamList);
+   }
+ 
+-  unused << SendMatchAllResponse(aRequestId, aRv, responses.SendAsResponseList());
++  if (!SendMatchAllResponse(aRequestId, aRv, responses.SendAsResponseList())) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("Cache failed to send MatchAll response.");
++  }
+ }
+ 
+ void
+ CacheParent::OnCachePutAll(RequestId aRequestId, nsresult aRv)
+ {
+-  unused << SendPutResponse(aRequestId, aRv);
++  if (!SendPutResponse(aRequestId, aRv)) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("Cache failed to send Put response.");
++  }
+ }
+ 
+ void
+ CacheParent::OnCacheDelete(RequestId aRequestId, nsresult aRv, bool aSuccess)
+ {
+-  unused << SendDeleteResponse(aRequestId, aRv, aSuccess);
++  if (!SendDeleteResponse(aRequestId, aRv, aSuccess)) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("Cache failed to send Delete response.");
++  }
+ }
+ 
+ void
+ CacheParent::OnCacheKeys(RequestId aRequestId, nsresult aRv,
+                          const nsTArray<SavedRequest>& aSavedRequests,
+                          StreamList* aStreamList)
+ {
+   AutoParentRequestList requests(Manager(), aSavedRequests.Length());
+ 
+   for (uint32_t i = 0; i < aSavedRequests.Length(); ++i) {
+     requests.Add(aSavedRequests[i], aStreamList);
+   }
+ 
+-  unused << SendKeysResponse(aRequestId, aRv, requests.SendAsRequestList());
++  if (!SendKeysResponse(aRequestId, aRv, requests.SendAsRequestList())) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("Cache failed to send Keys response.");
++  }
+ }
+ 
+ void
+ CacheParent::OnFetchPut(FetchPut* aFetchPut, RequestId aRequestId, nsresult aRv)
+ {
+   aFetchPut->ClearListener();
+   mFetchPutList.RemoveElement(aFetchPut);
+-  unused << SendAddAllResponse(aRequestId, aRv);
++  if (!SendAddAllResponse(aRequestId, aRv)) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("Cache failed to send AddAll response.");
++  }
+ }
+ 
+ already_AddRefed<nsIInputStream>
+ CacheParent::DeserializeCacheStream(const PCacheReadStreamOrVoid& aStreamOrVoid)
+ {
+   if (aStreamOrVoid.type() == PCacheReadStreamOrVoid::Tvoid_t) {
+     return nullptr;
+   }
+@@ -242,17 +272,20 @@ CacheParent::DeserializeCacheStream(cons
+ 
+     FileDescriptorSetParent* fdSetActor =
+       static_cast<FileDescriptorSetParent*>(readStream.fds().get_PFileDescriptorSetParent());
+     MOZ_ASSERT(fdSetActor);
+ 
+     fdSetActor->ForgetFileDescriptors(fds);
+     MOZ_ASSERT(!fds.IsEmpty());
+ 
+-    unused << fdSetActor->Send__delete__(fdSetActor);
++    if (!fdSetActor->Send__delete__(fdSetActor)) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("Cache failed to delete fd set actor.");
++    }
+   }
+ 
+   return DeserializeInputStream(readStream.params(), fds);
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namesapce mozilla
+diff --git a/dom/cache/CacheParent.h b/dom/cache/CacheParent.h
+--- a/dom/cache/CacheParent.h
++++ b/dom/cache/CacheParent.h
+@@ -27,16 +27,17 @@ struct StreamHolder;
+ class CacheParent MOZ_FINAL : public PCacheParent
+                             , public Manager::Listener
+                             , public FetchPut::Listener
+ {
+ public:
+   CacheParent(cache::Manager* aManager, CacheId aCacheId);
+   virtual ~CacheParent();
+ 
++private:
+   // PCacheParent method
+   virtual void ActorDestroy(ActorDestroyReason aReason) MOZ_OVERRIDE;
+   virtual bool RecvTeardown() MOZ_OVERRIDE;
+   virtual bool
+   RecvMatch(const RequestId& aRequestId, const PCacheRequest& aRequest,
+             const PCacheQueryParams& aParams) MOZ_OVERRIDE;
+   virtual bool
+   RecvMatchAll(const RequestId& aRequestId, const PCacheRequestOrVoid& aRequest,
+@@ -66,17 +67,16 @@ public:
+   virtual void OnCacheKeys(RequestId aRequestId, nsresult aRv,
+                            const nsTArray<SavedRequest>& aSavedRequests,
+                            StreamList* aStreamList) MOZ_OVERRIDE;
+ 
+   // FetchPut::Listener methods
+   virtual void OnFetchPut(FetchPut* aFetchPut, RequestId aRequestId,
+                           nsresult aRv) MOZ_OVERRIDE;
+ 
+-private:
+   already_AddRefed<nsIInputStream>
+   DeserializeCacheStream(const PCacheReadStreamOrVoid& aStreamOrVoid);
+ 
+   nsRefPtr<cache::Manager> mManager;
+   const CacheId mCacheId;
+   nsTArray<nsRefPtr<FetchPut>> mFetchPutList;
+ };
+ 
+diff --git a/dom/cache/CacheStorage.cpp b/dom/cache/CacheStorage.cpp
+--- a/dom/cache/CacheStorage.cpp
++++ b/dom/cache/CacheStorage.cpp
+@@ -146,16 +146,17 @@ CacheStorage::CacheStorage(Namespace aNa
+   PBackgroundChild* actor = BackgroundChild::GetForCurrentThread();
+   if (actor) {
+     ActorCreated(actor);
+     return;
+   }
+ 
+   // Otherwise we must begin the PBackground initialization process and
+   // wait for the async ActorCreated() callback.
++  MOZ_ASSERT(NS_IsMainThread());
+   bool ok = BackgroundChild::GetOrCreateForCurrentThread(this);
+   if (!ok) {
+     ActorFailed();
+   }
+ }
+ 
+ already_AddRefed<Promise>
+ CacheStorage::Match(const RequestOrUSVString& aRequest,
+@@ -359,17 +360,17 @@ CacheStorage::ActorFailed()
+     RequestId requestId = mPendingRequests[i].mRequestId;
+     nsRefPtr<Promise> promise = RemoveRequestPromise(requestId);
+     promise->MaybeReject(NS_ERROR_UNEXPECTED);
+   }
+   mPendingRequests.Clear();
+ }
+ 
+ void
+-CacheStorage::ActorDestroy(IProtocol* aActor)
++CacheStorage::DestroyInternal(CacheStorageChild* aActor)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorage);
+   MOZ_ASSERT(mActor);
+   MOZ_ASSERT(mActor == aActor);
+   mActor->ClearListener();
+   mActor = nullptr;
+ 
+   // Note that we will never get an actor again in case another request is
+@@ -503,17 +504,17 @@ CacheStorage::AssertOwningThread() const
+ #endif
+ 
+ CacheStorage::~CacheStorage()
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorage);
+ 
+   if (mActor) {
+     mActor->StartDestroy();
+-    // ActorDestroy() is called synchronously by StartDestroy().  So we
++    // DestroyInternal() is called synchronously by StartDestroy().  So we
+     // should have already cleared the mActor.
+     MOZ_ASSERT(!mActor);
+   }
+ }
+ 
+ void
+ CacheStorage::MaybeRunPendingRequests()
+ {
+@@ -531,17 +532,17 @@ CacheStorage::MaybeRunPendingRequests()
+       {
+         AutoChildRequest request(this);
+         ErrorResult rv;
+         request.Add(entry.mRequest, IgnoreBody, PassThroughReferrer,
+                     IgnoreInvalidScheme, rv);
+         if (NS_WARN_IF(rv.Failed())) {
+           nsRefPtr<Promise> promise = RemoveRequestPromise(requestId);
+           promise->MaybeReject(rv);
+-          return;
++          break;
+         }
+ 
+         PCacheQueryParams params;
+         ToPCacheQueryParams(params, entry.mOptions);
+ 
+         unused << mActor->SendMatch(requestId, request.SendAsRequest(), params);
+         break;
+       }
+@@ -552,16 +553,18 @@ CacheStorage::MaybeRunPendingRequests()
+         unused << mActor->SendOpen(requestId, entry.mKey);
+         break;
+       case OP_DELETE:
+         unused << mActor->SendDelete(requestId, entry.mKey);
+         break;
+       case OP_KEYS:
+         unused << mActor->SendKeys(requestId);
+         break;
++      default:
++        MOZ_ASSERT_UNREACHABLE("Unknown pending CacheStorage op.");
+     }
+   }
+   mPendingRequests.Clear();
+ }
+ 
+ RequestId
+ CacheStorage::AddRequestPromise(Promise* aPromise, ErrorResult& aRv)
+ {
+diff --git a/dom/cache/CacheStorage.h b/dom/cache/CacheStorage.h
+--- a/dom/cache/CacheStorage.h
++++ b/dom/cache/CacheStorage.h
+@@ -73,18 +73,20 @@ public:
+ 
+   nsISupports* GetParentObject() const;
+   virtual JSObject* WrapObject(JSContext* aContext) MOZ_OVERRIDE;
+ 
+   // nsIIPCbackgroundChildCreateCallback methods
+   virtual void ActorCreated(PBackgroundChild* aActor) MOZ_OVERRIDE;
+   virtual void ActorFailed() MOZ_OVERRIDE;
+ 
++  // Called when CacheStorageChild actor is being destroyed
++  void DestroyInternal(CacheStorageChild* aActor);
++
+   // Methods forwarded from CacheStorageChild
+-  void ActorDestroy(mozilla::ipc::IProtocol* aActor);
+   void RecvMatchResponse(RequestId aRequestId, nsresult aRv,
+                          const PCacheResponseOrVoid& aResponse);
+   void RecvHasResponse(RequestId aRequestId, nsresult aRv, bool aSuccess);
+   void RecvOpenResponse(RequestId aRequestId, nsresult aRv,
+                         CacheChild* aActor);
+   void RecvDeleteResponse(RequestId aRequestId, nsresult aRv, bool aSuccess);
+   void RecvKeysResponse(RequestId aRequestId, nsresult aRv,
+                         const nsTArray<nsString>& aKeys);
+diff --git a/dom/cache/CacheStorageChild.cpp b/dom/cache/CacheStorageChild.cpp
+--- a/dom/cache/CacheStorageChild.cpp
++++ b/dom/cache/CacheStorageChild.cpp
+@@ -11,16 +11,23 @@
+ #include "mozilla/dom/cache/CacheStorage.h"
+ #include "mozilla/dom/cache/Feature.h"
+ #include "mozilla/dom/cache/StreamUtils.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
++// declared in ActorUtils.h
++void
++DeallocPCacheStorageChild(PCacheStorageChild* aActor)
++{
++  delete aActor;
++}
++
+ CacheStorageChild::CacheStorageChild(CacheStorage* aListener, Feature* aFeature)
+   : mListener(aListener)
+   , mFeature(aFeature)
+ {
+   MOZ_COUNT_CTOR(cache::CacheStorageChild);
+   MOZ_ASSERT(mListener);
+ 
+   if (mFeature) {
+@@ -44,39 +51,42 @@ CacheStorageChild::ClearListener()
+   mListener = nullptr;
+ }
+ 
+ void
+ CacheStorageChild::StartDestroy()
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorageChild);
+ 
++  nsRefPtr<CacheStorage> listener = mListener;
++
+   // StartDestroy() can get called from either CacheStorage or the Feature.
+   // Theoretically we can get double called if the right race happens.  Handle
+   // that by just ignoring the second StartDestroy() call.
+-  if (!mListener) {
++  if (!listener) {
+     return;
+   }
+ 
+-  mListener->ActorDestroy(this);
++  listener->DestroyInternal(this);
+ 
+-  // CacheStorage listener should call ClearListener() in ActorDestroy()
++  // CacheStorage listener should call ClearListener() in DestroyInternal()
+   MOZ_ASSERT(!mListener);
+ 
+   // Start actor destruction from parent process
+   unused << SendTeardown();
+ }
+ 
+ void
+ CacheStorageChild::ActorDestroy(ActorDestroyReason aReason)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorageChild);
+-  if (mListener) {
+-    mListener->ActorDestroy(this);
+-    // CacheStorage listener should call ClearListener() in ActorDestroy()
++  nsRefPtr<CacheStorage> listener = mListener;
++  if (listener) {
++    listener->DestroyInternal(this);
++    // CacheStorage listener should call ClearListener() in DestroyInternal()
+     MOZ_ASSERT(!mListener);
+   }
+ 
+   if (mFeature) {
+     mFeature->RemoveActor(this);
+     mFeature = nullptr;
+   }
+ }
+@@ -85,82 +95,88 @@ bool
+ CacheStorageChild::RecvMatchResponse(const RequestId& aRequestId,
+                                      const nsresult& aRv,
+                                      const PCacheResponseOrVoid& aResponseOrVoid)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorageChild);
+ 
+   AddFeatureToStreamChild(aResponseOrVoid, mFeature);
+ 
+-  if (!mListener) {
++  nsRefPtr<CacheStorage> listener = mListener;
++  if (!listener) {
+     StartDestroyStreamChild(aResponseOrVoid);
+     return true;
+   }
+ 
+-  mListener->RecvMatchResponse(aRequestId, aRv, aResponseOrVoid);
++  listener->RecvMatchResponse(aRequestId, aRv, aResponseOrVoid);
+ 
+   return true;
+ }
+ 
+ bool
+ CacheStorageChild::RecvHasResponse(const RequestId& aRequestId,
+                                    const nsresult& aRv,
+                                    const bool& aSuccess)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorageChild);
+-  if (mListener) {
+-    mListener->RecvHasResponse(aRequestId, aRv, aSuccess);
++  nsRefPtr<CacheStorage> listener = mListener;
++  if (listener) {
++    listener->RecvHasResponse(aRequestId, aRv, aSuccess);
+   }
+   return true;
+ }
+ 
+ bool
+ CacheStorageChild::RecvOpenResponse(const RequestId& aRequestId,
+                                     const nsresult& aRv,
+                                     PCacheChild* aActor)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorageChild);
+-  MOZ_ASSERT(aActor);
+ 
+-  if (!mListener || (mFeature && mFeature->Notified())) {
+-    unused << aActor->SendTeardown();
++  nsRefPtr<CacheStorage> listener = mListener;
++  if (!listener || (mFeature && mFeature->Notified())) {
++    if (aActor) {
++      unused << aActor->SendTeardown();
++    }
+     return true;
+   }
+ 
+   CacheChild* cacheChild = static_cast<CacheChild*>(aActor);
+ 
+   // Since Feature::Notified returned false above, we are guaranteed that
+   // the feature won't try to shutdown the actor until after we create the
+   // Cache DOM object in the listener's RecvOpenResponse() method.  This
+   // is important because StartShutdown() expects a Cache object listener.
+   cacheChild->SetFeature(mFeature);
+ 
+-  mListener->RecvOpenResponse(aRequestId, aRv, cacheChild);
++  listener->RecvOpenResponse(aRequestId, aRv, cacheChild);
+   return true;
+ }
+ 
+ bool
+ CacheStorageChild::RecvDeleteResponse(const RequestId& aRequestId,
+                                       const nsresult& aRv,
+                                       const bool& aResult)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorageChild);
+-  if (mListener) {
+-    mListener->RecvDeleteResponse(aRequestId, aRv, aResult);
++  nsRefPtr<CacheStorage> listener = mListener;
++  if (listener) {
++    listener->RecvDeleteResponse(aRequestId, aRv, aResult);
+   }
+   return true;
+ }
+ 
+ bool
+ CacheStorageChild::RecvKeysResponse(const RequestId& aRequestId,
+                                     const nsresult& aRv,
+                                     nsTArray<nsString>&& aKeys)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorageChild);
+-  if (mListener) {
+-    mListener->RecvKeysResponse(aRequestId, aRv, aKeys);
++  nsRefPtr<CacheStorage> listener = mListener;
++  if (listener) {
++    listener->RecvKeysResponse(aRequestId, aRv, aKeys);
+   }
+   return true;
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/CacheStorageChild.h b/dom/cache/CacheStorageChild.h
+--- a/dom/cache/CacheStorageChild.h
++++ b/dom/cache/CacheStorageChild.h
+@@ -33,16 +33,17 @@ public:
+   void ClearListener();
+ 
+   // ActorChild methods
+ 
+   // Synchronously call ActorDestroy on our CacheStorage listener and then start
+   // the actor destruction asynchronously from the parent-side.
+   virtual void StartDestroy() MOZ_OVERRIDE;
+ 
++private:
+   // PCacheStorageChild methods
+   virtual void ActorDestroy(ActorDestroyReason aReason) MOZ_OVERRIDE;
+   virtual bool RecvMatchResponse(const RequestId& requestId,
+                                  const nsresult& aRv,
+                                  const PCacheResponseOrVoid& response) MOZ_OVERRIDE;
+   virtual bool RecvHasResponse(const cache::RequestId& aRequestId,
+                                const nsresult& aRv,
+                                const bool& aSuccess) MOZ_OVERRIDE;
+@@ -51,17 +52,16 @@ public:
+                                 PCacheChild* aActor) MOZ_OVERRIDE;
+   virtual bool RecvDeleteResponse(const cache::RequestId& aRequestId,
+                                   const nsresult& aRv,
+                                   const bool& aResult) MOZ_OVERRIDE;
+   virtual bool RecvKeysResponse(const cache::RequestId& aRequestId,
+                                 const nsresult& aRv,
+                                 nsTArray<nsString>&& aKeys) MOZ_OVERRIDE;
+ 
+-private:
+   // Use a weak ref so actor does not hold DOM object alive past content use.
+   // The CacheStorage object must call ClearListener() to null this before its
+   // destroyed.
+   CacheStorage* MOZ_NON_OWNING_REF mListener;
+ 
+   nsRefPtr<Feature> mFeature;
+ 
+   NS_DECL_OWNINGTHREAD
+diff --git a/dom/cache/CacheStorageParent.cpp b/dom/cache/CacheStorageParent.cpp
+--- a/dom/cache/CacheStorageParent.cpp
++++ b/dom/cache/CacheStorageParent.cpp
+@@ -15,17 +15,16 @@
+ #include "mozilla/dom/cache/ManagerId.h"
+ #include "mozilla/dom/cache/ReadStream.h"
+ #include "mozilla/dom/cache/SavedTypes.h"
+ #include "mozilla/dom/cache/StreamList.h"
+ #include "mozilla/ipc/PBackgroundParent.h"
+ #include "mozilla/ipc/InputStreamUtils.h"
+ #include "mozilla/ipc/PFileDescriptorSetParent.h"
+ #include "mozilla/DebugOnly.h"
+-#include "mozilla/unused.h"
+ #include "nsCOMPtr.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ using mozilla::ipc::PBackgroundParent;
+ using mozilla::ipc::PFileDescriptorSetParent;
+@@ -35,39 +34,36 @@ using mozilla::ipc::PrincipalInfo;
+ PCacheStorageParent*
+ AllocPCacheStorageParent(PBackgroundParent* aManagingActor,
+                          Namespace aNamespace,
+                          const mozilla::ipc::PrincipalInfo& aPrincipalInfo)
+ {
+   return new CacheStorageParent(aManagingActor, aNamespace, aPrincipalInfo);
+ }
+ 
++// declared in ActorUtils.h
++void
++DeallocPCacheStorageParent(PCacheStorageParent* aActor)
++{
++  delete aActor;
++}
++
+ CacheStorageParent::CacheStorageParent(PBackgroundParent* aManagingActor,
+                                        Namespace aNamespace,
+                                        const PrincipalInfo& aPrincipalInfo)
+   : mNamespace(aNamespace)
++  , mVerifiedStatus(NS_OK)
+ {
+   MOZ_COUNT_CTOR(cache::CacheStorageParent);
+   MOZ_ASSERT(aManagingActor);
+ 
+-  // Start the async principal verification process immediately.  If an
+-  // error occurs here, just delete the actor causing all operations on
+-  // the DOM object to reject.  This will be short lived since a failure
+-  // here means we are shutting down.
+-  //
+-  // While we could delay starting verification until the first request,
+-  // and therefore return the error code, this would also introduce
+-  // latency in the first request.  Lets not pessimize typical operations
+-  // for the handling of one rare corner condition.
+-  nsresult rv = PrincipalVerifier::CreateAndDispatch(this, aManagingActor,
+-                                                     aPrincipalInfo,
+-                                                     getter_AddRefs(mVerifier));
+-  if (NS_WARN_IF(NS_FAILED(rv))) {
+-    unused << Send__delete__(this);
+-  }
++  // Start the async principal verification process immediately.
++  mVerifier = PrincipalVerifier::CreateAndDispatch(this, aManagingActor,
++                                                   aPrincipalInfo);
++  MOZ_ASSERT(mVerifier);
+ }
+ 
+ CacheStorageParent::~CacheStorageParent()
+ {
+   MOZ_COUNT_DTOR(cache::CacheStorageParent);
+   MOZ_ASSERT(!mVerifier);
+   MOZ_ASSERT(!mManager);
+ }
+@@ -85,157 +81,212 @@ CacheStorageParent::ActorDestroy(ActorDe
+     mManager->RemoveListener(this);
+     mManager = nullptr;
+   }
+ }
+ 
+ bool
+ CacheStorageParent::RecvTeardown()
+ {
+-  unused << Send__delete__(this);
++  if (!Send__delete__(this)) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("CacheStorage failed to delete actor.");
++  }
+   return true;
+ }
+ 
+ bool
+ CacheStorageParent::RecvMatch(const RequestId& aRequestId,
+                               const PCacheRequest& aRequest,
+                               const PCacheQueryParams& aParams)
+ {
++  if (NS_WARN_IF(NS_FAILED(mVerifiedStatus))) {
++    if (!SendMatchResponse(aRequestId, mVerifiedStatus, void_t())) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("CacheStorage failed to send Match response.");
++    }
++    return true;
++  }
++
+   // queue requests if we are still waiting for principal verification
+   if (!mManagerId) {
+     Entry* entry = mPendingRequests.AppendElement();
+     entry->mOp = OP_MATCH;
+     entry->mRequestId = aRequestId;
+     entry->mRequest = aRequest;
+     entry->mParams = aParams;
+     return true;
+   }
+ 
+   nsRefPtr<cache::Manager> manager;
+   nsresult rv = RequestManager(aRequestId, getter_AddRefs(manager));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    PCacheResponseOrVoid response = void_t();
+-    unused << SendMatchResponse(aRequestId, rv, response);
++    if (!SendMatchResponse(aRequestId, rv, void_t())) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("CacheStorage failed to send Match response.");
++    }
+     return true;
+   }
+ 
+   manager->StorageMatch(this, aRequestId, mNamespace, aRequest,
+                         aParams);
+ 
+   return true;
+ }
+ 
+ bool
+ CacheStorageParent::RecvHas(const RequestId& aRequestId, const nsString& aKey)
+ {
++  if (NS_WARN_IF(NS_FAILED(mVerifiedStatus))) {
++    if (!SendHasResponse(aRequestId, mVerifiedStatus, false)) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("CacheStorage failed to send Has response.");
++    }
++    return true;
++  }
++
+   // queue requests if we are still waiting for principal verification
+   if (!mManagerId) {
+     Entry* entry = mPendingRequests.AppendElement();
+     entry->mOp = OP_HAS;
+     entry->mRequestId = aRequestId;
+     entry->mKey = aKey;
+     return true;
+   }
+ 
+   nsRefPtr<cache::Manager> manager;
+   nsresult rv = RequestManager(aRequestId, getter_AddRefs(manager));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    unused << SendHasResponse(aRequestId, rv, false);
++    if (!SendHasResponse(aRequestId, rv, false)) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("CacheStorage failed to send Has response.");
++    }
+     return true;
+   }
+ 
+   manager->StorageHas(this, aRequestId, mNamespace, aKey);
+ 
+   return true;
+ }
+ 
+ bool
+ CacheStorageParent::RecvOpen(const RequestId& aRequestId, const nsString& aKey)
+ {
++  if (NS_WARN_IF(NS_FAILED(mVerifiedStatus))) {
++    if (!SendOpenResponse(aRequestId, mVerifiedStatus, nullptr)) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("CacheStorage failed to send Open response.");
++    }
++    return true;
++  }
++
+   // queue requests if we are still waiting for principal verification
+   if (!mManagerId) {
+     Entry* entry = mPendingRequests.AppendElement();
+     entry->mOp = OP_OPEN;
+     entry->mRequestId = aRequestId;
+     entry->mKey = aKey;
+     return true;
+   }
+ 
+   nsRefPtr<cache::Manager> manager;
+   nsresult rv = RequestManager(aRequestId, getter_AddRefs(manager));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    unused << SendOpenResponse(aRequestId, rv, nullptr);
++    if (!SendOpenResponse(aRequestId, rv, nullptr)) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("CacheStorage failed to send Open response.");
++    }
+     return true;
+   }
+ 
+   manager->StorageOpen(this, aRequestId, mNamespace, aKey);
+ 
+   return true;
+ }
+ 
+ bool
+ CacheStorageParent::RecvDelete(const RequestId& aRequestId,
+                                const nsString& aKey)
+ {
++  if (NS_WARN_IF(NS_FAILED(mVerifiedStatus))) {
++    if (!SendDeleteResponse(aRequestId, mVerifiedStatus, false)) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("CacheStorage failed to send Delete response.");
++    }
++    return true;
++  }
++
+   // queue requests if we are still waiting for principal verification
+   if (!mManagerId) {
+     Entry* entry = mPendingRequests.AppendElement();
+     entry->mOp = OP_DELETE;
+     entry->mRequestId = aRequestId;
+     entry->mKey = aKey;
+     return true;
+   }
+ 
+   nsRefPtr<cache::Manager> manager;
+   nsresult rv = RequestManager(aRequestId, getter_AddRefs(manager));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    unused << SendDeleteResponse(aRequestId, rv, false);
++    if (!SendDeleteResponse(aRequestId, rv, false)) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("CacheStorage failed to send Delete response.");
++    }
+     return true;
+   }
+ 
+   manager->StorageDelete(this, aRequestId, mNamespace, aKey);
+ 
+   return true;
+ }
+ 
+ bool
+ CacheStorageParent::RecvKeys(const RequestId& aRequestId)
+ {
++  if (NS_WARN_IF(NS_FAILED(mVerifiedStatus))) {
++    if (!SendKeysResponse(aRequestId, mVerifiedStatus, nsTArray<nsString>())) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("CacheStorage failed to send Keys response.");
++    }
++  }
++
+   // queue requests if we are still waiting for principal verification
+   if (!mManagerId) {
+     Entry* entry = mPendingRequests.AppendElement();
+     entry->mOp = OP_DELETE;
+     entry->mRequestId = aRequestId;
+     return true;
+   }
+ 
+   nsRefPtr<cache::Manager> manager;
+   nsresult rv = RequestManager(aRequestId, getter_AddRefs(manager));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    unused << SendKeysResponse(aRequestId, rv, nsTArray<nsString>());
++    if (!SendKeysResponse(aRequestId, rv, nsTArray<nsString>())) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("CacheStorage failed to send Keys response.");
++    }
+     return true;
+   }
+ 
+   manager->StorageKeys(this, aRequestId, mNamespace);
+ 
+   return true;
+ }
+ 
+ void
+ CacheStorageParent::OnPrincipalVerified(nsresult aRv, ManagerId* aManagerId)
+ {
+-  if (NS_WARN_IF(NS_FAILED(aRv))) {
+-    FailPendingRequests(aRv);
+-    unused << Send__delete__(this);
+-    return;
+-  }
+-
+   MOZ_ASSERT(mVerifier);
+   MOZ_ASSERT(!mManagerId);
+   MOZ_ASSERT(!mManager);
++  MOZ_ASSERT(NS_SUCCEEDED(mVerifiedStatus));
++
++  if (NS_WARN_IF(NS_FAILED(aRv))) {
++    mVerifiedStatus = aRv;
++  }
+ 
+   mManagerId = aManagerId;
+   mVerifier->ClearListener();
+   mVerifier = nullptr;
+ 
+   RetryPendingRequests();
+ }
+ 
+@@ -247,74 +298,96 @@ CacheStorageParent::OnStorageMatch(Reque
+   PCacheResponseOrVoid responseOrVoid;
+ 
+   ReleaseManager(aRequestId);
+ 
+   AutoParentResponseOrVoid response(Manager());
+ 
+   // no match
+   if (NS_FAILED(aRv) || !aSavedResponse) {
+-    unused << SendMatchResponse(aRequestId, aRv, response.SendAsResponseOrVoid());
++    if (!SendMatchResponse(aRequestId, aRv, response.SendAsResponseOrVoid())) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("CacheStorage failed to send Match response.");
++    }
+     return;
+   }
+ 
+   if (aSavedResponse) {
+     response.Add(*aSavedResponse, aStreamList);
+   }
+ 
+-  unused << SendMatchResponse(aRequestId, aRv, response.SendAsResponseOrVoid());
++  if (!SendMatchResponse(aRequestId, aRv, response.SendAsResponseOrVoid())) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("CacheStorage failed to send Match response.");
++  }
+ }
+ 
+ void
+ CacheStorageParent::OnStorageHas(RequestId aRequestId, nsresult aRv,
+                                  bool aCacheFound)
+ {
+   ReleaseManager(aRequestId);
+-  unused << SendHasResponse(aRequestId, aRv, aCacheFound);
++  if (!SendHasResponse(aRequestId, aRv, aCacheFound)) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("CacheStorage failed to send Has response.");
++  }
+ }
+ 
+ void
+ CacheStorageParent::OnStorageOpen(RequestId aRequestId, nsresult aRv,
+                                   CacheId aCacheId)
+ {
+   if (NS_FAILED(aRv)) {
+     ReleaseManager(aRequestId);
+-    unused << SendOpenResponse(aRequestId, aRv, nullptr);
++    if (!SendOpenResponse(aRequestId, aRv, nullptr)) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("CacheStorage failed to send Open response.");
++    }
+     return;
+   }
+ 
+   MOZ_ASSERT(mManager);
+   CacheParent* actor = new CacheParent(mManager, aCacheId);
+ 
+   ReleaseManager(aRequestId);
+ 
+   PCacheParent* base = Manager()->SendPCacheConstructor(actor);
+   actor = static_cast<CacheParent*>(base);
+-  unused << SendOpenResponse(aRequestId, aRv, actor);
++  if (!SendOpenResponse(aRequestId, aRv, actor)) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("CacheStorage failed to send Open response.");
++  }
+ }
+ 
+ void
+ CacheStorageParent::OnStorageDelete(RequestId aRequestId, nsresult aRv,
+                                     bool aCacheDeleted)
+ {
+   ReleaseManager(aRequestId);
+-  unused << SendDeleteResponse(aRequestId, aRv, aCacheDeleted);
++  if (!SendDeleteResponse(aRequestId, aRv, aCacheDeleted)) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("CacheStorage failed to send Delete response.");
++  }
+ }
+ 
+ void
+ CacheStorageParent::OnStorageKeys(RequestId aRequestId, nsresult aRv,
+                                   const nsTArray<nsString>& aKeys)
+ {
+   ReleaseManager(aRequestId);
+-  unused << SendKeysResponse(aRequestId, aRv, aKeys);
++  if (!SendKeysResponse(aRequestId, aRv, aKeys)) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("CacheStorage failed to send Keys response.");
++  }
+ }
+ 
+ void
+ CacheStorageParent::RetryPendingRequests()
+ {
++  MOZ_ASSERT(mManagerId || NS_FAILED(mVerifiedStatus));
+   for (uint32_t i = 0; i < mPendingRequests.Length(); ++i) {
+     const Entry& entry = mPendingRequests[i];
+     switch(entry.mOp) {
+       case OP_MATCH:
+         RecvMatch(entry.mRequestId, entry.mRequest, entry.mParams);
+         break;
+       case OP_HAS:
+         RecvHas(entry.mRequestId, entry.mKey);
+@@ -328,53 +401,17 @@ CacheStorageParent::RetryPendingRequests
+       case OP_KEYS:
+         RecvKeys(entry.mRequestId);
+         break;
+       default:
+         MOZ_ASSERT_UNREACHABLE("Pending request within unknown op");
+     }
+   }
+   mPendingRequests.Clear();
+-}
+-
+-void
+-CacheStorageParent::FailPendingRequests(nsresult aRv)
+-{
+-  MOZ_ASSERT(NS_FAILED(aRv));
+-
+-  for (uint32_t i = 0; i < mPendingRequests.Length(); ++i) {
+-    const Entry& entry = mPendingRequests[i];
+-    switch(entry.mOp) {
+-      case OP_MATCH:
+-      {
+-        PCacheResponseOrVoid responseOrVoid;
+-        responseOrVoid = void_t();
+-        unused << SendMatchResponse(entry.mRequestId, aRv, responseOrVoid);
+-        break;
+-      }
+-      case OP_HAS:
+-        unused << SendHasResponse(entry.mRequestId, aRv, false);
+-        break;
+-      case OP_OPEN:
+-        unused << SendOpenResponse(entry.mRequestId, aRv, nullptr);
+-        break;
+-      case OP_DELETE:
+-        unused << SendDeleteResponse(entry.mRequestId, aRv, false);
+-        break;
+-      case OP_KEYS:
+-      {
+-        const nsTArray<nsString> emptyKeys;
+-        unused << SendKeysResponse(entry.mRequestId, aRv, emptyKeys);
+-        break;
+-      }
+-      default:
+-        MOZ_ASSERT_UNREACHABLE("Pending request within unknown op");
+-    }
+-  }
+-  mPendingRequests.Clear();
++  mPendingRequests.Compact();
+ }
+ 
+ nsresult
+ CacheStorageParent::RequestManager(RequestId aRequestId,
+                                    cache::Manager** aManagerOut)
+ {
+   MOZ_ASSERT(!mActiveRequests.Contains(aRequestId));
+   nsRefPtr<cache::Manager> ref = mManager;
+@@ -395,18 +432,17 @@ CacheStorageParent::ReleaseManager(Reque
+   // Note that if the child process dies we also clean up the mManager in
+   // ActorDestroy().  There is no race with this method, however, because
+   // ActorDestroy removes this object from the Manager's listener list.
+   // Therefore ReleaseManager() should never be called after ActorDestroy()
+   // runs.
+   MOZ_ASSERT(mManager);
+   MOZ_ASSERT(!mActiveRequests.IsEmpty());
+ 
+-  DebugOnly<bool> removed = mActiveRequests.RemoveElement(aRequestId);
+-  MOZ_ASSERT(removed);
++  MOZ_ALWAYS_TRUE(mActiveRequests.RemoveElement(aRequestId));
+ 
+   if (mActiveRequests.IsEmpty()) {
+     mManager->RemoveListener(this);
+     mManager = nullptr;
+   }
+ }
+ 
+ } // namespace cache
+diff --git a/dom/cache/CacheStorageParent.h b/dom/cache/CacheStorageParent.h
+--- a/dom/cache/CacheStorageParent.h
++++ b/dom/cache/CacheStorageParent.h
+@@ -26,16 +26,17 @@ class CacheStorageParent MOZ_FINAL : pub
+                                    , public PrincipalVerifier::Listener
+                                    , public Manager::Listener
+ {
+ public:
+   CacheStorageParent(PBackgroundParent* aManagingActor, Namespace aNamespace,
+                      const mozilla::ipc::PrincipalInfo& aPrincipalInfo);
+   virtual ~CacheStorageParent();
+ 
++private:
+   // PCacheStorageParent methods
+   virtual void ActorDestroy(ActorDestroyReason aReason) MOZ_OVERRIDE;
+   virtual bool RecvTeardown() MOZ_OVERRIDE;
+   virtual bool RecvMatch(const RequestId& aRequestId,
+                          const PCacheRequest& aRequest,
+                          const PCacheQueryParams& aParams) MOZ_OVERRIDE;
+   virtual bool RecvHas(const RequestId& aRequestId,
+                        const nsString& aKey) MOZ_OVERRIDE;
+@@ -57,30 +58,29 @@ public:
+                             bool aCacheFound) MOZ_OVERRIDE;
+   virtual void OnStorageOpen(RequestId aRequestId, nsresult aRv,
+                              CacheId aCacheId) MOZ_OVERRIDE;
+   virtual void OnStorageDelete(RequestId aRequestId, nsresult aRv,
+                                bool aCacheDeleted) MOZ_OVERRIDE;
+   virtual void OnStorageKeys(RequestId aRequestId, nsresult aRv,
+                              const nsTArray<nsString>& aKeys) MOZ_OVERRIDE;
+ 
+-private:
+   CacheStreamControlParent*
+   SerializeReadStream(CacheStreamControlParent *aStreamControl, const nsID& aId,
+                       StreamList* aStreamList,
+                       PCacheReadStream* aReadStreamOut);
+ 
+   void RetryPendingRequests();
+-  void FailPendingRequests(nsresult aRv);
+ 
+   nsresult RequestManager(RequestId aRequestId, cache::Manager** aManagerOut);
+   void ReleaseManager(RequestId aRequestId);
+ 
+   const Namespace mNamespace;
+   nsRefPtr<PrincipalVerifier> mVerifier;
++  nsresult mVerifiedStatus;
+   nsRefPtr<ManagerId> mManagerId;
+   nsRefPtr<cache::Manager> mManager;
+ 
+   enum Op
+   {
+     OP_MATCH,
+     OP_HAS,
+     OP_OPEN,
+diff --git a/dom/cache/CacheStreamControlChild.cpp b/dom/cache/CacheStreamControlChild.cpp
+--- a/dom/cache/CacheStreamControlChild.cpp
++++ b/dom/cache/CacheStreamControlChild.cpp
+@@ -19,119 +19,135 @@ namespace cache {
+ 
+ // declared in ActorUtils.h
+ PCacheStreamControlChild*
+ AllocPCacheStreamControlChild()
+ {
+   return new CacheStreamControlChild();
+ }
+ 
++// declared in ActorUtils.h
++void
++DeallocPCacheStreamControlChild(PCacheStreamControlChild* aActor)
++{
++  delete aActor;
++}
++
+ CacheStreamControlChild::CacheStreamControlChild()
+   : mDestroyStarted(false)
+ {
+   MOZ_COUNT_CTOR(cache::CacheStreamControlChild);
+ }
+ 
+ CacheStreamControlChild::~CacheStreamControlChild()
+ {
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+   MOZ_COUNT_DTOR(cache::CacheStreamControlChild);
+   MOZ_ASSERT(!mFeature);
+ }
+ 
+ void
+ CacheStreamControlChild::SetFeature(Feature* aFeature)
+ {
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+   MOZ_ASSERT(!mFeature);
+   mFeature = aFeature;
+   if (mFeature) {
+     mFeature->AddActor(this);
+   }
+ }
+ 
+ void
+ CacheStreamControlChild::AddListener(ReadStream* aListener)
+ {
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+   MOZ_ASSERT(aListener);
+   MOZ_ASSERT(!mListeners.Contains(aListener));
+   mListeners.AppendElement(aListener);
+ }
+ 
+ void
+ CacheStreamControlChild::RemoveListener(ReadStream* aListener)
+ {
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+   MOZ_ASSERT(aListener);
+-  DebugOnly<bool> removed = mListeners.RemoveElement(aListener);
+-  MOZ_ASSERT(removed);
++  MOZ_ALWAYS_TRUE(mListeners.RemoveElement(aListener));
+ }
+ 
+ void
+ CacheStreamControlChild::NoteClosed(const nsID& aId)
+ {
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+   unused << SendNoteClosed(aId);
+ }
+ 
+ void
+ CacheStreamControlChild::StartDestroy()
+ {
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+   // This can get called twice under some circumstances.  For example, if the
+   // actor is added to a Feature that has already been notified and the Cache
+   // actor has no mListener.
+   if (mDestroyStarted) {
+     return;
+   }
+   mDestroyStarted = true;
+ 
+   // Begin shutting down all streams.  This is the same as if the parent had
+   // asked us to shutdown.  So simulate the CloseAll IPC message.
+   RecvCloseAll();
+ }
+ 
+ void
+ CacheStreamControlChild::ActorDestroy(ActorDestroyReason aReason)
+ {
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+   // Note, we cannot trigger IPC traffic here.  So use
+-  // CloseStreamWithoutReporting().  This also means we don't need a defensive
+-  // copy.
+-  for (uint32_t i = 0; i < mListeners.Length(); ++i) {
+-    mListeners[i]->CloseStreamWithoutReporting();
++  // CloseStreamWithoutReporting().
++  ReadStreamList::ForwardIterator iter(mListeners);
++  while (iter.HasMore()) {
++    nsRefPtr<ReadStream> stream = iter.GetNext();
++    stream->CloseStreamWithoutReporting();
+   }
+   mListeners.Clear();
+ 
+   if (mFeature) {
+     mFeature->RemoveActor(this);
+     mFeature = nullptr;
+   }
+ }
+ 
+ bool
+ CacheStreamControlChild::RecvClose(const nsID& aId)
+ {
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+   DebugOnly<uint32_t> closedCount = 0;
+ 
+-  // defensive copy of list since may be modified as we close streams
+-  nsAutoTArray<ReadStream*, 256> listeners(mListeners);
+-  for (uint32_t i = 0; i < listeners.Length(); ++i) {
++  ReadStreamList::ForwardIterator iter(mListeners);
++  while (iter.HasMore()) {
++    nsRefPtr<ReadStream> stream = iter.GetNext();
+     // note, multiple streams may exist for same ID
+-    if (listeners[i]->MatchId(aId)) {
+-      listeners[i]->CloseStream();
++    if (stream->MatchId(aId)) {
++      stream->CloseStream();
+       closedCount += 1;
+     }
+   }
+ 
+   MOZ_ASSERT(closedCount > 0);
+ 
+   return true;
+ }
+ 
+ bool
+ CacheStreamControlChild::RecvCloseAll()
+ {
+-  // defensive copy of list since may be modified as we close streams
+-  nsAutoTArray<ReadStream*, 256> listeners(mListeners);
+-  for (uint32_t i = 0; i < listeners.Length(); ++i) {
+-    listeners[i]->CloseStream();
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
++  ReadStreamList::ForwardIterator iter(mListeners);
++  while (iter.HasMore()) {
++    nsRefPtr<ReadStream> stream = iter.GetNext();
++    stream->CloseStream();
+   }
+   return true;
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/CacheStreamControlChild.h b/dom/cache/CacheStreamControlChild.h
+--- a/dom/cache/CacheStreamControlChild.h
++++ b/dom/cache/CacheStreamControlChild.h
+@@ -4,17 +4,17 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_cache_CacheStreamControlChild_h
+ #define mozilla_dom_cache_CacheStreamControlChild_h
+ 
+ #include "mozilla/dom/cache/ActorChild.h"
+ #include "mozilla/dom/cache/PCacheStreamControlChild.h"
+-#include "nsTArray.h"
++#include "nsTObserverArray.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ class Feature;
+ class ReadStream;
+ 
+@@ -30,24 +30,28 @@ public:
+   void AddListener(ReadStream* aListener);
+   void RemoveListener(ReadStream* aListener);
+ 
+   void NoteClosed(const nsID& aId);
+ 
+   // ActorChild methods
+   virtual void StartDestroy() MOZ_OVERRIDE;
+ 
++private:
+   // PCacheStreamControlChild methods
+   virtual void ActorDestroy(ActorDestroyReason aReason) MOZ_OVERRIDE;
+   virtual bool RecvClose(const nsID& aId) MOZ_OVERRIDE;
+   virtual bool RecvCloseAll() MOZ_OVERRIDE;
+ 
+-private:
+-  nsTArray<ReadStream*> mListeners;
++  typedef nsTObserverArray<ReadStream*> ReadStreamList;
++  ReadStreamList mListeners;
++
+   nsRefPtr<Feature> mFeature;
+   bool mDestroyStarted;
++
++  NS_DECL_OWNINGTHREAD
+ };
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_cache_CacheStreamControlChild_h
+diff --git a/dom/cache/CacheStreamControlParent.cpp b/dom/cache/CacheStreamControlParent.cpp
+--- a/dom/cache/CacheStreamControlParent.cpp
++++ b/dom/cache/CacheStreamControlParent.cpp
+@@ -11,113 +11,137 @@
+ #include "mozilla/dom/cache/ReadStream.h"
+ #include "mozilla/dom/cache/StreamList.h"
+ #include "nsISupportsImpl.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
++// declared in ActorUtils.h
++void
++DeallocPCacheStreamControlParent(PCacheStreamControlParent* aActor)
++{
++  delete aActor;
++}
++
+ CacheStreamControlParent::CacheStreamControlParent()
+ {
+   MOZ_COUNT_CTOR(cache::CacheStreamControlParent);
+ }
+ 
+ CacheStreamControlParent::~CacheStreamControlParent()
+ {
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+   MOZ_ASSERT(!mStreamList);
+   MOZ_COUNT_DTOR(cache::CacheStreamControlParent);
+ }
+ 
+ void
+ CacheStreamControlParent::AddListener(ReadStream* aListener)
+ {
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+   MOZ_ASSERT(aListener);
+   MOZ_ASSERT(!mListeners.Contains(aListener));
+   mListeners.AppendElement(aListener);
+ }
+ 
+ void
+ CacheStreamControlParent::RemoveListener(ReadStream* aListener)
+ {
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+   MOZ_ASSERT(aListener);
+   DebugOnly<bool> removed = mListeners.RemoveElement(aListener);
+   MOZ_ASSERT(removed);
+ }
+ 
+ void
+ CacheStreamControlParent::ActorDestroy(ActorDestroyReason aReason)
+ {
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+   MOZ_ASSERT(mStreamList);
+-  for (uint32_t i = 0; i < mListeners.Length(); ++i) {
+-    mListeners[i]->CloseStreamWithoutReporting();
++  ReadStreamList::ForwardIterator iter(mListeners);
++  while (iter.HasMore()) {
++    nsRefPtr<ReadStream> stream = iter.GetNext();
++    stream->CloseStreamWithoutReporting();
+   }
+   mStreamList->RemoveStreamControl(this);
+   mStreamList->NoteClosedAll();
+   mStreamList = nullptr;
+ }
+ 
+ bool
+ CacheStreamControlParent::RecvNoteClosed(const nsID& aId)
+ {
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+   MOZ_ASSERT(mStreamList);
+   mStreamList->NoteClosed(aId);
+   return true;
+ }
+ 
+ void
+ CacheStreamControlParent::SetStreamList(StreamList* aStreamList)
+ {
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+   MOZ_ASSERT(!mStreamList);
+   mStreamList = aStreamList;
+ }
+ 
+ void
+ CacheStreamControlParent::Close(const nsID& aId)
+ {
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+   NotifyClose(aId);
+   unused << SendClose(aId);
+ }
+ 
+ void
+ CacheStreamControlParent::CloseAll()
+ {
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+   NotifyCloseAll();
+   unused << SendCloseAll();
+ }
+ 
+ void
+ CacheStreamControlParent::Shutdown()
+ {
+-  unused << Send__delete__(this);
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
++  if (!Send__delete__(this)) {
++    // child process is gone, allow actor to be destroyed normally
++    NS_WARNING("Cache failed to delete stream actor.");
++    return;
++  }
+ }
+ 
+ void
+ CacheStreamControlParent::NotifyClose(const nsID& aId)
+ {
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+   DebugOnly<uint32_t> closedCount = 0;
+ 
+-  // defensive copy of list since may be modified as we close streams
+-  nsAutoTArray<ReadStream*, 256> listeners(mListeners);
+-  for (uint32_t i = 0; i < listeners.Length(); ++i) {
++  ReadStreamList::ForwardIterator iter(mListeners);
++  while (iter.HasMore()) {
++    nsRefPtr<ReadStream> stream = iter.GetNext();
+     // note, multiple streams may exist for same ID
+-    if (listeners[i]->MatchId(aId)) {
+-      listeners[i]->CloseStream();
++    if (stream->MatchId(aId)) {
++      stream->CloseStream();
+       closedCount += 1;
+     }
+   }
+ 
+   MOZ_ASSERT(closedCount > 0);
+ }
+ 
+ void
+ CacheStreamControlParent::NotifyCloseAll()
+ {
+-  // defensive copy of list since may be modified as we close streams
+-  nsAutoTArray<ReadStream*, 256> listeners(mListeners);
+-  for (uint32_t i = 0; i < listeners.Length(); ++i) {
+-    listeners[i]->CloseStream();
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
++  ReadStreamList::ForwardIterator iter(mListeners);
++  while (iter.HasMore()) {
++    nsRefPtr<ReadStream> stream = iter.GetNext();
++    stream->CloseStream();
+   }
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/CacheStreamControlParent.h b/dom/cache/CacheStreamControlParent.h
+--- a/dom/cache/CacheStreamControlParent.h
++++ b/dom/cache/CacheStreamControlParent.h
+@@ -3,16 +3,17 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_cache_CacheStreamControlParent_h
+ #define mozilla_dom_cache_CacheStreamControlParent_h
+ 
+ #include "mozilla/dom/cache/PCacheStreamControlParent.h"
++#include "nsTObserverArray.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ class ReadStream;
+ class StreamList;
+ 
+@@ -38,16 +39,19 @@ private:
+   void NotifyClose(const nsID& aId);
+   void NotifyCloseAll();
+ 
+   // Cycle with StreamList via a weak-ref to us.  Cleanup occurs when the actor
+   // is deleted by the PBackground manager.  ActorDestroy() then calls
+   // StreamList::RemoveStreamControl() to clear the weak ref.
+   nsRefPtr<StreamList> mStreamList;
+ 
+-  nsTArray<ReadStream*> mListeners;
++  typedef nsTObserverArray<ReadStream*> ReadStreamList;
++  ReadStreamList mListeners;
++
++  NS_DECL_OWNINGTHREAD
+ };
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_cache_CacheStreamControlParent_h
+diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
+--- a/dom/cache/Context.cpp
++++ b/dom/cache/Context.cpp
+@@ -362,16 +362,17 @@ public:
+   void Cancel()
+   {
+     NS_ASSERT_OWNINGTHREAD(Action::Resolver);
+     mAction->CancelOnInitiatingThread();
+   }
+ 
+   virtual void Resolve(nsresult aRv) MOZ_OVERRIDE
+   {
++    MOZ_ASSERT(mTarget == NS_GetCurrentThread());
+     MOZ_ASSERT(mState == STATE_RUNNING);
+     mResult = aRv;
+     mState = STATE_COMPLETING;
+     nsresult rv = mInitiatingThread->Dispatch(this, nsIThread::DISPATCH_NORMAL);
+     if (NS_FAILED(rv)) {
+       // Shutdown must be delayed until all Contexts are destroyed.  Crash
+       // for this invariant violation.
+       MOZ_CRASH("Failed to dispatch ActionRunnable to initiating thread.");
+@@ -484,32 +485,41 @@ Context::ActionRunnable::Run()
+     {
+       MOZ_CRASH("unexpected state in ActionRunnable");
+       break;
+     }
+   }
+   return NS_OK;
+ }
+ 
+-Context::Context(Manager* aManager, Action* aQuotaIOThreadAction)
+-  : mManager(aManager)
+-  , mState(STATE_CONTEXT_INIT)
++// static
++already_AddRefed<Context>
++Context::Create(Manager* aManager, Action* aQuotaIOThreadAction)
+ {
+-  MOZ_ASSERT(mManager);
++  nsRefPtr<Context> context = new Context(aManager);
+ 
+   nsRefPtr<QuotaInitRunnable> runnable =
+-    new QuotaInitRunnable(this, mManager, NS_LITERAL_CSTRING("Cache"),
++    new QuotaInitRunnable(context, aManager, NS_LITERAL_CSTRING("Cache"),
+                           aQuotaIOThreadAction);
+   nsresult rv = runnable->Dispatch();
+   if (NS_FAILED(rv)) {
+     // Shutdown must be delayed until all Contexts are destroyed.  Shutdown
+     // must also prevent any new Contexts from being constructed.  Crash
+     // for this invariant violation.
+     MOZ_CRASH("Failed to dispatch QuotaInitRunnable.");
+   }
++
++  return context.forget();
++}
++
++Context::Context(Manager* aManager)
++  : mManager(aManager)
++  , mState(STATE_CONTEXT_INIT)
++{
++  MOZ_ASSERT(mManager);
+ }
+ 
+ void
+ Context::Dispatch(nsIEventTarget* aTarget, Action* aAction)
+ {
+   NS_ASSERT_OWNINGTHREAD(Context);
+   MOZ_ASSERT(aTarget);
+   MOZ_ASSERT(aAction);
+@@ -529,32 +539,34 @@ Context::Dispatch(nsIEventTarget* aTarge
+ 
+ void
+ Context::CancelAll()
+ {
+   NS_ASSERT_OWNINGTHREAD(Context);
+   mState = STATE_CONTEXT_CANCELED;
+   mPendingActions.Clear();
+   for (uint32_t i = 0; i < mActionRunnables.Length(); ++i) {
+-    mActionRunnables[i]->Cancel();
++    nsRefPtr<ActionRunnable> runnable = mActionRunnables[i];
++    runnable->Cancel();
+   }
+ }
+ 
+ void
+ Context::CancelForCacheId(CacheId aCacheId)
+ {
+   NS_ASSERT_OWNINGTHREAD(Context);
+   for (uint32_t i = 0; i < mPendingActions.Length(); ++i) {
+     if (mPendingActions[i].mAction->MatchesCacheId(aCacheId)) {
+       mPendingActions.RemoveElementAt(i);
+     }
+   }
+   for (uint32_t i = 0; i < mActionRunnables.Length(); ++i) {
+-    if (mActionRunnables[i]->MatchesCacheId(aCacheId)) {
+-      mActionRunnables[i]->Cancel();
++    nsRefPtr<ActionRunnable> runnable = mActionRunnables[i];
++    if (runnable->MatchesCacheId(aCacheId)) {
++      runnable->Cancel();
+     }
+   }
+ }
+ 
+ Context::~Context()
+ {
+   NS_ASSERT_OWNINGTHREAD(Context);
+   MOZ_ASSERT(mManager);
+@@ -587,46 +599,40 @@ Context::DispatchAction(nsIEventTarget* 
+   }
+   mActionRunnables.AppendElement(runnable);
+ }
+ 
+ void
+ Context::OnQuotaInit(nsresult aRv, const QuotaInfo& aQuotaInfo)
+ {
+   NS_ASSERT_OWNINGTHREAD(Context);
+-  MOZ_ASSERT(mState == STATE_CONTEXT_INIT);
+ 
+   mQuotaInfo = aQuotaInfo;
+ 
+-  if (NS_FAILED(aRv)) {
++  if (mState == STATE_CONTEXT_CANCELED || NS_FAILED(aRv)) {
+     for (uint32_t i = 0; i < mPendingActions.Length(); ++i) {
+       mPendingActions[i].mAction->CompleteOnInitiatingThread(aRv);
+     }
+     mPendingActions.Clear();
+     // Context will destruct after return here and last ref is released.
+     return;
+   }
+ 
++  MOZ_ASSERT(mState == STATE_CONTEXT_INIT);
+   mState = STATE_CONTEXT_READY;
+ 
+   for (uint32_t i = 0; i < mPendingActions.Length(); ++i) {
+     DispatchAction(mPendingActions[i].mTarget, mPendingActions[i].mAction);
+   }
+   mPendingActions.Clear();
+ }
+ 
+ void
+ Context::OnActionRunnableComplete(ActionRunnable* aActionRunnable)
+ {
+   NS_ASSERT_OWNINGTHREAD(Context);
+   MOZ_ASSERT(aActionRunnable);
+-  for (uint32_t i = 0; i < mActionRunnables.Length(); ++i) {
+-    if (aActionRunnable == mActionRunnables[i]) {
+-      mActionRunnables.RemoveElementAt(i);
+-      return;
+-    }
+-  }
+-  MOZ_ASSERT(false);
++  MOZ_ALWAYS_TRUE(mActionRunnables.RemoveElement(aActionRunnable));
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/Context.h b/dom/cache/Context.h
+--- a/dom/cache/Context.h
++++ b/dom/cache/Context.h
+@@ -40,17 +40,18 @@ class Manager;
+ // originally used to create the Context.
+ //
+ // As an invariant, all Context objects must be destroyed before permitting
+ // the "profile-before-change" shutdown event to complete.  This is ensured
+ // via the code in ShutdownObserver.cpp.
+ class Context MOZ_FINAL
+ {
+ public:
+-  Context(Manager* aManager, Action* aQuotaIOThreadAction);
++  static already_AddRefed<Context>
++  Create(Manager* aManager, Action* aQuotaIOThreadAction);
+ 
+   // Execute given action on the target once the quota manager has been
+   // initialized.
+   //
+   // Only callable from the thread that created the Context.
+   void Dispatch(nsIEventTarget* aTarget, Action* aAction);
+ 
+   // Cancel any Actions running or waiting to run.  This should allow the
+@@ -78,16 +79,17 @@ private:
+   };
+ 
+   struct PendingAction
+   {
+     nsCOMPtr<nsIEventTarget> mTarget;
+     nsRefPtr<Action> mAction;
+   };
+ 
++  Context(Manager* aManager);
+   ~Context();
+   void DispatchAction(nsIEventTarget* aTarget, Action* aAction);
+   void OnQuotaInit(nsresult aRv, const QuotaInfo& aQuotaInfo);
+   void OnActionRunnableComplete(ActionRunnable* const aAction);
+ 
+   nsRefPtr<Manager> mManager;
+   State mState;
+   QuotaInfo mQuotaInfo;
+diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
+--- a/dom/cache/FileUtils.cpp
++++ b/dom/cache/FileUtils.cpp
+@@ -54,17 +54,17 @@ FileUtils::BodyGetCacheDir(nsIFile* aBas
+ {
+   MOZ_ASSERT(aBaseDir);
+   MOZ_ASSERT(aCacheDirOut);
+ 
+   *aCacheDirOut = nullptr;
+ 
+   nsresult rv = aBaseDir->Clone(aCacheDirOut);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+-  if (NS_WARN_IF(!*aCacheDirOut)) { return NS_ERROR_UNEXPECTED; }
++  MOZ_ASSERT(*aCacheDirOut);
+ 
+   rv = (*aCacheDirOut)->Append(NS_LITERAL_STRING("morgue"));
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   // Some file systems have poor performance when there are too many files
+   // in a single directory.  Mitigate this issue by spreading the body
+   // files out into sub-directories.  We use the last byte of the ID for
+   // the name of the sub-directory.
+@@ -166,25 +166,21 @@ FileUtils::BodyFinalizeWrite(nsIFile* aB
+   nsCOMPtr<nsIFile> tmpFile;
+   nsresult rv = BodyIdToFile(aBaseDir, aId, BODY_FILE_TMP, getter_AddRefs(tmpFile));
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   nsCOMPtr<nsIFile> finalFile;
+   rv = BodyIdToFile(aBaseDir, aId, BODY_FILE_FINAL, getter_AddRefs(finalFile));
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+-  nsCOMPtr<nsIFile> finalDir;
+-  rv = finalFile->GetParent(getter_AddRefs(finalDir));
+-  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+-
+   nsAutoString finalFileName;
+   rv = finalFile->GetLeafName(finalFileName);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+-  rv = tmpFile->RenameTo(finalDir, finalFileName);
++  rv = tmpFile->RenameTo(nullptr, finalFileName);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   return rv;
+ }
+ 
+ // static
+ nsresult
+ FileUtils::BodyOpen(const QuotaInfo& aQuotaInfo, nsIFile* aBaseDir,
+@@ -259,22 +255,22 @@ FileUtils::BodyIdToFile(nsIFile* aBaseDi
+ {
+   MOZ_ASSERT(aBaseDir);
+   MOZ_ASSERT(aBodyFileOut);
+ 
+   *aBodyFileOut = nullptr;
+ 
+   nsresult rv = BodyGetCacheDir(aBaseDir, aId, aBodyFileOut);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+-  if (NS_WARN_IF(!(*aBodyFileOut))) { return NS_ERROR_UNEXPECTED; }
++  MOZ_ASSERT(*aBodyFileOut);
+ 
+   char idString[NSID_LENGTH];
+   aId.ToProvidedString(idString);
+ 
+-  NS_ConvertUTF8toUTF16 fileName(idString);
++  NS_ConvertASCIItoUTF16 fileName(idString);
+ 
+   if (aType == BODY_FILE_FINAL) {
+     fileName.AppendLiteral(".final");
+   } else {
+     fileName.AppendLiteral(".tmp");
+   }
+ 
+   rv = (*aBodyFileOut)->Append(fileName);
+diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
+--- a/dom/cache/Manager.cpp
++++ b/dom/cache/Manager.cpp
+@@ -171,24 +171,19 @@ public:
+   {
+     mozilla::ipc::AssertIsOnBackgroundThread();
+ 
+     nsresult rv = MaybeCreateInstance();
+     if (NS_WARN_IF(NS_FAILED(rv))) { return nullptr; }
+ 
+     ManagerList::ForwardIterator iter(sFactory->mManagerList);
+     while (iter.HasMore()) {
+-      // Weak ref to avoid a ton of AddRef calls on iteration.  We are
+-      // guaranteed won't be deleted since the manager list can only be
+-      // accessed on the background thread.
+-      Manager* manager = iter.GetNext();
+-      MOZ_ASSERT(manager);
++      nsRefPtr<Manager> manager = iter.GetNext();
+       if (*manager->mManagerId == *aManagerId) {
+-        nsRefPtr<Manager> ref = manager;
+-        return ref.forget();
++        return manager.forget();
+       }
+     }
+ 
+     return nullptr;
+   }
+ 
+   static void Remove(Manager* aManager)
+   {
+@@ -322,17 +317,18 @@ private:
+       sFactoryShutdownComplete = true;
+       return;
+     }
+ 
+     MOZ_ASSERT(!sFactory->mManagerList.IsEmpty());
+ 
+     ManagerList::ForwardIterator iter(sFactory->mManagerList);
+     while (iter.HasMore()) {
+-      iter.GetNext()->Shutdown();
++      nsRefPtr<Manager> manager = iter.GetNext();
++      manager->Shutdown();
+     }
+   }
+ 
+   class ShutdownAllRunnable : public nsRunnable
+   {
+   public:
+     NS_IMETHOD Run()
+     {
+@@ -397,25 +393,25 @@ class Manager::BaseAction : public SyncD
+ {
+ protected:
+   BaseAction(Manager* aManager, ListenerId aListenerId, RequestId aRequestId)
+     : SyncDBAction(DBAction::Existing)
+     , mManager(aManager)
+     , mListenerId(aListenerId)
+     , mRequestId (aRequestId)
+   {
+-    MOZ_ASSERT(mListenerId);
+   }
+ 
+   virtual void
+   Complete(Listener* aListener, nsresult aRv) = 0;
+ 
+   virtual void
+   CompleteOnInitiatingThread(nsresult aRv) MOZ_OVERRIDE
+   {
++    NS_ASSERT_OWNINGTHREAD(Manager::BaseAction);
+     Listener* listener = mManager->GetListener(mListenerId);
+     if (listener) {
+       Complete(listener, aRv);
+     }
+ 
+     // ensure we release the manager on the initiating thread
+     mManager = nullptr;
+   }
+@@ -618,16 +614,17 @@ public:
+     , mListenerId(aListenerId)
+     , mRequestId(aRequestId)
+     , mCacheId(aCacheId)
+     , mList(aPutList.Length())
+     , mExpectedAsyncCopyCompletions(1)
+     , mAsyncResult(NS_OK)
+     , mMutex("cache::Manager::CachePutAllAction")
+   {
++    MOZ_ASSERT(!aPutList.IsEmpty());
+     MOZ_ASSERT(aPutList.Length() == aRequestStreamList.Length());
+     MOZ_ASSERT(aPutList.Length() == aResponseStreamList.Length());
+ 
+     for (uint32_t i = 0; i < aPutList.Length(); ++i) {
+       Entry* entry = mList.AppendElement();
+       entry->mRequest = aPutList[i].request();
+       entry->mRequestStream = aRequestStreamList[i];
+       entry->mResponse = aPutList[i].response();
+@@ -1203,29 +1200,29 @@ public:
+     , mKey(aKey)
+     , mCacheId(0)
+   { }
+ 
+   virtual nsresult
+   RunSyncWithDBOnTarget(const QuotaInfo& aQuotaInfo, nsIFile* aDBDir,
+                         mozIStorageConnection* aConn) MOZ_OVERRIDE
+   {
++    // Cache does not exist, create it instead
++    mozStorageTransaction trans(aConn, false,
++                                mozIStorageConnection::TRANSACTION_IMMEDIATE);
++
+     // Look for existing cache
+     bool cacheFound;
+     nsresult rv = DBSchema::StorageGetCacheId(aConn, mNamespace, mKey,
+                                               &cacheFound, &mCacheId);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+     if (cacheFound) {
+       return rv;
+     }
+ 
+-    // Cache does not exist, create it instead
+-    mozStorageTransaction trans(aConn, false,
+-                                mozIStorageConnection::TRANSACTION_IMMEDIATE);
+-
+     rv = DBSchema::CreateCache(aConn, &mCacheId);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+     rv = DBSchema::StoragePutCache(aConn, mNamespace, mKey, mCacheId);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+     rv = trans.Commit();
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+@@ -1291,20 +1288,21 @@ public:
+   Complete(Listener* aListener, nsresult aRv) MOZ_OVERRIDE
+   {
+     if (mCacheDeleted) {
+       // If content is referencing this cache, mark it orphaned to be
+       // deleted later.
+       if (!mManager->SetCacheIdOrphanedIfRefed(mCacheId)) {
+ 
+         // no outstanding references, delete immediately
+-        mManager->CurrentContext()->CancelForCacheId(mCacheId);
++        nsRefPtr<Context> context = mManager->CurrentContext();
++        context->CancelForCacheId(mCacheId);
+         nsRefPtr<Action> action =
+           new DeleteOrphanedCacheAction(mManager, mCacheId);
+-        mManager->CurrentContext()->Dispatch(mManager->mIOThread, action);
++        context->Dispatch(mManager->mIOThread, action);
+       }
+     }
+ 
+     aListener->OnStorageDelete(mRequestId, aRv, mCacheDeleted);
+   }
+ 
+ private:
+   const Namespace mNamespace;
+@@ -1342,16 +1340,19 @@ public:
+ 
+ private:
+   const Namespace mNamespace;
+   nsTArray<nsString> mKeys;
+ };
+ 
+ // ----------------------------------------------------------------------------
+ 
++//static
++Manager::ListenerId Manager::sNextListenerId = 0;
++
+ // static
+ nsresult
+ Manager::GetOrCreate(ManagerId* aManagerId, Manager** aManagerOut)
+ {
+   mozilla::ipc::AssertIsOnBackgroundThread();
+   return Factory::GetOrCreate(aManagerId, aManagerOut);
+ }
+ 
+@@ -1378,18 +1379,21 @@ Manager::ShutdownAllOnMainThread()
+     }
+   }
+ }
+ 
+ void
+ Manager::RemoveListener(Listener* aListener)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+-  mListeners.RemoveElement(aListener);
+-  MOZ_ASSERT(!mListeners.Contains(aListener));
++  // There may not be a listener here in the case where an actor is killed
++  // before it can perform any actual async requests on Manager.
++  mListeners.RemoveElement(aListener, ListenerEntryListenerComparator());
++  MOZ_ASSERT(!mListeners.Contains(aListener,
++                                  ListenerEntryListenerComparator()));
+ }
+ 
+ void
+ Manager::RemoveContext(Context* aContext)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(mContext);
+   MOZ_ASSERT(mContext == aContext);
+@@ -1427,20 +1431,21 @@ Manager::ReleaseCacheId(CacheId aCacheId
+       DebugOnly<uint32_t> oldRef = mCacheIdRefs[i].mCount;
+       mCacheIdRefs[i].mCount -= 1;
+       MOZ_ASSERT(mCacheIdRefs[i].mCount < oldRef);
+       if (mCacheIdRefs[i].mCount == 0) {
+         bool orphaned = mCacheIdRefs[i].mOrphaned;
+         mCacheIdRefs.RemoveElementAt(i);
+         // TODO: note that we need to check this cache for staleness on startup (bug 1110446)
+         if (orphaned && !mShuttingDown) {
+-          CurrentContext()->CancelForCacheId(aCacheId);
++          nsRefPtr<Context> context = CurrentContext();
++          context->CancelForCacheId(aCacheId);
+           nsRefPtr<Action> action = new DeleteOrphanedCacheAction(this,
+                                                                   aCacheId);
+-          CurrentContext()->Dispatch(mIOThread, action);
++          context->Dispatch(mIOThread, action);
+         }
+       }
+       return;
+     }
+   }
+   MOZ_ASSERT_UNREACHABLE("Attempt to release CacheId that is not referenced!");
+ }
+ 
+@@ -1470,17 +1475,18 @@ Manager::ReleaseBodyId(const nsID& aBody
+       mBodyIdRefs[i].mCount -= 1;
+       MOZ_ASSERT(mBodyIdRefs[i].mCount < oldRef);
+       if (mBodyIdRefs[i].mCount < 1) {
+         bool orphaned = mBodyIdRefs[i].mOrphaned;
+         mBodyIdRefs.RemoveElementAt(i);
+         // TODO: note that we need to check this body for staleness on startup (bug 1110446)
+         if (orphaned && !mShuttingDown) {
+           nsRefPtr<Action> action = new DeleteOrphanedBodyAction(aBodyId);
+-          CurrentContext()->Dispatch(mIOThread, action);
++          nsRefPtr<Context> context = CurrentContext();
++          context->Dispatch(mIOThread, action);
+         }
+       }
+       return;
+     }
+   }
+   MOZ_ASSERT_UNREACHABLE("Attempt to release BodyId that is not referenced!");
+ }
+ 
+@@ -1514,42 +1520,44 @@ Manager::CacheMatch(Listener* aListener,
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(aListener);
+   if (mShuttingDown) {
+     aListener->OnCacheMatch(aRequestId, NS_ERROR_ILLEGAL_DURING_SHUTDOWN,
+                             nullptr, nullptr);
+     return;
+   }
+-  nsRefPtr<StreamList> streamList = new StreamList(this, CurrentContext());
++  nsRefPtr<Context> context = CurrentContext();
++  nsRefPtr<StreamList> streamList = new StreamList(this, context);
+   ListenerId listenerId = SaveListener(aListener);
+   nsRefPtr<Action> action = new CacheMatchAction(this, listenerId, aRequestId,
+                                                  aCacheId, aRequest, aParams,
+                                                  streamList);
+-  CurrentContext()->Dispatch(mIOThread, action);
++  context->Dispatch(mIOThread, action);
+ }
+ 
+ void
+ Manager::CacheMatchAll(Listener* aListener, RequestId aRequestId,
+                        CacheId aCacheId, const PCacheRequestOrVoid& aRequest,
+                        const PCacheQueryParams& aParams)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(aListener);
+   if (mShuttingDown) {
+     aListener->OnCacheMatchAll(aRequestId, NS_ERROR_ILLEGAL_DURING_SHUTDOWN,
+                                nsTArray<SavedResponse>(), nullptr);
+     return;
+   }
+-  nsRefPtr<StreamList> streamList = new StreamList(this, CurrentContext());
++  nsRefPtr<Context> context = CurrentContext();
++  nsRefPtr<StreamList> streamList = new StreamList(this, context);
+   ListenerId listenerId = SaveListener(aListener);
+   nsRefPtr<Action> action = new CacheMatchAllAction(this, listenerId, aRequestId,
+                                                     aCacheId, aRequest, aParams,
+                                                     streamList);
+-  CurrentContext()->Dispatch(mIOThread, action);
++  context->Dispatch(mIOThread, action);
+ }
+ 
+ void
+ Manager::CachePutAll(Listener* aListener, RequestId aRequestId, CacheId aCacheId,
+                      const nsTArray<CacheRequestResponse>& aPutList,
+                      const nsTArray<nsCOMPtr<nsIInputStream>>& aRequestStreamList,
+                      const nsTArray<nsCOMPtr<nsIInputStream>>& aResponseStreamList)
+ {
+@@ -1559,141 +1567,149 @@ Manager::CachePutAll(Listener* aListener
+     aListener->OnCachePutAll(aRequestId, NS_ERROR_ILLEGAL_DURING_SHUTDOWN);
+     return;
+   }
+   ListenerId listenerId = SaveListener(aListener);
+   nsRefPtr<Action> action = new CachePutAllAction(this, listenerId, aRequestId,
+                                                   aCacheId, aPutList,
+                                                   aRequestStreamList,
+                                                   aResponseStreamList);
+-  CurrentContext()->Dispatch(mIOThread, action);
++  nsRefPtr<Context> context = CurrentContext();
++  context->Dispatch(mIOThread, action);
+ }
+ 
+ void
+ Manager::CacheDelete(Listener* aListener, RequestId aRequestId,
+                      CacheId aCacheId, const PCacheRequest& aRequest,
+                      const PCacheQueryParams& aParams)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(aListener);
+   if (mShuttingDown) {
+     aListener->OnCacheDelete(aRequestId, NS_ERROR_ILLEGAL_DURING_SHUTDOWN, false);
+     return;
+   }
+   ListenerId listenerId = SaveListener(aListener);
+   nsRefPtr<Action> action = new CacheDeleteAction(this, listenerId, aRequestId,
+                                                   aCacheId, aRequest, aParams);
+-  CurrentContext()->Dispatch(mIOThread, action);
++  nsRefPtr<Context> context = CurrentContext();
++  context->Dispatch(mIOThread, action);
+ }
+ 
+ void
+ Manager::CacheKeys(Listener* aListener, RequestId aRequestId,
+                    CacheId aCacheId, const PCacheRequestOrVoid& aRequestOrVoid,
+                    const PCacheQueryParams& aParams)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(aListener);
+   if (mShuttingDown) {
+     aListener->OnCacheKeys(aRequestId, NS_ERROR_ILLEGAL_DURING_SHUTDOWN,
+                            nsTArray<SavedRequest>(), nullptr);
+     return;
+   }
+-  nsRefPtr<StreamList> streamList = new StreamList(this, CurrentContext());
++  nsRefPtr<Context> context = CurrentContext();
++  nsRefPtr<StreamList> streamList = new StreamList(this, context);
+   ListenerId listenerId = SaveListener(aListener);
+   nsRefPtr<Action> action = new CacheKeysAction(this, listenerId, aRequestId,
+                                                 aCacheId, aRequestOrVoid,
+                                                 aParams, streamList);
+-  CurrentContext()->Dispatch(mIOThread, action);
++  context->Dispatch(mIOThread, action);
+ }
+ 
+ void
+ Manager::StorageMatch(Listener* aListener, RequestId aRequestId,
+                       Namespace aNamespace, const PCacheRequest& aRequest,
+                       const PCacheQueryParams& aParams)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(aListener);
+   if (mShuttingDown) {
+     aListener->OnStorageMatch(aRequestId, NS_ERROR_ILLEGAL_DURING_SHUTDOWN,
+                               nullptr, nullptr);
+     return;
+   }
+-  nsRefPtr<StreamList> streamList = new StreamList(this, CurrentContext());
++  nsRefPtr<Context> context = CurrentContext();
++  nsRefPtr<StreamList> streamList = new StreamList(this, context);
+   ListenerId listenerId = SaveListener(aListener);
+   nsRefPtr<Action> action = new StorageMatchAction(this, listenerId, aRequestId,
+                                                    aNamespace, aRequest,
+                                                    aParams, streamList);
+-  CurrentContext()->Dispatch(mIOThread, action);
++  context->Dispatch(mIOThread, action);
+ }
+ 
+ void
+ Manager::StorageHas(Listener* aListener, RequestId aRequestId,
+                     Namespace aNamespace, const nsAString& aKey)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(aListener);
+   if (mShuttingDown) {
+     aListener->OnStorageHas(aRequestId, NS_ERROR_ILLEGAL_DURING_SHUTDOWN,
+                             false);
+     return;
+   }
+   ListenerId listenerId = SaveListener(aListener);
+   nsRefPtr<Action> action = new StorageHasAction(this, listenerId, aRequestId,
+                                                  aNamespace, aKey);
+-  CurrentContext()->Dispatch(mIOThread, action);
++  nsRefPtr<Context> context = CurrentContext();
++  context->Dispatch(mIOThread, action);
+ }
+ 
+ void
+ Manager::StorageOpen(Listener* aListener, RequestId aRequestId,
+                      Namespace aNamespace, const nsAString& aKey)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(aListener);
+   if (mShuttingDown) {
+     aListener->OnStorageOpen(aRequestId, NS_ERROR_ILLEGAL_DURING_SHUTDOWN, 0);
+     return;
+   }
+   ListenerId listenerId = SaveListener(aListener);
+   nsRefPtr<Action> action = new StorageOpenAction(this, listenerId, aRequestId,
+                                                   aNamespace, aKey);
+-  CurrentContext()->Dispatch(mIOThread, action);
++  nsRefPtr<Context> context = CurrentContext();
++  context->Dispatch(mIOThread, action);
+ }
+ 
+ void
+ Manager::StorageDelete(Listener* aListener, RequestId aRequestId,
+                        Namespace aNamespace, const nsAString& aKey)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(aListener);
+   if (mShuttingDown) {
+     aListener->OnStorageDelete(aRequestId, NS_ERROR_ILLEGAL_DURING_SHUTDOWN,
+                                false);
+     return;
+   }
+   ListenerId listenerId = SaveListener(aListener);
+   nsRefPtr<Action> action = new StorageDeleteAction(this, listenerId, aRequestId,
+                                                     aNamespace, aKey);
+-  CurrentContext()->Dispatch(mIOThread, action);
++  nsRefPtr<Context> context = CurrentContext();
++  context->Dispatch(mIOThread, action);
+ }
+ 
+ void
+ Manager::StorageKeys(Listener* aListener, RequestId aRequestId,
+                      Namespace aNamespace)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(aListener);
+   if (mShuttingDown) {
+     aListener->OnStorageKeys(aRequestId, NS_ERROR_ILLEGAL_DURING_SHUTDOWN,
+                              nsTArray<nsString>());
+     return;
+   }
+   ListenerId listenerId = SaveListener(aListener);
+   nsRefPtr<Action> action = new StorageKeysAction(this, listenerId, aRequestId,
+                                                   aNamespace);
+-  CurrentContext()->Dispatch(mIOThread, action);
++  nsRefPtr<Context> context = CurrentContext();
++  context->Dispatch(mIOThread, action);
+ }
+ 
+ Manager::Manager(ManagerId* aManagerId, nsIThread* aIOThread)
+   : mManagerId(aManagerId)
+   , mIOThread(aIOThread)
+   , mContext(nullptr)
+   , mShuttingDown(false)
+ {
+@@ -1701,17 +1717,25 @@ Manager::Manager(ManagerId* aManagerId, 
+   MOZ_ASSERT(mIOThread);
+ }
+ 
+ Manager::~Manager()
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(!mContext);
+   Shutdown();
+-  mIOThread->Shutdown();
++
++  nsCOMPtr<nsIThread> ioThread;
++  mIOThread.swap(ioThread);
++
++  // Don't spin the event loop in the destructor waiting for the thread to
++  // shutdown.  Defer this to the main thread, instead.
++  nsCOMPtr<nsIRunnable> runnable =
++    NS_NewRunnableMethod(ioThread, &nsIThread::Shutdown);
++  MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(runnable)));
+ }
+ 
+ void
+ Manager::Shutdown()
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+ 
+   // Ignore duplicate attempts to shutdown.  This can occur when we start
+@@ -1722,67 +1746,75 @@ Manager::Shutdown()
+   }
+ 
+   // Set a flag to prevent any new requests from coming in and creating
+   // a new Context.  We must ensure all Contexts and IO operations are
+   // complete before shutdown proceeds.
+   mShuttingDown = true;
+ 
+   for (uint32_t i = 0; i < mStreamLists.Length(); ++i) {
+-    mStreamLists[i]->CloseAll();
++    nsRefPtr<StreamList> streamList = mStreamLists[i];
++    streamList->CloseAll();
+   }
+ 
+   // If there is a context, then we must wait for it to complete.  Cancel and
+   // only note that we are done after its cleaned up.
+   if (mContext) {
+-    mContext->CancelAll();
++    nsRefPtr<Context> context = mContext;
++    context->CancelAll();
+     return;
+   }
+ 
+   // Otherwise, note that we are complete immediately
+   Factory::Remove(this);
+ }
+ 
+-Context*
++already_AddRefed<Context>
+ Manager::CurrentContext()
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+-  if (!mContext) {
++  nsRefPtr<Context> ref = mContext;
++  if (!ref) {
+     MOZ_ASSERT(!mShuttingDown);
+     nsRefPtr<Action> setupAction = new SetupAction();
+-    mContext = new Context(this, setupAction);
++    ref = Context::Create(this, setupAction);
++    mContext = ref;
+   }
+-  return mContext;
++  return ref.forget();
+ }
+ 
+ Manager::ListenerId
+ Manager::SaveListener(Listener* aListener)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+ 
+   // Once a Listener is added, we keep a reference to it until its
+   // removed.  Since the same Listener might make multiple requests,
+   // ensure we only have a single reference in our list.
+-  for (uint32_t i = 0; i < mListeners.Length(); ++i) {
+-    if (mListeners[i] == aListener) {
+-      return reinterpret_cast<ListenerId>(aListener);
+-    }
++  ListenerList::index_type index =
++    mListeners.IndexOf(aListener, 0, ListenerEntryListenerComparator());
++  if (index != ListenerList::NoIndex) {
++    return mListeners[index].mId;
+   }
+-  mListeners.AppendElement(aListener);
+-  return reinterpret_cast<ListenerId>(aListener);
++
++  ListenerId id = sNextListenerId;
++  sNextListenerId += 1;
++
++  mListeners.AppendElement(ListenerEntry(id, aListener));
++  return id;
+ }
+ 
+ Manager::Listener*
+ Manager::GetListener(ListenerId aListenerId) const
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+-  for (uint32_t i = 0; i < mListeners.Length(); ++i) {
+-    if (reinterpret_cast<ListenerId>(mListeners[i]) == aListenerId) {
+-      return mListeners[i];
+-    }
++  ListenerList::index_type index =
++    mListeners.IndexOf(aListenerId, 0, ListenerEntryIdComparator());
++  if (index != ListenerList::NoIndex) {
++    return mListeners[index].mListener;
+   }
+ 
+   // This can legitimately happen if the actor is deleted while a request is
+   // in process.  For example, the child process OOMs.
+   return nullptr;
+ }
+ 
+ bool
+@@ -1828,15 +1860,16 @@ Manager::NoteOrphanedBodyIdList(const ns
+   for (uint32_t i = 0; i < aDeletedBodyIdList.Length(); ++i) {
+     if (!SetBodyIdOrphanedIfRefed(aDeletedBodyIdList[i])) {
+       deleteNowList.AppendElement(aDeletedBodyIdList[i]);
+     }
+   }
+ 
+   if (!deleteNowList.IsEmpty()) {
+     nsRefPtr<Action> action = new DeleteOrphanedBodyAction(deleteNowList);
+-    CurrentContext()->Dispatch(mIOThread, action);
++    nsRefPtr<Context> context = CurrentContext();
++    context->Dispatch(mIOThread, action);
+   }
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
+--- a/dom/cache/Manager.h
++++ b/dom/cache/Manager.h
+@@ -187,38 +187,76 @@ private:
+   class CacheKeysAction;
+ 
+   class StorageMatchAction;
+   class StorageHasAction;
+   class StorageOpenAction;
+   class StorageDeleteAction;
+   class StorageKeysAction;
+ 
+-  typedef uintptr_t ListenerId;
++  typedef uint64_t ListenerId;
+ 
+   Manager(ManagerId* aManagerId, nsIThread* aIOThread);
+   ~Manager();
+   void Shutdown();
+-  Context* CurrentContext();
++  already_AddRefed<Context> CurrentContext();
+ 
+   ListenerId SaveListener(Listener* aListener);
+   Listener* GetListener(ListenerId aListenerId) const;
+ 
+   bool SetCacheIdOrphanedIfRefed(CacheId aCacheId);
+   bool SetBodyIdOrphanedIfRefed(const nsID& aBodyId);
+   void NoteOrphanedBodyIdList(const nsTArray<nsID>& aDeletedBodyIdList);
+ 
+   nsRefPtr<ManagerId> mManagerId;
+   nsCOMPtr<nsIThread> mIOThread;
+ 
+   // Weak reference cleared by RemoveContext() in Context destructor.
+   Context* MOZ_NON_OWNING_REF mContext;
+ 
+   // Weak references cleared by RemoveListener() in Listener destructors.
+-  nsTArray<Listener*> mListeners;
++  struct ListenerEntry
++  {
++    ListenerEntry()
++      : mId(UINT64_MAX),
++      mListener(nullptr)
++    {
++    }
++
++    ListenerEntry(ListenerId aId, Listener* aListener)
++      : mId(aId)
++      , mListener(aListener)
++    {
++    }
++
++    ListenerId mId;
++    Listener* mListener;
++  };
++
++  class ListenerEntryIdComparator
++  {
++  public:
++    bool Equals(const ListenerEntry& aA, const ListenerId& aB) const
++    {
++      return aA.mId == aB;
++    }
++  };
++
++  class ListenerEntryListenerComparator
++  {
++  public:
++    bool Equals(const ListenerEntry& aA, const Listener* aB) const
++    {
++      return aA.mListener == aB;
++    }
++  };
++
++  typedef nsTArray<ListenerEntry> ListenerList;
++  ListenerList mListeners;
++  static ListenerId sNextListenerId;
+ 
+   // Weak references cleared by RemoveStreamList() in StreamList destructors.
+   nsTArray<StreamList*> mStreamLists;
+ 
+   bool mShuttingDown;
+ 
+   struct CacheIdRefCounter
+   {
+diff --git a/dom/cache/PCache.ipdl b/dom/cache/PCache.ipdl
+--- a/dom/cache/PCache.ipdl
++++ b/dom/cache/PCache.ipdl
+@@ -4,17 +4,18 @@
+ 
+ include protocol PBackground;
+ include PCacheTypes;
+ include protocol PFileDescriptorSet;
+ 
+ include protocol PBlob; // FIXME: bug 792908
+ include protocol PCacheStreamControl;
+ 
+-using mozilla::dom::cache::RequestId from "mozilla/dom/cache/IPCUtils.h";
++using mozilla::dom::cache::RequestId from "mozilla/dom/cache/Types.h";
++include "mozilla/dom/cache/IPCUtils.h";
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ protocol PCache
+ {
+   manager PBackground;
+diff --git a/dom/cache/PrincipalVerifier.cpp b/dom/cache/PrincipalVerifier.cpp
+--- a/dom/cache/PrincipalVerifier.cpp
++++ b/dom/cache/PrincipalVerifier.cpp
+@@ -10,49 +10,44 @@
+ #include "mozilla/dom/ContentParent.h"
+ #include "mozilla/dom/cache/ManagerId.h"
+ #include "mozilla/ipc/BackgroundParent.h"
+ #include "mozilla/ipc/PBackgroundParent.h"
+ #include "mozilla/ipc/BackgroundUtils.h"
+ #include "nsIPrincipal.h"
+ #include "nsIScriptSecurityManager.h"
+ #include "nsNetUtil.h"
+-#include "nsProxyRelease.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ using mozilla::ipc::AssertIsOnBackgroundThread;
+ using mozilla::ipc::BackgroundParent;
+ using mozilla::ipc::PBackgroundParent;
+ using mozilla::ipc::PrincipalInfo;
+ using mozilla::ipc::PrincipalInfoToPrincipal;
+ 
+ // static
+-nsresult
++already_AddRefed<PrincipalVerifier>
+ PrincipalVerifier::CreateAndDispatch(Listener* aListener,
+                                      PBackgroundParent* aActor,
+-                                     const PrincipalInfo& aPrincipalInfo,
+-                                     PrincipalVerifier** aVerifierOut)
++                                     const PrincipalInfo& aPrincipalInfo)
+ {
+   // We must get the ContentParent actor from the PBackgroundParent.  This
+   // only works on the PBackground thread.
+   AssertIsOnBackgroundThread();
+ 
+   nsRefPtr<PrincipalVerifier> verifier = new PrincipalVerifier(aListener,
+                                                                aActor,
+                                                                aPrincipalInfo);
+ 
+-  nsresult rv = NS_DispatchToMainThread(verifier);
+-  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++  MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(verifier)));
+ 
+-  verifier.forget(aVerifierOut);
+-
+-  return NS_OK;
++  return verifier.forget();
+ }
+ 
+ void
+ PrincipalVerifier::ClearListener()
+ {
+   AssertIsOnBackgroundThread();
+   MOZ_ASSERT(mListener);
+   mListener = nullptr;
+@@ -75,31 +70,19 @@ PrincipalVerifier::PrincipalVerifier(Lis
+ PrincipalVerifier::~PrincipalVerifier()
+ {
+   // Since the PrincipalVerifier is a Runnable that executes on multiple
+   // threads, its a race to see which thread de-refs us last.  Therefore
+   // we cannot guarantee which thread we destruct on.
+ 
+   MOZ_ASSERT(!mListener);
+ 
+-  // If we are on the main thread, the normal destruction is fine.  Likewise,
+-  // if we don't have an actor.  We only have to do special action if we're
+-  // releasing the ContentParent actor off the main thread.
+-  if (!mActor || NS_IsMainThread()) {
+-    return;
+-  }
+-
+-  // Otherwise we need to proxy to main thread to do the release
+-
+-  // The PBackground worker thread shouldn't be running after the main thread
+-  // is stopped.  So main thread is guaranteed to exist here.
+-  nsCOMPtr<nsIThread> mainThread = do_GetMainThread();
+-  MOZ_ASSERT(mainThread);
+-
+-  NS_ProxyRelease(mainThread, ToSupports(mActor.forget().take()));
++  // We should always be able to explicitly release the actor on the main
++  // thread.
++  MOZ_ASSERT(!mActor);
+ }
+ 
+ NS_IMETHODIMP
+ PrincipalVerifier::Run()
+ {
+   // Executed twice.  First, on the main thread and then back on the
+   // originating thread.
+ 
+@@ -112,16 +95,21 @@ PrincipalVerifier::Run()
+   return NS_OK;
+ }
+ 
+ void
+ PrincipalVerifier::VerifyOnMainThread()
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+ 
++  // No matter what happens, we need to release the actor before leaving
++  // this method.
++  nsRefPtr<ContentParent> actor;
++  actor.swap(mActor);
++
+   nsresult rv;
+   nsRefPtr<nsIPrincipal> principal = PrincipalInfoToPrincipal(mPrincipalInfo,
+                                                               &rv);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     DispatchToInitiatingThread(rv);
+     return;
+   }
+ 
+@@ -129,28 +117,29 @@ PrincipalVerifier::VerifyOnMainThread()
+   // double-check here.
+   if (NS_WARN_IF(principal->GetIsNullPrincipal() ||
+                  principal->GetUnknownAppId())) {
+     DispatchToInitiatingThread(NS_ERROR_FAILURE);
+     return;
+   }
+ 
+   // Verify that a child process claims to own the app for this principal
+-  if (NS_WARN_IF(mActor && !AssertAppPrincipal(mActor, principal))) {
++  if (NS_WARN_IF(actor && !AssertAppPrincipal(actor, principal))) {
+     DispatchToInitiatingThread(NS_ERROR_FAILURE);
+     return;
+   }
+-  mActor = nullptr;
++  actor = nullptr;
+ 
+   nsCOMPtr<nsIScriptSecurityManager> ssm = nsContentUtils::GetSecurityManager();
+   if (NS_WARN_IF(!ssm)) {
+     DispatchToInitiatingThread(NS_ERROR_ILLEGAL_DURING_SHUTDOWN);
+     return;
+   }
+ 
++#ifdef DEBUG
+   // Sanity check principal origin by using it to construct a URI and security
+   // checking it.  Don't do this for the system principal, though, as its origin
+   // is a synthetic [System Principal] string.
+   if (!ssm->IsSystemPrincipal(principal)) {
+     nsAutoCString origin;
+     rv = principal->GetOrigin(getter_Copies(origin));
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       DispatchToInitiatingThread(rv);
+@@ -163,16 +152,17 @@ PrincipalVerifier::VerifyOnMainThread()
+       return;
+     }
+     rv = principal->CheckMayLoad(uri, false, false);
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       DispatchToInitiatingThread(rv);
+       return;
+     }
+   }
++#endif
+ 
+   rv = ManagerId::Create(principal, getter_AddRefs(mManagerId));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     DispatchToInitiatingThread(rv);
+     return;
+   }
+ 
+   DispatchToInitiatingThread(NS_OK);
+@@ -206,17 +196,13 @@ PrincipalVerifier::DispatchToInitiatingT
+   // cannot ensure this always succeeds.  Instead, simply warn on failures.
+   // This will result in a new CacheStorage object delaying operations until
+   // shutdown completes and the browser goes away.  This is as graceful as
+   // we can get here.
+   nsresult rv = mInitiatingThread->Dispatch(this, nsIThread::DISPATCH_NORMAL);
+   if (NS_FAILED(rv)) {
+     NS_WARNING("Cache unable to complete principal verification due to shutdown.");
+   }
+-
+-  // Drop our thread ref to avoid maintaining a ref cycle in the case where
+-  // the thread does not drain its event queue.
+-  mInitiatingThread = nullptr;
+ }
+ 
+ } // namesapce cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/PrincipalVerifier.h b/dom/cache/PrincipalVerifier.h
+--- a/dom/cache/PrincipalVerifier.h
++++ b/dom/cache/PrincipalVerifier.h
+@@ -26,24 +26,22 @@ class PrincipalVerifier MOZ_FINAL : publ
+ public:
+   // An interface to be implemented by code wishing to use the
+   // PrincipalVerifier.  Note, the Listener implementation is responsible
+   // for calling ClearListener() on the PrincipalVerifier to clear the
+   // weak reference.
+   class Listener
+   {
+   public:
+-    ~Listener() { }
+     virtual void OnPrincipalVerified(nsresult aRv, ManagerId* aManagerId) = 0;
+   };
+ 
+-  static nsresult
++  static already_AddRefed<PrincipalVerifier>
+   CreateAndDispatch(Listener* aListener, mozilla::ipc::PBackgroundParent* aActor,
+-                    const mozilla::ipc::PrincipalInfo& aPrincipalInfo,
+-                    PrincipalVerifier** aVerifierOut);
++                    const mozilla::ipc::PrincipalInfo& aPrincipalInfo);
+ 
+   // The Listener must call ClearListener() when OnPrincipalVerified() is
+   // called or when the Listener is destroyed.
+   void ClearListener();
+ 
+ private:
+   PrincipalVerifier(Listener* aListener, mozilla::ipc::PBackgroundParent* aActor,
+                     const mozilla::ipc::PrincipalInfo& aPrincipalInfo);
+diff --git a/dom/cache/QuotaClient.cpp b/dom/cache/QuotaClient.cpp
+--- a/dom/cache/QuotaClient.cpp
++++ b/dom/cache/QuotaClient.cpp
+@@ -33,17 +33,16 @@ GetBodyUsage(nsIFile* aDir, UsageInfo* a
+   bool hasMore;
+   while (NS_SUCCEEDED(rv = entries->HasMoreElements(&hasMore)) && hasMore &&
+          !aUsageInfo->Canceled()) {
+     nsCOMPtr<nsISupports> entry;
+     rv = entries->GetNext(getter_AddRefs(entry));
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+     nsCOMPtr<nsIFile> file = do_QueryInterface(entry);
+-    if (!file) { return NS_NOINTERFACE; }
+ 
+     bool isDir;
+     rv = file->IsDirectory(&isDir);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+     if (isDir) {
+       rv = GetBodyUsage(file, aUsageInfo);
+       if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+@@ -88,32 +87,28 @@ public:
+     nsCOMPtr<nsIFile> dir;
+     nsresult rv = qm->GetDirectoryForOrigin(aPersistenceType, aOrigin,
+                                             getter_AddRefs(dir));
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+     rv = dir->Append(NS_LITERAL_STRING(DOMCACHE_DIRECTORY_NAME));
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+-    DebugOnly<bool> exists;
+-    MOZ_ASSERT(NS_SUCCEEDED(dir->Exists(&exists)) && exists);
+-
+     nsCOMPtr<nsISimpleEnumerator> entries;
+     rv = dir->GetDirectoryEntries(getter_AddRefs(entries));
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+     bool hasMore;
+     while (NS_SUCCEEDED(rv = entries->HasMoreElements(&hasMore)) && hasMore &&
+            !aUsageInfo->Canceled()) {
+       nsCOMPtr<nsISupports> entry;
+       rv = entries->GetNext(getter_AddRefs(entry));
+       if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+       nsCOMPtr<nsIFile> file = do_QueryInterface(entry);
+-      if (!file) { return NS_NOINTERFACE; }
+ 
+       nsAutoString leafName;
+       rv = file->GetLeafName(leafName);
+       if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+       bool isDir;
+       rv = file->IsDirectory(&isDir);
+       if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+diff --git a/dom/cache/ReadStream.cpp b/dom/cache/ReadStream.cpp
+--- a/dom/cache/ReadStream.cpp
++++ b/dom/cache/ReadStream.cpp
+@@ -61,52 +61,54 @@ public:
+ 
+   virtual ~ReadStreamChild()
+   {
+     NS_ASSERT_OWNINGTHREAD(ReadStream);
+ 
+     NoteClosed();
+   }
+ 
+-  virtual void NoteClosedOnWorkerThread() MOZ_OVERRIDE
++  virtual void NoteClosedOnOwningThread() MOZ_OVERRIDE
+   {
+     NS_ASSERT_OWNINGTHREAD(ReadStream);
+ 
+     if (mClosed) {
+       return;
+     }
+ 
+     mClosed = true;
+     mControl->RemoveListener(this);
+     mControl->NoteClosed(mId);
+   }
+ 
+-  virtual void ForgetOnWorkerThread() MOZ_OVERRIDE
++  virtual void ForgetOnOwningThread() MOZ_OVERRIDE
+   {
+     NS_ASSERT_OWNINGTHREAD(ReadStream);
+ 
+     if (mClosed) {
+       return;
+     }
+ 
+     mClosed = true;
+     mControl->RemoveListener(this);
+   }
+ 
+   virtual void SerializeControl(PCacheReadStream* aReadStreamOut) MOZ_OVERRIDE
+   {
+     MOZ_ASSERT(aReadStreamOut);
++    MOZ_ASSERT(!mClosed);
+     aReadStreamOut->controlParent() = nullptr;
+     aReadStreamOut->controlChild() = mControl;
+   }
+ 
+   virtual void
+   SerializeFds(PCacheReadStream* aReadStreamOut,
+                const nsTArray<FileDescriptor>& fds) MOZ_OVERRIDE
+   {
++    MOZ_ASSERT(!mClosed);
+     PFileDescriptorSetChild* fdSet = nullptr;
+     if (!fds.IsEmpty()) {
+       fdSet = mControl->Manager()->SendPFileDescriptorSetConstructor(fds[0]);
+       for (uint32_t i = 1; i < fds.Length(); ++i) {
+         unused << fdSet->SendAddFileDescriptor(fds[i]);
+       }
+     }
+ 
+@@ -137,32 +139,32 @@ public:
+ 
+   virtual ~ReadStreamParent()
+   {
+     NS_ASSERT_OWNINGTHREAD(ReadStream);
+ 
+     NoteClosed();
+   }
+ 
+-  virtual void NoteClosedOnWorkerThread() MOZ_OVERRIDE
++  virtual void NoteClosedOnOwningThread() MOZ_OVERRIDE
+   {
+     NS_ASSERT_OWNINGTHREAD(ReadStream);
+ 
+     if (mClosed) {
+       return;
+     }
+ 
+     mClosed = true;
+     mControl->RemoveListener(this);
+     // This can cause mControl to be destructed
+     mControl->RecvNoteClosed(mId);
+     mControl = nullptr;
+   }
+ 
+-  virtual void ForgetOnWorkerThread() MOZ_OVERRIDE
++  virtual void ForgetOnOwningThread() MOZ_OVERRIDE
+   {
+     NS_ASSERT_OWNINGTHREAD(ReadStream);
+ 
+     if (mClosed) {
+       return;
+     }
+ 
+     mClosed = true;
+@@ -229,23 +231,27 @@ class ReadStream::NoteClosedRunnable MOZ
+ {
+ public:
+   explicit NoteClosedRunnable(ReadStream* aStream)
+     : mStream(aStream)
+   { }
+ 
+   NS_IMETHOD Run()
+   {
+-    mStream->NoteClosedOnWorkerThread();
++    mStream->NoteClosedOnOwningThread();
+     return NS_OK;
+   }
+ 
+-  // Safe to do nothing if canceled here as the worker thread is being
+-  // destroyed.  The resulting IPC actor destruction will trigger all
+-  // attached streams to be noted as closed.
++  // Note, we must proceed with the Run() method since our actor will not
++  // clean itself up until we note that the stream is closed.
++  NS_IMETHOD Cancel()
++  {
++    Run();
++    return NS_OK;
++  }
+ 
+ private:
+   ~NoteClosedRunnable() { }
+ 
+   nsRefPtr<ReadStream> mStream;
+ };
+ 
+ // Runnable to clear actors without reporting that the ReadStream has
+@@ -257,22 +263,27 @@ class ReadStream::ForgetRunnable MOZ_FIN
+ {
+ public:
+   explicit ForgetRunnable(ReadStream* aStream)
+     : mStream(aStream)
+   { }
+ 
+   NS_IMETHOD Run()
+   {
+-    mStream->ForgetOnWorkerThread();
++    mStream->ForgetOnOwningThread();
+     return NS_OK;
+   }
+ 
+-  // Safe to do nothing if canceled here as the worker thread is being
+-  // destroyed.  Therefore the actor will be destroyed anyway.
++  // Note, we must proceed with the Run() method so that we properly
++  // call RemoveListener on the actor.
++  NS_IMETHOD Cancel()
++  {
++    Run();
++    return NS_OK;
++  }
+ 
+ private:
+   ~ForgetRunnable() { }
+ 
+   nsRefPtr<ReadStream> mStream;
+ };
+ 
+ NS_IMPL_ISUPPORTS(mozilla::dom::cache::ReadStream, nsIInputStream,
+@@ -288,16 +299,19 @@ ReadStream::Create(const PCacheReadStrea
+ 
+   return Create(aReadStreamOrVoid.get_PCacheReadStream());
+ }
+ 
+ // static
+ already_AddRefed<ReadStream>
+ ReadStream::Create(const PCacheReadStream& aReadStream)
+ {
++  // The parameter may or may not be for a Cache created stream.  The way we
++  // tell is by looking at the stream control actor.  If the actor exists,
++  // then we know the Cache created it.
+   if (!aReadStream.controlChild() && !aReadStream.controlParent()) {
+     return nullptr;
+   }
+ 
+   nsAutoTArray<FileDescriptor, 4> fds;
+   if (aReadStream.fds().type() ==
+       OptionalFileDescriptorSet::TPFileDescriptorSetChild) {
+ 
+@@ -314,25 +328,25 @@ ReadStream::Create(const PCacheReadStrea
+ 
+     FileDescriptorSetParent* fdSetActor =
+       static_cast<FileDescriptorSetParent*>(aReadStream.fds().get_PFileDescriptorSetParent());
+     MOZ_ASSERT(fdSetActor);
+ 
+     fdSetActor->ForgetFileDescriptors(fds);
+     MOZ_ASSERT(!fds.IsEmpty());
+ 
+-    unused << fdSetActor->Send__delete__(fdSetActor);
++    if (!fdSetActor->Send__delete__(fdSetActor)) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("Cache failed to delete fd set actor.");
++    }
+   }
+ 
+   nsCOMPtr<nsIInputStream> stream =
+     DeserializeInputStream(aReadStream.params(), fds);
+-
+-  if (!stream) {
+-    return nullptr;
+-  }
++  MOZ_ASSERT(stream);
+ 
+   // Currently we expect all cache read streams to be blocking file streams.
+ #ifdef DEBUG
+   nsCOMPtr<nsIAsyncInputStream> asyncStream = do_QueryInterface(stream);
+   MOZ_ASSERT(!asyncStream);
+ #endif
+ 
+   nsRefPtr<ReadStream> ref;
+@@ -402,64 +416,65 @@ ReadStream::MatchId(const nsID& aId) con
+ {
+   return mId.Equals(aId);
+ }
+ 
+ ReadStream::ReadStream(const nsID& aId, nsIInputStream* aStream)
+   : mId(aId)
+   , mStream(aStream)
+   , mSnappyStream(new SnappyUncompressInputStream(aStream))
+-  , mThread(NS_GetCurrentThread())
++  , mOwningThread(NS_GetCurrentThread())
+   , mClosed(false)
+ {
+   MOZ_ASSERT(mStream);
+ }
+ 
+ ReadStream::~ReadStream()
+ {
+   NS_ASSERT_OWNINGTHREAD(ReadStream);
+ 
+   // We cannot directly call NoteClosed() here.  The concrete subclasses
+   // destructors must do this because it takes code paths through virtual
+   // methods.  We don't want to execute these while partially destroyed.
++  MOZ_ASSERT(mClosed);
+ }
+ 
+ void
+ ReadStream::NoteClosed()
+ {
+   if (mClosed) {
+     return;
+   }
+ 
+-  if (NS_GetCurrentThread() == mThread) {
+-    NoteClosedOnWorkerThread();
++  if (NS_GetCurrentThread() == mOwningThread) {
++    NoteClosedOnOwningThread();
+     return;
+   }
+ 
+   nsCOMPtr<nsIRunnable> runnable = new NoteClosedRunnable(this);
+-  nsresult rv = mThread->Dispatch(runnable, nsIThread::DISPATCH_NORMAL);
++  nsresult rv = mOwningThread->Dispatch(runnable, nsIThread::DISPATCH_NORMAL);
+   if (NS_FAILED(rv)) {
+     NS_WARNING("Failed to dispatch Cache ReadStream NoteClosed() runnable.");
+   }
+ }
+ 
+ void
+ ReadStream::Forget()
+ {
+   if (mClosed) {
+     return;
+   }
+ 
+-  if (NS_GetCurrentThread() == mThread) {
+-    ForgetOnWorkerThread();
++  if (NS_GetCurrentThread() == mOwningThread) {
++    ForgetOnOwningThread();
+     return;
+   }
+ 
+   nsCOMPtr<nsIRunnable> runnable = new ForgetRunnable(this);
+-  nsresult rv = mThread->Dispatch(runnable, nsIThread::DISPATCH_NORMAL);
++  nsresult rv = mOwningThread->Dispatch(runnable, nsIThread::DISPATCH_NORMAL);
+   if (NS_FAILED(rv)) {
+     NS_WARNING("Failed to dispatch Cache ReadStream Forget() runnable.");
+   }
+ }
+ 
+ NS_IMETHODIMP
+ ReadStream::Close()
+ {
+diff --git a/dom/cache/ReadStream.h b/dom/cache/ReadStream.h
+--- a/dom/cache/ReadStream.h
++++ b/dom/cache/ReadStream.h
+@@ -20,17 +20,17 @@ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ class PCacheReadStream;
+ class PCacheReadStreamOrVoid;
+ class PCacheStreamControlParent;
+ 
+ // IID for the dom::cache::ReadStream interface
+-#define NS_DOM_CACHE_IID \
++#define NS_DOM_CACHE_READSTREAM_IID \
+ {0x8e5da7c9, 0x0940, 0x4f1d, \
+   {0x97, 0x25, 0x5c, 0x59, 0x38, 0xdd, 0xb9, 0x9f}}
+ 
+ // Custom stream class for Request and Response bodies being read from
+ // a Cache.  The main purpose of this class is to report back to the
+ // Cache's Manager when the stream is closed.  This allows the Cache to
+ // accurately determine when the underlying body file can be deleted,
+ // etc.
+@@ -57,45 +57,46 @@ public:
+   void Serialize(PCacheReadStream* aReadStreamOut);
+ 
+   // methods called from the child and parent CacheStreamControl actors
+   void CloseStream();
+   void CloseStreamWithoutReporting();
+   bool MatchId(const nsID& aId) const;
+ 
+ protected:
++  class NoteClosedRunnable;
++  class ForgetRunnable;
++
+   ReadStream(const nsID& aId, nsIInputStream* aStream);
+   virtual ~ReadStream();
+ 
+   void NoteClosed();
+   void Forget();
+ 
+-  virtual void NoteClosedOnWorkerThread() = 0;
+-  virtual void ForgetOnWorkerThread() = 0;
++  virtual void NoteClosedOnOwningThread() = 0;
++  virtual void ForgetOnOwningThread() = 0;
+   virtual void SerializeControl(PCacheReadStream* aReadStreamOut) = 0;
+ 
+   virtual void
+   SerializeFds(PCacheReadStream* aReadStreamOut,
+                const nsTArray<mozilla::ipc::FileDescriptor>& fds) = 0;
+ 
+   const nsID mId;
+   nsCOMPtr<nsIInputStream> mStream;
+   nsCOMPtr<nsIInputStream> mSnappyStream;
+-  nsCOMPtr<nsIThread> mThread;
++  nsCOMPtr<nsIThread> mOwningThread;
+   bool mClosed;
+ 
+ public:
+-  class NoteClosedRunnable;
+-  class ForgetRunnable;
+ 
+-  NS_DECLARE_STATIC_IID_ACCESSOR(NS_DOM_CACHE_IID);
++  NS_DECLARE_STATIC_IID_ACCESSOR(NS_DOM_CACHE_READSTREAM_IID);
+ 
+   NS_DECL_THREADSAFE_ISUPPORTS
+   NS_DECL_NSIINPUTSTREAM
+ };
+ 
+-NS_DEFINE_STATIC_IID_ACCESSOR(ReadStream, NS_DOM_CACHE_IID);
++NS_DEFINE_STATIC_IID_ACCESSOR(ReadStream, NS_DOM_CACHE_READSTREAM_IID);
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_cache_ReadStream_h
+diff --git a/ipc/glue/BackgroundChildImpl.cpp b/ipc/glue/BackgroundChildImpl.cpp
+--- a/ipc/glue/BackgroundChildImpl.cpp
++++ b/ipc/glue/BackgroundChildImpl.cpp
+@@ -5,19 +5,16 @@
+ #include "BackgroundChildImpl.h"
+ 
+ #include "ActorsChild.h" // IndexedDB
+ #include "BroadcastChannelChild.h"
+ #include "FileDescriptorSetChild.h"
+ #include "mozilla/Assertions.h"
+ #include "mozilla/dom/PBlobChild.h"
+ #include "mozilla/dom/cache/ActorUtils.h"
+-#include "mozilla/dom/cache/PCacheChild.h"
+-#include "mozilla/dom/cache/PCacheStorageChild.h"
+-#include "mozilla/dom/cache/PCacheStreamControlChild.h"
+ #include "mozilla/dom/indexedDB/PBackgroundIDBFactoryChild.h"
+ #include "mozilla/dom/ipc/BlobChild.h"
+ #include "mozilla/ipc/PBackgroundTestChild.h"
+ #include "mozilla/layout/VsyncChild.h"
+ #include "nsID.h"
+ #include "nsTraceRefcnt.h"
+ 
+ namespace {
+@@ -249,47 +246,43 @@ BackgroundChildImpl::AllocPCacheStorageC
+ {
+   MOZ_CRASH("CacheStorageChild actor must be provided to PBackground manager");
+   return nullptr;
+ }
+ 
+ bool
+ BackgroundChildImpl::DeallocPCacheStorageChild(PCacheStorageChild* aActor)
+ {
+-  // The CacheStorageChild actor is provided to the PBackground manager, but
+-  // we own the object and must delete it.
+-  delete aActor;
++  dom::cache::DeallocPCacheStorageChild(aActor);
+   return true;
+ }
+ 
+ PCacheChild*
+ BackgroundChildImpl::AllocPCacheChild()
+ {
+   return dom::cache::AllocPCacheChild();
+ }
+ 
+ bool
+ BackgroundChildImpl::DeallocPCacheChild(PCacheChild* aActor)
+ {
+-  // The CacheChild actor is provided to the PBackground manager, but
+-  // we own the object and must delete it.
+-  delete aActor;
++  dom::cache::DeallocPCacheChild(aActor);
+   return true;
+ }
+ 
+ PCacheStreamControlChild*
+ BackgroundChildImpl::AllocPCacheStreamControlChild()
+ {
+   return dom::cache::AllocPCacheStreamControlChild();
+ }
+ 
+ bool
+ BackgroundChildImpl::DeallocPCacheStreamControlChild(PCacheStreamControlChild* aActor)
+ {
+-  delete aActor;
++  dom::cache::DeallocPCacheStreamControlChild(aActor);
+   return true;
+ }
+ 
+ } // namespace ipc
+ } // namespace mozilla
+ 
+ bool
+ TestChild::Recv__delete__(const nsCString& aTestArg)
+diff --git a/ipc/glue/BackgroundChildImpl.h b/ipc/glue/BackgroundChildImpl.h
+--- a/ipc/glue/BackgroundChildImpl.h
++++ b/ipc/glue/BackgroundChildImpl.h
+@@ -6,23 +6,16 @@
+ #define mozilla_ipc_backgroundchildimpl_h__
+ 
+ #include "mozilla/Attributes.h"
+ #include "mozilla/ipc/PBackgroundChild.h"
+ #include "nsAutoPtr.h"
+ 
+ namespace mozilla {
+ namespace dom {
+-namespace cache {
+-
+-class PCacheChild;
+-class PCacheStorageChild;
+-class PCacheStreamControlChild;
+-
+-} // namespace cache
+ namespace indexedDB {
+ 
+ class ThreadLocal;
+ 
+ } // namespace indexedDB
+ } // namespace dom
+ 
+ namespace ipc {
+diff --git a/ipc/glue/BackgroundParentImpl.cpp b/ipc/glue/BackgroundParentImpl.cpp
+--- a/ipc/glue/BackgroundParentImpl.cpp
++++ b/ipc/glue/BackgroundParentImpl.cpp
+@@ -7,19 +7,16 @@
+ #include "BroadcastChannelParent.h"
+ #include "FileDescriptorSetParent.h"
+ #include "mozilla/AppProcessChecker.h"
+ #include "mozilla/Assertions.h"
+ #include "mozilla/dom/ContentParent.h"
+ #include "mozilla/dom/PBlobParent.h"
+ #include "mozilla/dom/ServiceWorkerRegistrar.h"
+ #include "mozilla/dom/cache/ActorUtils.h"
+-#include "mozilla/dom/cache/PCacheParent.h"
+-#include "mozilla/dom/cache/PCacheStorageParent.h"
+-#include "mozilla/dom/cache/PCacheStreamControlParent.h"
+ #include "mozilla/dom/indexedDB/ActorsParent.h"
+ #include "mozilla/dom/ipc/BlobParent.h"
+ #include "mozilla/ipc/BackgroundParent.h"
+ #include "mozilla/ipc/BackgroundUtils.h"
+ #include "mozilla/ipc/PBackgroundSharedTypes.h"
+ #include "mozilla/ipc/PBackgroundTestParent.h"
+ #include "mozilla/layout/VsyncParent.h"
+ #include "nsNetUtil.h"
+@@ -559,49 +556,45 @@ BackgroundParentImpl::AllocPCacheStorage
+                                                const PrincipalInfo& aPrincipalInfo)
+ {
+   return dom::cache::AllocPCacheStorageParent(this, aNamespace, aPrincipalInfo);
+ }
+ 
+ bool
+ BackgroundParentImpl::DeallocPCacheStorageParent(PCacheStorageParent* aActor)
+ {
+-  delete aActor;
++  dom::cache::DeallocPCacheStorageParent(aActor);
+   return true;
+ }
+ 
+ PCacheParent*
+ BackgroundParentImpl::AllocPCacheParent()
+ {
+   MOZ_CRASH("CacheParent actor must be provided to PBackground manager");
+   return nullptr;
+ }
+ 
+ bool
+ BackgroundParentImpl::DeallocPCacheParent(PCacheParent* aActor)
+ {
+-  // The CacheParent actor is provided to the PBackground manager, but
+-  // we own the object and must delete it.
+-  delete aActor;
++  dom::cache::DeallocPCacheParent(aActor);
+   return true;
+ }
+ 
+ PCacheStreamControlParent*
+ BackgroundParentImpl::AllocPCacheStreamControlParent()
+ {
+   MOZ_CRASH("CacheStreamControlParent actor must be provided to PBackground manager");
+   return nullptr;
+ }
+ 
+ bool
+ BackgroundParentImpl::DeallocPCacheStreamControlParent(PCacheStreamControlParent* aActor)
+ {
+-  // The CacheStreamControlParent actor is provided to the PBackground manager, but
+-  // we own the object and must delete it.
+-  delete aActor;
++  dom::cache::DeallocPCacheStreamControlParent(aActor);
+   return true;
+ }
+ 
+ } // namespace ipc
+ } // namespace mozilla
+ 
+ void
+ TestParent::ActorDestroy(ActorDestroyReason aWhy)
+diff --git a/ipc/glue/BackgroundParentImpl.h b/ipc/glue/BackgroundParentImpl.h
+--- a/ipc/glue/BackgroundParentImpl.h
++++ b/ipc/glue/BackgroundParentImpl.h
+@@ -5,22 +5,16 @@
+ #ifndef mozilla_ipc_backgroundparentimpl_h__
+ #define mozilla_ipc_backgroundparentimpl_h__
+ 
+ #include "mozilla/Attributes.h"
+ #include "mozilla/ipc/PBackgroundParent.h"
+ 
+ namespace mozilla {
+ 
+-namespace cache {
+-class PCacheParent;
+-class PCacheStorageParent;
+-class PCacheStreamControlParent;
+-}
+-
+ namespace layout {
+ class VsyncParent;
+ }
+ 
+ namespace ipc {
+ 
+ // Instances of this class should never be created directly. This class is meant
+ // to be inherited in BackgroundImpl.
+diff --git a/ipc/glue/PBackground.ipdl b/ipc/glue/PBackground.ipdl
+--- a/ipc/glue/PBackground.ipdl
++++ b/ipc/glue/PBackground.ipdl
+@@ -12,17 +12,18 @@ include protocol PCacheStreamControl;
+ include protocol PFileDescriptorSet;
+ include protocol PVsync;
+ 
+ include DOMTypes;
+ include PBackgroundSharedTypes;
+ include PBackgroundIDBSharedTypes;
+ include ServiceWorkerRegistrarTypes;
+ 
+-using mozilla::dom::cache::Namespace from "mozilla/dom/cache/IPCUtils.h";
++using mozilla::dom::cache::Namespace from "mozilla/dom/cache/Types.h";
++include "mozilla/dom/cache/IPCUtils.h";
+ 
+ namespace mozilla {
+ namespace ipc {
+ 
+ sync protocol PBackground
+ {
+   manages PBackgroundIDBFactory;
+   manages PBackgroundTest;
