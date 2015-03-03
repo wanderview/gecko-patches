@@ -1,0 +1,416 @@
+# HG changeset patch
+# Parent 487bf1eeb619c8057030ebedd99f581e2db2e707
+# User Ben Kelly <ben@wanderview.com>
+Bug 1133939 P1 interdiff 006
+
+
+diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
+--- a/xpcom/io/nsPipe3.cpp
++++ b/xpcom/io/nsPipe3.cpp
+@@ -1,14 +1,15 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
++#include <algorithm>
+ #include "mozilla/Attributes.h"
+ #include "mozilla/ReentrantMonitor.h"
+ #include "nsICloneableInputStream.h"
+ #include "nsIPipe.h"
+ #include "nsIEventTarget.h"
+ #include "nsISeekableStream.h"
+ #include "nsIProgrammingLanguage.h"
+ #include "nsRefPtr.h"
+@@ -48,16 +49,17 @@ GetPipeLog()
+ 
+ #define DEFAULT_SEGMENT_SIZE  4096
+ #define DEFAULT_SEGMENT_COUNT 16
+ 
+ class nsPipe;
+ class nsPipeEvents;
+ class nsPipeInputStream;
+ class nsPipeOutputStream;
++class AutoReadSegment;
+ 
+ //-----------------------------------------------------------------------------
+ 
+ // this class is used to delay notifications until the end of a particular
+ // scope.  it helps avoid the complexity of issuing callbacks while inside
+ // a critical section.
+ class nsPipeEvents
+ {
+@@ -94,21 +96,25 @@ private:
+ // nsPipeInputStream class because generally the nsPipe should be modifying
+ // this state and not the input stream itself.
+ struct nsPipeReadState
+ {
+   nsPipeReadState()
+     : mReadCursor(nullptr)
+     , mReadLimit(nullptr)
+     , mSegment(0)
++    , mActiveReadCount(0)
++    , mNeedDrain(false)
+   { }
+ 
+   char*    mReadCursor;
+   char*    mReadLimit;
+   int32_t  mSegment;
++  uint32_t mActiveReadCount;
++  bool     mNeedDrain;
+ };
+ 
+ //-----------------------------------------------------------------------------
+ 
+ // an input end of a pipe (maintained as a list of refs within the pipe)
+ class nsPipeInputStream
+   : public nsIAsyncInputStream
+   , public nsISeekableStream
+@@ -283,19 +289,20 @@ public:
+ 
+   void PeekSegment(const nsPipeReadState& aReadState, uint32_t aIndex,
+                    char*& aCursor, char*& aLimit);
+ 
+   //
+   // methods below may be called while outside the pipe's monitor
+   //
+ 
+-  nsresult GetReadSegment(const nsPipeReadState& aReadState,
+-                          const char*& aSegment, uint32_t& aSegmentLen);
+-  void     AdvanceReadCursor(nsPipeReadState& aReadState, uint32_t aCount,
++  nsresult GetReadSegment(nsPipeReadState& aReadState,
++                          AutoReadSegment& aSegment);
++  void     ReleaseReadSegment(nsPipeReadState& aReadState);
++  void     AdvanceReadCursor(AutoReadSegment& aSegment, uint32_t aCount,
+                              uint32_t* aAvailableOut);
+   bool     AdvanceReadSegment(nsPipeReadState& aReadState);
+   void     DrainInputStream(nsPipeReadState& aReadState, nsPipeEvents& aEvents,
+                             uint32_t* aAvailableOut);
+ 
+   nsresult GetWriteSegment(char*& aSegment, uint32_t& aSegmentLen);
+   void     AdvanceWriteCursor(uint32_t aCount);
+ 
+@@ -337,16 +344,110 @@ protected:
+   int32_t             mWriteSegment;
+   char*               mWriteCursor;
+   char*               mWriteLimit;
+ 
+   nsresult            mStatus;
+   bool                mInited;
+ };
+ 
++//-----------------------------------------------------------------------------
++
++class MOZ_STACK_CLASS AutoReadSegment MOZ_FINAL
++{
++friend class nsPipe;
++public:
++  AutoReadSegment(uint32_t aMaxLength)
++    : mMaxLength(aMaxLength)
++    , mPipe(nullptr)
++    , mReadState(nullptr)
++    , mSegment(nullptr)
++    , mLength(0)
++  {
++  }
++
++  ~AutoReadSegment()
++  {
++    if (mPipe) {
++      Release();
++    }
++    MOZ_ASSERT(!mPipe);
++    MOZ_ASSERT(!mReadState);
++    MOZ_ASSERT(!mSegment);
++  }
++
++  const char* Data() const
++  {
++    MOZ_ASSERT(mSegment);
++    return mSegment;
++  }
++
++  uint32_t Length() const
++  {
++    MOZ_ASSERT(mSegment);
++    return mLength;
++  }
++
++  void
++  Advance(uint32_t aCount)
++  {
++    MOZ_ASSERT(aCount <= mLength);
++    mSegment += aCount;
++    mLength -= aCount;
++  }
++
++  nsPipeReadState&
++  ReadState() const
++  {
++    MOZ_ASSERT(mReadState);
++    return *mReadState;
++  }
++
++private:
++  void
++  Assign(nsPipe* aPipe, nsPipeReadState* aReadState,
++         const char* aSegment, uint32_t aLength)
++  {
++    MOZ_ASSERT(!mPipe);
++    MOZ_ASSERT(!mReadState);
++    MOZ_ASSERT(!mSegment);
++
++    mPipe = aPipe;
++    mReadState = aReadState;
++    mSegment = aSegment;
++    mLength = std::min(aLength, mMaxLength);
++
++    MOZ_ASSERT(mPipe);
++    MOZ_ASSERT(mReadState);
++    MOZ_ASSERT(mSegment);
++  }
++
++  void
++  Release()
++  {
++    MOZ_ASSERT(mPipe);
++    MOZ_ASSERT(mReadState);
++    MOZ_ASSERT(mSegment);
++
++    mPipe->ReleaseReadSegment(*mReadState);
++
++    mPipe = nullptr;
++    mReadState = nullptr;
++    mSegment = nullptr;
++    mLength = 0;
++  }
++
++private:
++  const uint32_t mMaxLength;
++  nsPipe* mPipe;
++  nsPipeReadState* mReadState;
++  const char* mSegment;
++  uint32_t mLength;
++};
++
+ //
+ // NOTES on buffer architecture:
+ //
+ //       +-----------------+ - - mBuffer.GetSegment(0)
+ //       |                 |
+ //       + - - - - - - - - + - - nsPipeReadState.mReadCursor
+ //       |/////////////////|
+ //       |/////////////////|
+@@ -498,69 +599,89 @@ nsPipe::PeekSegment(const nsPipeReadStat
+       } else {
+         aLimit = aCursor + mBuffer.GetSegmentSize();
+       }
+     }
+   }
+ }
+ 
+ nsresult
+-nsPipe::GetReadSegment(const nsPipeReadState& aReadState, const char*& aSegment,
+-                       uint32_t& aSegmentLen)
++nsPipe::GetReadSegment(nsPipeReadState& aReadState,
++                       AutoReadSegment& aSegment)
+ {
+   ReentrantMonitorAutoEnter mon(mReentrantMonitor);
+ 
+   if (aReadState.mReadCursor == aReadState.mReadLimit) {
+     return NS_FAILED(mStatus) ? mStatus : NS_BASE_STREAM_WOULD_BLOCK;
+   }
+ 
+-  aSegment    = aReadState.mReadCursor;
+-  aSegmentLen = aReadState.mReadLimit - aReadState.mReadCursor;
++  aReadState.mActiveReadCount += 1;
++  aSegment.Assign(this, &aReadState, aReadState.mReadCursor,
++                  aReadState.mReadLimit - aReadState.mReadCursor);
++
+   return NS_OK;
+ }
+ 
+ void
+-nsPipe::AdvanceReadCursor(nsPipeReadState& aReadState, uint32_t aBytesRead,
++nsPipe::ReleaseReadSegment(nsPipeReadState& aReadState)
++{
++  nsPipeEvents events;
++  {
++    ReentrantMonitorAutoEnter mon(mReentrantMonitor);
++    MOZ_ASSERT(aReadState.mActiveReadCount != 0);
++    aReadState.mActiveReadCount -= 1;
++    if (aReadState.mActiveReadCount == 0 && aReadState.mNeedDrain) {
++      DrainInputStream(aReadState, events, nullptr);
++    }
++  }
++}
++
++void
++nsPipe::AdvanceReadCursor(AutoReadSegment& aSegment, uint32_t aBytesRead,
+                           uint32_t* aAvailableOut)
+ {
+   NS_ASSERTION(aBytesRead, "don't call if no bytes read");
+ 
+   nsPipeEvents events;
+   {
+     ReentrantMonitorAutoEnter mon(mReentrantMonitor);
+ 
++    nsPipeReadState& readState = aSegment.ReadState();
++
+     LOG(("III advancing read cursor by %u\n", aBytesRead));
+     NS_ASSERTION(aBytesRead <= mBuffer.GetSegmentSize(), "read too much");
+ 
+-    aReadState.mReadCursor += aBytesRead;
+-    NS_ASSERTION(aReadState.mReadCursor <= aReadState.mReadLimit,
++    readState.mReadCursor += aBytesRead;
++    NS_ASSERTION(readState.mReadCursor <= readState.mReadLimit,
+                  "read cursor exceeds limit");
+ 
+     MOZ_ASSERT(*aAvailableOut >= aBytesRead);
+     *aAvailableOut -= aBytesRead;
+ 
+-    if (aReadState.mReadCursor == aReadState.mReadLimit) {
++    if (readState.mReadCursor == readState.mReadLimit) {
+       // we've reached the limit of how much we can read from this segment.
+       // if at the end of this segment, then we must discard this segment.
+ 
+       // if still writing in this segment then bail because we're not done
+       // with the segment and have to wait for now...
+-      if (mWriteSegment == aReadState.mSegment && mWriteLimit > mWriteCursor) {
+-        NS_ASSERTION(aReadState.mReadLimit == mWriteCursor, "unexpected state");
++      if (mWriteSegment == readState.mSegment && mWriteLimit > mWriteCursor) {
++        NS_ASSERTION(readState.mReadLimit == mWriteCursor, "unexpected state");
+         return;
+       }
+ 
+-      bool modified = AdvanceReadSegment(aReadState);
++      bool modified = AdvanceReadSegment(readState);
+ 
+       // if we've free'd up a segment, notify output stream that pipe has
+       // room for a new segment.
+       if (modified && mOutput.OnOutputWritable(events)) {
+         mon.Notify();
+       }
+     }
++
++    aSegment.Release();
+   }
+ }
+ 
+ bool
+ nsPipe::AdvanceReadSegment(nsPipeReadState& aReadState)
+ {
+   uint32_t currentSegment = aReadState.mSegment;
+ 
+@@ -610,24 +731,29 @@ nsPipe::AdvanceReadSegment(nsPipeReadSta
+ }
+ 
+ void
+ nsPipe::DrainInputStream(nsPipeReadState& aReadState, nsPipeEvents& aEvents,
+                          uint32_t* aAvailableOut)
+ {
+   ReentrantMonitorAutoEnter mon(mReentrantMonitor);
+ 
++  if (aReadState.mActiveReadCount > 0) {
++    aReadState.mNeedDrain = true;
++    return;
++  }
++
+   bool modified = false;
+   while(mWriteSegment > aReadState.mSegment) {
+     modified = AdvanceReadSegment(aReadState) || modified;
+   }
+ 
+   // if we've free'd up a segment, notify output stream that pipe has
+   // room for a new segment.
+-  if (true && mOutput.OnOutputWritable(aEvents)) {
++  if (mOutput.OnOutputWritable(aEvents)) {
+     mon.Notify();
+   }
+ }
+ 
+ nsresult
+ nsPipe::GetWriteSegment(char*& aSegment, uint32_t& aSegmentLen)
+ {
+   ReentrantMonitorAutoEnter mon(mReentrantMonitor);
+@@ -1063,22 +1189,20 @@ nsPipeInputStream::ReadSegments(nsWriteS
+                                 void* aClosure,
+                                 uint32_t aCount,
+                                 uint32_t* aReadCount)
+ {
+   LOG(("III ReadSegments [this=%x count=%u]\n", this, aCount));
+ 
+   nsresult rv = NS_OK;
+ 
+-  const char* segment;
+-  uint32_t segmentLen;
+-
+   *aReadCount = 0;
+   while (aCount) {
+-    rv = mPipe->GetReadSegment(mReadState, segment, segmentLen);
++    AutoReadSegment segment(aCount);
++    rv = mPipe->GetReadSegment(mReadState, segment);
+     if (NS_FAILED(rv)) {
+       // ignore this error if we've already read something.
+       if (*aReadCount > 0) {
+         rv = NS_OK;
+         break;
+       }
+       if (rv == NS_BASE_STREAM_WOULD_BLOCK) {
+         // pipe is empty
+@@ -1095,45 +1219,41 @@ nsPipeInputStream::ReadSegments(nsWriteS
+       if (rv == NS_BASE_STREAM_CLOSED) {
+         rv = NS_OK;
+         break;
+       }
+       mPipe->OnInputStreamException(this, rv);
+       break;
+     }
+ 
+-    // read no more than aCount
+-    if (segmentLen > aCount) {
+-      segmentLen = aCount;
+-    }
+-
+-    uint32_t writeCount, originalLen = segmentLen;
+-    while (segmentLen) {
++    uint32_t writeCount, originalLen = segment.Length();
++    while (segment.Length()) {
+       writeCount = 0;
+ 
+-      rv = aWriter(this, aClosure, segment, *aReadCount, segmentLen, &writeCount);
++      rv = aWriter(this, aClosure, segment.Data(), *aReadCount,
++                   segment.Length(), &writeCount);
+ 
+       if (NS_FAILED(rv) || writeCount == 0) {
+         aCount = 0;
+         // any errors returned from the writer end here: do not
+         // propagate to the caller of ReadSegments.
+         rv = NS_OK;
+         break;
+       }
+ 
+-      NS_ASSERTION(writeCount <= segmentLen, "wrote more than expected");
+-      segment += writeCount;
+-      segmentLen -= writeCount;
++      NS_ASSERTION(writeCount <= segment.Length(), "wrote more than expected");
++      segment.Advance(writeCount);
+       aCount -= writeCount;
+       *aReadCount += writeCount;
+       mLogicalOffset += writeCount;
+     }
+ 
+-    if (segmentLen < originalLen) {
+-      mPipe->AdvanceReadCursor(mReadState, originalLen - segmentLen, &mAvailable);
++    if (segment.Length() < originalLen) {
++      mPipe->AdvanceReadCursor(segment, originalLen - segment.Length(),
++                               &mAvailable);
+     }
+   }
+ 
+   return rv;
+ }
+ 
+ NS_IMETHODIMP
+ nsPipeInputStream::Read(char* aToBuf, uint32_t aBufLen, uint32_t* aReadCount)
