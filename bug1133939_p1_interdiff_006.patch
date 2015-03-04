@@ -1,8 +1,7 @@
 # HG changeset patch
-# Parent 487bf1eeb619c8057030ebedd99f581e2db2e707
+# Parent 0b93028c2f7c6615beed85134aeb08bed1cd7bff
 # User Ben Kelly <ben@wanderview.com>
 Bug 1133939 P1 interdiff 006
-
 
 diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 --- a/xpcom/io/nsPipe3.cpp
@@ -34,14 +33,14 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  class nsPipeOutputStream;
 +class AutoReadSegment;
  
- //-----------------------------------------------------------------------------
+ namespace {
  
- // this class is used to delay notifications until the end of a particular
- // scope.  it helps avoid the complexity of issuing callbacks while inside
- // a critical section.
- class nsPipeEvents
+ enum MonitorAction
  {
-@@ -94,21 +96,25 @@ private:
+   DoNotNotifyMonitor,
+   NotifyMonitor
+ };
+@@ -110,21 +112,25 @@ private:
  // nsPipeInputStream class because generally the nsPipe should be modifying
  // this state and not the input stream itself.
  struct nsPipeReadState
@@ -67,7 +66,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  class nsPipeInputStream
    : public nsIAsyncInputStream
    , public nsISeekableStream
-@@ -283,19 +289,20 @@ public:
+@@ -295,19 +301,20 @@ public:
  
    void PeekSegment(const nsPipeReadState& aReadState, uint32_t aIndex,
                     char*& aCursor, char*& aLimit);
@@ -84,14 +83,14 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 +  void     ReleaseReadSegment(nsPipeReadState& aReadState);
 +  void     AdvanceReadCursor(AutoReadSegment& aSegment, uint32_t aCount,
                               uint32_t* aAvailableOut);
-   bool     AdvanceReadSegment(nsPipeReadState& aReadState);
+   SegmentChangeResult AdvanceReadSegment(nsPipeReadState& aReadState);
    void     DrainInputStream(nsPipeReadState& aReadState, nsPipeEvents& aEvents,
                              uint32_t* aAvailableOut);
+   bool     ReadSegmentBeingWritten(nsPipeReadState& aReadState);
  
    nsresult GetWriteSegment(char*& aSegment, uint32_t& aSegmentLen);
    void     AdvanceWriteCursor(uint32_t aCount);
- 
-@@ -337,16 +344,110 @@ protected:
+@@ -350,16 +357,110 @@ protected:
    int32_t             mWriteSegment;
    char*               mWriteCursor;
    char*               mWriteLimit;
@@ -202,7 +201,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  //       + - - - - - - - - + - - nsPipeReadState.mReadCursor
  //       |/////////////////|
  //       |/////////////////|
-@@ -498,69 +599,89 @@ nsPipe::PeekSegment(const nsPipeReadStat
+@@ -511,67 +612,86 @@ nsPipe::PeekSegment(const nsPipeReadStat
        } else {
          aLimit = aCursor + mBuffer.GetSegmentSize();
        }
@@ -213,8 +212,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  nsresult
 -nsPipe::GetReadSegment(const nsPipeReadState& aReadState, const char*& aSegment,
 -                       uint32_t& aSegmentLen)
-+nsPipe::GetReadSegment(nsPipeReadState& aReadState,
-+                       AutoReadSegment& aSegment)
++nsPipe::GetReadSegment(nsPipeReadState& aReadState, AutoReadSegment& aSegment)
  {
    ReentrantMonitorAutoEnter mon(mReentrantMonitor);
  
@@ -277,20 +275,17 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  
        // if still writing in this segment then bail because we're not done
        // with the segment and have to wait for now...
--      if (mWriteSegment == aReadState.mSegment && mWriteLimit > mWriteCursor) {
--        NS_ASSERTION(aReadState.mReadLimit == mWriteCursor, "unexpected state");
-+      if (mWriteSegment == readState.mSegment && mWriteLimit > mWriteCursor) {
-+        NS_ASSERTION(readState.mReadLimit == mWriteCursor, "unexpected state");
+-      if (ReadSegmentBeingWritten(aReadState)) {
++      if (ReadSegmentBeingWritten(readState)) {
          return;
        }
  
--      bool modified = AdvanceReadSegment(aReadState);
-+      bool modified = AdvanceReadSegment(readState);
- 
-       // if we've free'd up a segment, notify output stream that pipe has
-       // room for a new segment.
-       if (modified && mOutput.OnOutputWritable(events)) {
-         mon.Notify();
+       // Check to see if we can free up any segments.  If we can, then notify
+       // the output stream that the pipe has room for a new segment.
+-      if (AdvanceReadSegment(aReadState) == SegmentDeleted &&
++      if (AdvanceReadSegment(readState) == SegmentDeleted &&
+           mOutput.OnOutputWritable(events) == NotifyMonitor) {
+         mon.NotifyAll();
        }
      }
 +
@@ -298,12 +293,12 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
    }
  }
  
- bool
+ SegmentChangeResult
  nsPipe::AdvanceReadSegment(nsPipeReadState& aReadState)
  {
-   uint32_t currentSegment = aReadState.mSegment;
+   int32_t currentSegment = aReadState.mSegment;
  
-@@ -610,24 +731,29 @@ nsPipe::AdvanceReadSegment(nsPipeReadSta
+@@ -621,16 +741,21 @@ nsPipe::AdvanceReadSegment(nsPipeReadSta
  }
  
  void
@@ -317,24 +312,15 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 +    return;
 +  }
 +
-   bool modified = false;
-   while(mWriteSegment > aReadState.mSegment) {
-     modified = AdvanceReadSegment(aReadState) || modified;
-   }
+   *aAvailableOut = 0;
  
-   // if we've free'd up a segment, notify output stream that pipe has
-   // room for a new segment.
--  if (true && mOutput.OnOutputWritable(aEvents)) {
-+  if (mOutput.OnOutputWritable(aEvents)) {
-     mon.Notify();
-   }
- }
+   SegmentChangeResult result = SegmentNotChanged;
+   while(mWriteSegment >= aReadState.mSegment) {
  
- nsresult
- nsPipe::GetWriteSegment(char*& aSegment, uint32_t& aSegmentLen)
- {
-   ReentrantMonitorAutoEnter mon(mReentrantMonitor);
-@@ -1063,22 +1189,20 @@ nsPipeInputStream::ReadSegments(nsWriteS
+     // If the last segment to free is still being written to, we're done
+     // draining.  We can't free any more.
+     if (ReadSegmentBeingWritten(aReadState)) {
+@@ -1096,22 +1221,20 @@ nsPipeInputStream::ReadSegments(nsWriteS
                                  void* aClosure,
                                  uint32_t aCount,
                                  uint32_t* aReadCount)
@@ -359,7 +345,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
        }
        if (rv == NS_BASE_STREAM_WOULD_BLOCK) {
          // pipe is empty
-@@ -1095,45 +1219,41 @@ nsPipeInputStream::ReadSegments(nsWriteS
+@@ -1128,45 +1251,41 @@ nsPipeInputStream::ReadSegments(nsWriteS
        if (rv == NS_BASE_STREAM_CLOSED) {
          rv = NS_OK;
          break;
