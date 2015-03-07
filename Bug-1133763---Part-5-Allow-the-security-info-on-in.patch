@@ -1,0 +1,253 @@
+# HG changeset patch
+# User Ehsan Akhgari <ehsan@mozilla.com>
+
+Bug 1133763 - Part 5: Allow the security info on intercepted HTTP channels to be overridden; r=mayhemer
+
+diff --git a/netwerk/base/nsINetworkInterceptController.idl b/netwerk/base/nsINetworkInterceptController.idl
+index 576082c..c87a1ce 100644
+--- a/netwerk/base/nsINetworkInterceptController.idl
++++ b/netwerk/base/nsINetworkInterceptController.idl
+@@ -11,17 +11,17 @@ interface nsIURI;
+ 
+ /**
+  * Interface to allow implementors of nsINetworkInterceptController to control the behaviour
+  * of intercepted channels without tying implementation details of the interception to
+  * the actual channel. nsIInterceptedChannel is expected to be implemented by objects
+  * which do not implement nsIChannel.
+  */
+ 
+-[scriptable, uuid(9d127b63-dfad-484d-a0e1-cb82697a095b)]
++[scriptable, uuid(155378c1-ebb2-4492-917f-85483430d5f5)]
+ interface nsIInterceptedChannel : nsISupports
+ {
+     /**
+      * Instruct a channel that has been intercepted to continue with the original
+      * network request.
+      */
+     void resetInterception();
+ 
+@@ -54,16 +54,21 @@ interface nsIInterceptedChannel : nsISupports
+      * The underlying channel object that was intercepted.
+      */
+     readonly attribute nsIChannel channel;
+ 
+     /**
+      * True if the underlying request was caused by a navigation attempt.
+      */
+     readonly attribute bool isNavigation;
++
++    /**
++     * This method allows to override the security info for the channel.
++     */
++    void setSecurityInfo(in nsISupports securityInfo);
+ };
+ 
+ /**
+  * Interface to allow consumers to attach themselves to a channel's
+  * notification callbacks/loadgroup and determine if a given channel
+  * request should be intercepted before any network request is initiated.
+  */
+ 
+diff --git a/netwerk/protocol/http/HttpBaseChannel.cpp b/netwerk/protocol/http/HttpBaseChannel.cpp
+index 69a3594..60368d0 100644
+--- a/netwerk/protocol/http/HttpBaseChannel.cpp
++++ b/netwerk/protocol/http/HttpBaseChannel.cpp
+@@ -1353,16 +1353,29 @@ NS_IMETHODIMP
+ HttpBaseChannel::SetRedirectionLimit(uint32_t value)
+ {
+   ENSURE_CALLED_BEFORE_CONNECT();
+ 
+   mRedirectionLimit = std::min<uint32_t>(value, 0xff);
+   return NS_OK;
+ }
+ 
++nsresult
++HttpBaseChannel::OverrideSecurityInfo(nsISupports* aSecurityInfo)
++{
++  MOZ_ASSERT(!mSecurityInfo,
++             "This can only be called when we don't have a security info object already");
++  MOZ_ASSERT(aSecurityInfo,
++             "This can only be called with a valid security info object");
++  MOZ_ASSERT(ShouldIntercept(),
++             "This can only be called on channels that can be intercepted");
++  mSecurityInfo = aSecurityInfo;
++  return NS_OK;
++}
++
+ NS_IMETHODIMP
+ HttpBaseChannel::IsNoStoreResponse(bool *value)
+ {
+   if (!mResponseHead)
+     return NS_ERROR_NOT_AVAILABLE;
+   *value = mResponseHead->NoStore();
+   return NS_OK;
+ }
+diff --git a/netwerk/protocol/http/HttpBaseChannel.h b/netwerk/protocol/http/HttpBaseChannel.h
+index de7d0ba..661e098 100644
+--- a/netwerk/protocol/http/HttpBaseChannel.h
++++ b/netwerk/protocol/http/HttpBaseChannel.h
+@@ -235,16 +235,18 @@ public:
+     };
+ 
+     nsHttpResponseHead * GetResponseHead() const { return mResponseHead; }
+     nsHttpRequestHead * GetRequestHead() { return &mRequestHead; }
+ 
+     const NetAddr& GetSelfAddr() { return mSelfAddr; }
+     const NetAddr& GetPeerAddr() { return mPeerAddr; }
+ 
++    nsresult OverrideSecurityInfo(nsISupports* aSecurityInfo);
++
+ public: /* Necko internal use only... */
+     bool IsNavigation();
+ 
+     // Return whether upon a redirect code of httpStatus for method, the
+     // request method should be rewritten to GET.
+     static bool ShouldRewriteRedirectToGET(uint32_t httpStatus,
+                                            nsHttpRequestHead::ParsedMethodType method);
+ 
+@@ -311,16 +313,17 @@ protected:
+   nsCOMPtr<nsIURI>                  mReferrer;
+   nsCOMPtr<nsIApplicationCache>     mApplicationCache;
+ 
+   nsHttpRequestHead                 mRequestHead;
+   nsCOMPtr<nsIInputStream>          mUploadStream;
+   nsAutoPtr<nsHttpResponseHead>     mResponseHead;
+   nsRefPtr<nsHttpConnectionInfo>    mConnectionInfo;
+   nsCOMPtr<nsIProxyInfo>            mProxyInfo;
++  nsCOMPtr<nsISupports>             mSecurityInfo;
+ 
+   nsCString                         mSpec; // ASCII encoded URL spec
+   nsCString                         mContentTypeHint;
+   nsCString                         mContentCharsetHint;
+   nsCString                         mUserSetCookieHeader;
+ 
+   NetAddr                           mSelfAddr;
+   NetAddr                           mPeerAddr;
+diff --git a/netwerk/protocol/http/HttpChannelChild.h b/netwerk/protocol/http/HttpChannelChild.h
+index 4bca9ea..fc6e3bb 100644
+--- a/netwerk/protocol/http/HttpChannelChild.h
++++ b/netwerk/protocol/http/HttpChannelChild.h
+@@ -158,17 +158,16 @@ private:
+   void ResetInterception();
+ 
+   // Override this channel's pending response with a synthesized one. The content will be
+   // asynchronously read from the pump.
+   void OverrideWithSynthesizedResponse(nsAutoPtr<nsHttpResponseHead>& aResponseHead, nsInputStreamPump* aPump);
+ 
+   RequestHeaderTuples mClientSetRequestHeaders;
+   nsCOMPtr<nsIChildChannel> mRedirectChannelChild;
+-  nsCOMPtr<nsISupports> mSecurityInfo;
+   nsRefPtr<InterceptStreamListener> mInterceptListener;
+   nsRefPtr<nsInputStreamPump> mSynthesizedResponsePump;
+ 
+   bool mIsFromCache;
+   bool mCacheEntryAvailable;
+   uint32_t     mCacheExpirationTime;
+   nsCString    mCachedCharset;
+ 
+diff --git a/netwerk/protocol/http/InterceptedChannel.cpp b/netwerk/protocol/http/InterceptedChannel.cpp
+index 9cc4ead..12ed6a2 100644
+--- a/netwerk/protocol/http/InterceptedChannel.cpp
++++ b/netwerk/protocol/http/InterceptedChannel.cpp
+@@ -189,16 +189,22 @@ InterceptedChannelChrome::Cancel()
+ 
+   // we need to use AsyncAbort instead of Cancel since there's no active pump
+   // to cancel which will provide OnStart/OnStopRequest to the channel.
+   nsresult rv = mChannel->AsyncAbort(NS_BINDING_ABORTED);
+   NS_ENSURE_SUCCESS(rv, rv);
+   return NS_OK;
+ }
+ 
++NS_IMETHODIMP
++InterceptedChannelChrome::SetSecurityInfo(nsISupports* aSecurityInfo)
++{
++  return mChannel->OverrideSecurityInfo(aSecurityInfo);
++}
++
+ InterceptedChannelContent::InterceptedChannelContent(HttpChannelChild* aChannel,
+                                                      nsINetworkInterceptController* aController,
+                                                      nsIStreamListener* aListener)
+ : InterceptedChannelBase(aController, aChannel->IsNavigation())
+ , mChannel(aChannel)
+ , mStreamListener(aListener)
+ {
+ }
+@@ -285,10 +291,16 @@ InterceptedChannelContent::Cancel()
+   // to cancel which will provide OnStart/OnStopRequest to the channel.
+   nsresult rv = mChannel->AsyncAbort(NS_BINDING_ABORTED);
+   NS_ENSURE_SUCCESS(rv, rv);
+   mChannel = nullptr;
+   mStreamListener = nullptr;
+   return NS_OK;
+ }
+ 
++NS_IMETHODIMP
++InterceptedChannelContent::SetSecurityInfo(nsISupports* aSecurityInfo)
++{
++  return mChannel->OverrideSecurityInfo(aSecurityInfo);
++}
++
+ } // namespace net
+ } // namespace mozilla
+diff --git a/netwerk/protocol/http/InterceptedChannel.h b/netwerk/protocol/http/InterceptedChannel.h
+index 30da255..036ed3b 100644
+--- a/netwerk/protocol/http/InterceptedChannel.h
++++ b/netwerk/protocol/http/InterceptedChannel.h
+@@ -70,16 +70,17 @@ public:
+                            nsINetworkInterceptController* aController,
+                            nsICacheEntry* aEntry);
+ 
+   NS_IMETHOD ResetInterception() MOZ_OVERRIDE;
+   NS_IMETHOD FinishSynthesizedResponse() MOZ_OVERRIDE;
+   NS_IMETHOD GetChannel(nsIChannel** aChannel) MOZ_OVERRIDE;
+   NS_IMETHOD SynthesizeHeader(const nsACString& aName, const nsACString& aValue) MOZ_OVERRIDE;
+   NS_IMETHOD Cancel() MOZ_OVERRIDE;
++  NS_IMETHOD SetSecurityInfo(nsISupports* aSecurityInfo) MOZ_OVERRIDE;
+ 
+   virtual void NotifyController() MOZ_OVERRIDE;
+ };
+ 
+ class InterceptedChannelContent : public InterceptedChannelBase
+ {
+   // The actual channel being intercepted.
+   nsRefPtr<HttpChannelChild> mChannel;
+@@ -98,16 +99,17 @@ public:
+                             nsINetworkInterceptController* aController,
+                             nsIStreamListener* aListener);
+ 
+   NS_IMETHOD ResetInterception() MOZ_OVERRIDE;
+   NS_IMETHOD FinishSynthesizedResponse() MOZ_OVERRIDE;
+   NS_IMETHOD GetChannel(nsIChannel** aChannel) MOZ_OVERRIDE;
+   NS_IMETHOD SynthesizeHeader(const nsACString& aName, const nsACString& aValue) MOZ_OVERRIDE;
+   NS_IMETHOD Cancel() MOZ_OVERRIDE;
++  NS_IMETHOD SetSecurityInfo(nsISupports* aSecurityInfo) MOZ_OVERRIDE;
+ 
+   virtual void NotifyController() MOZ_OVERRIDE;
+ };
+ 
+ } // namespace net
+ } // namespace mozilla
+ 
+ #endif // InterceptedChannel_h
+diff --git a/netwerk/protocol/http/nsHttpChannel.h b/netwerk/protocol/http/nsHttpChannel.h
+index 36c71ed..001c71b 100644
+--- a/netwerk/protocol/http/nsHttpChannel.h
++++ b/netwerk/protocol/http/nsHttpChannel.h
+@@ -370,17 +370,16 @@ private:
+     void UntieByteRangeRequest();
+     void UntieValidationRequest();
+     nsresult OpenCacheInputStream(nsICacheEntry* cacheEntry, bool startBuffering,
+                                   bool checkingAppCacheEntry);
+ 
+     void SetPushedStream(Http2PushedStream *stream);
+ 
+ private:
+-    nsCOMPtr<nsISupports>             mSecurityInfo;
+     nsCOMPtr<nsICancelable>           mProxyRequest;
+ 
+     nsRefPtr<nsInputStreamPump>       mTransactionPump;
+     nsRefPtr<nsHttpTransaction>       mTransaction;
+ 
+     uint64_t                          mLogicalOffset;
+ 
+     // cache specific data
