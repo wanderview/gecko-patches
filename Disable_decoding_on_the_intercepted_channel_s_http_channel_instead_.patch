@@ -1,0 +1,453 @@
+# HG changeset patch
+# User Nikhil Marathe <nsm.nikhil@gmail.com>
+# Date 1425672141 28800
+#      Fri Mar 06 12:02:21 2015 -0800
+# Node ID e607a0e74080c0cc337a6545298c4677ab77d0e6
+# Parent  87832eaf683a1ab934a4b00ad91b2f5118b73422
+Disable decoding on the intercepted channel's http channel instead.
+
+diff --git a/dom/fetch/Fetch.cpp b/dom/fetch/Fetch.cpp
+--- a/dom/fetch/Fetch.cpp
++++ b/dom/fetch/Fetch.cpp
+@@ -2,22 +2,24 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "Fetch.h"
+ 
+ #include "nsIDocument.h"
+ #include "nsIGlobalObject.h"
++#include "nsIStreamConverterService.h"
+ #include "nsIStreamLoader.h"
+ #include "nsIThreadRetargetableRequest.h"
+ #include "nsIUnicodeDecoder.h"
+ #include "nsIUnicodeEncoder.h"
+ 
+ #include "nsDOMString.h"
++#include "nsHttp.h"
+ #include "nsNetUtil.h"
+ #include "nsStreamUtils.h"
+ #include "nsStringStream.h"
+ 
+ #include "mozilla/ErrorResult.h"
+ #include "mozilla/dom/EncodingUtils.h"
+ #include "mozilla/dom/Exceptions.h"
+ #include "mozilla/dom/FetchDriver.h"
+@@ -963,16 +965,119 @@ FetchBody<Derived>::BeginConsumeBody()
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     ReleaseObject();
+     return rv;
+   }
+   return NS_OK;
+ }
+ 
+ /*
++namespace {
++bool
++IsAcceptableEncoding(const char* enc)
++{
++  if (!enc) {
++    return false;
++  }
++
++  // HTTP 1.1 allows servers to send x-gzip and x-compress instead
++  // of gzip and compress, for example.  So, we'll always strip off
++  // an "x-" prefix before matching the encoding to one we claim
++  // to accept.
++  if (!PL_strncasecmp(enc, "x-", 2))
++    enc += 2;
++
++  // gzip and deflate are inherently acceptable in modern HTTP - always
++  // process them if a stream converter can also be found.
++  if (!PL_strcasecmp(enc, "gzip") || !PL_strcasecmp(enc, "deflate"))
++    return true;
++
++  // XXX hardcoded encodings!
++  return net::nsHttp::FindToken("gzip, deflate", enc, HTTP_LWS ",") != nullptr;
++}
++} // anonymous namespace
++
++// Closely follows HttpBaseChannel::DoApplyContentConversions, but uses Fetch
++// APIs as required.
++template <class Derived>
++nsresult
++FetchBody<Derived>::MaybeApplyConversions(nsIStreamListener* aNextListener,
++                                          nsIStreamListener** aNewNextListener)
++{
++  *aNewNextListener = nullptr;
++
++  if (!aNextListener) {
++    return NS_OK;
++  }
++
++  nsCOMPtr<nsIStreamListener> nextListener = aNextListener;
++
++  ErrorResult result;
++  nsAutoCString contentEncoding;
++  MOZ_ASSERT(DerivedClass()->GetInternalHeaders());
++  DerivedClass()->GetInternalHeaders()->Get(NS_LITERAL_CSTRING("Content-Encoding"), contentEncoding, result);
++  if (result.Failed() || contentEncoding.IsEmpty()) {
++    return NS_OK;
++  }
++
++  // The encodings are listed in the order they were applied
++  // (see rfc 2616 section 14.11), so they need to removed in reverse
++  // order. This is accomplished because the converter chain ends up
++  // being a stack with the last converter created being the first one
++  // to accept the raw network data.
++
++  char* cePtr = contentEncoding.BeginWriting();
++  uint32_t count = 0;
++  while (char* val = nsCRT::strtok(cePtr, HTTP_LWS ",", &cePtr)) {
++    if (++count > 16) {
++      // That's ridiculous. We only understand 2 different ones :)
++      // but for compatibility with old code, we will just carry on without
++      // removing the encodings
++      NS_WARNING("Too many Content-Encodings. Ignoring remainder.\n");
++      break;
++    }
++
++    nsresult rv;
++    if (IsAcceptableEncoding(val)) {
++      nsCOMPtr<nsIStreamConverterService> serv = do_GetService(NS_STREAMCONVERTERSERVICE_CONTRACTID, &rv);
++      // XXX Necko doesn't fail here, but can this really happen when content JS is
++      // running and should we abort?
++      if (NS_FAILED(rv)) {
++        continue;
++      }
++
++      nsCOMPtr<nsIStreamListener> converter;
++      nsAutoCString from(val);
++      ToLowerCase(from);
++      rv = serv->AsyncConvertData(from.get(),
++                                  "uncompressed",
++                                  nextListener,
++                                  nullptr ,
++                                  getter_AddRefs(converter));
++      if (NS_FAILED(rv)) {
++        NS_WARNING("Unexpected failure of AsyncConvertData");
++        return rv;
++      }
++
++      fprintf(stderr, "converter removed '%s' content-encoding\n", val);
++      nextListener = converter;
++    }
++    else {
++      if (val) {
++        fprintf(stderr, "Unknown content encoding '%s', ignoring\n", val);
++      }
++    }
++  }
++  *aNewNextListener = nextListener;
++  NS_IF_ADDREF(*aNewNextListener);
++  return NS_OK;
++}
++*/
++
++/*
+  * BeginConsumeBodyMainThread() will automatically reject the consume promise
+  * and clean up on any failures, so there is no need for callers to do so,
+  * reflected in a lack of error return code.
+  */
+ template <class Derived>
+ void
+ FetchBody<Derived>::BeginConsumeBodyMainThread()
+ {
+@@ -997,33 +1102,47 @@ FetchBody<Derived>::BeginConsumeBodyMain
+ 
+   nsRefPtr<ConsumeBodyDoneObserver<Derived>> p = new ConsumeBodyDoneObserver<Derived>(this);
+   nsCOMPtr<nsIStreamLoader> loader;
+   rv = NS_NewStreamLoader(getter_AddRefs(loader), p);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return;
+   }
+ 
+-  rv = pump->AsyncRead(loader, nullptr);
++  nsCOMPtr<nsIStreamListener> listener = do_QueryInterface(loader);
++  nsCOMPtr<nsIStreamListener> newListener;
++
++  //rv = MaybeApplyConversions(listener, getter_AddRefs(newListener));
++  //if (NS_WARN_IF(NS_FAILED(rv))) {
++  //  return;
++  //}
++
++  if (newListener) {
++    listener = newListener;
++  }
++
++  rv = pump->AsyncRead(listener, nullptr);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return;
+   }
+ 
++  // Deal 
++
+   // Now that everything succeeded, we can assign the pump to a pointer that
+   // stays alive for the lifetime of the FetchBody.
+   mConsumeBodyPump = new nsMainThreadPtrHolder<nsIInputStreamPump>(pump);
+   // It is ok for retargeting to fail and reads to happen on the main thread.
+   autoReject.DontFail();
+ 
+   // Try to retarget, otherwise fall back to main thread.
+   nsCOMPtr<nsIThreadRetargetableRequest> rr = do_QueryInterface(pump);
+   if (rr) {
+     nsCOMPtr<nsIEventTarget> sts = do_GetService(NS_STREAMTRANSPORTSERVICE_CONTRACTID);
+     rv = rr->RetargetDeliveryTo(sts);
+-    if (NS_WARN_IF(NS_FAILED(rv))) {
++    if (NS_FAILED(rv)) {
+       NS_WARNING("Retargeting failed");
+     }
+   }
+ }
+ 
+ template <class Derived>
+ void
+ FetchBody<Derived>::ContinueConsumeBody(nsresult aStatus, uint32_t aResultLength, uint8_t* aResult)
+diff --git a/dom/fetch/Fetch.h b/dom/fetch/Fetch.h
+--- a/dom/fetch/Fetch.h
++++ b/dom/fetch/Fetch.h
+@@ -120,16 +120,19 @@ public:
+   }
+ 
+   already_AddRefed<Promise>
+   Text(ErrorResult& aRv)
+   {
+     return ConsumeBody(CONSUME_TEXT, aRv);
+   }
+ 
++  nsresult
++  MaybeApplyConversions(nsIStreamListener* aNextListener,
++                        nsIStreamListener** aNewNextListener);
+   // Utility public methods accessed by various runnables.
+   void
+   BeginConsumeBodyMainThread();
+ 
+   void
+   ContinueConsumeBody(nsresult aStatus, uint32_t aLength, uint8_t* aResult);
+ 
+   void
+diff --git a/dom/fetch/FetchDriver.cpp b/dom/fetch/FetchDriver.cpp
+--- a/dom/fetch/FetchDriver.cpp
++++ b/dom/fetch/FetchDriver.cpp
+@@ -1,16 +1,17 @@
+ /* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/FetchDriver.h"
+ 
+ #include "nsIDocument.h"
++#include "nsIEncodedChannel.h"
+ #include "nsIInputStream.h"
+ #include "nsIOutputStream.h"
+ #include "nsIHttpChannel.h"
+ #include "nsIHttpChannelInternal.h"
+ #include "nsIHttpHeaderVisitor.h"
+ #include "nsIScriptSecurityManager.h"
+ #include "nsIThreadRetargetableRequest.h"
+ #include "nsIUploadChannel2.h"
+@@ -644,17 +645,17 @@ FetchDriver::OnStartRequest(nsIRequest* 
+   MOZ_ASSERT(channel);
+ 
+   // Prohibit stream conversion. This allows us to send intercepted channels
+   // the 'raw' stream, where Necko can then treat it as having come from the
+   // network and apply conversions. If JS tries to use this via the Body
+   // methods, we convert manually.
+   nsCOMPtr<nsIEncodedChannel> encChannel = do_QueryInterface(channel);
+   if (encChannel) {
+-    encChannel->SetApplyConversion(false);
++    //encChannel->SetApplyConversion(false);
+   }
+ 
+   aRequest->GetStatus(&rv);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     FailWithNetworkError();
+     return rv;
+   }
+ 
+@@ -712,16 +713,17 @@ FetchDriver::OnStartRequest(nsIRequest* 
+ 
+ NS_IMETHODIMP
+ FetchDriver::OnDataAvailable(nsIRequest* aRequest,
+                              nsISupports* aContext,
+                              nsIInputStream* aInputStream,
+                              uint64_t aOffset,
+                              uint32_t aCount)
+ {
++  NS_WARNING("NSM ONDATAAVAILABLE");
+   uint32_t aRead;
+   MOZ_ASSERT(mResponse);
+   MOZ_ASSERT(mPipeOutputStream);
+ 
+   nsresult rv = aInputStream->ReadSegments(NS_CopySegmentToStream,
+                                            mPipeOutputStream,
+                                            aCount, &aRead);
+   return rv;
+diff --git a/dom/workers/test/serviceworkers/fetch/deliver-gzip.sjs b/dom/workers/test/serviceworkers/fetch/deliver-gzip.sjs
+new file mode 100644
+--- /dev/null
++++ b/dom/workers/test/serviceworkers/fetch/deliver-gzip.sjs
+@@ -0,0 +1,17 @@
++function handleRequest(request, response) {
++  // The string "hello" repeated 10 times followed by newline. Compressed using gzip.
++  var bytes = [0x1f, 0x8b, 0x08, 0x08, 0x4d, 0xe2, 0xf9, 0x54, 0x00, 0x03, 0x68,
++               0x65, 0x6c, 0x6c, 0x6f, 0x00, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0xcf,
++               0x20, 0x85, 0xe0, 0x02, 0x00, 0xf5, 0x4b, 0x38, 0xcf, 0x33, 0x00,
++               0x00, 0x00];
++
++  response.setHeader("Content-Encoding", "gzip", false);
++  response.setHeader("Content-Length", "" + bytes.length, false);
++  response.setHeader("Content-Type", "text/plain", false);
++
++  var bos = Components.classes["@mozilla.org/binaryoutputstream;1"]
++      .createInstance(Components.interfaces.nsIBinaryOutputStream);
++  bos.setOutputStream(response.bodyOutputStream);
++
++  bos.writeByteArray(bytes, bytes.length);
++}
+diff --git a/dom/workers/test/serviceworkers/fetch/fetch_tests.js b/dom/workers/test/serviceworkers/fetch/fetch_tests.js
+--- a/dom/workers/test/serviceworkers/fetch/fetch_tests.js
++++ b/dom/workers/test/serviceworkers/fetch/fetch_tests.js
+@@ -35,28 +35,28 @@ fetch('synthesized-404.txt', function(xh
+ 
+ fetch('synthesized-headers.txt', function(xhr) {
+   my_ok(xhr.status == 200, "load should be successful");
+   my_ok(xhr.getResponseHeader("X-Custom-Greeting") === "Hello", "custom header should be set");
+   my_ok(xhr.responseText == "synthesized response body", "custom header load should have synthesized response");
+   finish();
+ });
+ 
+-//fetch('synthesized-redirect-real-file.txt', function(xhr) {
+-//dump("Got status AARRGH " + xhr.status + " " + xhr.responseText + "\n");
+-//  my_ok(xhr.status == 200, "load should be successful");
+-//  my_ok(xhr.responseText == "This is a real file.", "Redirect to real file should complete.");
+-//  finish();
+-//});
+-//
+-//fetch('synthesized-redirect-synthesized.txt', function(xhr) {
+-//  my_ok(xhr.status == 200, "load should be successful");
+-//  my_ok(xhr.responseText == "synthesized response body", "load should have synthesized response");
+-//  finish();
+-//});
++fetch('synthesized-redirect-real-file.txt', function(xhr) {
++dump("Got status AARRGH " + xhr.status + " " + xhr.responseText + "\n");
++  my_ok(xhr.status == 200, "load should be successful");
++  my_ok(xhr.responseText == "This is a real file.", "Redirect to real file should complete.");
++  finish();
++});
++
++fetch('synthesized-redirect-synthesized.txt', function(xhr) {
++  my_ok(xhr.status == 200, "load should be successful");
++  my_ok(xhr.responseText == "synthesized response body", "load should have synthesized response");
++  finish();
++});
+ 
+ fetch('ignored.txt', function(xhr) {
+   my_ok(xhr.status == 404, "load should be uninterrupted");
+   finish();
+ });
+ 
+ fetch('rejected.txt', null, function(xhr) {
+   my_ok(xhr.status == 0, "load should not complete");
+@@ -75,17 +75,35 @@ fetch('nonresponse2.txt', null, function
+ 
+ fetch('headers.txt', function(xhr) {
+   my_ok(xhr.status == 200, "load should be successful");
+   my_ok(xhr.responseText == "1", "request header checks should have passed");
+   finish();
+ }, null, [["X-Test1", "header1"], ["X-Test2", "header2"]]);
+ 
+ fetch('hello.gz', function(xhr) {
+-  var expectedResponse;
++  var expectedResponse = "";
+   for (var i = 0; i < 10; ++i) {
+     expectedResponse += "hello";
+   }
++  expectedResponse += "\n";
++
+ 
+   my_ok(xhr.status == 200, "gzip load should be successful");
+   my_ok(xhr.responseText == expectedResponse, "gzip load should have synthesized response");
++  my_ok(xhr.getResponseHeader("Content-Encoding"), "gzip");
++  my_ok(xhr.getResponseHeader("Content-Length"), "35");
+   finish();
+ });
++
++fetch('hello-after-extracting.gz', function(xhr) {
++  var expectedResponse = "";
++  for (var i = 0; i < 10; ++i) {
++    expectedResponse += "hello";
++  }
++  expectedResponse += "\n";
++
++  my_ok(xhr.status == 200, "gzip load should be successful");
++  my_ok(xhr.responseText == expectedResponse, "gzip load should have synthesized response");
++  my_ok(xhr.getResponseHeader("Content-Encoding"), "gzip");
++  my_ok(xhr.getResponseHeader("Content-Length"), "35");
++  finish();
++});
+diff --git a/dom/workers/test/serviceworkers/fetch_event_worker.js b/dom/workers/test/serviceworkers/fetch_event_worker.js
+--- a/dom/workers/test/serviceworkers/fetch_event_worker.js
++++ b/dom/workers/test/serviceworkers/fetch_event_worker.js
+@@ -101,11 +101,19 @@ onfetch = function(ev) {
+ 
+   else if (ev.request.url.contains("nonexistent_imported_script.js")) {
+     ev.respondWith(Promise.resolve(
+       new Response("check_intercepted_script();", {})
+     ));
+   }
+ 
+   else if (ev.request.url.contains("hello.gz")) {
+-    ev.respondWith(fetch("deliver-gzip.sjs"));
++    ev.respondWith(fetch("fetch/deliver-gzip.sjs"));
++  }
++
++  else if (ev.request.url.contains("hello-after-extracting.gz")) {
++    ev.respondWith(fetch("fetch/deliver-gzip.sjs").then(function(res) {
++      return res.text().then(function(body) {
++        return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
++      });
++    }));
+   }
+ }
+diff --git a/netwerk/protocol/http/InterceptedChannel.cpp b/netwerk/protocol/http/InterceptedChannel.cpp
+--- a/netwerk/protocol/http/InterceptedChannel.cpp
++++ b/netwerk/protocol/http/InterceptedChannel.cpp
+@@ -167,16 +167,17 @@ InterceptedChannelChrome::FinishSynthesi
+ {
+   if (!mChannel) {
+     return NS_ERROR_NOT_AVAILABLE;
+   }
+ 
+   EnsureSynthesizedResponse();
+ 
+   mChannel->MarkIntercepted();
++  mChannel->SetApplyConversion(false);
+ 
+   // First we ensure the appropriate metadata is set on the synthesized cache entry
+   // (i.e. the flattened response head)
+ 
+   nsCOMPtr<nsISupports> securityInfo;
+   nsresult rv = mChannel->GetSecurityInfo(getter_AddRefs(securityInfo));
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+@@ -298,16 +299,17 @@ InterceptedChannelContent::FinishSynthes
+     return rv;
+   }
+ 
+   mResponseBody = nullptr;
+ 
+   rv = mStoragePump->AsyncRead(mStreamListener, nullptr);
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
++  mChannel->SetApplyConversion(false);
+   // In our current implementation, the FetchEvent handler will copy the
+   // response stream completely into the pipe backing the input stream so we
+   // can treat the available as the length of the stream.
+   int64_t streamLength;
+   uint64_t available;
+   rv = mSynthesizedInput->Available(&available);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     streamLength = -1;
