@@ -1,112 +1,192 @@
 # HG changeset patch
-# Parent 0d04be8c39518da843cedfe9eb91b7cf9ea88db6
+# Parent 8e229b8d92d9698a5de79eb970e09abcf4f5cd59
 # User Ben Kelly <ben@wanderview.com>
 Bug 1110487 P2 Implement the nsIOfflineStorage interface in Cache.
 
-
-diff --git a/dom/cache/QuotaOfflineStorage.cpp b/dom/cache/QuotaOfflineStorage.cpp
+diff --git a/dom/cache/OfflineStorage.cpp b/dom/cache/OfflineStorage.cpp
 new file mode 100644
 --- /dev/null
-+++ b/dom/cache/QuotaOfflineStorage.cpp
-@@ -0,0 +1,93 @@
++++ b/dom/cache/OfflineStorage.cpp
+@@ -0,0 +1,174 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 +
-+#include "mozilla/dom/cache/QuotaOfflineStorage.h"
++#include "mozilla/dom/cache/OfflineStorage.h"
 +
 +#include "mozilla/dom/cache/Context.h"
++#include "mozilla/dom/quota/QuotaManager.h"
++#include "nsIOfflineStorage.h"
 +#include "nsThreadUtils.h"
 +
-+namespace mozilla {
-+namespace dom {
-+namespace cache {
++namespace {
 +
++using mozilla::dom::cache::Context;
 +using mozilla::dom::quota::Client;
++using mozilla::dom::quota::QuotaManager;
 +
-+NS_IMPL_ISUPPORTS(mozilla::dom::cache::QuotaOfflineStorage, nsIOfflineStorage);
++// ----------------------------------------------------------------------------
 +
-+QuotaOfflineStorage::QuotaOfflineStorage(Context* aContext,
-+                                         nsIThread* aBackgroundThread)
-+  : mContext(aContext)
-+  , mBackgroundThread(aBackgroundThread)
++class CacheOfflineStorage MOZ_FINAL : public nsIOfflineStorage
 +{
-+  MOZ_ASSERT(mContext);
-+  MOZ_ASSERT(mBackgroundThread);
-+}
++public:
++  CacheOfflineStorage(already_AddRefed<Context>&& aContext,
++                      nsIThread* aBackgroundThread)
++    : mContext(aContext)
++    , mBackgroundThread(aBackgroundThread)
++  {
++    MOZ_ASSERT(mContext);
++    MOZ_ASSERT(mBackgroundThread);
++  }
 +
-+QuotaOfflineStorage::~QuotaOfflineStorage()
-+{
-+  MOZ_ASSERT(NS_IsMainThread());
++private:
++  ~CacheOfflineStorage()
++  {
++    MOZ_ASSERT(NS_IsMainThread());
++    MaybeReleaseContext();
++  }
 +
-+  // TODO: proxy release Context on background thread
-+}
++  void
++  MaybeReleaseContext()
++  {
++    MOZ_ASSERT(NS_IsMainThread());
++
++    if (!mContext) {
++      return;
++    }
++
++    // Due to shutdown handler this dispatch must always succeed.
++    // If it fails, then a design invariant has been violated.
++    nsCOMPtr<nsIRunnable> releaser =
++      NS_NewNonOwningRunnableMethod(mContext.forget().take(),
++                                    &Context::Release);
++    MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
++      mBackgroundThread->Dispatch(releaser, nsIThread::DISPATCH_NORMAL)));
++  }
++
++  nsRefPtr<Context> mContext;
++  nsCOMPtr<nsIThread> mBackgroundThread;
++
++  NS_DECL_ISUPPORTS
++  NS_DECL_NSIOFFLINESTORAGE
++};
++
++NS_IMPL_ISUPPORTS(CacheOfflineStorage, nsIOfflineStorage);
 +
 +NS_IMETHODIMP_(const nsACString&)
-+QuotaOfflineStorage::Id()
++CacheOfflineStorage::Id()
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
 +  return EmptyCString();
 +}
 +
 +NS_IMETHODIMP_(Client*)
-+QuotaOfflineStorage::GetClient()
++CacheOfflineStorage::GetClient()
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
 +  return nullptr;
 +}
 +
 +NS_IMETHODIMP_(bool)
-+QuotaOfflineStorage::IsOwnedByProcess(ContentParent* aOwner)
++CacheOfflineStorage::IsOwnedByProcess(ContentParent* aOwner)
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
 +  return true;
 +}
 +
 +NS_IMETHODIMP_(const nsACString&)
-+QuotaOfflineStorage::Origin()
++CacheOfflineStorage::Origin()
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
 +  return EmptyCString();
 +}
 +
 +NS_IMETHODIMP_(nsresult)
-+QuotaOfflineStorage::Close()
++CacheOfflineStorage::Close()
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
-+
-+  // TODO: proxy to background thread
-+
-+  // To "close" we just de-ref the Context and let it destroy itself once all
-+  // pending Actions have completed.
-+  MOZ_ASSERT(mContext);
-+  mContext = nullptr;
 +  return NS_OK;
 +}
 +
 +NS_IMETHODIMP_(void)
-+QuotaOfflineStorage::Invalidate()
++CacheOfflineStorage::Invalidate()
++{
++  MOZ_ASSERT(NS_IsMainThread());
++}
++
++// ----------------------------------------------------------------------------
++
++class CacheOfflineStorageRegistration MOZ_FINAL : public nsISupports
++{
++public:
++  explicit CacheOfflineStorageRegistration(CacheOfflineStorage* aStorage)
++    : mStorage(aStorage)
++  {
++    MOZ_ASSERT(NS_IsMainThread());
++    MOZ_ASSERT(mStorage);
++  }
++
++private:
++  ~CacheOfflineStorageRegistration()
++  {
++    MOZ_ASSERT(NS_IsMainThread());
++    MOZ_ASSERT(mStorage);
++
++    nsRefPtr<QuotaManager> qm = QuotaManager::Get();
++    if (!qm) {
++      NS_WARNING("QuotaManager gone before Cache offline storage unregistered");
++      return;
++    }
++    qm->UnregisterStorage(mStorage);
++  }
++
++  nsRefPtr<CacheOfflineStorage> mStorage;
++
++  NS_DECL_ISUPPORTS
++};
++
++NS_IMPL_ISUPPORTS0(CacheOfflineStorageRegistration);
++
++// ----------------------------------------------------------------------------
++
++} // anonymous namespace
++
++namespace mozilla {
++namespace dom {
++namespace cache {
++
++already_AddRefed<nsISupports>
++RegisterOfflineStorage(already_AddRefed<Context>&& aContext,
++                       nsIThread* aBackgroundThread)
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
 +
-+  // TODO: proxy to background thread
++  nsRefPtr<CacheOfflineStorage> storage =
++    new CacheOfflineStorage(Move(aContext), aBackgroundThread);
 +
-+  // To "invalidate" we cancel all pending Actions and then de-ref so that it
-+  // will destroy itself.
-+  mContext->CancelAll();
-+  mContext = nullptr;
++  nsRefPtr<QuotaManager> qm = QuotaManager::GetOrCreate();
++  if (NS_WARN_IF(!qm)) {
++    return nullptr;
++  }
++
++  if (NS_WARN_IF(!qm->RegisterStorage(storage))) {
++    return nullptr;
++  }
++
++  nsCOMPtr<nsISupports> reg = new CacheOfflineStorageRegistration(storage);
++  return reg.forget();
 +}
 +
 +} // namespace cache
 +} // namespace dom
 +} // namespace mozilla
-diff --git a/dom/cache/QuotaOfflineStorage.h b/dom/cache/QuotaOfflineStorage.h
+diff --git a/dom/cache/OfflineStorage.h b/dom/cache/OfflineStorage.h
 new file mode 100644
 --- /dev/null
-+++ b/dom/cache/QuotaOfflineStorage.h
-@@ -0,0 +1,41 @@
++++ b/dom/cache/OfflineStorage.h
+@@ -0,0 +1,33 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -116,9 +196,8 @@ new file mode 100644
 +#ifndef mozilla_dom_cache_QuotaOfflineStorage_h
 +#define mozilla_dom_cache_QuotaOfflineStorage_h
 +
-+#include "nsCOMPtr.h"
-+#include "nsIOfflineStorage.h"
-+#include "nsRefPtr.h"
++#include "nsISupportsImpl.h"
++#include "mozilla/AlreadyAddRefed.h"
 +
 +class nsIThread;
 +
@@ -128,20 +207,13 @@ new file mode 100644
 +
 +class Context;
 +
-+class QuotaOfflineStorage MOZ_FINAL : public nsIOfflineStorage
-+{
-+public:
-+  QuotaOfflineStorage(Context* aContext, nsIThread* aBackgroundThread);
-+
-+private:
-+  ~QuotaOfflineStorage();
-+
-+  nsRefPtr<Context> mContext;
-+  nsCOMPtr<nsIThread> mBackgroundThread;
-+
-+  NS_DECL_NSIOFFLINESTORAGE
-+  NS_DECL_ISUPPORTS
-+};
++// Register a QuotaManager OfflineStorage object on the main thread.  The
++// returned registration reference is to an RAII object.  When this object
++// is released then the OfflineStorage is unregistered.  This release must
++// occur on the main thread.
++already_AddRefed<nsISupports>
++RegisterOfflineStorage(already_AddRefed<Context>&& aContext,
++                       nsIThread* aBackgroundThread);
 +
 +} // namespace cache
 +} // namespace dom
@@ -151,16 +223,18 @@ new file mode 100644
 diff --git a/dom/cache/moz.build b/dom/cache/moz.build
 --- a/dom/cache/moz.build
 +++ b/dom/cache/moz.build
-@@ -23,25 +23,27 @@ EXPORTS.mozilla.dom.cache += [
+@@ -21,27 +21,29 @@ EXPORTS.mozilla.dom.cache += [
+     'DBAction.h',
+     'DBSchema.h',
      'Feature.h',
      'FetchPut.h',
      'FileUtils.h',
      'IPCUtils.h',
      'Manager.h',
      'ManagerId.h',
++    'OfflineStorage.h',
      'PrincipalVerifier.h',
      'QuotaClient.h',
-+    'QuotaOfflineStorage.h',
      'ReadStream.h',
      'SavedTypes.h',
      'StreamList.h',
@@ -180,21 +254,21 @@ diff --git a/dom/cache/moz.build b/dom/cache/moz.build
      'CacheParent.cpp',
      'CacheStorage.cpp',
      'CacheStorageChild.cpp',
-@@ -53,16 +55,17 @@ UNIFIED_SOURCES += [
+@@ -51,16 +53,17 @@ UNIFIED_SOURCES += [
+     'Context.cpp',
+     'DBAction.cpp',
      'DBSchema.cpp',
      'Feature.cpp',
      'FetchPut.cpp',
      'FileUtils.cpp',
      'Manager.cpp',
      'ManagerId.cpp',
++    'OfflineStorage.cpp',
      'PrincipalVerifier.cpp',
      'QuotaClient.cpp',
-+    'QuotaOfflineStorage.cpp',
      'ReadStream.cpp',
      'StreamList.cpp',
      'StreamUtils.cpp',
      'TypeUtils.cpp',
  ]
  
- IPDL_SOURCES += [
-     'CacheInitData.ipdlh',
