@@ -3,11 +3,106 @@
 # User Ben Kelly <ben@wanderview.com>
 Bug 1110487 P2 Implement the nsIOfflineStorage interface in Cache.
 
+diff --git a/dom/cache/Context.h b/dom/cache/Context.h
+--- a/dom/cache/Context.h
++++ b/dom/cache/Context.h
+@@ -62,16 +62,22 @@ public:
+   void CancelAll();
+ 
+   // Cancel any Actions running or waiting to run that operate on the given
+   // cache ID.
+   //
+   // Only callable from the thread that created the Context.
+   void CancelForCacheId(CacheId aCacheId);
+ 
++  const QuotaInfo
++  GetQuotaInfo() const
++  {
++    return mQuotaInfo;
++  }
++
+ private:
+   class QuotaInitRunnable;
+   class ActionRunnable;
+ 
+   enum State
+   {
+     STATE_CONTEXT_INIT,
+     STATE_CONTEXT_READY,
+diff --git a/dom/cache/ManagerId.cpp b/dom/cache/ManagerId.cpp
+--- a/dom/cache/ManagerId.cpp
++++ b/dom/cache/ManagerId.cpp
+@@ -62,16 +62,25 @@ ManagerId::Principal() const
+ ManagerId::ManagerId(nsIPrincipal* aPrincipal, const nsACString& aOrigin,
+                      uint32_t aAppId, bool aInBrowserElement)
+     : mPrincipal(aPrincipal)
+     , mOrigin(aOrigin)
+     , mAppId(aAppId)
+     , mInBrowserElement(aInBrowserElement)
+ {
+   MOZ_ASSERT(mPrincipal);
++
++  // Construct unique string for this origin+appId+browserFlag triplet.
++  mQuotaId.AppendLiteral("cache-");
++  mQuotaId.Append(mOrigin);
++  mQuotaId.AppendLiteral("-");
++  mQuotaId.AppendInt(mAppId);
++  if (mInBrowserElement) {
++    mQuotaId.AppendLiteral("-browser");
++  }
+ }
+ 
+ ManagerId::~ManagerId()
+ {
+   // If we're already on the main thread, then default destruction is fine
+   if (NS_IsMainThread()) {
+     return;
+   }
+diff --git a/dom/cache/ManagerId.h b/dom/cache/ManagerId.h
+--- a/dom/cache/ManagerId.h
++++ b/dom/cache/ManagerId.h
+@@ -34,16 +34,18 @@ public:
+   // Main thread only
+   static nsresult Create(nsIPrincipal* aPrincipal, ManagerId** aManagerIdOut);
+ 
+   // Main thread only
+   already_AddRefed<nsIPrincipal> Principal() const;
+ 
+   const nsACString& Origin() const { return mOrigin; }
+ 
++  const nsACString& QuotaId() const { return mQuotaId; }
++
+   bool operator==(const ManagerId& aOther) const
+   {
+     return mOrigin == aOther.mOrigin &&
+            mAppId == aOther.mAppId &&
+            mInBrowserElement == aOther.mInBrowserElement;
+   }
+ 
+   bool operator<(const ManagerId& aOther) const
+@@ -64,16 +66,17 @@ private:
+ 
+   // only accessible on main thread
+   nsCOMPtr<nsIPrincipal> mPrincipal;
+ 
+   // immutable to allow threadsfe access
+   const nsCString mOrigin;
+   const uint32_t mAppId;
+   const bool mInBrowserElement;
++  nsCString mQuotaId;
+ 
+ public:
+   NS_INLINE_DECL_THREADSAFE_REFCOUNTING(mozilla::dom::cache::ManagerId)
+ };
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
 diff --git a/dom/cache/OfflineStorage.cpp b/dom/cache/OfflineStorage.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/OfflineStorage.cpp
-@@ -0,0 +1,174 @@
+@@ -0,0 +1,199 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -17,6 +112,8 @@ new file mode 100644
 +#include "mozilla/dom/cache/OfflineStorage.h"
 +
 +#include "mozilla/dom/cache/Context.h"
++#include "mozilla/dom/cache/ManagerId.h"
++#include "mozilla/dom/cache/QuotaClient.h"
 +#include "mozilla/dom/quota/QuotaManager.h"
 +#include "nsIOfflineStorage.h"
 +#include "nsThreadUtils.h"
@@ -24,6 +121,8 @@ new file mode 100644
 +namespace {
 +
 +using mozilla::dom::cache::Context;
++using mozilla::dom::cache::CreateQuotaClient;
++using mozilla::dom::cache::ManagerId;
 +using mozilla::dom::quota::Client;
 +using mozilla::dom::quota::QuotaManager;
 +
@@ -33,12 +132,16 @@ new file mode 100644
 +{
 +public:
 +  CacheOfflineStorage(already_AddRefed<Context>&& aContext,
-+                      nsIThread* aBackgroundThread)
++                      nsIThread* aBackgroundThread,
++                      ManagerId* aManagerId)
 +    : mContext(aContext)
 +    , mBackgroundThread(aBackgroundThread)
++    , mManagerId(aManagerId)
 +  {
 +    MOZ_ASSERT(mContext);
 +    MOZ_ASSERT(mBackgroundThread);
++
++    mClient = CreateQuotaClient();
 +  }
 +
 +private:
@@ -68,6 +171,8 @@ new file mode 100644
 +
 +  nsRefPtr<Context> mContext;
 +  nsCOMPtr<nsIThread> mBackgroundThread;
++  nsRefPtr<ManagerId> mManagerId;
++  nsRefPtr<Client> mClient;
 +
 +  NS_DECL_ISUPPORTS
 +  NS_DECL_NSIOFFLINESTORAGE
@@ -79,34 +184,47 @@ new file mode 100644
 +CacheOfflineStorage::Id()
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
-+  return EmptyCString();
++  return mManagerId->QuotaId();
 +}
 +
 +NS_IMETHODIMP_(Client*)
 +CacheOfflineStorage::GetClient()
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
-+  return nullptr;
++  return mClient;
 +}
 +
 +NS_IMETHODIMP_(bool)
 +CacheOfflineStorage::IsOwnedByProcess(ContentParent* aOwner)
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
-+  return true;
++  // The Cache and Context can be shared by multiple client processes.  They
++  // are not exclusively owned by a single process.
++  //
++  // As far as I can tell this is used by QuotaManager to shutdown storages
++  // when a particular process goes away.  We definitely don't want this
++  // since we are shared.  Also, the Cache actor code already properly
++  // handles asynchronous actor destruction when the child process dies.
++  //
++  // Therefore, always return false here.
++  return false;
 +}
 +
 +NS_IMETHODIMP_(const nsACString&)
 +CacheOfflineStorage::Origin()
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
-+  return EmptyCString();
++  return mManagerId->Origin();
 +}
 +
 +NS_IMETHODIMP_(nsresult)
 +CacheOfflineStorage::Close()
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
++  // In order to "close" the context without stopping current IO we simply
++  // drop our reference.  This will cause the Context to automatically
++  // destroy itself as soon as it becomes idle.
++  MaybeReleaseContext();
 +  return NS_OK;
 +}
 +
@@ -114,6 +232,7 @@ new file mode 100644
 +CacheOfflineStorage::Invalidate()
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
++  // TODO
 +}
 +
 +// ----------------------------------------------------------------------------
@@ -159,12 +278,13 @@ new file mode 100644
 +
 +already_AddRefed<nsISupports>
 +RegisterOfflineStorage(already_AddRefed<Context>&& aContext,
-+                       nsIThread* aBackgroundThread)
++                       nsIThread* aBackgroundThread,
++                       ManagerId* aManagerId)
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
 +
 +  nsRefPtr<CacheOfflineStorage> storage =
-+    new CacheOfflineStorage(Move(aContext), aBackgroundThread);
++    new CacheOfflineStorage(Move(aContext), aBackgroundThread, aManagerId);
 +
 +  nsRefPtr<QuotaManager> qm = QuotaManager::GetOrCreate();
 +  if (NS_WARN_IF(!qm)) {
@@ -186,7 +306,7 @@ diff --git a/dom/cache/OfflineStorage.h b/dom/cache/OfflineStorage.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/OfflineStorage.h
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,35 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -206,6 +326,7 @@ new file mode 100644
 +namespace cache {
 +
 +class Context;
++class ManagerId;
 +
 +// Register a QuotaManager OfflineStorage object on the main thread.  The
 +// returned registration reference is to an RAII object.  When this object
@@ -213,7 +334,8 @@ new file mode 100644
 +// occur on the main thread.
 +already_AddRefed<nsISupports>
 +RegisterOfflineStorage(already_AddRefed<Context>&& aContext,
-+                       nsIThread* aBackgroundThread);
++                       nsIThread* aBackgroundThread,
++                       ManagerId* aManagerId);
 +
 +} // namespace cache
 +} // namespace dom
