@@ -1,14 +1,546 @@
 # HG changeset patch
-# Parent 8e229b8d92d9698a5de79eb970e09abcf4f5cd59
+# Parent 30fba3f4756b70f55af0e1982e0a7e45fd712632
 # User Ben Kelly <ben@wanderview.com>
 Bug 1110487 P2 Implement the nsIOfflineStorage interface in Cache.
 
+diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
+--- a/dom/cache/Context.cpp
++++ b/dom/cache/Context.cpp
+@@ -5,58 +5,57 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/Context.h"
+ 
+ #include "mozilla/DebugOnly.h"
+ #include "mozilla/dom/cache/Action.h"
+ #include "mozilla/dom/cache/Manager.h"
+ #include "mozilla/dom/cache/ManagerId.h"
++#include "mozilla/dom/cache/OfflineStorage.h"
+ #include "mozilla/dom/quota/OriginOrPatternString.h"
+ #include "mozilla/dom/quota/QuotaManager.h"
+ #include "nsIFile.h"
+ #include "nsIPrincipal.h"
+ #include "nsIRunnable.h"
+ #include "nsThreadUtils.h"
+ 
+ namespace {
+ 
+ using mozilla::dom::Nullable;
+ using mozilla::dom::cache::QuotaInfo;
++using mozilla::dom::quota::Client;
+ using mozilla::dom::quota::OriginOrPatternString;
+ using mozilla::dom::quota::QuotaManager;
+ using mozilla::dom::quota::PERSISTENCE_TYPE_DEFAULT;
+ using mozilla::dom::quota::PersistenceType;
+ 
+-// Executed when the context is destroyed to release our lock on the
+-// QuotaManager.
++// Release out lock on the QuotaManager directory asynchronously.
+ class QuotaReleaseRunnable MOZ_FINAL : public nsRunnable
+ {
+ public:
+-  QuotaReleaseRunnable(const QuotaInfo& aQuotaInfo, const nsACString& aQuotaId)
++  explicit QuotaReleaseRunnable(const QuotaInfo& aQuotaInfo)
+     : mQuotaInfo(aQuotaInfo)
+-    , mQuotaId(aQuotaId)
+   { }
+ 
+   NS_IMETHOD Run() MOZ_OVERRIDE
+   {
+     MOZ_ASSERT(NS_IsMainThread());
+     QuotaManager* qm = QuotaManager::Get();
+     MOZ_ASSERT(qm);
+     qm->AllowNextSynchronizedOp(OriginOrPatternString::FromOrigin(mQuotaInfo.mOrigin),
+                                 Nullable<PersistenceType>(PERSISTENCE_TYPE_DEFAULT),
+-                                mQuotaId);
++                                mQuotaInfo.mStorageId);
+     return NS_OK;
+   }
+ 
+ private:
+   ~QuotaReleaseRunnable() { }
+ 
+   const QuotaInfo mQuotaInfo;
+-  const nsCString mQuotaId;
+ };
+ 
+ } // anonymous namespace
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+@@ -70,25 +69,25 @@ using mozilla::dom::quota::PersistenceTy
+ // the QuotaManager.  This must be performed for each origin before any disk
+ // IO occurrs.
+ class Context::QuotaInitRunnable MOZ_FINAL : public nsIRunnable
+                                            , public Action::Resolver
+ {
+ public:
+   QuotaInitRunnable(Context* aContext,
+                     Manager* aManager,
+-                    const nsACString& aQuotaId,
+                     Action* aQuotaIOThreadAction)
+     : mContext(aContext)
++    , mThreadsafeHandle(aContext->CreateThreadsafeHandle())
+     , mManager(aManager)
+-    , mQuotaId(aQuotaId)
+     , mQuotaIOThreadAction(aQuotaIOThreadAction)
+     , mInitiatingThread(NS_GetCurrentThread())
+     , mState(STATE_INIT)
+     , mResult(NS_OK)
++    , mNeedsQuotaRelease(false)
+   {
+     MOZ_ASSERT(mContext);
+     MOZ_ASSERT(mManager);
+     MOZ_ASSERT(mInitiatingThread);
+   }
+ 
+   nsresult Dispatch()
+   {
+@@ -147,23 +146,25 @@ private:
+     NS_ASSERT_OWNINGTHREAD(Action::Resolver);
+     MOZ_ASSERT(mContext);
+     mContext = nullptr;
+     mManager = nullptr;
+     mQuotaIOThreadAction = nullptr;
+   }
+ 
+   nsRefPtr<Context> mContext;
++  nsRefPtr<ThreadsafeHandle> mThreadsafeHandle;
+   nsRefPtr<Manager> mManager;
+-  const nsCString mQuotaId;
+   nsRefPtr<Action> mQuotaIOThreadAction;
+   nsCOMPtr<nsIThread> mInitiatingThread;
+   State mState;
+   nsresult mResult;
+   QuotaInfo mQuotaInfo;
++  nsMainThreadPtrHandle<nsISupports> mOfflineStorage;
++  bool mNeedsQuotaRelease;
+ 
+ public:
+   NS_DECL_ISUPPORTS_INHERITED
+   NS_DECL_NSIRUNNABLE
+ };
+ 
+ NS_IMPL_ISUPPORTS_INHERITED(mozilla::dom::cache::Context::QuotaInitRunnable,
+                             Action::Resolver, nsIRunnable);
+@@ -225,35 +226,46 @@ Context::QuotaInitRunnable::Run()
+                                              &mQuotaInfo.mGroup,
+                                              &mQuotaInfo.mOrigin,
+                                              &mQuotaInfo.mIsApp);
+       if (NS_WARN_IF(NS_FAILED(rv))) {
+         Resolve(rv);
+         return NS_OK;
+       }
+ 
++      QuotaManager::GetStorageId(PERSISTENCE_TYPE_DEFAULT,
++                                 mQuotaInfo.mOrigin,
++                                 Client::DOMCACHE,
++                                 NS_LITERAL_STRING("cache"),
++                                 mQuotaInfo.mStorageId);
++
+       // QuotaManager::WaitForOpenAllowed() will hold a reference to us as
+       // a callback.  We will then get executed again on the main thread when
+       // it is safe to open the quota directory.
+       mState = STATE_WAIT_FOR_OPEN_ALLOWED;
+       rv = qm->WaitForOpenAllowed(OriginOrPatternString::FromOrigin(mQuotaInfo.mOrigin),
+                                   Nullable<PersistenceType>(PERSISTENCE_TYPE_DEFAULT),
+-                                  mQuotaId, this);
++                                  mQuotaInfo.mStorageId, this);
+       if (NS_FAILED(rv)) {
+         Resolve(rv);
+         return NS_OK;
+       }
+       break;
+     }
+     // ------------------------------
+     case STATE_WAIT_FOR_OPEN_ALLOWED:
+     {
+       MOZ_ASSERT(NS_IsMainThread());
+       QuotaManager* qm = QuotaManager::Get();
+       MOZ_ASSERT(qm);
++
++      nsCOMPtr<nsISupports> offlineStorage =
++        RegisterOfflineStorage(mThreadsafeHandle, mQuotaInfo);
++      mOfflineStorage = new nsMainThreadPtrHolder<nsISupports>(offlineStorage);
++
+       mState = STATE_ENSURE_ORIGIN_INITIALIZED;
+       nsresult rv = qm->IOThread()->Dispatch(this, nsIThread::DISPATCH_NORMAL);
+       if (NS_WARN_IF(NS_FAILED(rv))) {
+         Resolve(rv);
+         return NS_OK;
+       }
+       break;
+     }
+@@ -272,16 +284,17 @@ Context::QuotaInitRunnable::Run()
+                                                   mQuotaInfo.mOrigin,
+                                                   mQuotaInfo.mIsApp,
+                                                   getter_AddRefs(mQuotaInfo.mDir));
+       if (NS_FAILED(rv)) {
+         Resolve(rv);
+         return NS_OK;
+       }
+ 
++      mNeedsQuotaRelease = true;
+       mState = STATE_RUNNING;
+ 
+       if (!mQuotaIOThreadAction) {
+         Resolve(NS_OK);
+         return NS_OK;
+       }
+ 
+       // Execute the provided initialization Action.  We pass ourselves as the
+@@ -293,18 +306,26 @@ Context::QuotaInitRunnable::Run()
+     }
+     // -------------------
+     case STATE_COMPLETING:
+     {
+       NS_ASSERT_OWNINGTHREAD(Action::Resolver);
+       if (mQuotaIOThreadAction) {
+         mQuotaIOThreadAction->CompleteOnInitiatingThread(mResult);
+       }
+-      mContext->OnQuotaInit(mResult, mQuotaInfo);
++      mContext->OnQuotaInit(mResult, mQuotaInfo, mOfflineStorage);
+       mState = STATE_COMPLETE;
++
++      if (mNeedsQuotaRelease) {
++        // Unlock the quota dir if we locked it previously
++        nsCOMPtr<nsIRunnable> runnable = new QuotaReleaseRunnable(mQuotaInfo);
++        MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
++          NS_DispatchToMainThread(runnable, nsIThread::DISPATCH_NORMAL)));
++      }
++
+       // Explicitly cleanup here as the destructor could fire on any of
+       // the threads we have bounced through.
+       Clear();
+       break;
+     }
+     // -----
+     default:
+     {
+@@ -477,25 +498,117 @@ Context::ActionRunnable::Run()
+     {
+       MOZ_CRASH("unexpected state in ActionRunnable");
+       break;
+     }
+   }
+   return NS_OK;
+ }
+ 
++void
++Context::ThreadsafeHandle::AllowToClose()
++{
++  if (mOwningThread == NS_GetCurrentThread()) {
++    AllowToCloseOnOwningThread();
++    return;
++  }
++
++  // Dispatch is guaranteed to succeed here because we block shutdown until
++  // all Contexts have been destroyed.
++  nsCOMPtr<nsIRunnable> runnable =
++    NS_NewRunnableMethod(this, &ThreadsafeHandle::AllowToCloseOnOwningThread);
++  MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
++    mOwningThread->Dispatch(runnable, nsIThread::DISPATCH_NORMAL)));
++}
++
++void
++Context::ThreadsafeHandle::CancelAndAllowToClose()
++{
++  if (mOwningThread == NS_GetCurrentThread()) {
++    CancelAndAllowToCloseOnOwningThread();
++    return;
++  }
++
++  // Dispatch is guaranteed to succeed here because we block shutdown until
++  // all Contexts have been destroyed.
++  nsCOMPtr<nsIRunnable> runnable =
++    NS_NewRunnableMethod(this, &ThreadsafeHandle::CancelAndAllowToCloseOnOwningThread);
++  MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
++    mOwningThread->Dispatch(runnable, nsIThread::DISPATCH_NORMAL)));
++}
++
++Context::ThreadsafeHandle::ThreadsafeHandle(Context* aContext)
++  : mStrongRef(aContext)
++  , mWeakRef(aContext)
++  , mOwningThread(NS_GetCurrentThread())
++{
++}
++
++Context::ThreadsafeHandle::~ThreadsafeHandle()
++{
++  // Normally we only touch mStrongRef on the owning thread.  This is safe,
++  // however, because when we do use mStrongRef on the owning thread we are
++  // always holding a strong ref to the ThreadsafeHandle via the owning
++  // runnable.  So we cannot run the ThreadsafeHandle destructor simultaneously.
++  if (!mStrongRef || mOwningThread == NS_GetCurrentThread()) {
++    return;
++  }
++
++  // Dispatch is guaranteed to succeed here because we block shutdown until
++  // all Contexts have been destroyed.
++  nsCOMPtr<nsIRunnable> runnable =
++    NS_NewNonOwningRunnableMethod(mStrongRef.forget().take(), &Context::Release);
++  MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
++    mOwningThread->Dispatch(runnable, nsIThread::DISPATCH_NORMAL)));
++}
++
++void
++Context::ThreadsafeHandle::AllowToCloseOnOwningThread()
++{
++  MOZ_ASSERT(mOwningThread == NS_GetCurrentThread());
++  // A Context "closes" when its ref count drops to zero.  Dropping this
++  // strong ref is necessary, but not sufficient for the close to occur.
++  // Any outstanding IO will continue and keep the Context alive.  Once
++  // the Context is idle, it will be destroyed.
++  mStrongRef = nullptr;
++}
++
++void
++Context::ThreadsafeHandle::CancelAndAllowToCloseOnOwningThread()
++{
++  MOZ_ASSERT(mOwningThread == NS_GetCurrentThread());
++  // Cancel the Context through the weak reference.  This means we can
++  // allow the Context to close by dropping the strong ref, but then
++  // still cancel ongoing IO if necessary.
++  if (mWeakRef) {
++    mWeakRef->CancelAll();
++  }
++  // We should synchronously have AllowToCloseOnOwningThread called when
++  // the Context is canceled.
++  MOZ_ASSERT(!mStrongRef);
++}
++
++void
++Context::ThreadsafeHandle::ContextDestroyed(Context* aContext)
++{
++  MOZ_ASSERT(mOwningThread == NS_GetCurrentThread());
++  MOZ_ASSERT(!mStrongRef);
++  MOZ_ASSERT(mWeakRef);
++  MOZ_ASSERT(mWeakRef == aContext);
++  mWeakRef = nullptr;
++}
++
+ // static
+ already_AddRefed<Context>
+ Context::Create(Manager* aManager, Action* aQuotaIOThreadAction)
+ {
+   nsRefPtr<Context> context = new Context(aManager);
+ 
+   nsRefPtr<QuotaInitRunnable> runnable =
+-    new QuotaInitRunnable(context, aManager, NS_LITERAL_CSTRING("Cache"),
+-                          aQuotaIOThreadAction);
++    new QuotaInitRunnable(context, aManager, aQuotaIOThreadAction);
+   nsresult rv = runnable->Dispatch();
+   if (NS_FAILED(rv)) {
+     // Shutdown must be delayed until all Contexts are destroyed.  Shutdown
+     // must also prevent any new Contexts from being constructed.  Crash
+     // for this invariant violation.
+     MOZ_CRASH("Failed to dispatch QuotaInitRunnable.");
+   }
+ 
+@@ -534,16 +647,26 @@ Context::CancelAll()
+ {
+   NS_ASSERT_OWNINGTHREAD(Context);
+   mState = STATE_CONTEXT_CANCELED;
+   mPendingActions.Clear();
+   for (uint32_t i = 0; i < mActionRunnables.Length(); ++i) {
+     nsRefPtr<ActionRunnable> runnable = mActionRunnables[i];
+     runnable->Cancel();
+   }
++  AllowToClose();
++}
++
++void
++Context::AllowToClose()
++{
++  NS_ASSERT_OWNINGTHREAD(Context);
++  if (mThreadsafeHandle) {
++    mThreadsafeHandle->AllowToClose();
++  }
+ }
+ 
+ void
+ Context::CancelForCacheId(CacheId aCacheId)
+ {
+   NS_ASSERT_OWNINGTHREAD(Context);
+   for (uint32_t i = 0; i < mPendingActions.Length(); ++i) {
+     if (mPendingActions[i].mAction->MatchesCacheId(aCacheId)) {
+@@ -558,24 +681,18 @@ Context::CancelForCacheId(CacheId aCache
+   }
+ }
+ 
+ Context::~Context()
+ {
+   NS_ASSERT_OWNINGTHREAD(Context);
+   MOZ_ASSERT(mManager);
+ 
+-  // Unlock the quota dir as we go out of scope.
+-  nsCOMPtr<nsIRunnable> runnable =
+-    new QuotaReleaseRunnable(mQuotaInfo, NS_LITERAL_CSTRING("Cache"));
+-  nsresult rv = NS_DispatchToMainThread(runnable, nsIThread::DISPATCH_NORMAL);
+-  if (NS_FAILED(rv)) {
+-    // Shutdown must be delayed until all Contexts are destroyed.  Crash
+-    // for this invariant violation.
+-    MOZ_CRASH("Failed to dispatch QuotaReleaseRunnable to main thread.");
++  if (mThreadsafeHandle) {
++    mThreadsafeHandle->ContextDestroyed(this);
+   }
+ 
+   mManager->RemoveContext(this);
+ }
+ 
+ void
+ Context::DispatchAction(nsIEventTarget* aTarget, Action* aAction)
+ {
+@@ -588,43 +705,58 @@ Context::DispatchAction(nsIEventTarget* 
+     // Shutdown must be delayed until all Contexts are destroyed.  Crash
+     // for this invariant violation.
+     MOZ_CRASH("Failed to dispatch ActionRunnable to target thread.");
+   }
+   mActionRunnables.AppendElement(runnable);
+ }
+ 
+ void
+-Context::OnQuotaInit(nsresult aRv, const QuotaInfo& aQuotaInfo)
++Context::OnQuotaInit(nsresult aRv, const QuotaInfo& aQuotaInfo,
++                     nsMainThreadPtrHandle<nsISupports>& aOfflineStorage)
+ {
+   NS_ASSERT_OWNINGTHREAD(Context);
+ 
+   mQuotaInfo = aQuotaInfo;
+ 
+   if (mState == STATE_CONTEXT_CANCELED || NS_FAILED(aRv)) {
+     for (uint32_t i = 0; i < mPendingActions.Length(); ++i) {
+       mPendingActions[i].mAction->CompleteOnInitiatingThread(aRv);
+     }
+     mPendingActions.Clear();
++    mThreadsafeHandle = nullptr;
+     // Context will destruct after return here and last ref is released.
+     return;
+   }
+ 
+   MOZ_ASSERT(mState == STATE_CONTEXT_INIT);
+   mState = STATE_CONTEXT_READY;
+ 
++  mOfflineStorage = aOfflineStorage;
++
+   for (uint32_t i = 0; i < mPendingActions.Length(); ++i) {
+     DispatchAction(mPendingActions[i].mTarget, mPendingActions[i].mAction);
+   }
+   mPendingActions.Clear();
+ }
+ 
+ void
+ Context::OnActionRunnableComplete(ActionRunnable* aActionRunnable)
+ {
+   NS_ASSERT_OWNINGTHREAD(Context);
+   MOZ_ASSERT(aActionRunnable);
+   MOZ_ALWAYS_TRUE(mActionRunnables.RemoveElement(aActionRunnable));
+ }
+ 
++already_AddRefed<Context::ThreadsafeHandle>
++Context::CreateThreadsafeHandle()
++{
++  NS_ASSERT_OWNINGTHREAD(Context);
++  if (!mThreadsafeHandle) {
++    mThreadsafeHandle = new ThreadsafeHandle(this);
++  }
++  nsRefPtr<ThreadsafeHandle> ref = mThreadsafeHandle;
++  return ref.forget();
++}
++
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
 diff --git a/dom/cache/Context.h b/dom/cache/Context.h
 --- a/dom/cache/Context.h
 +++ b/dom/cache/Context.h
-@@ -62,16 +62,22 @@ public:
+@@ -6,21 +6,23 @@
+ 
+ #ifndef mozilla_dom_cache_Context_h
+ #define mozilla_dom_cache_Context_h
+ 
+ #include "mozilla/dom/cache/Types.h"
+ #include "nsAutoPtr.h"
+ #include "nsCOMPtr.h"
+ #include "nsISupportsImpl.h"
++#include "nsProxyRelease.h"
+ #include "nsString.h"
+ #include "nsTArray.h"
+ 
+ class nsIEventTarget;
+ class nsIFile;
++class nsIThread;
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ class Action;
+ class Manager;
+ 
+@@ -40,38 +42,79 @@ class Manager;
+ // originally used to create the Context.
+ //
+ // As an invariant, all Context objects must be destroyed before permitting
+ // the "profile-before-change" shutdown event to complete.  This is ensured
+ // via the code in ShutdownObserver.cpp.
+ class Context MOZ_FINAL
+ {
+ public:
++  // Define a class allowing other threads to hold the Context alive.  This also
++  // allows these other threads to safely close or cancel the Context.
++  class ThreadsafeHandle MOZ_FINAL
++  {
++    friend class Context;
++  public:
++    void AllowToClose();
++    void CancelAndAllowToClose();
++  private:
++    explicit ThreadsafeHandle(Context* aContext);
++    ~ThreadsafeHandle();
++
++    void AllowToCloseOnOwningThread();
++    void CancelAndAllowToCloseOnOwningThread();
++
++    void ContextDestroyed(Context* aContext);
++
++    // Cleared to allow the Context to close.  Only safe to access on
++    // owning thread.
++    nsRefPtr<Context> mStrongRef;
++
++    // Used to support cancelation even while the Context is already allowed
++    // to close.  Cleared by ~Context() calling ContextDestroyed().  Only
++    // safe to access on owning thread.
++    Context* mWeakRef;
++
++    nsCOMPtr<nsIThread> mOwningThread;
++
++    NS_INLINE_DECL_THREADSAFE_REFCOUNTING(cache::Context::ThreadsafeHandle)
++  };
++
+   static already_AddRefed<Context>
+   Create(Manager* aManager, Action* aQuotaIOThreadAction);
+ 
+   // Execute given action on the target once the quota manager has been
+   // initialized.
+   //
+   // Only callable from the thread that created the Context.
+   void Dispatch(nsIEventTarget* aTarget, Action* aAction);
+ 
+   // Cancel any Actions running or waiting to run.  This should allow the
+   // Context to be released and Listener::RemoveContext() will be called
+-  // when complete.
++  // when complete.  This effectively implies AllowToClose() as well.
+   //
+   // Only callable from the thread that created the Context.
    void CancelAll();
  
++  // Remove any self references and allow the Context to be released when
++  // there are no more Actions to process.
++  void AllowToClose();
++
    // Cancel any Actions running or waiting to run that operate on the given
    // cache ID.
    //
@@ -29,80 +561,74 @@ diff --git a/dom/cache/Context.h b/dom/cache/Context.h
    {
      STATE_CONTEXT_INIT,
      STATE_CONTEXT_READY,
-diff --git a/dom/cache/ManagerId.cpp b/dom/cache/ManagerId.cpp
---- a/dom/cache/ManagerId.cpp
-+++ b/dom/cache/ManagerId.cpp
-@@ -62,16 +62,25 @@ ManagerId::Principal() const
- ManagerId::ManagerId(nsIPrincipal* aPrincipal, const nsACString& aOrigin,
-                      uint32_t aAppId, bool aInBrowserElement)
-     : mPrincipal(aPrincipal)
-     , mOrigin(aOrigin)
-     , mAppId(aAppId)
-     , mInBrowserElement(aInBrowserElement)
- {
-   MOZ_ASSERT(mPrincipal);
-+
-+  // Construct unique string for this origin+appId+browserFlag triplet.
-+  mQuotaId.AppendLiteral("cache-");
-+  mQuotaId.Append(mOrigin);
-+  mQuotaId.AppendLiteral("-");
-+  mQuotaId.AppendInt(mAppId);
-+  if (mInBrowserElement) {
-+    mQuotaId.AppendLiteral("-browser");
-+  }
- }
- 
- ManagerId::~ManagerId()
- {
-   // If we're already on the main thread, then default destruction is fine
-   if (NS_IsMainThread()) {
-     return;
-   }
-diff --git a/dom/cache/ManagerId.h b/dom/cache/ManagerId.h
---- a/dom/cache/ManagerId.h
-+++ b/dom/cache/ManagerId.h
-@@ -34,16 +34,18 @@ public:
-   // Main thread only
-   static nsresult Create(nsIPrincipal* aPrincipal, ManagerId** aManagerIdOut);
- 
-   // Main thread only
-   already_AddRefed<nsIPrincipal> Principal() const;
- 
-   const nsACString& Origin() const { return mOrigin; }
- 
-+  const nsACString& QuotaId() const { return mQuotaId; }
-+
-   bool operator==(const ManagerId& aOther) const
+@@ -82,27 +125,38 @@ private:
    {
-     return mOrigin == aOther.mOrigin &&
-            mAppId == aOther.mAppId &&
-            mInBrowserElement == aOther.mInBrowserElement;
-   }
+     nsCOMPtr<nsIEventTarget> mTarget;
+     nsRefPtr<Action> mAction;
+   };
  
-   bool operator<(const ManagerId& aOther) const
-@@ -64,16 +66,17 @@ private:
+   explicit Context(Manager* aManager);
+   ~Context();
+   void DispatchAction(nsIEventTarget* aTarget, Action* aAction);
+-  void OnQuotaInit(nsresult aRv, const QuotaInfo& aQuotaInfo);
++  void OnQuotaInit(nsresult aRv, const QuotaInfo& aQuotaInfo,
++                   nsMainThreadPtrHandle<nsISupports>& aOfflineStorage);
+   void OnActionRunnableComplete(ActionRunnable* const aAction);
  
-   // only accessible on main thread
-   nsCOMPtr<nsIPrincipal> mPrincipal;
++  already_AddRefed<ThreadsafeHandle>
++  CreateThreadsafeHandle();
++
+   nsRefPtr<Manager> mManager;
+   State mState;
+   QuotaInfo mQuotaInfo;
+   nsTArray<PendingAction> mPendingActions;
  
-   // immutable to allow threadsfe access
-   const nsCString mOrigin;
-   const uint32_t mAppId;
-   const bool mInBrowserElement;
-+  nsCString mQuotaId;
+   // weak refs since ~ActionRunnable() removes itself from this list
+   nsTArray<ActionRunnable*> mActionRunnables;
  
++  // The ThreadsafeHandle may have a strong ref back to us.  This creates
++  // a ref-cycle that keeps the Context alive.  The ref-cycle is broken
++  // when ThreadsafeHandle::AllowToClose() is called.
++  nsRefPtr<ThreadsafeHandle> mThreadsafeHandle;
++
++  nsMainThreadPtrHandle<nsISupports> mOfflineStorage;
++
  public:
-   NS_INLINE_DECL_THREADSAFE_REFCOUNTING(mozilla::dom::cache::ManagerId)
+   NS_INLINE_DECL_REFCOUNTING(cache::Context)
  };
  
  } // namespace cache
  } // namespace dom
  } // namespace mozilla
+ 
+diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
+--- a/dom/cache/Manager.cpp
++++ b/dom/cache/Manager.cpp
+@@ -1402,16 +1402,19 @@ void
+ Manager::RemoveListener(Listener* aListener)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   // There may not be a listener here in the case where an actor is killed
+   // before it can perform any actual async requests on Manager.
+   mListeners.RemoveElement(aListener, ListenerEntryListenerComparator());
+   MOZ_ASSERT(!mListeners.Contains(aListener,
+                                   ListenerEntryListenerComparator()));
++  if (mListeners.IsEmpty() && mContext) {
++    mContext->AllowToClose();
++  }
+ }
+ 
+ void
+ Manager::RemoveContext(Context* aContext)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(mContext);
+   MOZ_ASSERT(mContext == aContext);
 diff --git a/dom/cache/OfflineStorage.cpp b/dom/cache/OfflineStorage.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/OfflineStorage.cpp
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,142 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -112,39 +638,32 @@ new file mode 100644
 +#include "mozilla/dom/cache/OfflineStorage.h"
 +
 +#include "mozilla/dom/cache/Context.h"
-+#include "mozilla/dom/cache/ManagerId.h"
 +#include "mozilla/dom/cache/QuotaClient.h"
 +#include "mozilla/dom/quota/QuotaManager.h"
 +#include "nsIOfflineStorage.h"
 +#include "nsThreadUtils.h"
 +
-+// TODO: remove registration object
-+// TODO: introduce an interface that lets Context() trigger a close from BG thread
-+// TODO: trigger close when all Manager actor listeners are removed
-+
 +namespace {
 +
 +using mozilla::dom::cache::Context;
 +using mozilla::dom::cache::CreateQuotaClient;
-+using mozilla::dom::cache::ManagerId;
++using mozilla::dom::cache::QuotaInfo;
 +using mozilla::dom::quota::Client;
++using mozilla::dom::quota::PERSISTENCE_TYPE_DEFAULT;
 +using mozilla::dom::quota::QuotaManager;
-+
-+// ----------------------------------------------------------------------------
 +
 +class CacheOfflineStorage MOZ_FINAL : public nsIOfflineStorage
 +{
 +public:
-+  CacheOfflineStorage(already_AddRefed<Context>&& aContext,
-+                      nsIThread* aBackgroundThread,
-+                      ManagerId* aManagerId)
++  CacheOfflineStorage(Context::ThreadsafeHandle* aContext,
++                      const QuotaInfo& aQuotaInfo)
 +    : mContext(aContext)
-+    , mBackgroundThread(aBackgroundThread)
-+    , mManagerId(aManagerId)
++    , mQuotaInfo(aQuotaInfo)
 +  {
 +    MOZ_ASSERT(mContext);
-+    MOZ_ASSERT(mBackgroundThread);
 +
++    mPersistenceType = PERSISTENCE_TYPE_DEFAULT;
++    mGroup = mQuotaInfo.mGroup;
 +    mClient = CreateQuotaClient();
 +  }
 +
@@ -152,30 +671,16 @@ new file mode 100644
 +  ~CacheOfflineStorage()
 +  {
 +    MOZ_ASSERT(NS_IsMainThread());
-+    MaybeReleaseContext();
-+  }
-+
-+  void
-+  MaybeReleaseContext()
-+  {
-+    MOZ_ASSERT(NS_IsMainThread());
-+
-+    if (!mContext) {
++    nsRefPtr<QuotaManager> qm = QuotaManager::GetOrCreate();
++    if (!qm) {
++      NS_WARNING("QuotaManager gone before Cache storage could unregister");
 +      return;
 +    }
-+
-+    // Due to shutdown handler this dispatch must always succeed.
-+    // If it fails, then a design invariant has been violated.
-+    nsCOMPtr<nsIRunnable> releaser =
-+      NS_NewNonOwningRunnableMethod(mContext.forget().take(),
-+                                    &Context::Release);
-+    MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
-+      mBackgroundThread->Dispatch(releaser, nsIThread::DISPATCH_NORMAL)));
++    qm->UnregisterStorage(this);
 +  }
 +
-+  nsRefPtr<Context> mContext;
-+  nsCOMPtr<nsIThread> mBackgroundThread;
-+  nsRefPtr<ManagerId> mManagerId;
++  nsRefPtr<Context::ThreadsafeHandle> mContext;
++  const QuotaInfo mQuotaInfo;
 +  nsRefPtr<Client> mClient;
 +
 +  NS_DECL_ISUPPORTS
@@ -188,7 +693,7 @@ new file mode 100644
 +CacheOfflineStorage::Id()
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
-+  return mManagerId->QuotaId();
++  return mQuotaInfo.mStorageId;
 +}
 +
 +NS_IMETHODIMP_(Client*)
@@ -218,17 +723,14 @@ new file mode 100644
 +CacheOfflineStorage::Origin()
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
-+  return mManagerId->Origin();
++  return mQuotaInfo.mOrigin;
 +}
 +
 +NS_IMETHODIMP_(nsresult)
 +CacheOfflineStorage::Close()
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
-+  // In order to "close" the context without stopping current IO we simply
-+  // drop our reference.  This will cause the Context to automatically
-+  // destroy itself as soon as it becomes idle.
-+  MaybeReleaseContext();
++  mContext->AllowToClose();
 +  return NS_OK;
 +}
 +
@@ -236,43 +738,8 @@ new file mode 100644
 +CacheOfflineStorage::Invalidate()
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
-+  // TODO
++  mContext->CancelAndAllowToClose();
 +}
-+
-+// ----------------------------------------------------------------------------
-+
-+class CacheOfflineStorageRegistration MOZ_FINAL : public nsISupports
-+{
-+public:
-+  explicit CacheOfflineStorageRegistration(CacheOfflineStorage* aStorage)
-+    : mStorage(aStorage)
-+  {
-+    MOZ_ASSERT(NS_IsMainThread());
-+    MOZ_ASSERT(mStorage);
-+  }
-+
-+private:
-+  ~CacheOfflineStorageRegistration()
-+  {
-+    MOZ_ASSERT(NS_IsMainThread());
-+    MOZ_ASSERT(mStorage);
-+
-+    nsRefPtr<QuotaManager> qm = QuotaManager::Get();
-+    if (!qm) {
-+      NS_WARNING("QuotaManager gone before Cache offline storage unregistered");
-+      return;
-+    }
-+    qm->UnregisterStorage(mStorage);
-+  }
-+
-+  nsRefPtr<CacheOfflineStorage> mStorage;
-+
-+  NS_DECL_ISUPPORTS
-+};
-+
-+NS_IMPL_ISUPPORTS0(CacheOfflineStorageRegistration);
-+
-+// ----------------------------------------------------------------------------
 +
 +} // anonymous namespace
 +
@@ -281,26 +748,24 @@ new file mode 100644
 +namespace cache {
 +
 +already_AddRefed<nsISupports>
-+RegisterOfflineStorage(already_AddRefed<Context>&& aContext,
-+                       nsIThread* aBackgroundThread,
-+                       ManagerId* aManagerId)
++RegisterOfflineStorage(Context::ThreadsafeHandle* aContext,
++                       const QuotaInfo& aQuotaInfo)
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
-+
-+  nsRefPtr<CacheOfflineStorage> storage =
-+    new CacheOfflineStorage(Move(aContext), aBackgroundThread, aManagerId);
 +
 +  nsRefPtr<QuotaManager> qm = QuotaManager::GetOrCreate();
 +  if (NS_WARN_IF(!qm)) {
 +    return nullptr;
 +  }
 +
++  nsRefPtr<CacheOfflineStorage> storage =
++    new CacheOfflineStorage(aContext, aQuotaInfo);
++
 +  if (NS_WARN_IF(!qm->RegisterStorage(storage))) {
 +    return nullptr;
 +  }
 +
-+  nsCOMPtr<nsISupports> reg = new CacheOfflineStorageRegistration(storage);
-+  return reg.forget();
++  return storage.forget();
 +}
 +
 +} // namespace cache
@@ -310,7 +775,7 @@ diff --git a/dom/cache/OfflineStorage.h b/dom/cache/OfflineStorage.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/OfflineStorage.h
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,34 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -322,6 +787,7 @@ new file mode 100644
 +
 +#include "nsISupportsImpl.h"
 +#include "mozilla/AlreadyAddRefed.h"
++#include "mozilla/dom/cache/Context.h"
 +
 +class nsIThread;
 +
@@ -329,7 +795,6 @@ new file mode 100644
 +namespace dom {
 +namespace cache {
 +
-+class Context;
 +class ManagerId;
 +
 +// Register a QuotaManager OfflineStorage object on the main thread.  The
@@ -337,19 +802,39 @@ new file mode 100644
 +// is released then the OfflineStorage is unregistered.  This release must
 +// occur on the main thread.
 +already_AddRefed<nsISupports>
-+RegisterOfflineStorage(already_AddRefed<Context>&& aContext,
-+                       nsIThread* aBackgroundThread,
-+                       ManagerId* aManagerId);
++RegisterOfflineStorage(Context::ThreadsafeHandle* aContext,
++                       const QuotaInfo& aQuotaInfo);
 +
 +} // namespace cache
 +} // namespace dom
 +} // namespace mozilla
 +
 +#endif // mozilla_dom_cache_QuotaOfflineStorage_h
+diff --git a/dom/cache/Types.h b/dom/cache/Types.h
+--- a/dom/cache/Types.h
++++ b/dom/cache/Types.h
+@@ -29,16 +29,17 @@ static const RequestId INVALID_REQUEST_I
+ typedef int32_t CacheId;
+ 
+ struct QuotaInfo
+ {
+   QuotaInfo() : mIsApp(false) { }
+   nsCOMPtr<nsIFile> mDir;
+   nsCString mGroup;
+   nsCString mOrigin;
++  nsCString mStorageId;
+   bool mIsApp;
+ };
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_cache_Types_h
 diff --git a/dom/cache/moz.build b/dom/cache/moz.build
 --- a/dom/cache/moz.build
 +++ b/dom/cache/moz.build
-@@ -21,27 +21,29 @@ EXPORTS.mozilla.dom.cache += [
+@@ -21,16 +21,17 @@ EXPORTS.mozilla.dom.cache += [
      'DBAction.h',
      'DBSchema.h',
      'Feature.h',
@@ -367,20 +852,7 @@ diff --git a/dom/cache/moz.build b/dom/cache/moz.build
      'StreamUtils.h',
      'Types.h',
      'TypeUtils.h',
- ]
- 
--UNIFIED_SOURCES += [
-+#UNIFIED_SOURCES += [
-+SOURCES += [
-     'Action.cpp',
-     'ActorChild.cpp',
-     'AutoUtils.cpp',
-     'Cache.cpp',
-     'CacheChild.cpp',
-     'CacheParent.cpp',
-     'CacheStorage.cpp',
-     'CacheStorageChild.cpp',
-@@ -51,16 +53,17 @@ UNIFIED_SOURCES += [
+@@ -51,16 +52,17 @@ UNIFIED_SOURCES += [
      'Context.cpp',
      'DBAction.cpp',
      'DBSchema.cpp',
