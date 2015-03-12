@@ -3,6 +3,147 @@
 # User Ben Kelly <ben@wanderview.com>
 Bug 1110487 P2 Implement the nsIOfflineStorage interface in Cache.
 
+diff --git a/dom/cache/CacheParent.cpp b/dom/cache/CacheParent.cpp
+--- a/dom/cache/CacheParent.cpp
++++ b/dom/cache/CacheParent.cpp
+@@ -52,17 +52,19 @@ void
+ CacheParent::ActorDestroy(ActorDestroyReason aReason)
+ {
+   MOZ_ASSERT(mManager);
+   for (uint32_t i = 0; i < mFetchPutList.Length(); ++i) {
+     mFetchPutList[i]->ClearListener();
+   }
+   mFetchPutList.Clear();
+   mManager->RemoveListener(this);
+-  mManager->ReleaseCacheId(mCacheId);
++  if (mCacheId != INVALID_CACHEID) {
++    mManager->ReleaseCacheId(mCacheId);
++  }
+   mManager = nullptr;
+ }
+ 
+ bool
+ CacheParent::RecvTeardown()
+ {
+   if (!Send__delete__(this)) {
+     // child process is gone, warn and allow actor to clean up normally
+@@ -159,16 +161,28 @@ CacheParent::RecvKeys(const RequestId& a
+                       const PCacheQueryParams& aParams)
+ {
+   MOZ_ASSERT(mManager);
+   mManager->CacheKeys(this, aRequestId, mCacheId, aRequest, aParams);
+   return true;
+ }
+ 
+ void
++CacheParent::Invalidate()
++{
++  // Our previously attached cache is no more.  Forget it and instead reference
++  // a non-existent Cache.  This will trigger errors on any future requests.
++  // TODO: consider re-attaching to a new Cache (bug 1110491)
++  if (mCacheId != INVALID_CACHEID) {
++    mManager->ReleaseCacheId(mCacheId);
++    mCacheId = INVALID_CACHEID;
++  }
++}
++
++void
+ CacheParent::OnCacheMatch(RequestId aRequestId, nsresult aRv,
+                           const SavedResponse* aSavedResponse,
+                           StreamList* aStreamList)
+ {
+   AutoParentResponseOrVoid response(Manager());
+ 
+   // no match
+   if (NS_FAILED(aRv) || !aSavedResponse || !aStreamList) {
+diff --git a/dom/cache/CacheParent.h b/dom/cache/CacheParent.h
+--- a/dom/cache/CacheParent.h
++++ b/dom/cache/CacheParent.h
+@@ -51,16 +51,17 @@ private:
+   virtual bool
+   RecvDelete(const RequestId& aRequestId, const PCacheRequest& aRequest,
+              const PCacheQueryParams& aParams) MOZ_OVERRIDE;
+   virtual bool
+   RecvKeys(const RequestId& aRequestId, const PCacheRequestOrVoid& aRequest,
+            const PCacheQueryParams& aParams) MOZ_OVERRIDE;
+ 
+   // Manager::Listener methods
++  virtual void Invalidate() MOZ_OVERRIDE;
+   virtual void OnCacheMatch(RequestId aRequestId, nsresult aRv,
+                             const SavedResponse* aSavedResponse,
+                             StreamList* aStreamList) MOZ_OVERRIDE;
+   virtual void OnCacheMatchAll(RequestId aRequestId, nsresult aRv,
+                                const nsTArray<SavedResponse>& aSavedResponses,
+                                StreamList* aStreamList) MOZ_OVERRIDE;
+   virtual void OnCachePutAll(RequestId aRequestId, nsresult aRv) MOZ_OVERRIDE;
+   virtual void OnCacheDelete(RequestId aRequestId, nsresult aRv,
+@@ -72,17 +73,17 @@ private:
+   // FetchPut::Listener methods
+   virtual void OnFetchPut(FetchPut* aFetchPut, RequestId aRequestId,
+                           nsresult aRv) MOZ_OVERRIDE;
+ 
+   already_AddRefed<nsIInputStream>
+   DeserializeCacheStream(const PCacheReadStreamOrVoid& aStreamOrVoid);
+ 
+   nsRefPtr<cache::Manager> mManager;
+-  const CacheId mCacheId;
++  CacheId mCacheId;
+   nsTArray<nsRefPtr<FetchPut>> mFetchPutList;
+ };
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_cache_CacheParent_h
+diff --git a/dom/cache/CacheStorageParent.cpp b/dom/cache/CacheStorageParent.cpp
+--- a/dom/cache/CacheStorageParent.cpp
++++ b/dom/cache/CacheStorageParent.cpp
+@@ -286,16 +286,23 @@ CacheStorageParent::OnPrincipalVerified(
+   mManagerId = aManagerId;
+   mVerifier->ClearListener();
+   mVerifier = nullptr;
+ 
+   RetryPendingRequests();
+ }
+ 
+ void
++CacheStorageParent::Invalidate()
++{
++  // Nothing to do here as we don't have internal state.  Our next
++  // request will connect to a fresh database.
++}
++
++void
+ CacheStorageParent::OnStorageMatch(RequestId aRequestId, nsresult aRv,
+                                    const SavedResponse* aSavedResponse,
+                                    StreamList* aStreamList)
+ {
+   PCacheResponseOrVoid responseOrVoid;
+ 
+   ReleaseManager(aRequestId);
+ 
+diff --git a/dom/cache/CacheStorageParent.h b/dom/cache/CacheStorageParent.h
+--- a/dom/cache/CacheStorageParent.h
++++ b/dom/cache/CacheStorageParent.h
+@@ -46,16 +46,17 @@ private:
+                           const nsString& aKey) MOZ_OVERRIDE;
+   virtual bool RecvKeys(const RequestId& aRequestId) MOZ_OVERRIDE;
+ 
+   // PrincipalVerifier::Listener methods
+   virtual void OnPrincipalVerified(nsresult aRv,
+                                    ManagerId* aManagerId) MOZ_OVERRIDE;
+ 
+   // Manager::Listener methods
++  virtual void Invalidate() MOZ_OVERRIDE;
+   virtual void OnStorageMatch(RequestId aRequestId, nsresult aRv,
+                               const SavedResponse* aResponse,
+                               StreamList* aStreamList) MOZ_OVERRIDE;
+   virtual void OnStorageHas(RequestId aRequestId, nsresult aRv,
+                             bool aCacheFound) MOZ_OVERRIDE;
+   virtual void OnStorageOpen(RequestId aRequestId, nsresult aRv,
+                              CacheId aCacheId) MOZ_OVERRIDE;
+   virtual void OnStorageDelete(RequestId aRequestId, nsresult aRv,
 diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
 --- a/dom/cache/Context.cpp
 +++ b/dom/cache/Context.cpp
@@ -115,7 +256,7 @@ diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
    State mState;
    nsresult mResult;
    QuotaInfo mQuotaInfo;
-+  nsMainThreadPtrHandle<nsISupports> mOfflineStorage;
++  nsMainThreadPtrHandle<OfflineStorage> mOfflineStorage;
 +  bool mNeedsQuotaRelease;
  
  public:
@@ -161,9 +302,9 @@ diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
        QuotaManager* qm = QuotaManager::Get();
        MOZ_ASSERT(qm);
 +
-+      nsCOMPtr<nsISupports> offlineStorage =
-+        RegisterOfflineStorage(mThreadsafeHandle, mQuotaInfo);
-+      mOfflineStorage = new nsMainThreadPtrHolder<nsISupports>(offlineStorage);
++      nsRefPtr<OfflineStorage> offlineStorage =
++        OfflineStorage::Register(mThreadsafeHandle, mQuotaInfo);
++      mOfflineStorage = new nsMainThreadPtrHolder<OfflineStorage>(offlineStorage);
 +
        mState = STATE_ENSURE_ORIGIN_INITIALIZED;
        nsresult rv = qm->IOThread()->Dispatch(this, nsIThread::DISPATCH_NORMAL);
@@ -219,7 +360,72 @@ diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
      // -----
      default:
      {
-@@ -477,25 +498,117 @@ Context::ActionRunnable::Run()
+@@ -316,16 +337,17 @@ Context::QuotaInitRunnable::Run()
+   return NS_OK;
+ }
+ 
+ // Runnable wrapper around Action objects dispatched on the Context.  This
+ // runnable executes the Action on the appropriate threads while the Context
+ // is initialized.
+ class Context::ActionRunnable MOZ_FINAL : public nsIRunnable
+                                         , public Action::Resolver
++                                        , public Context::Activity
+ {
+ public:
+   ActionRunnable(Context* aContext, nsIEventTarget* aTarget, Action* aAction,
+                  const QuotaInfo& aQuotaInfo)
+     : mContext(aContext)
+     , mTarget(aTarget)
+     , mAction(aAction)
+     , mQuotaInfo(aQuotaInfo)
+@@ -349,22 +371,25 @@ public:
+     nsresult rv = mTarget->Dispatch(this, nsIEventTarget::DISPATCH_NORMAL);
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       mState = STATE_COMPLETE;
+       Clear();
+     }
+     return rv;
+   }
+ 
+-  bool MatchesCacheId(CacheId aCacheId) {
++  virtual bool
++  MatchesCacheId(CacheId aCacheId) const MOZ_OVERRIDE
++  {
+     NS_ASSERT_OWNINGTHREAD(Action::Resolver);
+     return mAction->MatchesCacheId(aCacheId);
+   }
+ 
+-  void Cancel()
++  virtual void
++  Cancel() MOZ_OVERRIDE
+   {
+     NS_ASSERT_OWNINGTHREAD(Action::Resolver);
+     mAction->CancelOnInitiatingThread();
+   }
+ 
+   virtual void Resolve(nsresult aRv) MOZ_OVERRIDE
+   {
+     MOZ_ASSERT(mTarget == NS_GetCurrentThread());
+@@ -387,17 +412,17 @@ private:
+     MOZ_ASSERT(!mAction);
+   }
+ 
+   void Clear()
+   {
+     NS_ASSERT_OWNINGTHREAD(Action::Resolver);
+     MOZ_ASSERT(mContext);
+     MOZ_ASSERT(mAction);
+-    mContext->OnActionRunnableComplete(this);
++    mContext->RemoveActivity(this);
+     mContext = nullptr;
+     mAction = nullptr;
+   }
+ 
+   enum State
+   {
+     STATE_INIT,
+     STATE_RUN_ON_TARGET,
+@@ -477,25 +502,117 @@ Context::ActionRunnable::Run()
      {
        MOZ_CRASH("unexpected state in ActionRunnable");
        break;
@@ -339,15 +545,22 @@ diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
      MOZ_CRASH("Failed to dispatch QuotaInitRunnable.");
    }
  
-@@ -534,16 +647,26 @@ Context::CancelAll()
+@@ -530,52 +647,63 @@ Context::Dispatch(nsIEventTarget* aTarge
+ }
+ 
+ void
+ Context::CancelAll()
  {
    NS_ASSERT_OWNINGTHREAD(Context);
    mState = STATE_CONTEXT_CANCELED;
    mPendingActions.Clear();
-   for (uint32_t i = 0; i < mActionRunnables.Length(); ++i) {
-     nsRefPtr<ActionRunnable> runnable = mActionRunnables[i];
-     runnable->Cancel();
-   }
+-  for (uint32_t i = 0; i < mActionRunnables.Length(); ++i) {
+-    nsRefPtr<ActionRunnable> runnable = mActionRunnables[i];
+-    runnable->Cancel();
++  ActivityList::ForwardIterator iter(mActivityList);
++  while (iter.HasMore()) {
++    iter.GetNext()->Cancel();
++  }
 +  AllowToClose();
 +}
 +
@@ -357,16 +570,36 @@ diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
 +  NS_ASSERT_OWNINGTHREAD(Context);
 +  if (mThreadsafeHandle) {
 +    mThreadsafeHandle->AllowToClose();
-+  }
+   }
  }
  
  void
  Context::CancelForCacheId(CacheId aCacheId)
  {
    NS_ASSERT_OWNINGTHREAD(Context);
++
++  // Remove matching pending actions
++  nsTArray<PendingAction> remainingPendingActions;
    for (uint32_t i = 0; i < mPendingActions.Length(); ++i) {
-     if (mPendingActions[i].mAction->MatchesCacheId(aCacheId)) {
-@@ -558,24 +681,18 @@ Context::CancelForCacheId(CacheId aCache
+-    if (mPendingActions[i].mAction->MatchesCacheId(aCacheId)) {
+-      mPendingActions.RemoveElementAt(i);
++    if (!mPendingActions[i].mAction->MatchesCacheId(aCacheId)) {
++      remainingPendingActions.AppendElement(mPendingActions[i]);
+     }
+   }
+-  for (uint32_t i = 0; i < mActionRunnables.Length(); ++i) {
+-    nsRefPtr<ActionRunnable> runnable = mActionRunnables[i];
+-    if (runnable->MatchesCacheId(aCacheId)) {
+-      runnable->Cancel();
++  mPendingActions = Move(remainingPendingActions);
++
++  // Cancel activities and let them remove themselves
++  ActivityList::ForwardIterator iter(mActivityList);
++  while (iter.HasMore()) {
++    Activity* activity = iter.GetNext();
++    if (activity->MatchesCacheId(aCacheId)) {
++      activity->Cancel();
+     }
    }
  }
  
@@ -393,18 +626,23 @@ diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
  void
  Context::DispatchAction(nsIEventTarget* aTarget, Action* aAction)
  {
-@@ -588,43 +705,58 @@ Context::DispatchAction(nsIEventTarget* 
+@@ -584,47 +712,72 @@ Context::DispatchAction(nsIEventTarget* 
+   nsRefPtr<ActionRunnable> runnable =
+     new ActionRunnable(this, aTarget, aAction, mQuotaInfo);
+   nsresult rv = runnable->Dispatch();
+   if (NS_FAILED(rv)) {
      // Shutdown must be delayed until all Contexts are destroyed.  Crash
      // for this invariant violation.
      MOZ_CRASH("Failed to dispatch ActionRunnable to target thread.");
    }
-   mActionRunnables.AppendElement(runnable);
+-  mActionRunnables.AppendElement(runnable);
++  AddActivity(runnable);
  }
  
  void
 -Context::OnQuotaInit(nsresult aRv, const QuotaInfo& aQuotaInfo)
 +Context::OnQuotaInit(nsresult aRv, const QuotaInfo& aQuotaInfo,
-+                     nsMainThreadPtrHandle<nsISupports>& aOfflineStorage)
++                     nsMainThreadPtrHandle<OfflineStorage>& aOfflineStorage)
  {
    NS_ASSERT_OWNINGTHREAD(Context);
  
@@ -432,13 +670,26 @@ diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
  }
  
  void
- Context::OnActionRunnableComplete(ActionRunnable* aActionRunnable)
+-Context::OnActionRunnableComplete(ActionRunnable* aActionRunnable)
++Context::AddActivity(Activity* aActivity)
  {
    NS_ASSERT_OWNINGTHREAD(Context);
-   MOZ_ASSERT(aActionRunnable);
-   MOZ_ALWAYS_TRUE(mActionRunnables.RemoveElement(aActionRunnable));
- }
- 
+-  MOZ_ASSERT(aActionRunnable);
+-  MOZ_ALWAYS_TRUE(mActionRunnables.RemoveElement(aActionRunnable));
++  MOZ_ASSERT(aActivity);
++  MOZ_ASSERT(!mActivityList.Contains(aActivity));
++  mActivityList.AppendElement(aActivity);
++}
++
++void
++Context::RemoveActivity(Activity* aActivity)
++{
++  NS_ASSERT_OWNINGTHREAD(Context);
++  MOZ_ASSERT(aActivity);
++  MOZ_ALWAYS_TRUE(mActivityList.RemoveElement(aActivity));
++  MOZ_ASSERT(!mActivityList.Contains(aActivity));
++}
++
 +already_AddRefed<Context::ThreadsafeHandle>
 +Context::CreateThreadsafeHandle()
 +{
@@ -448,15 +699,15 @@ diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
 +  }
 +  nsRefPtr<ThreadsafeHandle> ref = mThreadsafeHandle;
 +  return ref.forget();
-+}
-+
+ }
+ 
  } // namespace cache
  } // namespace dom
  } // namespace mozilla
 diff --git a/dom/cache/Context.h b/dom/cache/Context.h
 --- a/dom/cache/Context.h
 +++ b/dom/cache/Context.h
-@@ -6,21 +6,23 @@
+@@ -6,28 +6,32 @@
  
  #ifndef mozilla_dom_cache_Context_h
  #define mozilla_dom_cache_Context_h
@@ -468,6 +719,7 @@ diff --git a/dom/cache/Context.h b/dom/cache/Context.h
 +#include "nsProxyRelease.h"
  #include "nsString.h"
  #include "nsTArray.h"
++#include "nsTObserverArray.h"
  
  class nsIEventTarget;
  class nsIFile;
@@ -479,8 +731,16 @@ diff --git a/dom/cache/Context.h b/dom/cache/Context.h
  
  class Action;
  class Manager;
++class OfflineStorage;
  
-@@ -40,38 +42,79 @@ class Manager;
+ // The Context class is RAII-style class for managing IO operations within the
+ // Cache.
+ //
+ // When a Context is created it performs the complicated steps necessary to
+ // initialize the QuotaManager.  Action objects dispatched on the Context are
+ // delayed until this initialization is complete.  They are then allow to
+ // execute on any specified thread.  Once all references to the Context are
+@@ -40,38 +44,90 @@ class Manager;
  // originally used to create the Context.
  //
  // As an invariant, all Context objects must be destroyed before permitting
@@ -520,6 +780,14 @@ diff --git a/dom/cache/Context.h b/dom/cache/Context.h
 +    NS_INLINE_DECL_THREADSAFE_REFCOUNTING(cache::Context::ThreadsafeHandle)
 +  };
 +
++  // Must call RemoveActivity() in its destructor
++  class Activity
++  {
++  public:
++    virtual void Cancel() = 0;
++    virtual bool MatchesCacheId(CacheId aCacheId) const = 0;
++  };
++
    static already_AddRefed<Context>
    Create(Manager* aManager, Action* aQuotaIOThreadAction);
  
@@ -547,6 +815,9 @@ diff --git a/dom/cache/Context.h b/dom/cache/Context.h
    // Only callable from the thread that created the Context.
    void CancelForCacheId(CacheId aCacheId);
  
++  void AddActivity(Activity* aActivity);
++  void RemoveActivity(Activity* aActivity);
++
 +  const QuotaInfo
 +  GetQuotaInfo() const
 +  {
@@ -561,7 +832,7 @@ diff --git a/dom/cache/Context.h b/dom/cache/Context.h
    {
      STATE_CONTEXT_INIT,
      STATE_CONTEXT_READY,
-@@ -82,27 +125,38 @@ private:
+@@ -82,26 +138,38 @@ private:
    {
      nsCOMPtr<nsIEventTarget> mTarget;
      nsRefPtr<Action> mAction;
@@ -571,28 +842,32 @@ diff --git a/dom/cache/Context.h b/dom/cache/Context.h
    ~Context();
    void DispatchAction(nsIEventTarget* aTarget, Action* aAction);
 -  void OnQuotaInit(nsresult aRv, const QuotaInfo& aQuotaInfo);
+-  void OnActionRunnableComplete(ActionRunnable* const aAction);
 +  void OnQuotaInit(nsresult aRv, const QuotaInfo& aQuotaInfo,
-+                   nsMainThreadPtrHandle<nsISupports>& aOfflineStorage);
-   void OnActionRunnableComplete(ActionRunnable* const aAction);
- 
++                   nsMainThreadPtrHandle<OfflineStorage>& aOfflineStorage);
++
 +  already_AddRefed<ThreadsafeHandle>
 +  CreateThreadsafeHandle();
-+
+ 
    nsRefPtr<Manager> mManager;
    State mState;
    QuotaInfo mQuotaInfo;
    nsTArray<PendingAction> mPendingActions;
  
-   // weak refs since ~ActionRunnable() removes itself from this list
-   nsTArray<ActionRunnable*> mActionRunnables;
- 
+-  // weak refs since ~ActionRunnable() removes itself from this list
+-  nsTArray<ActionRunnable*> mActionRunnables;
++  // Weak refs since activites must remove themselves from this list before
++  // being destroyed by calling RemoveActivity().
++  typedef nsTObserverArray<Activity*> ActivityList;
++  ActivityList mActivityList;
++
 +  // The ThreadsafeHandle may have a strong ref back to us.  This creates
 +  // a ref-cycle that keeps the Context alive.  The ref-cycle is broken
 +  // when ThreadsafeHandle::AllowToClose() is called.
 +  nsRefPtr<ThreadsafeHandle> mThreadsafeHandle;
 +
-+  nsMainThreadPtrHandle<nsISupports> mOfflineStorage;
-+
++  nsMainThreadPtrHandle<OfflineStorage> mOfflineStorage;
+ 
  public:
    NS_INLINE_DECL_REFCOUNTING(cache::Context)
  };
@@ -600,11 +875,265 @@ diff --git a/dom/cache/Context.h b/dom/cache/Context.h
  } // namespace cache
  } // namespace dom
  } // namespace mozilla
+diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
+--- a/dom/cache/DBSchema.cpp
++++ b/dom/cache/DBSchema.cpp
+@@ -434,17 +434,17 @@ DBSchema::StorageMatch(mozIStorageConnec
  
+   nsresult rv;
+ 
+   // If we are given a cache to check, then simply find its cache ID
+   // and perform the match.
+   if (!aParams.cacheName().EqualsLiteral("")) {
+     bool foundCache = false;
+     // no invalid CacheId, init to least likely real value
+-    CacheId cacheId = INT32_MAX;
++    CacheId cacheId = INVALID_CACHEID;
+     rv = StorageGetCacheId(aConn, aNamespace, aParams.cacheName(), &foundCache,
+                            &cacheId);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+     if (!foundCache) { return NS_ERROR_DOM_NOT_FOUND_ERR; }
+ 
+     rv = CacheMatch(aConn, cacheId, aRequest, aParams, aFoundResponseOut,
+                     aSavedResponseOut);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+@@ -462,17 +462,17 @@ DBSchema::StorageMatch(mozIStorageConnec
+ 
+   rv = state->BindInt32Parameter(0, aNamespace);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   nsAutoTArray<CacheId, 32> cacheIdList;
+ 
+   bool hasMoreData = false;
+   while (NS_SUCCEEDED(state->ExecuteStep(&hasMoreData)) && hasMoreData) {
+-    CacheId cacheId = INT32_MAX;
++    CacheId cacheId = INVALID_CACHEID;
+     rv = state->GetInt32(0, &cacheId);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+     cacheIdList.AppendElement(cacheId);
+   }
+ 
+   // Now try to find a match in each cache in order
+   for (uint32_t i = 0; i < cacheIdList.Length(); ++i) {
+     rv = CacheMatch(aConn, cacheIdList[i], aRequest, aParams, aFoundResponseOut,
+diff --git a/dom/cache/FetchPut.cpp b/dom/cache/FetchPut.cpp
+--- a/dom/cache/FetchPut.cpp
++++ b/dom/cache/FetchPut.cpp
+@@ -149,17 +149,19 @@ FetchPut::FetchPut(Listener* aListener, 
+   mManager->AddRefCacheId(mCacheId);
+ }
+ 
+ FetchPut::~FetchPut()
+ {
+   MOZ_ASSERT(mInitiatingThread == NS_GetCurrentThread());
+   MOZ_ASSERT(!mListener);
+   mManager->RemoveListener(this);
+-  mManager->ReleaseCacheId(mCacheId);
++  if (mCacheId != INVALID_CACHEID) {
++    mManager->ReleaseCacheId(mCacheId);
++  }
+ }
+ 
+ nsresult
+ FetchPut::DispatchToMainThread()
+ {
+   MOZ_ASSERT(!mRunnable);
+ 
+   nsRefPtr<nsIRunnable> runnable = new Runnable(this);
+@@ -409,16 +411,28 @@ void
+ FetchPut::OnCachePutAll(RequestId aRequestId, nsresult aRv)
+ {
+   MOZ_ASSERT(mInitiatingThread == NS_GetCurrentThread());
+   MaybeSetError(aRv);
+   MaybeNotifyListener();
+ }
+ 
+ void
++FetchPut::Invalidate()
++{
++  // Our previously attached cache is no more.  Forget it and instead reference
++  // a non-existent Cache.  This will trigger errors on any future requests.
++  // TODO: consider re-attaching to a new Cache (bug 1110491)
++  if (mCacheId != INVALID_CACHEID) {
++    mManager->ReleaseCacheId(mCacheId);
++    mCacheId = INVALID_CACHEID;
++  }
++}
++
++void
+ FetchPut::MaybeSetError(nsresult aRv)
+ {
+   if (NS_FAILED(mResult) || NS_SUCCEEDED(aRv)) {
+     return;
+   }
+   mResult = aRv;
+ }
+ 
+diff --git a/dom/cache/FetchPut.h b/dom/cache/FetchPut.h
+--- a/dom/cache/FetchPut.h
++++ b/dom/cache/FetchPut.h
+@@ -85,31 +85,33 @@ private:
+   void DoFetchOnMainThread();
+   void FetchComplete(FetchObserver* aObserver,
+                      InternalResponse* aInternalResponse);
+   void MaybeCompleteOnMainThread();
+ 
+   void DoPutOnWorkerThread();
+   static bool MatchInPutList(const PCacheRequest& aRequest,
+                              const nsTArray<CacheRequestResponse>& aPutList);
++
++  virtual void Invalidate() MOZ_OVERRIDE;
+   virtual void OnCachePutAll(RequestId aRequestId, nsresult aRv) MOZ_OVERRIDE;
+ 
+   void MaybeSetError(nsresult aRv);
+   void MaybeNotifyListener();
+ 
+   // TypeUtils methods
+   virtual nsIGlobalObject* GetGlobalObject() const MOZ_OVERRIDE;
+ #ifdef DEBUG
+   virtual void AssertOwningThread() const MOZ_OVERRIDE;
+ #endif
+ 
+   Listener* mListener;
+   nsRefPtr<Manager> mManager;
+   const RequestId mRequestId;
+-  const CacheId mCacheId;
++  CacheId mCacheId;
+   nsCOMPtr<nsIThread> mInitiatingThread;
+   nsTArray<State> mStateList;
+   uint32_t mPendingCount;
+   nsresult mResult;
+   nsCOMPtr<nsIRunnable> mRunnable;
+ 
+ public:
+   NS_INLINE_DECL_THREADSAFE_REFCOUNTING(mozilla::dom::cache::FetchPut)
 diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
 --- a/dom/cache/Manager.cpp
 +++ b/dom/cache/Manager.cpp
-@@ -1402,16 +1402,19 @@ void
+@@ -218,16 +218,37 @@ public:
+     // Guaranteed to succeed because we should be shutdown before the
+     // background thread is destroyed.
+     nsCOMPtr<nsIRunnable> runnable = new ShutdownAllRunnable();
+     nsresult rv = sBackgroundThread->Dispatch(runnable,
+                                               nsIThread::DISPATCH_NORMAL);
+     MOZ_ALWAYS_TRUE(NS_SUCCEEDED(rv));
+   }
+ 
++  static void
++  InvalidateActorsOnIOThread()
++  {
++    MOZ_ASSERT(!NS_IsMainThread());
++
++    StaticMutexAutoLock lock(sMutex);
++
++    // Don't bother invalidating actors if we are shutting down.  It will
++    // just slow shutdown down as we waste CPU cycles with useless work.
++    if (!sBackgroundThread && !sFactoryShutdown) {
++      return;
++    }
++
++    MOZ_ASSERT(NS_GetCurrentThread() != sBackgroundThread);
++
++    nsCOMPtr<nsIRunnable> runnable = new InvalidateActorsRunnable();
++    nsresult rv = sBackgroundThread->Dispatch(runnable,
++                                              nsIThread::DISPATCH_NORMAL);
++    MOZ_ALWAYS_TRUE(NS_SUCCEEDED(rv));
++  }
++
+   static bool
+   IsShutdownAllCompleteOnMainThread()
+   {
+     MOZ_ASSERT(NS_IsMainThread());
+     StaticMutexAutoLock lock(sMutex);
+     // Infer whether we have shutdown using the sBackgroundThread value.  We
+     // guarantee this is nullptr when sFactory is destroyed.
+     return sFactoryShutdown && !sBackgroundThread;
+@@ -341,30 +362,66 @@ private:
+         nsRefPtr<Manager> manager = iter.GetNext();
+         manager->Shutdown();
+       }
+     }
+ 
+     MaybeDestroyInstance();
+   }
+ 
++  static void
++  InvalidateActorsOnBackgroundThread()
++  {
++    mozilla::ipc::AssertIsOnBackgroundThread();
++
++    if (!sFactory) {
++#ifdef DEBUG
++      StaticMutexAutoLock lock(sMutex);
++      MOZ_ASSERT(!sBackgroundThread);
++#endif
++      return;
++    }
++
++    MOZ_ASSERT(!sFactory->mManagerList.IsEmpty());
++
++    ManagerList::ForwardIterator iter(sFactory->mManagerList);
++    while (iter.HasMore()) {
++      nsRefPtr<Manager> manager = iter.GetNext();
++      manager->InvalidateActors();
++    }
++  }
++
+   class ShutdownAllRunnable MOZ_FINAL : public nsRunnable
+   {
+   public:
+     NS_IMETHOD
+     Run() MOZ_OVERRIDE
+     {
+       mozilla::ipc::AssertIsOnBackgroundThread();
+       ShutdownAllOnBackgroundThread();
+       return NS_OK;
+     }
+   private:
+     ~ShutdownAllRunnable() { }
+   };
+ 
++  class InvalidateActorsRunnable MOZ_FINAL : public nsRunnable
++  {
++  public:
++    NS_IMETHOD
++    Run() MOZ_OVERRIDE
++    {
++      mozilla::ipc::AssertIsOnBackgroundThread();
++      InvalidateActorsOnBackgroundThread();
++      return NS_OK;
++    }
++  private:
++    ~InvalidateActorsRunnable() { }
++  };
++
+   // Singleton created on demand and deleted when last Manager is cleared
+   // in Remove().
+   // PBackground thread only.
+   static StaticAutoPtr<Factory> sFactory;
+ 
+   // protects following static attributes
+   static StaticMutex sMutex;
+ 
+@@ -1393,25 +1450,37 @@ Manager::ShutdownAllOnMainThread()
+   while (!Factory::IsShutdownAllCompleteOnMainThread()) {
+     if (!NS_ProcessNextEvent()) {
+       NS_WARNING("Something bad happened!");
+       break;
+     }
+   }
+ }
+ 
++// static
++void
++Manager::InvalidateActorsOnIOThread()
++{
++  MOZ_ASSERT(!NS_IsMainThread());
++  // On QuotaManager IO thread
++  Factory::InvalidateActorsOnIOThread();
++}
++
+ void
  Manager::RemoveListener(Listener* aListener)
  {
    NS_ASSERT_OWNINGTHREAD(Manager);
@@ -624,11 +1153,134 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
    NS_ASSERT_OWNINGTHREAD(Manager);
    MOZ_ASSERT(mContext);
    MOZ_ASSERT(mContext == aContext);
+@@ -1763,33 +1832,37 @@ Manager::Shutdown()
+     return;
+   }
+ 
+   // Set a flag to prevent any new requests from coming in and creating
+   // a new Context.  We must ensure all Contexts and IO operations are
+   // complete before shutdown proceeds.
+   mShuttingDown = true;
+ 
+-  for (uint32_t i = 0; i < mStreamLists.Length(); ++i) {
+-    nsRefPtr<StreamList> streamList = mStreamLists[i];
+-    streamList->CloseAll();
+-  }
+-
+   // If there is a context, then we must wait for it to complete.  Cancel and
+   // only note that we are done after its cleaned up.
+   if (mContext) {
+     nsRefPtr<Context> context = mContext;
+     context->CancelAll();
+     return;
+   }
+ 
+   // Otherwise, note that we are complete immediately
+   Factory::Remove(this);
+ }
+ 
++void
++Manager::InvalidateActors()
++{
++  NS_ASSERT_OWNINGTHREAD(Manager);
++  for (uint32_t i = 0; i < mListeners.Length(); ++i) {
++    mListeners[i].mListener->Invalidate();
++  }
++}
++
+ already_AddRefed<Context>
+ Manager::CurrentContext()
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   nsRefPtr<Context> ref = mContext;
+   if (!ref) {
+     MOZ_ASSERT(!mShuttingDown);
+     nsRefPtr<Action> setupAction = new SetupAction();
+diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
+--- a/dom/cache/Manager.h
++++ b/dom/cache/Manager.h
+@@ -81,16 +81,17 @@ public:
+   // Listeners must call Manager::RemoveListener() before they are destroyed
+   // to clear these weak references.
+   //
+   // All public methods should be invoked on the same thread used to create
+   // the Manager.
+   class Listener
+   {
+   public:
++    virtual void Invalidate() = 0;
+     virtual void OnCacheMatch(RequestId aRequestId, nsresult aRv,
+                               const SavedResponse* aResponse,
+                               StreamList* aStreamList) { }
+     virtual void OnCacheMatchAll(RequestId aRequestId, nsresult aRv,
+                                  const nsTArray<SavedResponse>& aSavedResponses,
+                                  StreamList* aStreamList) { }
+     virtual void OnCachePutAll(RequestId aRequestId, nsresult aRv) { }
+     virtual void OnCacheDelete(RequestId aRequestId, nsresult aRv,
+@@ -116,16 +117,19 @@ public:
+   };
+ 
+   static nsresult GetOrCreate(ManagerId* aManagerId, Manager** aManagerOut);
+   static already_AddRefed<Manager> Get(ManagerId* aManagerId);
+ 
+   // Synchronously shutdown from main thread.  This spins the event loop.
+   static void ShutdownAllOnMainThread();
+ 
++  // Asynchronously invalidates all existing Cache actors.
++  static void InvalidateActorsOnIOThread();
++
+   // Must be called by Listener objects before they are destroyed.
+   void RemoveListener(Listener* aListener);
+ 
+   // Must be called by Context objects before they are destroyed.
+   void RemoveContext(Context* aContext);
+ 
+   // If an actor represents a long term reference to a cache or body stream,
+   // then they must call AddRefCacheId() or AddRefBodyId().  This will
+@@ -192,16 +196,17 @@ private:
+   class StorageDeleteAction;
+   class StorageKeysAction;
+ 
+   typedef uint64_t ListenerId;
+ 
+   Manager(ManagerId* aManagerId, nsIThread* aIOThread);
+   ~Manager();
+   void Shutdown();
++  void InvalidateActors();
+   already_AddRefed<Context> CurrentContext();
+ 
+   ListenerId SaveListener(Listener* aListener);
+   Listener* GetListener(ListenerId aListenerId) const;
+ 
+   bool SetCacheIdOrphanedIfRefed(CacheId aCacheId);
+   bool SetBodyIdOrphanedIfRefed(const nsID& aBodyId);
+   void NoteOrphanedBodyIdList(const nsTArray<nsID>& aDeletedBodyIdList);
+@@ -211,18 +216,18 @@ private:
+ 
+   // Weak reference cleared by RemoveContext() in Context destructor.
+   Context* MOZ_NON_OWNING_REF mContext;
+ 
+   // Weak references cleared by RemoveListener() in Listener destructors.
+   struct ListenerEntry
+   {
+     ListenerEntry()
+-      : mId(UINT64_MAX),
+-      mListener(nullptr)
++      : mId(UINT64_MAX)
++      , mListener(nullptr)
+     {
+     }
+ 
+     ListenerEntry(ListenerId aId, Listener* aListener)
+       : mId(aId)
+       , mListener(aListener)
+     {
+     }
 diff --git a/dom/cache/OfflineStorage.cpp b/dom/cache/OfflineStorage.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/OfflineStorage.cpp
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,133 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -640,71 +1292,89 @@ new file mode 100644
 +#include "mozilla/dom/cache/Context.h"
 +#include "mozilla/dom/cache/QuotaClient.h"
 +#include "mozilla/dom/quota/QuotaManager.h"
-+#include "nsIOfflineStorage.h"
 +#include "nsThreadUtils.h"
 +
-+namespace {
++namespace mozilla {
++namespace dom {
++namespace cache {
 +
-+using mozilla::dom::cache::Context;
-+using mozilla::dom::cache::CreateQuotaClient;
-+using mozilla::dom::cache::QuotaInfo;
 +using mozilla::dom::quota::Client;
 +using mozilla::dom::quota::PERSISTENCE_TYPE_DEFAULT;
 +using mozilla::dom::quota::QuotaManager;
 +
-+class CacheOfflineStorage MOZ_FINAL : public nsIOfflineStorage
++NS_IMPL_ISUPPORTS(OfflineStorage, nsIOfflineStorage);
++
++// static
++already_AddRefed<OfflineStorage>
++OfflineStorage::Register(Context::ThreadsafeHandle* aContext,
++                         const QuotaInfo& aQuotaInfo)
 +{
-+public:
-+  CacheOfflineStorage(Context::ThreadsafeHandle* aContext,
-+                      const QuotaInfo& aQuotaInfo)
-+    : mContext(aContext)
-+    , mQuotaInfo(aQuotaInfo)
-+  {
-+    MOZ_ASSERT(mContext);
++  MOZ_ASSERT(NS_IsMainThread());
 +
-+    mPersistenceType = PERSISTENCE_TYPE_DEFAULT;
-+    mGroup = mQuotaInfo.mGroup;
-+    mClient = CreateQuotaClient();
++  nsRefPtr<QuotaManager> qm = QuotaManager::GetOrCreate();
++  if (NS_WARN_IF(!qm)) {
++    return nullptr;
 +  }
 +
-+private:
-+  ~CacheOfflineStorage()
-+  {
-+    MOZ_ASSERT(NS_IsMainThread());
-+    nsRefPtr<QuotaManager> qm = QuotaManager::GetOrCreate();
-+    if (!qm) {
-+      NS_WARNING("QuotaManager gone before Cache storage could unregister");
-+      return;
-+    }
-+    qm->UnregisterStorage(this);
++  nsRefPtr<OfflineStorage> storage =
++    new OfflineStorage(aContext, aQuotaInfo);
++
++  if (NS_WARN_IF(!qm->RegisterStorage(storage))) {
++    return nullptr;
 +  }
 +
-+  nsRefPtr<Context::ThreadsafeHandle> mContext;
-+  const QuotaInfo mQuotaInfo;
-+  nsRefPtr<Client> mClient;
++  return storage.forget();
++}
 +
-+  NS_DECL_ISUPPORTS
-+  NS_DECL_NSIOFFLINESTORAGE
-+};
++void
++OfflineStorage::SetDestroyCallback(nsIRunnable* aCallback)
++{
++  MOZ_ASSERT(!mDestroyCallback);
++  mDestroyCallback = aCallback;
++}
 +
-+NS_IMPL_ISUPPORTS(CacheOfflineStorage, nsIOfflineStorage);
++OfflineStorage::OfflineStorage(Context::ThreadsafeHandle* aContext,
++                               const QuotaInfo& aQuotaInfo)
++  : mContext(aContext)
++  , mQuotaInfo(aQuotaInfo)
++{
++  MOZ_ASSERT(mContext);
++
++  mPersistenceType = PERSISTENCE_TYPE_DEFAULT;
++  mGroup = mQuotaInfo.mGroup;
++  mClient = CreateQuotaClient();
++}
++
++OfflineStorage::~OfflineStorage()
++{
++  MOZ_ASSERT(NS_IsMainThread());
++  nsRefPtr<QuotaManager> qm = QuotaManager::GetOrCreate();
++  if (!qm) {
++    NS_WARNING("QuotaManager gone before Cache storage could unregister");
++    return;
++  }
++  qm->UnregisterStorage(this);
++  if (mDestroyCallback) {
++    mDestroyCallback->Run();
++  }
++}
 +
 +NS_IMETHODIMP_(const nsACString&)
-+CacheOfflineStorage::Id()
++OfflineStorage::Id()
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
 +  return mQuotaInfo.mStorageId;
 +}
 +
 +NS_IMETHODIMP_(Client*)
-+CacheOfflineStorage::GetClient()
++OfflineStorage::GetClient()
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
 +  return mClient;
 +}
 +
 +NS_IMETHODIMP_(bool)
-+CacheOfflineStorage::IsOwnedByProcess(ContentParent* aOwner)
++OfflineStorage::IsOwnedByProcess(ContentParent* aOwner)
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
 +  // The Cache and Context can be shared by multiple client processes.  They
@@ -720,14 +1390,14 @@ new file mode 100644
 +}
 +
 +NS_IMETHODIMP_(const nsACString&)
-+CacheOfflineStorage::Origin()
++OfflineStorage::Origin()
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
 +  return mQuotaInfo.mOrigin;
 +}
 +
 +NS_IMETHODIMP_(nsresult)
-+CacheOfflineStorage::Close()
++OfflineStorage::Close()
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
 +  mContext->AllowToClose();
@@ -735,37 +1405,10 @@ new file mode 100644
 +}
 +
 +NS_IMETHODIMP_(void)
-+CacheOfflineStorage::Invalidate()
++OfflineStorage::Invalidate()
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
 +  mContext->CancelAndAllowToClose();
-+}
-+
-+} // anonymous namespace
-+
-+namespace mozilla {
-+namespace dom {
-+namespace cache {
-+
-+already_AddRefed<nsISupports>
-+RegisterOfflineStorage(Context::ThreadsafeHandle* aContext,
-+                       const QuotaInfo& aQuotaInfo)
-+{
-+  MOZ_ASSERT(NS_IsMainThread());
-+
-+  nsRefPtr<QuotaManager> qm = QuotaManager::GetOrCreate();
-+  if (NS_WARN_IF(!qm)) {
-+    return nullptr;
-+  }
-+
-+  nsRefPtr<CacheOfflineStorage> storage =
-+    new CacheOfflineStorage(aContext, aQuotaInfo);
-+
-+  if (NS_WARN_IF(!qm->RegisterStorage(storage))) {
-+    return nullptr;
-+  }
-+
-+  return storage.forget();
 +}
 +
 +} // namespace cache
@@ -775,7 +1418,7 @@ diff --git a/dom/cache/OfflineStorage.h b/dom/cache/OfflineStorage.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/OfflineStorage.h
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,48 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -788,6 +1431,7 @@ new file mode 100644
 +#include "nsISupportsImpl.h"
 +#include "mozilla/AlreadyAddRefed.h"
 +#include "mozilla/dom/cache/Context.h"
++#include "nsIOfflineStorage.h"
 +
 +class nsIThread;
 +
@@ -795,26 +1439,313 @@ new file mode 100644
 +namespace dom {
 +namespace cache {
 +
-+class ManagerId;
++class OfflineStorage MOZ_FINAL : public nsIOfflineStorage
++{
++public:
++  static already_AddRefed<OfflineStorage>
++  Register(Context::ThreadsafeHandle* aContext, const QuotaInfo& aQuotaInfo);
 +
-+// Register a QuotaManager OfflineStorage object on the main thread.  The
-+// returned registration reference is to an RAII object.  When this object
-+// is released then the OfflineStorage is unregistered.  This release must
-+// occur on the main thread.
-+already_AddRefed<nsISupports>
-+RegisterOfflineStorage(Context::ThreadsafeHandle* aContext,
-+                       const QuotaInfo& aQuotaInfo);
++  void
++  SetDestroyCallback(nsIRunnable* aCallback);
++
++private:
++  OfflineStorage(Context::ThreadsafeHandle* aContext,
++                 const QuotaInfo& aQuotaInfo);
++  ~OfflineStorage();
++
++  nsRefPtr<Context::ThreadsafeHandle> mContext;
++  const QuotaInfo mQuotaInfo;
++  nsRefPtr<Client> mClient;
++  nsCOMPtr<nsIRunnable> mDestroyCallback;
++
++  NS_DECL_ISUPPORTS
++  NS_DECL_NSIOFFLINESTORAGE
++};
 +
 +} // namespace cache
 +} // namespace dom
 +} // namespace mozilla
 +
 +#endif // mozilla_dom_cache_QuotaOfflineStorage_h
+diff --git a/dom/cache/QuotaClient.cpp b/dom/cache/QuotaClient.cpp
+--- a/dom/cache/QuotaClient.cpp
++++ b/dom/cache/QuotaClient.cpp
+@@ -3,26 +3,28 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/QuotaClient.h"
+ 
+ #include "mozilla/DebugOnly.h"
+ #include "mozilla/dom/cache/Manager.h"
++#include "mozilla/dom/cache/OfflineStorage.h"
+ #include "mozilla/dom/quota/QuotaManager.h"
+ #include "mozilla/dom/quota/UsageInfo.h"
+ #include "nsIFile.h"
+ #include "nsISimpleEnumerator.h"
+ #include "nsThreadUtils.h"
+ 
+ namespace {
+ 
+ using mozilla::DebugOnly;
+ using mozilla::dom::cache::Manager;
++using mozilla::dom::cache::OfflineStorage;
+ using mozilla::dom::quota::Client;
+ using mozilla::dom::quota::PersistenceType;
+ using mozilla::dom::quota::QuotaManager;
+ using mozilla::dom::quota::UsageInfo;
+ 
+ static nsresult
+ GetBodyUsage(nsIFile* aDir, UsageInfo* aUsageInfo)
+ {
+@@ -55,16 +57,51 @@ GetBodyUsage(nsIFile* aDir, UsageInfo* a
+     MOZ_ASSERT(fileSize >= 0);
+ 
+     aUsageInfo->AppendToFileUsage(fileSize);
+   }
+ 
+   return NS_OK;
+ }
+ 
++class StoragesDestroyedRunnable MOZ_FINAL : public nsRunnable
++{
++  uint32_t mExpectedCalls;
++  nsCOMPtr<nsIRunnable> mCallback;
++
++public:
++  StoragesDestroyedRunnable(uint32_t aExpectedCalls, nsIRunnable* aCallback)
++    : mExpectedCalls(aExpectedCalls)
++    , mCallback(aCallback)
++  {
++    MOZ_ASSERT(NS_IsMainThread());
++    MOZ_ASSERT(mExpectedCalls);
++    MOZ_ASSERT(mCallback);
++  }
++
++  NS_IMETHOD Run() MOZ_OVERRIDE
++  {
++    MOZ_ASSERT(NS_IsMainThread());
++    MOZ_ASSERT(mExpectedCalls);
++    mExpectedCalls -= 1;
++    if (!mExpectedCalls) {
++      mCallback->Run();
++    }
++    return NS_OK;
++  }
++
++private:
++  ~StoragesDestroyedRunnable()
++  {
++    // This is a callback runnable and not used for thread dispatch.  It should
++    // always be destroyed on the main thread.
++    MOZ_ASSERT(NS_IsMainThread());
++  }
++};
++
+ class CacheQuotaClient MOZ_FINAL : public Client
+ {
+ public:
+   virtual Type
+   GetType() MOZ_OVERRIDE
+   {
+     return DOMCACHE;
+   }
+@@ -146,43 +183,55 @@ public:
+ 
+     return NS_OK;
+   }
+ 
+   virtual void
+   OnOriginClearCompleted(PersistenceType aPersistenceType,
+                          const nsACString& aOrigin) MOZ_OVERRIDE
+   {
+-    // nothing to do
++    Manager::InvalidateActorsOnIOThread();
+   }
+ 
+   virtual void
+   ReleaseIOThreadObjects() MOZ_OVERRIDE
+   {
+-    // nothing to do
++    // Nothing to do here as the Context handles cleaning everything up
++    // automatically.
+   }
+ 
+   virtual bool
+   IsFileServiceUtilized() MOZ_OVERRIDE
+   {
+-    return false;
++    return true;
+   }
+ 
+   virtual bool
+   IsTransactionServiceActivated() MOZ_OVERRIDE
+   {
+-    // TODO: implement nsIOfflineStorage interface (bug 1110487)
+-    return false;
++    return true;
+   }
+ 
+   virtual void
+   WaitForStoragesToComplete(nsTArray<nsIOfflineStorage*>& aStorages,
+                             nsIRunnable* aCallback) MOZ_OVERRIDE
+   {
+-    // TODO: implement nsIOfflineStorage interface (bug 1110487)
++    MOZ_ASSERT(NS_IsMainThread());
++    MOZ_ASSERT(!aStorages.IsEmpty());
++
++    nsCOMPtr<nsIRunnable> callback =
++      new StoragesDestroyedRunnable(aStorages.Length(),aCallback);
++
++    for (uint32_t i = 0; i < aStorages.Length(); ++i) {
++      MOZ_ASSERT(aStorages[i]->GetClient());
++      MOZ_ASSERT(aStorages[i]->GetClient()->GetType() == Client::DOMCACHE);
++      nsRefPtr<OfflineStorage> storage =
++        static_cast<OfflineStorage*>(aStorages[i]);
++      storage->SetDestroyCallback(callback);
++    }
+   }
+ 
+ 
+   virtual void
+   ShutdownTransactionService() MOZ_OVERRIDE
+   {
+     MOZ_ASSERT(NS_IsMainThread());
+ 
+diff --git a/dom/cache/StreamList.cpp b/dom/cache/StreamList.cpp
+--- a/dom/cache/StreamList.cpp
++++ b/dom/cache/StreamList.cpp
+@@ -18,17 +18,17 @@ namespace cache {
+ StreamList::StreamList(Manager* aManager, Context* aContext)
+   : mManager(aManager)
+   , mContext(aContext)
+   , mCacheId(0)
+   , mStreamControl(nullptr)
+   , mActivated(false)
+ {
+   MOZ_ASSERT(mManager);
+-  MOZ_ASSERT(mContext);
++  mContext->AddActivity(this);
+ }
+ 
+ void
+ StreamList::SetStreamControl(CacheStreamControlParent* aStreamControl)
+ {
+   NS_ASSERT_OWNINGTHREAD(StreamList);
+   MOZ_ASSERT(aStreamControl);
+ 
+@@ -137,24 +137,39 @@ void
+ StreamList::CloseAll()
+ {
+   NS_ASSERT_OWNINGTHREAD(StreamList);
+   if (mStreamControl) {
+     mStreamControl->CloseAll();
+   }
+ }
+ 
++void
++StreamList::Cancel()
++{
++  NS_ASSERT_OWNINGTHREAD(StreamList);
++  CloseAll();
++}
++
++bool
++StreamList::MatchesCacheId(CacheId aCacheId) const
++{
++  NS_ASSERT_OWNINGTHREAD(StreamList);
++  return aCacheId == mCacheId;
++}
++
+ StreamList::~StreamList()
+ {
+   NS_ASSERT_OWNINGTHREAD(StreamList);
+   MOZ_ASSERT(!mStreamControl);
+   if (mActivated) {
+     mManager->RemoveStreamList(this);
+     for (uint32_t i = 0; i < mList.Length(); ++i) {
+       mManager->ReleaseBodyId(mList[i].mId);
+     }
+     mManager->ReleaseCacheId(mCacheId);
+   }
++  mContext->RemoveActivity(this);
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/StreamList.h b/dom/cache/StreamList.h
+--- a/dom/cache/StreamList.h
++++ b/dom/cache/StreamList.h
+@@ -2,31 +2,31 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_cache_StreamList_h
+ #define mozilla_dom_cache_StreamList_h
+ 
++#include "mozilla/dom/cache/Context.h"
+ #include "mozilla/dom/cache/Types.h"
+ #include "nsRefPtr.h"
+ #include "nsTArray.h"
+ 
+ class nsIInputStream;
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ class CacheStreamControlParent;
+-class Context;
+ class Manager;
+ 
+-class StreamList
++class StreamList MOZ_FINAL : public Context::Activity
+ {
+ public:
+   StreamList(Manager* aManager, Context* aContext);
+ 
+   void SetStreamControl(CacheStreamControlParent* aStreamControl);
+   void RemoveStreamControl(CacheStreamControlParent* aStreamControl);
+ 
+   void Activate(CacheId aCacheId);
+@@ -34,16 +34,20 @@ public:
+   void Add(const nsID& aId, nsIInputStream* aStream);
+   already_AddRefed<nsIInputStream> Extract(const nsID& aId);
+ 
+   void NoteClosed(const nsID& aId);
+   void NoteClosedAll();
+   void Close(const nsID& aId);
+   void CloseAll();
+ 
++  // Context::Activity methods
++  virtual void Cancel() MOZ_OVERRIDE;
++  virtual bool MatchesCacheId(CacheId aCacheId) const MOZ_OVERRIDE;
++
+ private:
+   ~StreamList();
+   struct Entry
+   {
+     nsID mId;
+     nsCOMPtr<nsIInputStream> mStream;
+   };
+   nsRefPtr<Manager> mManager;
 diff --git a/dom/cache/Types.h b/dom/cache/Types.h
 --- a/dom/cache/Types.h
 +++ b/dom/cache/Types.h
-@@ -29,16 +29,17 @@ static const RequestId INVALID_REQUEST_I
+@@ -22,23 +22,25 @@ enum Namespace
+   CHROME_ONLY_NAMESPACE,
+   NUMBER_OF_NAMESPACES
+ };
+ 
+ typedef uintptr_t RequestId;
+ static const RequestId INVALID_REQUEST_ID = 0;
+ 
  typedef int32_t CacheId;
++static const CacheId INVALID_CACHEID = -1;
  
  struct QuotaInfo
  {
@@ -870,3 +1801,65 @@ diff --git a/dom/cache/moz.build b/dom/cache/moz.build
      'TypeUtils.cpp',
  ]
  
+diff --git a/dom/cache/test/mochitest/test_cache.html b/dom/cache/test/mochitest/test_cache.html
+--- a/dom/cache/test/mochitest/test_cache.html
++++ b/dom/cache/test/mochitest/test_cache.html
+@@ -2,16 +2,17 @@
+    - http://creativecommons.org/publicdomain/zero/1.0/ -->
+ <!DOCTYPE HTML>
+ <html>
+ <head>
+   <title>Validate Interfaces Exposed to Workers</title>
+   <script type="text/javascript" src="/tests/SimpleTest/SimpleTest.js"></script>
+   <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css" />
+   <script type="text/javascript" src="worker_driver.js"></script>
++  <script type="text/javascript" src="helpers.js"></script>
+ </head>
+ <body>
+ <iframe id="frame"></iframe>
+ <script class="testbody" type="text/javascript">
+ SimpleTest.waitForExplicitFinish();
+ SpecialPowers.pushPrefEnv({
+   "set": [["dom.caches.enabled", true]]
+ }, function() {
+diff --git a/dom/cache/test/mochitest/worker_driver.js b/dom/cache/test/mochitest/worker_driver.js
+--- a/dom/cache/test/mochitest/worker_driver.js
++++ b/dom/cache/test/mochitest/worker_driver.js
+@@ -21,24 +21,35 @@
+ //
+ //  workerTestGetPrefs() - request an array of prefs value from the main thread
+ //  workerTestGetPermissions() - request an array permissions from the MT
+ //  workerTestGetVersion() - request the current version string from the MT
+ //  workerTestGetUserAgent() - request the user agent string from the MT
+ //
+ // For an example see test_worker_interfaces.html and test_worker_interfaces.js.
+ 
++function clearStorage(callback) {
++  var principal = SpecialPowers.wrap(document).nodePrincipal;
++  var appId, inBrowser;
++  var nsIPrincipal = SpecialPowers.Components.interfaces.nsIPrincipal;
++  if (principal.appId != nsIPrincipal.UNKNOWN_APP_ID &&
++      principal.appId != nsIPrincipal.NO_APP_ID) {
++    appId = principal.appId;
++    inBrowser = principal.isInBrowserElement;
++  }
++  SpecialPowers.clearStorageForURI(document.documentURI, callback, appId, inBrowser);
++}
++
+ function workerTestExec(script) {
+   SimpleTest.waitForExplicitFinish();
+   var worker = new Worker('worker_wrapper.js');
+   worker.onmessage = function(event) {
+     if (event.data.type == 'finish') {
+       SpecialPowers.forceGC();
+-      SimpleTest.finish();
+-
++      clearStorage(SimpleTest.finish);
+     } else if (event.data.type == 'status') {
+       ok(event.data.status, event.data.msg);
+ 
+     } else if (event.data.type == 'getPrefs') {
+       var result = {};
+       event.data.prefs.forEach(function(pref) {
+         result[pref] = SpecialPowers.Services.prefs.getBoolPref(pref);
+       });
