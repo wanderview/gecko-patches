@@ -1,13 +1,30 @@
 # HG changeset patch
-# Parent f77a385356198d0f0e48c72b17f2691964ff5cae
+# Parent acfbb3546dcec7fd97b124186a4dcf2f74ef539f
 # User Ben Kelly <ben@wanderview.com>
-Bug 1110814 Push nsPipe data across the IPC actor boundary.
-
+Bug 1110814 P1 Implement Cache actor for streaming data from child to parent.
 
 diff --git a/dom/cache/CacheChild.cpp b/dom/cache/CacheChild.cpp
 --- a/dom/cache/CacheChild.cpp
 +++ b/dom/cache/CacheChild.cpp
-@@ -89,16 +89,30 @@ CacheChild::ActorDestroy(ActorDestroyRea
+@@ -4,16 +4,17 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/CacheChild.h"
+ 
+ #include "mozilla/unused.h"
+ #include "mozilla/dom/cache/ActorUtils.h"
+ #include "mozilla/dom/cache/Cache.h"
++#include "mozilla/dom/cache/PCachePushStreamChild.h"
+ #include "mozilla/dom/cache/StreamUtils.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ // Declared in ActorUtils.h
+ PCacheChild*
+@@ -89,16 +90,30 @@ CacheChild::ActorDestroy(ActorDestroyRea
      listener->DestroyInternal(this);
      // Cache listener should call ClearListener() in DestroyInternal()
      MOZ_ASSERT(!mListener);
@@ -19,15 +36,15 @@ diff --git a/dom/cache/CacheChild.cpp b/dom/cache/CacheChild.cpp
 +PCachePushStreamChild*
 +CacheChild::AllocPCachePushStreamChild()
 +{
-+  // TODO
++  MOZ_CRASH("CachePushStreamChild should be manually constructed.");
 +  return nullptr;
 +}
 +
 +bool
 +CacheChild::DeallocPCachePushStreamChild(PCachePushStreamChild* aActor)
 +{
-+  // TODO
-+  return false;
++  delete aActor;
++  return true;
 +}
 +
  bool
@@ -67,7 +84,25 @@ diff --git a/dom/cache/CacheChild.h b/dom/cache/CacheChild.h
 diff --git a/dom/cache/CacheParent.cpp b/dom/cache/CacheParent.cpp
 --- a/dom/cache/CacheParent.cpp
 +++ b/dom/cache/CacheParent.cpp
-@@ -56,16 +56,30 @@ CacheParent::ActorDestroy(ActorDestroyRe
+@@ -3,16 +3,17 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/CacheParent.h"
+ 
+ #include "mozilla/DebugOnly.h"
+ #include "mozilla/dom/cache/AutoUtils.h"
++#include "mozilla/dom/cache/CachePushStreamParent.h"
+ #include "mozilla/dom/cache/CacheStreamControlParent.h"
+ #include "mozilla/dom/cache/ReadStream.h"
+ #include "mozilla/dom/cache/SavedTypes.h"
+ #include "mozilla/dom/cache/StreamList.h"
+ #include "mozilla/ipc/InputStreamUtils.h"
+ #include "mozilla/ipc/PBackgroundParent.h"
+ #include "mozilla/ipc/FileDescriptorSetParent.h"
+ #include "mozilla/ipc/PFileDescriptorSetParent.h"
+@@ -56,16 +57,29 @@ CacheParent::ActorDestroy(ActorDestroyRe
      mFetchPutList[i]->ClearListener();
    }
    mFetchPutList.Clear();
@@ -79,15 +114,14 @@ diff --git a/dom/cache/CacheParent.cpp b/dom/cache/CacheParent.cpp
 +PCachePushStreamParent*
 +CacheParent::AllocPCachePushStreamParent()
 +{
-+  // TODO
-+  return nullptr;
++  return CachePushStreamParent::Create();
 +}
 +
 +bool
 +CacheParent::DeallocPCachePushStreamParent(PCachePushStreamParent* aActor)
 +{
-+  // TODO
-+  return false;
++  delete aActor;
++  return true;
 +}
 +
  bool
@@ -124,7 +158,7 @@ diff --git a/dom/cache/CachePushStreamChild.cpp b/dom/cache/CachePushStreamChild
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/CachePushStreamChild.cpp
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,229 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -133,27 +167,222 @@ new file mode 100644
 +
 +#include "mozilla/dom/cache/CachePushStreamChild.h"
 +
++#include "mozilla/unused.h"
++#include "nsIAsyncInputStream.h"
++#include "nsICancelableRunnable.h"
++#include "nsIThread.h"
++#include "nsStreamUtils.h"
++
 +namespace mozilla {
 +namespace dom {
 +namespace cache {
 +
-+CachePushStreamChild::CachePushStreamChild()
++class CachePushStreamChild::Callback MOZ_FINAL : public nsIInputStreamCallback
++                                               , public nsICancelableRunnable
 +{
++public:
++  Callback(CachePushStreamChild* aActor)
++    : mActor(aActor)
++    , mOwningThread(NS_GetCurrentThread())
++  {
++    MOZ_ASSERT(mActor);
++  }
++
++  NS_METHOD
++  OnInputStreamReady(nsIAsyncInputStream* aStream)
++  {
++    // any thread
++    if (mOwningThread == NS_GetCurrentThread()) {
++      return Run();
++    }
++
++    // If this fails, then it means the owning thread is a Worker that has
++    // been shutdown.  Its ok to lose the event in this case because the
++    // CachePushStreamChild listens for this event through the Feature.
++    nsresult rv = mOwningThread->Dispatch(this, nsIThread::DISPATCH_NORMAL);
++    if (NS_FAILED(rv)) {
++      NS_WARNING("Failed to dispatch stream readable event to owning thread");
++    }
++
++    return NS_OK;
++  }
++
++  NS_METHOD
++  Run()
++  {
++    MOZ_ASSERT(mOwningThread == NS_GetCurrentThread());
++    if (mActor) {
++      mActor->OnStreamReady(this);
++    }
++    return NS_OK;
++  }
++
++  NS_METHOD
++  Cancel()
++  {
++    // Cancel() gets called when the Worker thread is being shutdown.  We have
++    // nothing to do here because CachePushStreamChild handles this case via
++    // the Feature.
++    return NS_OK;
++  }
++
++  void
++  ClearActor()
++  {
++    MOZ_ASSERT(mOwningThread == NS_GetCurrentThread());
++    MOZ_ASSERT(mActor);
++    mActor = nullptr;
++  }
++
++private:
++  ~Callback()
++  {
++    // called on any thread
++
++    // ClearActor() should be called before the Callback is destroyed
++    MOZ_ASSERT(!mActor);
++  }
++
++  CachePushStreamChild* mActor;
++  nsCOMPtr<nsIThread> mOwningThread;
++
++  NS_DECL_THREADSAFE_ISUPPORTS
++};
++
++NS_IMPL_ISUPPORTS(CachePushStreamChild::Callback, nsIInputStreamCallback,
++                                                  nsIRunnable,
++                                                  nsICancelableRunnable);
++
++CachePushStreamChild::CachePushStreamChild(Feature* aFeature,
++                                           nsIAsyncInputStream* aStream)
++  : mStream(aStream)
++  , mClosed(false)
++{
++  MOZ_ASSERT(mStream);
++  MOZ_ASSERT(NS_InputStreamIsBuffered(mStream));
++  MOZ_ASSERT_IF(!NS_IsMainThread(), aFeature);
++  SetFeature(aFeature);
 +}
 +
 +CachePushStreamChild::~CachePushStreamChild()
 +{
++  NS_ASSERT_OWNINGTHREAD(CachePushStreamChild);
++  MOZ_ASSERT(mClosed);
++  MOZ_ASSERT(!mCallback);
++}
++
++void
++CachePushStreamChild::Start()
++{
++  DoRead();
 +}
 +
 +void
 +CachePushStreamChild::StartDestroy()
 +{
-+  Send__delete__(this);
++  // called if we are running on a Worker and the thread gets shutdown on us
++  OnEnd(NS_ERROR_ABORT);
 +}
 +
 +void
 +CachePushStreamChild::ActorDestroy(ActorDestroyReason aReason)
 +{
++  NS_ASSERT_OWNINGTHREAD(CachePushStreamChild);
++
++  // This should always be called as a result of OnEnd()
++  MOZ_ASSERT(mClosed);
++
++  if (mCallback) {
++    mCallback->ClearActor();
++    mCallback = nullptr;
++  }
++}
++
++void
++CachePushStreamChild::DoRead()
++{
++  NS_ASSERT_OWNINGTHREAD(CachePushStreamChild);
++  MOZ_ASSERT(!mClosed);
++  MOZ_ASSERT(!mCallback);
++
++  // The input stream (likely a pipe) probably uses a segment size of
++  // 4kb.  If there is data already buffered it would be nice to aggregate
++  // multiple segments into a single IPC call.  Conversely, don't send too
++  // too large of a buffer in a single call to avoid spiking memory.
++  static const uint32_t kMaxBytesPerMessage = 32 * 1024;
++
++  while (true) {
++    // Use non-auto here as we're unlikely to hit stack storage with the
++    // sizes we are sending.  Also, it would be nice to avoid another copy
++    // to the IPC layer which we avoid if we use COW strings.  Unfortunately
++    // IPC does not seem to support passing dependent storage types.
++    nsCString buffer;
++    nsresult rv = NS_ConsumeStream(mStream, kMaxBytesPerMessage, buffer);
++
++    // If we read any data from the stream, send it across.
++    if (!buffer.IsEmpty()) {
++      unused << SendBuffer(buffer);
++    }
++
++    if (rv == NS_BASE_STREAM_WOULD_BLOCK) {
++      Wait();
++      return;
++    }
++
++    // Any other error indicates end-of-stream
++    if (NS_FAILED(rv)) {
++      OnEnd(rv);
++      return;
++    }
++  }
++
++  MOZ_ASSERT_UNREACHABLE("Read loop should exit via WOULD_BLOCK or stream close.");
++}
++
++void
++CachePushStreamChild::Wait()
++{
++  NS_ASSERT_OWNINGTHREAD(CachePushStreamChild);
++  MOZ_ASSERT(!mClosed);
++  MOZ_ASSERT(!mCallback);
++
++  // Set mCallback immediately instead of waiting for success.  Its possible
++  // AsyncWait() will callback synchronously.
++  mCallback = new Callback(this);
++  nsresult rv = mStream->AsyncWait(mCallback, 0, 0, nullptr);
++  if (NS_FAILED(rv)) {
++    OnEnd(rv);
++    return;
++  }
++}
++
++void
++CachePushStreamChild::OnStreamReady(Callback* aCallback)
++{
++  NS_ASSERT_OWNINGTHREAD(CachePushStreamChild);
++  MOZ_ASSERT(mCallback);
++  MOZ_ASSERT(aCallback == mCallback);
++  mCallback = nullptr;
++  DoRead();
++}
++
++void
++CachePushStreamChild::OnEnd(nsresult aRv)
++{
++  NS_ASSERT_OWNINGTHREAD(CachePushStreamChild);
++  MOZ_ASSERT(aRv != NS_BASE_STREAM_WOULD_BLOCK);
++
++  if (mClosed) {
++    return;
++  }
++
++  mStream->CloseWithStatus(aRv);
++
++  if (NS_SUCCEEDED(aRv) || aRv == NS_BASE_STREAM_CLOSED) {
++    unused << SendClose();
++  }
++
++  unused << Send__delete__(this);
 +}
 +
 +} // namespace cache
@@ -163,7 +392,7 @@ diff --git a/dom/cache/CachePushStreamChild.h b/dom/cache/CachePushStreamChild.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/CachePushStreamChild.h
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,59 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -175,6 +404,9 @@ new file mode 100644
 +
 +#include "mozilla/dom/cache/ActorChild.h"
 +#include "mozilla/dom/cache/PCachePushStreamChild.h"
++#include "nsCOMPtr.h"
++
++class nsIAsyncInputStream;
 +
 +namespace mozilla {
 +namespace dom {
@@ -184,17 +416,33 @@ new file mode 100644
 +                                     , public ActorChild
 +{
 +public:
-+  CachePushStreamChild();
++  CachePushStreamChild(Feature* aFeature, nsIAsyncInputStream* aStream);
 +  ~CachePushStreamChild();
++
++  void Start();
++
++private:
++  class Callback;
 +
 +  // Synchronously call ActorDestroy on our Cache listener and then start the
 +  // actor destruction asynchronously from the parent-side.
 +  virtual void StartDestroy() MOZ_OVERRIDE;
 +
-+private:
 +  // PCachePushStreamChild methods
 +  virtual void
 +  ActorDestroy(ActorDestroyReason aReason) MOZ_OVERRIDE;
++
++  void DoRead();
++
++  void Wait();
++
++  void OnStreamReady(Callback* aCallback);
++
++  void OnEnd(nsresult aRv);
++
++  nsCOMPtr<nsIAsyncInputStream> mStream;
++  nsRefPtr<Callback> mCallback;
++  bool mClosed = false;
 +
 +  NS_DECL_OWNINGTHREAD
 +};
@@ -208,7 +456,7 @@ diff --git a/dom/cache/CachePushStreamParent.cpp b/dom/cache/CachePushStreamPare
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/CachePushStreamParent.cpp
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,98 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -217,9 +465,92 @@ new file mode 100644
 +
 +#include "mozilla/dom/cache/CachePushStreamParent.h"
 +
++#include "nsIAsyncInputStream.h"
++#include "nsIAsyncOutputStream.h"
++#include "nsIPipe.h"
++
 +namespace mozilla {
 +namespace dom {
 +namespace cache {
++
++// static
++CachePushStreamParent*
++CachePushStreamParent::Create()
++{
++  // use async versions for both reader and writer even though we are
++  // opening the writer as an infinite stream.  We want to be able to
++  // use CloseWithStatus() to communicate errors through the pipe.
++  nsCOMPtr<nsIAsyncInputStream> reader;
++  nsCOMPtr<nsIAsyncOutputStream> writer;
++
++  // Use an "infinite" pipe because we cannot apply back-pressure through
++  // the async IPC layer at the moment.  Blocking the IPC worker thread
++  // is not desirable, either.
++  nsresult rv = NS_NewPipe2(getter_AddRefs(reader),
++                            getter_AddRefs(writer),
++                            true, true,   // non-blocking
++                            0,            // segment size
++                            UINT32_MAX);  // "infinite" pipe
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return nullptr;
++  }
++
++  return new CachePushStreamParent(reader, writer);
++}
++
++CachePushStreamParent::~CachePushStreamParent()
++{
++}
++
++already_AddRefed<nsIInputStream>
++CachePushStreamParent::ExtractReader()
++{
++  MOZ_ASSERT(mReader);
++  return mReader.forget();
++}
++
++void
++CachePushStreamParent::ActorDestroy(ActorDestroyReason aReason)
++{
++  // If we were gracefully closed we should have gotten RecvClose().  In
++  // that case, the writer will already be closed and this will have no
++  // effect.
++  mWriter->CloseWithStatus(NS_ERROR_ABORT);
++}
++
++bool
++CachePushStreamParent::RecvBuffer(const nsCString& aBuffer)
++{
++  uint32_t numWritten = 0;
++
++  // This should only fail if we hit an OOM condition.  Simply close the
++  // stream.  On the rare chance that the process survives the OOM, the
++  // result code will get propagated back to the child process from the
++  // CachePutAllAction's copy handler.
++  nsresult rv = mWriter->Write(aBuffer.get(), aBuffer.Length(), &numWritten);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    mWriter->CloseWithStatus(rv);
++  }
++
++  return true;
++}
++
++bool
++CachePushStreamParent::RecvClose()
++{
++  // We gracefully closed
++  mWriter->Close();
++  return true;
++}
++
++CachePushStreamParent::CachePushStreamParent(nsIAsyncInputStream* aReader,
++                                             nsIAsyncOutputStream* aWriter)
++  : mReader(aReader)
++  , mWriter(aWriter)
++{
++  MOZ_ASSERT(mReader);
++  MOZ_ASSERT(mWriter);
++}
 +
 +} // namespace cache
 +} // namespace dom
@@ -228,7 +559,7 @@ diff --git a/dom/cache/CachePushStreamParent.h b/dom/cache/CachePushStreamParent
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/CachePushStreamParent.h
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,55 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -240,6 +571,10 @@ new file mode 100644
 +
 +#include "mozilla/dom/cache/PCachePushStreamParent.h"
 +
++class nsIAsyncInputStream;
++class nsIAsyncOutputStream;
++class nsIInputStream;
++
 +namespace mozilla {
 +namespace dom {
 +namespace cache {
@@ -247,13 +582,30 @@ new file mode 100644
 +class CachePushStreamParent MOZ_FINAL : public PCachePushStreamParent
 +{
 +public:
-+  CachePushStreamParent();
++  static CachePushStreamParent*
++  Create();
++
 +  ~CachePushStreamParent();
 +
++  already_AddRefed<nsIInputStream>
++  ExtractReader();
++
 +private:
++  CachePushStreamParent(nsIAsyncInputStream* aReader,
++                        nsIAsyncOutputStream* aWriter);
++
 +  // PCachePushStreamParent methods
 +  virtual void
 +  ActorDestroy(ActorDestroyReason aReason) MOZ_OVERRIDE;
++
++  virtual bool
++  RecvBuffer(const nsCString& aBuffer) MOZ_OVERRIDE;
++
++  virtual bool
++  RecvClose() MOZ_OVERRIDE;
++
++  nsCOMPtr<nsIAsyncInputStream> mReader;
++  nsCOMPtr<nsIAsyncOutputStream> mWriter;
 +
 +  NS_DECL_OWNINGTHREAD
 +};
@@ -266,7 +618,25 @@ new file mode 100644
 diff --git a/dom/cache/CacheStorageChild.cpp b/dom/cache/CacheStorageChild.cpp
 --- a/dom/cache/CacheStorageChild.cpp
 +++ b/dom/cache/CacheStorageChild.cpp
-@@ -78,16 +78,30 @@ CacheStorageChild::ActorDestroy(ActorDes
+@@ -4,16 +4,17 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/CacheStorageChild.h"
+ 
+ #include "mozilla/unused.h"
+ #include "mozilla/dom/cache/CacheChild.h"
+ #include "mozilla/dom/cache/CacheStorage.h"
++#include "mozilla/dom/cache/PCachePushStreamChild.h"
+ #include "mozilla/dom/cache/StreamUtils.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ // declared in ActorUtils.h
+ void
+@@ -78,16 +79,30 @@ CacheStorageChild::ActorDestroy(ActorDes
      listener->DestroyInternal(this);
      // CacheStorage listener should call ClearListener() in DestroyInternal()
      MOZ_ASSERT(!mListener);
@@ -278,15 +648,15 @@ diff --git a/dom/cache/CacheStorageChild.cpp b/dom/cache/CacheStorageChild.cpp
 +PCachePushStreamChild*
 +CacheStorageChild::AllocPCachePushStreamChild()
 +{
-+  // TODO
++  MOZ_CRASH("CachePushStreamChild should be manually constructed.");
 +  return nullptr;
 +}
 +
 +bool
 +CacheStorageChild::DeallocPCachePushStreamChild(PCachePushStreamChild* aActor)
 +{
-+  // TODO
-+  return false;
++  delete aActor;
++  return true;
 +}
 +
  bool
@@ -327,7 +697,25 @@ diff --git a/dom/cache/CacheStorageChild.h b/dom/cache/CacheStorageChild.h
 diff --git a/dom/cache/CacheStorageParent.cpp b/dom/cache/CacheStorageParent.cpp
 --- a/dom/cache/CacheStorageParent.cpp
 +++ b/dom/cache/CacheStorageParent.cpp
-@@ -78,16 +78,30 @@ CacheStorageParent::ActorDestroy(ActorDe
+@@ -5,16 +5,17 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/CacheStorageParent.h"
+ 
+ #include "mozilla/dom/ContentParent.h"
+ #include "mozilla/dom/cache/ActorUtils.h"
+ #include "mozilla/dom/cache/AutoUtils.h"
+ #include "mozilla/dom/cache/CacheParent.h"
++#include "mozilla/dom/cache/CachePushStreamParent.h"
+ #include "mozilla/dom/cache/CacheStreamControlParent.h"
+ #include "mozilla/dom/cache/Manager.h"
+ #include "mozilla/dom/cache/ManagerId.h"
+ #include "mozilla/dom/cache/ReadStream.h"
+ #include "mozilla/dom/cache/SavedTypes.h"
+ #include "mozilla/dom/cache/StreamList.h"
+ #include "mozilla/ipc/PBackgroundParent.h"
+ #include "mozilla/ipc/InputStreamUtils.h"
+@@ -78,16 +79,29 @@ CacheStorageParent::ActorDestroy(ActorDe
  
    if (mManager) {
      MOZ_ASSERT(!mActiveRequests.IsEmpty());
@@ -339,15 +727,14 @@ diff --git a/dom/cache/CacheStorageParent.cpp b/dom/cache/CacheStorageParent.cpp
 +PCachePushStreamParent*
 +CacheStorageParent::AllocPCachePushStreamParent()
 +{
-+  // TODO
-+  return nullptr;
++  return CachePushStreamParent::Create();
 +}
 +
 +bool
 +CacheStorageParent::DeallocPCachePushStreamParent(PCachePushStreamParent* aActor)
 +{
-+  // TODO
-+  return false;
++  delete aActor;
++  return true;
 +}
 +
  bool
@@ -439,7 +826,7 @@ new file mode 100644
 +  manager PCache or PCacheStorage;
 +
 +parent:
-+  Buffer(uint8_t[] aBuffer);
++  Buffer(nsCString aBuffer);
 +  Close();
 +  __delete__();
 +};
