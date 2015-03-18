@@ -1,0 +1,987 @@
+# HG changeset patch
+# Parent 41a61514461e055808ebaab3dbd2c1121e96bd15
+# User Ben Kelly <ben@wanderview.com>
+
+diff --git a/dom/cache/CacheStreamControlChild.cpp b/dom/cache/CacheStreamControlChild.cpp
+--- a/dom/cache/CacheStreamControlChild.cpp
++++ b/dom/cache/CacheStreamControlChild.cpp
+@@ -4,23 +4,29 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/CacheStreamControlChild.h"
+ 
+ #include "mozilla/DebugOnly.h"
+ #include "mozilla/unused.h"
+ #include "mozilla/dom/cache/ActorUtils.h"
++#include "mozilla/dom/cache/PCacheTypes.h"
+ #include "mozilla/dom/cache/ReadStream.h"
++#include "mozilla/ipc/PBackgroundChild.h"
++#include "mozilla/ipc/PFileDescriptorSetChild.h"
+ #include "nsISupportsImpl.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
++using mozilla::ipc::FileDescriptor;
++using mozilla::ipc::PFileDescriptorSetChild;
++
+ // declared in ActorUtils.h
+ PCacheStreamControlChild*
+ AllocPCacheStreamControlChild()
+ {
+   return new CacheStreamControlChild();
+ }
+ 
+ // declared in ActorUtils.h
+@@ -37,16 +43,25 @@ CacheStreamControlChild::CacheStreamCont
+ }
+ 
+ CacheStreamControlChild::~CacheStreamControlChild()
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+   MOZ_COUNT_DTOR(cache::CacheStreamControlChild);
+ }
+ 
++already_AddRefed<StreamControl>
++CacheStreamControlChild::CreateStreamControl()
++{
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
++  nsRefPtr<StreamControl> ref = new StreamControl(this);
++  mControlList.AppendElement(ref);
++  return ref.forget();
++}
++
+ void
+ CacheStreamControlChild::AddListener(ReadStream* aListener)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+   MOZ_ASSERT(aListener);
+   MOZ_ASSERT(!mListeners.Contains(aListener));
+   mListeners.AppendElement(aListener);
+ }
+@@ -55,16 +70,44 @@ void
+ CacheStreamControlChild::RemoveListener(ReadStream* aListener)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+   MOZ_ASSERT(aListener);
+   MOZ_ALWAYS_TRUE(mListeners.RemoveElement(aListener));
+ }
+ 
+ void
++CacheStreamControlChild::SerializeControl(PCacheReadStream* aReadStreamOut)
++{
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
++  aReadStreamOut->controlParent() = nullptr;
++  aReadStreamOut->controlChild() = this;
++}
++
++void
++CacheStreamControlChild::SerializeFds(PCacheReadStream* aReadStreamOut,
++                                      const nsTArray<FileDescriptor>& aFds)
++{
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
++  PFileDescriptorSetChild* fdSet = nullptr;
++  if (!aFds.IsEmpty()) {
++    fdSet = Manager()->SendPFileDescriptorSetConstructor(aFds[0]);
++    for (uint32_t i = 1; i < aFds.Length(); ++i) {
++      unused << fdSet->SendAddFileDescriptor(aFds[i]);
++    }
++  }
++
++  if (fdSet) {
++    aReadStreamOut->fds() = fdSet;
++  } else {
++    aReadStreamOut->fds() = void_t();
++  }
++}
++
++void
+ CacheStreamControlChild::NoteClosed(const nsID& aId)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+   unused << SendNoteClosed(aId);
+ }
+ 
+ void
+ CacheStreamControlChild::StartDestroy()
+@@ -84,54 +127,75 @@ CacheStreamControlChild::StartDestroy()
+ }
+ 
+ void
+ CacheStreamControlChild::ActorDestroy(ActorDestroyReason aReason)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+   // Note, we cannot trigger IPC traffic here.  So use
+   // CloseStreamWithoutReporting().
++  /*
+   ReadStreamList::ForwardIterator iter(mListeners);
+   while (iter.HasMore()) {
+     nsRefPtr<ReadStream> stream = iter.GetNext();
+     stream->CloseStreamWithoutReporting();
+   }
+   mListeners.Clear();
++  */
++
++  for (uint32_t i = 0; i < mControlList.Length(); ++i) {
++    mControlList[i]->CloseStreamWithoutReporting();
++  }
++  mControlList.Clear();
+ 
+   RemoveFeature();
+ }
+ 
+ bool
+ CacheStreamControlChild::RecvClose(const nsID& aId)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+   DebugOnly<uint32_t> closedCount = 0;
+ 
++  /*
+   ReadStreamList::ForwardIterator iter(mListeners);
+   while (iter.HasMore()) {
+     nsRefPtr<ReadStream> stream = iter.GetNext();
+     // note, multiple streams may exist for same ID
+     if (stream->MatchId(aId)) {
+       stream->CloseStream();
+       closedCount += 1;
+     }
+   }
++  */
++
++  for (uint32_t i = 0; i < mControlList.Length(); ++i) {
++    if (mControlList[i]->MatchId(aId)) {
++      mControlList[i]->CloseStream();
++      closedCount += 1;
++    }
++  }
+ 
+   MOZ_ASSERT(closedCount > 0);
+ 
+   return true;
+ }
+ 
+ bool
+ CacheStreamControlChild::RecvCloseAll()
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
++  /*
+   ReadStreamList::ForwardIterator iter(mListeners);
+   while (iter.HasMore()) {
+     nsRefPtr<ReadStream> stream = iter.GetNext();
+     stream->CloseStream();
+   }
++  */
++  for (uint32_t i = 0; i < mControlList.Length(); ++i) {
++    mControlList[i]->CloseStream();
++  }
+   return true;
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/CacheStreamControlChild.h b/dom/cache/CacheStreamControlChild.h
+--- a/dom/cache/CacheStreamControlChild.h
++++ b/dom/cache/CacheStreamControlChild.h
+@@ -4,48 +4,64 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_cache_CacheStreamControlChild_h
+ #define mozilla_dom_cache_CacheStreamControlChild_h
+ 
+ #include "mozilla/dom/cache/ActorChild.h"
+ #include "mozilla/dom/cache/PCacheStreamControlChild.h"
++#include "mozilla/dom/cache/StreamControl.h"
+ #include "nsTObserverArray.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ class ReadStream;
+ 
+ class CacheStreamControlChild MOZ_FINAL : public PCacheStreamControlChild
++                                        , public StreamControl::Actor
+                                         , public ActorChild
+ {
+ public:
+   CacheStreamControlChild();
+   ~CacheStreamControlChild();
+ 
++  already_AddRefed<StreamControl>
++  CreateStreamControl();
++
+   void AddListener(ReadStream* aListener);
+   void RemoveListener(ReadStream* aListener);
+ 
+-  void NoteClosed(const nsID& aId);
++  // StreamControl::Actor methods
++  virtual void
++  SerializeControl(PCacheReadStream* aReadStreamOut) MOZ_OVERRIDE;
++
++  virtual void
++  SerializeFds(PCacheReadStream* aReadStreamOut,
++               const nsTArray<mozilla::ipc::FileDescriptor>& aFds) MOZ_OVERRIDE;
++
++  virtual void
++  NoteClosed(const nsID& aId) MOZ_OVERRIDE;
+ 
+   // ActorChild methods
+   virtual void StartDestroy() MOZ_OVERRIDE;
+ 
+ private:
+   // PCacheStreamControlChild methods
+   virtual void ActorDestroy(ActorDestroyReason aReason) MOZ_OVERRIDE;
+   virtual bool RecvClose(const nsID& aId) MOZ_OVERRIDE;
+   virtual bool RecvCloseAll() MOZ_OVERRIDE;
+ 
+   typedef nsTObserverArray<ReadStream*> ReadStreamList;
+   ReadStreamList mListeners;
+ 
++  nsTArray<nsRefPtr<StreamControl>> mControlList;
++
+   bool mDestroyStarted;
+ 
+   NS_DECL_OWNINGTHREAD
+ };
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/CacheStreamControlParent.cpp b/dom/cache/CacheStreamControlParent.cpp
+--- a/dom/cache/CacheStreamControlParent.cpp
++++ b/dom/cache/CacheStreamControlParent.cpp
+@@ -3,24 +3,30 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/CacheStreamControlParent.h"
+ 
+ #include "mozilla/DebugOnly.h"
+ #include "mozilla/unused.h"
++#include "mozilla/dom/cache/PCacheTypes.h"
+ #include "mozilla/dom/cache/ReadStream.h"
+ #include "mozilla/dom/cache/StreamList.h"
++#include "mozilla/ipc/PBackgroundParent.h"
++#include "mozilla/ipc/PFileDescriptorSetParent.h"
+ #include "nsISupportsImpl.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
++using mozilla::ipc::FileDescriptor;
++using mozilla::ipc::PFileDescriptorSetParent;
++
+ // declared in ActorUtils.h
+ void
+ DeallocPCacheStreamControlParent(PCacheStreamControlParent* aActor)
+ {
+   delete aActor;
+ }
+ 
+ CacheStreamControlParent::CacheStreamControlParent()
+@@ -30,16 +36,25 @@ CacheStreamControlParent::CacheStreamCon
+ 
+ CacheStreamControlParent::~CacheStreamControlParent()
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+   MOZ_ASSERT(!mStreamList);
+   MOZ_COUNT_DTOR(cache::CacheStreamControlParent);
+ }
+ 
++already_AddRefed<StreamControl>
++CacheStreamControlParent::CreateStreamControl()
++{
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
++  nsRefPtr<StreamControl> ref = new StreamControl(this);
++  mControlList.AppendElement(ref);
++  return ref.forget();
++}
++
+ void
+ CacheStreamControlParent::AddListener(ReadStream* aListener)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+   MOZ_ASSERT(aListener);
+   MOZ_ASSERT(!mListeners.Contains(aListener));
+   mListeners.AppendElement(aListener);
+ }
+@@ -49,36 +64,75 @@ CacheStreamControlParent::RemoveListener
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+   MOZ_ASSERT(aListener);
+   DebugOnly<bool> removed = mListeners.RemoveElement(aListener);
+   MOZ_ASSERT(removed);
+ }
+ 
+ void
++CacheStreamControlParent::SerializeControl(PCacheReadStream* aReadStreamOut)
++{
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
++  aReadStreamOut->controlChild() = nullptr;
++  aReadStreamOut->controlParent() = this;
++}
++
++void
++CacheStreamControlParent::SerializeFds(PCacheReadStream* aReadStreamOut,
++                                       const nsTArray<FileDescriptor>& aFds)
++{
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
++  PFileDescriptorSetParent* fdSet = nullptr;
++  if (!aFds.IsEmpty()) {
++    fdSet = Manager()->SendPFileDescriptorSetConstructor(aFds[0]);
++    for (uint32_t i = 1; i < aFds.Length(); ++i) {
++      unused << fdSet->SendAddFileDescriptor(aFds[i]);
++    }
++  }
++
++  if (fdSet) {
++    aReadStreamOut->fds() = fdSet;
++  } else {
++    aReadStreamOut->fds() = void_t();
++  }
++}
++
++void
++CacheStreamControlParent::NoteClosed(const nsID& aId)
++{
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
++  MOZ_ASSERT(mStreamList);
++  mStreamList->NoteClosed(aId);
++}
++
++void
+ CacheStreamControlParent::ActorDestroy(ActorDestroyReason aReason)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+   MOZ_ASSERT(mStreamList);
++  /*
+   ReadStreamList::ForwardIterator iter(mListeners);
+   while (iter.HasMore()) {
+     nsRefPtr<ReadStream> stream = iter.GetNext();
+     stream->CloseStreamWithoutReporting();
+   }
++  */
++  for (uint32_t i = 0; i < mControlList.Length(); ++i) {
++    mControlList[i]->CloseStreamWithoutReporting();
++  }
+   mStreamList->RemoveStreamControl(this);
+   mStreamList->NoteClosedAll();
+   mStreamList = nullptr;
+ }
+ 
+ bool
+ CacheStreamControlParent::RecvNoteClosed(const nsID& aId)
+ {
+-  NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+-  MOZ_ASSERT(mStreamList);
+-  mStreamList->NoteClosed(aId);
++  NoteClosed(aId);
+   return true;
+ }
+ 
+ void
+ CacheStreamControlParent::SetStreamList(StreamList* aStreamList)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+   MOZ_ASSERT(!mStreamList);
+@@ -113,35 +167,50 @@ CacheStreamControlParent::Shutdown()
+ }
+ 
+ void
+ CacheStreamControlParent::NotifyClose(const nsID& aId)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+   DebugOnly<uint32_t> closedCount = 0;
+ 
++  /*
+   ReadStreamList::ForwardIterator iter(mListeners);
+   while (iter.HasMore()) {
+     nsRefPtr<ReadStream> stream = iter.GetNext();
+     // note, multiple streams may exist for same ID
+     if (stream->MatchId(aId)) {
+       stream->CloseStream();
+       closedCount += 1;
+     }
+   }
++  */
++
++  for (uint32_t i = 0; i < mControlList.Length(); ++i) {
++    if (mControlList[i]->MatchId(aId)) {
++      mControlList[i]->CloseStream();
++      closedCount += 1;
++    }
++  }
+ 
+   MOZ_ASSERT(closedCount > 0);
+ }
+ 
+ void
+ CacheStreamControlParent::NotifyCloseAll()
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
++  /*
+   ReadStreamList::ForwardIterator iter(mListeners);
+   while (iter.HasMore()) {
+     nsRefPtr<ReadStream> stream = iter.GetNext();
+     stream->CloseStream();
+   }
++  */
++
++  for (uint32_t i = 0; i < mControlList.Length(); ++i) {
++    mControlList[i]->CloseStream();
++  }
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/CacheStreamControlParent.h b/dom/cache/CacheStreamControlParent.h
+--- a/dom/cache/CacheStreamControlParent.h
++++ b/dom/cache/CacheStreamControlParent.h
+@@ -3,55 +3,73 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_cache_CacheStreamControlParent_h
+ #define mozilla_dom_cache_CacheStreamControlParent_h
+ 
+ #include "mozilla/dom/cache/PCacheStreamControlParent.h"
++#include "mozilla/dom/cache/StreamControl.h"
+ #include "nsTObserverArray.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ class ReadStream;
+ class StreamList;
+ 
+ class CacheStreamControlParent : public PCacheStreamControlParent
++                               , public StreamControl::Actor
+ {
+ public:
+   CacheStreamControlParent();
+   ~CacheStreamControlParent();
+ 
++  already_AddRefed<StreamControl>
++  CreateStreamControl();
++
+   void AddListener(ReadStream* aListener);
+   void RemoveListener(ReadStream* aListener);
+ 
+   void SetStreamList(StreamList* aStreamList);
+   void Close(const nsID& aId);
+   void CloseAll();
+   void Shutdown();
+ 
++  // StreamControl::Actor methods
++  virtual void
++  SerializeControl(PCacheReadStream* aReadStreamOut) MOZ_OVERRIDE;
++
++  virtual void
++  SerializeFds(PCacheReadStream* aReadStreamOut,
++               const nsTArray<mozilla::ipc::FileDescriptor>& aFds) MOZ_OVERRIDE;
++
++  virtual void
++  NoteClosed(const nsID& aId) MOZ_OVERRIDE;
++
++private:
+   // PCacheStreamControlParent methods
+   virtual void ActorDestroy(ActorDestroyReason aReason) MOZ_OVERRIDE;
+   virtual bool RecvNoteClosed(const nsID& aId) MOZ_OVERRIDE;
+ 
+-private:
+   void NotifyClose(const nsID& aId);
+   void NotifyCloseAll();
+ 
+   // Cycle with StreamList via a weak-ref to us.  Cleanup occurs when the actor
+   // is deleted by the PBackground manager.  ActorDestroy() then calls
+   // StreamList::RemoveStreamControl() to clear the weak ref.
+   nsRefPtr<StreamList> mStreamList;
+ 
+   typedef nsTObserverArray<ReadStream*> ReadStreamList;
+   ReadStreamList mListeners;
+ 
++  nsTArray<nsRefPtr<StreamControl>> mControlList;
++
+   NS_DECL_OWNINGTHREAD
+ };
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_cache_CacheStreamControlParent_h
+diff --git a/dom/cache/ReadStream.cpp b/dom/cache/ReadStream.cpp
+--- a/dom/cache/ReadStream.cpp
++++ b/dom/cache/ReadStream.cpp
+@@ -20,16 +20,17 @@
+ #include "mozilla/ipc/PBackgroundChild.h"
+ #include "mozilla/ipc/PBackgroundParent.h"
+ #include "mozilla/ipc/PFileDescriptorSetChild.h"
+ #include "mozilla/ipc/PFileDescriptorSetParent.h"
+ #include "mozilla/SnappyUncompressInputStream.h"
+ #include "nsIAsyncInputStream.h"
+ #include "nsTArray.h"
+ 
++#if 0
+ namespace {
+ 
+ using mozilla::unused;
+ using mozilla::void_t;
+ using mozilla::dom::cache::CacheStreamControlChild;
+ using mozilla::dom::cache::CacheStreamControlParent;
+ using mozilla::dom::cache::PCacheReadStream;
+ using mozilla::dom::cache::PCacheStreamControlChild;
+@@ -150,17 +151,17 @@ public:
+ 
+     if (mClosed) {
+       return;
+     }
+ 
+     mClosed = true;
+     mControl->RemoveListener(this);
+     // This can cause mControl to be destructed
+-    mControl->RecvNoteClosed(mId);
++    mControl->NoteClosed(mId);
+     mControl = nullptr;
+   }
+ 
+   virtual void ForgetOnOwningThread() MOZ_OVERRIDE
+   {
+     NS_ASSERT_OWNINGTHREAD(ReadStream);
+ 
+     if (mClosed) {
+@@ -205,16 +206,17 @@ public:
+ 
+ private:
+   CacheStreamControlParent* mControl;
+ };
+ 
+ // ----------------------------------------------------------------------------
+ 
+ } // anonymous namespace
++#endif // 0
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ using mozilla::unused;
+ using mozilla::ipc::FileDescriptor;
+ using mozilla::ipc::FileDescriptorSetChild;
+@@ -281,19 +283,16 @@ public:
+   }
+ 
+ private:
+   ~ForgetRunnable() { }
+ 
+   nsRefPtr<ReadStream> mStream;
+ };
+ 
+-NS_IMPL_ISUPPORTS(mozilla::dom::cache::ReadStream, nsIInputStream,
+-                                                   ReadStream);
+-
+ // static
+ already_AddRefed<ReadStream>
+ ReadStream::Create(const PCacheReadStreamOrVoid& aReadStreamOrVoid)
+ {
+   if (aReadStreamOrVoid.type() == PCacheReadStreamOrVoid::Tvoid_t) {
+     return nullptr;
+   }
+ 
+@@ -306,16 +305,27 @@ ReadStream::Create(const PCacheReadStrea
+ {
+   // The parameter may or may not be for a Cache created stream.  The way we
+   // tell is by looking at the stream control actor.  If the actor exists,
+   // then we know the Cache created it.
+   if (!aReadStream.controlChild() && !aReadStream.controlParent()) {
+     return nullptr;
+   }
+ 
++  nsRefPtr<StreamControl> control;
++  if (aReadStream.controlChild()) {
++    auto actor = static_cast<CacheStreamControlChild*>(aReadStream.controlChild());
++    control = actor->CreateStreamControl();
++  } else {
++    auto actor = static_cast<CacheStreamControlParent*>(aReadStream.controlParent());
++    control = actor->CreateStreamControl();
++  }
++  MOZ_ASSERT(control);
++
++  // TODO: move this into virtual method
+   nsAutoTArray<FileDescriptor, 4> fds;
+   if (aReadStream.fds().type() ==
+       OptionalFileDescriptorSet::TPFileDescriptorSetChild) {
+ 
+     FileDescriptorSetChild* fdSetActor =
+       static_cast<FileDescriptorSetChild*>(aReadStream.fds().get_PFileDescriptorSetChild());
+     MOZ_ASSERT(fdSetActor);
+ 
+@@ -347,57 +357,60 @@ ReadStream::Create(const PCacheReadStrea
+ #ifdef DEBUG
+   nsCOMPtr<nsIAsyncInputStream> asyncStream = do_QueryInterface(stream);
+   MOZ_ASSERT(!asyncStream);
+ #endif
+ 
+   nsRefPtr<ReadStream> ref;
+ 
+   if (aReadStream.controlChild()) {
+-    ref = new ReadStreamChild(aReadStream.controlChild(), aReadStream.id(),
+-                              stream);
++    ref = new ReadStream(control, aReadStream.id(), stream);
+   } else {
+-    ref = new ReadStreamParent(aReadStream.controlParent(), aReadStream.id(),
+-                               stream);
++    ref = new ReadStream(control, aReadStream.id(), stream);
+   }
+ 
+   return ref.forget();
+ }
+ 
+ // static
+ already_AddRefed<ReadStream>
+ ReadStream::Create(PCacheStreamControlParent* aControl, const nsID& aId,
+                    nsIInputStream* aStream)
+ {
+-  nsRefPtr<ReadStream> ref = new ReadStreamParent(aControl, aId, aStream);
++  MOZ_ASSERT(aControl);
++  auto actor = static_cast<CacheStreamControlParent*>(aControl);
++  nsRefPtr<StreamControl> control = actor->CreateStreamControl();
++  nsRefPtr<ReadStream> ref = new ReadStream(control, aId, aStream);
+   return ref.forget();
+ }
+ 
+ void
+ ReadStream::Serialize(PCacheReadStreamOrVoid* aReadStreamOut)
+ {
++  NS_ASSERT_OWNINGTHREAD(ReadStream);
+   MOZ_ASSERT(aReadStreamOut);
+   PCacheReadStream stream;
+   Serialize(&stream);
+   *aReadStreamOut = stream;
+ }
+ 
+ void
+ ReadStream::Serialize(PCacheReadStream* aReadStreamOut)
+ {
++  NS_ASSERT_OWNINGTHREAD(ReadStream);
+   MOZ_ASSERT(aReadStreamOut);
+   MOZ_ASSERT(!mClosed);
+ 
+   aReadStreamOut->id() = mId;
+-  SerializeControl(aReadStreamOut);
++  mControl->SerializeControl(aReadStreamOut);
+ 
+   nsAutoTArray<FileDescriptor, 4> fds;
+   SerializeInputStream(mStream, aReadStreamOut->params(), fds);
+ 
+-  SerializeFds(aReadStreamOut, fds);
++  mControl->SerializeFds(aReadStreamOut, fds);
+ 
+   // We're passing ownership across the IPC barrier with the control, so
+   // do not signal that the stream is closed here.
+   Forget();
+ }
+ 
+ void
+ ReadStream::CloseStream()
+@@ -412,72 +425,98 @@ ReadStream::CloseStreamWithoutReporting(
+ }
+ 
+ bool
+ ReadStream::MatchId(const nsID& aId) const
+ {
+   return mId.Equals(aId);
+ }
+ 
+-ReadStream::ReadStream(const nsID& aId, nsIInputStream* aStream)
+-  : mId(aId)
++ReadStream::ReadStream(StreamControl* aControl, const nsID& aId,
++                       nsIInputStream* aStream)
++  : mControl(aControl)
++  , mId(aId)
+   , mStream(aStream)
+   , mSnappyStream(new SnappyUncompressInputStream(aStream))
+   , mOwningThread(NS_GetCurrentThread())
+   , mClosed(false)
+ {
+   MOZ_ASSERT(mStream);
++  mControl->SetReadStream(this);
+ }
+ 
+ ReadStream::~ReadStream()
+ {
+   NS_ASSERT_OWNINGTHREAD(ReadStream);
+ 
+   // We cannot directly call NoteClosed() here.  The concrete subclasses
+   // destructors must do this because it takes code paths through virtual
+   // methods.  We don't want to execute these while partially destroyed.
+   MOZ_ASSERT(mClosed);
++
++  if (NS_GetCurrentThread() == mOwningThread) {
++    return;
++  }
++
++  nsCOMPtr<nsIRunnable> runnable =
++    NS_NewNonOwningRunnableMethod(mControl.forget().take(), &StreamControl::Release);
++  MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
++    mOwningThread->Dispatch(runnable, nsIThread::DISPATCH_NORMAL)));
+ }
+ 
+ void
+ ReadStream::NoteClosed()
+ {
+   if (mClosed) {
+     return;
+   }
+ 
++  mClosed = true;
++
+   if (NS_GetCurrentThread() == mOwningThread) {
+     NoteClosedOnOwningThread();
+     return;
+   }
+ 
+   nsCOMPtr<nsIRunnable> runnable = new NoteClosedRunnable(this);
+-  nsresult rv = mOwningThread->Dispatch(runnable, nsIThread::DISPATCH_NORMAL);
+-  if (NS_FAILED(rv)) {
+-    NS_WARNING("Failed to dispatch Cache ReadStream NoteClosed() runnable.");
+-  }
++  MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
++    mOwningThread->Dispatch(runnable, nsIThread::DISPATCH_NORMAL)));
+ }
+ 
+ void
+ ReadStream::Forget()
+ {
+   if (mClosed) {
+     return;
+   }
+ 
++  mClosed = true;
++
+   if (NS_GetCurrentThread() == mOwningThread) {
+     ForgetOnOwningThread();
+     return;
+   }
+ 
+   nsCOMPtr<nsIRunnable> runnable = new ForgetRunnable(this);
+-  nsresult rv = mOwningThread->Dispatch(runnable, nsIThread::DISPATCH_NORMAL);
+-  if (NS_FAILED(rv)) {
+-    NS_WARNING("Failed to dispatch Cache ReadStream Forget() runnable.");
+-  }
++  MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
++    mOwningThread->Dispatch(runnable, nsIThread::DISPATCH_NORMAL)));
++}
++
++void
++ReadStream::NoteClosedOnOwningThread()
++{
++  NS_ASSERT_OWNINGTHREAD(ReadStream);
++  mControl->NoteClosed(mId);
++}
++
++void
++ReadStream::ForgetOnOwningThread()
++{
++  NS_ASSERT_OWNINGTHREAD(ReadStream);
++  mControl->ForgetReadStream();
+ }
+ 
+ NS_IMETHODIMP
+ ReadStream::Close()
+ {
+   nsresult rv = mStream->Close();
+   NoteClosed();
+   return rv;
+@@ -528,11 +567,31 @@ ReadStream::ReadSegments(nsWriteSegmentF
+ }
+ 
+ NS_IMETHODIMP
+ ReadStream::IsNonBlocking(bool* aNonBlockingOut)
+ {
+   return mSnappyStream->IsNonBlocking(aNonBlockingOut);
+ }
+ 
++NS_IMPL_ADDREF(cache::ReadStream);
++NS_IMPL_QUERY_INTERFACE(cache::ReadStream, nsIInputStream, ReadStream);
++
++NS_IMETHODIMP_(MozExternalRefCountType)
++ReadStream::Release()
++{
++  MOZ_ASSERT(int32_t(mRefCnt) > 0, "dup release");
++  nsrefcnt count = --mRefCnt;
++  NS_LOG_RELEASE(this, count, "nsPipe");
++  if (count == 0) {
++    delete (this);
++    return 0;
++  }
++  if (!mClosed && count == 1) {
++    Forget();
++    return 1;
++  }
++  return count;
++}
++
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/ReadStream.h b/dom/cache/ReadStream.h
+--- a/dom/cache/ReadStream.h
++++ b/dom/cache/ReadStream.h
+@@ -7,27 +7,29 @@
+ #ifndef mozilla_dom_cache_ReadStream_h
+ #define mozilla_dom_cache_ReadStream_h
+ 
+ #include "mozilla/ipc/FileDescriptor.h"
+ #include "nsCOMPtr.h"
+ #include "nsID.h"
+ #include "nsIInputStream.h"
+ #include "nsISupportsImpl.h"
++#include "nsRefPtr.h"
+ #include "nsTArrayForwardDeclare.h"
+ 
+ class nsIThread;
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ class PCacheReadStream;
+ class PCacheReadStreamOrVoid;
+ class PCacheStreamControlParent;
++class StreamControl;
+ 
+ // IID for the dom::cache::ReadStream interface
+ #define NS_DOM_CACHE_READSTREAM_IID \
+ {0x8e5da7c9, 0x0940, 0x4f1d, \
+   {0x97, 0x25, 0x5c, 0x59, 0x38, 0xdd, 0xb9, 0x9f}}
+ 
+ // Custom stream class for Request and Response bodies being read from
+ // a Cache.  The main purpose of this class is to report back to the
+@@ -35,17 +37,17 @@ class PCacheStreamControlParent;
+ // accurately determine when the underlying body file can be deleted,
+ // etc.
+ //
+ // The ReadStream class also provides us with a convenient QI'able
+ // interface that we can use to pass additional meta-data with the
+ // stream channel.  For example, Cache.put() can detect that the content
+ // script is passing a Cache-originated-stream back into the Cache
+ // again.  This enables certain optimizations.
+-class ReadStream : public nsIInputStream
++class ReadStream MOZ_FINAL : public nsIInputStream
+ {
+ public:
+   static already_AddRefed<ReadStream>
+   Create(const PCacheReadStreamOrVoid& aReadStreamOrVoid);
+ 
+   static already_AddRefed<ReadStream>
+   Create(const PCacheReadStream& aReadStream);
+ 
+@@ -56,39 +58,46 @@ public:
+   void Serialize(PCacheReadStreamOrVoid* aReadStreamOut);
+   void Serialize(PCacheReadStream* aReadStreamOut);
+ 
+   // methods called from the child and parent CacheStreamControl actors
+   void CloseStream();
+   void CloseStreamWithoutReporting();
+   bool MatchId(const nsID& aId) const;
+ 
+-protected:
++private:
+   class NoteClosedRunnable;
+   class ForgetRunnable;
+ 
+-  ReadStream(const nsID& aId, nsIInputStream* aStream);
+-  virtual ~ReadStream();
++  ReadStream(StreamControl* aStreamControl, const nsID& aId,
++             nsIInputStream* aStream);
++  ~ReadStream();
+ 
+   void NoteClosed();
+   void Forget();
+ 
++  void NoteClosedOnOwningThread();
++  void ForgetOnOwningThread();
++
++  /*
+   virtual void NoteClosedOnOwningThread() = 0;
+   virtual void ForgetOnOwningThread() = 0;
+   virtual void SerializeControl(PCacheReadStream* aReadStreamOut) = 0;
+ 
+   virtual void
+   SerializeFds(PCacheReadStream* aReadStreamOut,
+                const nsTArray<mozilla::ipc::FileDescriptor>& fds) = 0;
++  */
+ 
++  nsRefPtr<StreamControl> mControl;
+   const nsID mId;
+   nsCOMPtr<nsIInputStream> mStream;
+   nsCOMPtr<nsIInputStream> mSnappyStream;
+   nsCOMPtr<nsIThread> mOwningThread;
+-  bool mClosed;
++  Atomic<bool> mClosed;
+ 
+ public:
+ 
+   NS_DECLARE_STATIC_IID_ACCESSOR(NS_DOM_CACHE_READSTREAM_IID);
+ 
+   NS_DECL_THREADSAFE_ISUPPORTS
+   NS_DECL_NSIINPUTSTREAM
+ };
+diff --git a/dom/cache/moz.build b/dom/cache/moz.build
+--- a/dom/cache/moz.build
++++ b/dom/cache/moz.build
+@@ -25,23 +25,25 @@ EXPORTS.mozilla.dom.cache += [
+     'FileUtils.h',
+     'IPCUtils.h',
+     'Manager.h',
+     'ManagerId.h',
+     'PrincipalVerifier.h',
+     'QuotaClient.h',
+     'ReadStream.h',
+     'SavedTypes.h',
++    'StreamControl.h',
+     'StreamList.h',
+     'StreamUtils.h',
+     'Types.h',
+     'TypeUtils.h',
+ ]
+ 
+-UNIFIED_SOURCES += [
++#UNIFIED_SOURCES += [
++SOURCES += [
+     'Action.cpp',
+     'ActorChild.cpp',
+     'AutoUtils.cpp',
+     'Cache.cpp',
+     'CacheChild.cpp',
+     'CacheParent.cpp',
+     'CacheStorage.cpp',
+     'CacheStorageChild.cpp',
+@@ -54,16 +56,17 @@ UNIFIED_SOURCES += [
+     'Feature.cpp',
+     'FetchPut.cpp',
+     'FileUtils.cpp',
+     'Manager.cpp',
+     'ManagerId.cpp',
+     'PrincipalVerifier.cpp',
+     'QuotaClient.cpp',
+     'ReadStream.cpp',
++    'StreamControl.cpp',
+     'StreamList.cpp',
+     'StreamUtils.cpp',
+     'TypeUtils.cpp',
+ ]
+ 
+ IPDL_SOURCES += [
+     'CacheInitData.ipdlh',
+     'PCache.ipdl',
