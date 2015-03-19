@@ -1,13 +1,48 @@
 # HG changeset patch
-# Parent 02bf32736877a7c18328ad3946b6da49a9d33f38
+# Parent 53874bc6e2fff5f31667bab18b03c3eae0832c49
 # User Ben Kelly <ben@wanderview.com>
 Bug 1143223 interdiff 001 address review feedback
-
 
 diff --git a/dom/cache/ReadStream.cpp b/dom/cache/ReadStream.cpp
 --- a/dom/cache/ReadStream.cpp
 +++ b/dom/cache/ReadStream.cpp
-@@ -126,24 +126,17 @@ ReadStream::Create(const PCacheReadStrea
+@@ -32,16 +32,17 @@ class ReadStream::NoteClosedRunnable MOZ
+ public:
+   explicit NoteClosedRunnable(ReadStream* aStream)
+     : mStream(aStream)
+   { }
+ 
+   NS_IMETHOD Run()
+   {
+     mStream->NoteClosedOnOwningThread();
++    mStream = nullptr;
+     return NS_OK;
+   }
+ 
+   // Note, we must proceed with the Run() method since our actor will not
+   // clean itself up until we note that the stream is closed.
+   NS_IMETHOD Cancel()
+   {
+     Run();
+@@ -64,16 +65,17 @@ class ReadStream::ForgetRunnable MOZ_FIN
+ public:
+   explicit ForgetRunnable(ReadStream* aStream)
+     : mStream(aStream)
+   { }
+ 
+   NS_IMETHOD Run()
+   {
+     mStream->ForgetOnOwningThread();
++    mStream = nullptr;
+     return NS_OK;
+   }
+ 
+   // Note, we must proceed with the Run() method so that we properly
+   // call RemoveListener on the actor.
+   NS_IMETHOD Cancel()
+   {
+     Run();
+@@ -126,24 +128,17 @@ ReadStream::Create(const PCacheReadStrea
    MOZ_ASSERT(stream);
  
    // Currently we expect all cache read streams to be blocking file streams.
@@ -33,46 +68,66 @@ diff --git a/dom/cache/ReadStream.cpp b/dom/cache/ReadStream.cpp
  ReadStream::Create(PCacheStreamControlParent* aControl, const nsID& aId,
                     nsIInputStream* aStream)
  {
-@@ -208,114 +201,120 @@ ReadStream::ReadStream(StreamControl* aC
+@@ -194,19 +189,28 @@ void
+ ReadStream::CloseStreamWithoutReporting()
+ {
+   Forget();
+ }
+ 
+ bool
+ ReadStream::MatchId(const nsID& aId) const
+ {
++  NS_ASSERT_OWNINGTHREAD(ReadStream);
+   return mId.Equals(aId);
+ }
+ 
++void
++ReadStream::ActorClosed()
++{
++  NS_ASSERT_OWNINGTHREAD(ReadStream);
++  mClosed = true;
++  mControl = nullptr;
++}
++
+ ReadStream::ReadStream(StreamControl* aControl, const nsID& aId,
+                        nsIInputStream* aStream)
+   : mControl(aControl)
    , mId(aId)
    , mStream(aStream)
    , mSnappyStream(new SnappyUncompressInputStream(aStream))
    , mOwningThread(NS_GetCurrentThread())
    , mClosed(false)
- {
+@@ -214,36 +218,26 @@ ReadStream::ReadStream(StreamControl* aC
    MOZ_ASSERT(mStream);
    mControl->SetReadStream(this);
-+  printf_stderr("### ### [%p] ReadStream()\n", this);
  }
  
  ReadStream::~ReadStream()
  {
    // Any thread
    MOZ_ASSERT(mClosed);
- 
-+  printf_stderr("### ### [%p] ~ReadStream()\n", this);
-+
-   if (NS_GetCurrentThread() == mOwningThread) {
-     return;
-   }
- 
-   nsCOMPtr<nsIRunnable> runnable =
-     NS_NewNonOwningRunnableMethod(mControl.forget().take(), &StreamControl::Release);
-   MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
-     mOwningThread->Dispatch(runnable, nsIThread::DISPATCH_NORMAL)));
+-
+-  if (NS_GetCurrentThread() == mOwningThread) {
+-    return;
+-  }
+-
+-  nsCOMPtr<nsIRunnable> runnable =
+-    NS_NewNonOwningRunnableMethod(mControl.forget().take(), &StreamControl::Release);
+-  MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
+-    mOwningThread->Dispatch(runnable, nsIThread::DISPATCH_NORMAL)));
++  MOZ_ASSERT(!mControl);
  }
  
  void
  ReadStream::NoteClosed()
  {
--  if (mClosed) {
--    return;
--  }
--
+   if (mClosed) {
+     return;
+   }
+ 
 -  mClosed = true;
 -
--  if (NS_GetCurrentThread() == mOwningThread) {
-+  if (false && NS_GetCurrentThread() == mOwningThread) {
+   if (NS_GetCurrentThread() == mOwningThread) {
      NoteClosedOnOwningThread();
      return;
    }
@@ -80,15 +135,15 @@ diff --git a/dom/cache/ReadStream.cpp b/dom/cache/ReadStream.cpp
    nsCOMPtr<nsIRunnable> runnable = new NoteClosedRunnable(this);
    MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
      mOwningThread->Dispatch(runnable, nsIThread::DISPATCH_NORMAL)));
- }
+@@ -251,40 +245,54 @@ ReadStream::NoteClosed()
  
  void
  ReadStream::Forget()
  {
--  if (mClosed) {
--    return;
--  }
--
+   if (mClosed) {
+     return;
+   }
+ 
 -  mClosed = true;
 -
    if (NS_GetCurrentThread() == mOwningThread) {
@@ -105,87 +160,41 @@ diff --git a/dom/cache/ReadStream.cpp b/dom/cache/ReadStream.cpp
  ReadStream::NoteClosedOnOwningThread()
  {
    NS_ASSERT_OWNINGTHREAD(ReadStream);
+-  mControl->NoteClosed(mId);
 +
 +  if (mClosed) {
 +    return;
 +  }
 +
 +  mClosed = true;
-   mControl->NoteClosed(mId);
++  nsRefPtr<StreamControl> control;
++  control.swap(mControl);
++  control->NoteClosed(mId);
  }
  
  void
  ReadStream::ForgetOnOwningThread()
  {
    NS_ASSERT_OWNINGTHREAD(ReadStream);
+-  mControl->ForgetReadStream();
 +
 +  if (mClosed) {
 +    return;
 +  }
 +
 +  mClosed = true;
-   mControl->ForgetReadStream();
++  nsRefPtr<StreamControl> control;
++  control.swap(mControl);
++  control->ForgetReadStream();
  }
  
  NS_IMETHODIMP
  ReadStream::Close()
  {
-+  printf_stderr("### ### [%p] ReadStream::Close()\n", this);
    nsresult rv = mStream->Close();
    NoteClosed();
    return rv;
- }
- 
- NS_IMETHODIMP
- ReadStream::Available(uint64_t* aNumAvailableOut)
- {
-   nsresult rv = mSnappyStream->Available(aNumAvailableOut);
- 
-   if (NS_FAILED(rv)) {
-+    printf_stderr("### ### [%p] ReadStream::Available() close\n", this);
-     Close();
-   }
- 
-   return rv;
- }
- 
- NS_IMETHODIMP
- ReadStream::Read(char* aBuf, uint32_t aCount, uint32_t* aNumReadOut)
- {
-   MOZ_ASSERT(aNumReadOut);
- 
-   nsresult rv = mSnappyStream->Read(aBuf, aCount, aNumReadOut);
- 
-   if ((NS_FAILED(rv) && rv != NS_BASE_STREAM_WOULD_BLOCK) ||
-       *aNumReadOut == 0) {
-+    printf_stderr("### ### [%p] ReadStream::Read() close\n", this);
-     Close();
-   }
- 
-   return rv;
- }
- 
- NS_IMETHODIMP
- ReadStream::ReadSegments(nsWriteSegmentFun aWriter, void* aClosure,
-@@ -323,16 +322,17 @@ ReadStream::ReadSegments(nsWriteSegmentF
- {
-   MOZ_ASSERT(aNumReadOut);
- 
-   nsresult rv = mSnappyStream->ReadSegments(aWriter, aClosure, aCount,
-                                             aNumReadOut);
- 
-   if ((NS_FAILED(rv) && rv != NS_BASE_STREAM_WOULD_BLOCK &&
-                         rv != NS_ERROR_NOT_IMPLEMENTED) || *aNumReadOut == 0) {
-+    printf_stderr("### ### [%p] ReadStream::ReadSegments() close\n", this);
-     Close();
-   }
- 
-   return rv;
- }
- 
- NS_IMETHODIMP
- ReadStream::IsNonBlocking(bool* aNonBlockingOut)
-@@ -348,25 +348,26 @@ NS_IMPL_QUERY_INTERFACE(cache::ReadStrea
+@@ -348,25 +356,28 @@ NS_IMPL_QUERY_INTERFACE(cache::ReadStrea
  // to perform this operation, so the object must not be completely
  // destroyed yet.  Therefore, we hold a ref-cycle and perform a Close()
  // when the ref count drops to 1.
@@ -205,7 +214,9 @@ diff --git a/dom/cache/ReadStream.cpp b/dom/cache/ReadStream.cpp
    // ref-cycle with StreamControl.
 -  if (!mClosed && count == 1) {
 +  if (count == 1 && !mClosed) {
-+    printf_stderr("### ### [%p] ReadStream::Release() implicit close\n", this);
++    // Hold a temp self-ref in case Close() synchronously drops our ref-count
++    // to zero.
++    nsRefPtr<ReadStream> kungFuGrip = this;
      Close();
 -    return 1;
    }
@@ -215,3 +226,47 @@ diff --git a/dom/cache/ReadStream.cpp b/dom/cache/ReadStream.cpp
  } // namespace cache
  } // namespace dom
  } // namespace mozilla
+diff --git a/dom/cache/ReadStream.h b/dom/cache/ReadStream.h
+--- a/dom/cache/ReadStream.h
++++ b/dom/cache/ReadStream.h
+@@ -57,16 +57,17 @@ public:
+ 
+   void Serialize(PCacheReadStreamOrVoid* aReadStreamOut);
+   void Serialize(PCacheReadStream* aReadStreamOut);
+ 
+   // methods called from the child and parent CacheStreamControl actors
+   void CloseStream();
+   void CloseStreamWithoutReporting();
+   bool MatchId(const nsID& aId) const;
++  void ActorClosed();
+ 
+ private:
+   class NoteClosedRunnable;
+   class ForgetRunnable;
+ 
+   ReadStream(StreamControl* aStreamControl, const nsID& aId,
+              nsIInputStream* aStream);
+   ~ReadStream();
+diff --git a/dom/cache/StreamControl.cpp b/dom/cache/StreamControl.cpp
+--- a/dom/cache/StreamControl.cpp
++++ b/dom/cache/StreamControl.cpp
+@@ -25,16 +25,19 @@ StreamControl::StreamControl(Actor* aAct
+ 
+ void
+ StreamControl::RemoveActor(Actor* aActor)
+ {
+   NS_ASSERT_OWNINGTHREAD(StreamControl);
+   MOZ_ASSERT(mActor);
+   MOZ_ASSERT(mActor == aActor);
+   mActor = nullptr;
++  if (mReadStream) {
++    mReadStream->ActorClosed();
++  }
+ }
+ 
+ void
+ StreamControl::CloseStream()
+ {
+   NS_ASSERT_OWNINGTHREAD(StreamControl);
+   if (mReadStream) {
+     mReadStream->CloseStream();
