@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent 008b3f65a7e0471abb6887812ee56dd87cc528df
+# Parent 400c2a449d8d76e4d6f8f53730a2b5ec8c4d3590
 # User Ben Kelly <ben@wanderview.com>
 Bug 1110814 Implement Cache IPC actor for streaming data from child to parent. r=khuey
 
@@ -275,7 +275,7 @@ diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
  #include "nsIGlobalObject.h"
  #include "nsNetUtil.h"
  
-@@ -511,16 +512,28 @@ Cache::GetGlobalObject() const
+@@ -521,16 +522,28 @@ Cache::GetGlobalObject() const
  #ifdef DEBUG
  void
  Cache::AssertOwningThread() const
@@ -1008,7 +1008,7 @@ new file mode 100644
 diff --git a/dom/cache/CacheStorage.cpp b/dom/cache/CacheStorage.cpp
 --- a/dom/cache/CacheStorage.cpp
 +++ b/dom/cache/CacheStorage.cpp
-@@ -502,16 +502,23 @@ CacheStorage::GetGlobalObject() const
+@@ -511,16 +511,23 @@ CacheStorage::GetGlobalObject() const
  #ifdef DEBUG
  void
  CacheStorage::AssertOwningThread() const
@@ -1244,7 +1244,29 @@ diff --git a/dom/cache/PCacheTypes.ipdlh b/dom/cache/PCacheTypes.ipdlh
 diff --git a/dom/cache/ReadStream.cpp b/dom/cache/ReadStream.cpp
 --- a/dom/cache/ReadStream.cpp
 +++ b/dom/cache/ReadStream.cpp
-@@ -306,16 +306,19 @@ ReadStream::Create(const PCacheReadStrea
+@@ -205,16 +205,21 @@ ReadStream::Inner::Serialize(PCacheReadS
+ void
+ ReadStream::Inner::Serialize(PCacheReadStream* aReadStreamOut)
+ {
+   MOZ_ASSERT(NS_GetCurrentThread() == mOwningThread);
+   MOZ_ASSERT(aReadStreamOut);
+   MOZ_ASSERT(mState == Open);
+   MOZ_ASSERT(mControl);
+ 
++  // If we are sending a ReadStream, then we never want to set the
++  // pushStream actors at the same time.
++  aReadStreamOut->pushStreamChild() = nullptr;
++  aReadStreamOut->pushStreamParent() = nullptr;
++
+   aReadStreamOut->id() = mId;
+   mControl->SerializeControl(aReadStreamOut);
+ 
+   nsAutoTArray<FileDescriptor, 4> fds;
+   SerializeInputStream(mStream, aReadStreamOut->params(), fds);
+ 
+   mControl->SerializeFds(aReadStreamOut, fds);
+ 
+@@ -401,16 +406,19 @@ ReadStream::Create(const PCacheReadStrea
  {
    // The parameter may or may not be for a Cache created stream.  The way we
    // tell is by looking at the stream control actor.  If the actor exists,
@@ -1256,36 +1278,14 @@ diff --git a/dom/cache/ReadStream.cpp b/dom/cache/ReadStream.cpp
 +  MOZ_ASSERT(!aReadStream.pushStreamChild());
 +  MOZ_ASSERT(!aReadStream.pushStreamParent());
 +
-   nsAutoTArray<FileDescriptor, 4> fds;
-   if (aReadStream.fds().type() ==
-       OptionalFileDescriptorSet::TPFileDescriptorSetChild) {
- 
-     FileDescriptorSetChild* fdSetActor =
-       static_cast<FileDescriptorSetChild*>(aReadStream.fds().get_PFileDescriptorSetChild());
-     MOZ_ASSERT(fdSetActor);
- 
-@@ -381,16 +384,21 @@ ReadStream::Serialize(PCacheReadStreamOr
- }
- 
- void
- ReadStream::Serialize(PCacheReadStream* aReadStreamOut)
- {
-   MOZ_ASSERT(aReadStreamOut);
-   MOZ_ASSERT(!mClosed);
- 
-+  // If we are sending a ReadStream, then we never want to set the
-+  // pushStream actors at the same time.
-+  aReadStreamOut->pushStreamChild() = nullptr;
-+  aReadStreamOut->pushStreamParent() = nullptr;
-+
-   aReadStreamOut->id() = mId;
-   SerializeControl(aReadStreamOut);
- 
-   nsAutoTArray<FileDescriptor, 4> fds;
-   SerializeInputStream(mStream, aReadStreamOut->params(), fds);
- 
-   SerializeFds(aReadStreamOut, fds);
- 
+   // Control is guaranteed to survive this method as ActorDestroy() cannot
+   // run on this thread until we complete.
+   StreamControl* control;
+   if (aReadStream.controlChild()) {
+     auto actor = static_cast<CacheStreamControlChild*>(aReadStream.controlChild());
+     control = actor;
+   } else {
+     auto actor = static_cast<CacheStreamControlParent*>(aReadStream.controlParent());
 diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
 --- a/dom/cache/TypeUtils.cpp
 +++ b/dom/cache/TypeUtils.cpp
@@ -1373,7 +1373,7 @@ diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
  
  using mozilla::ipc::BackgroundChild;
  using mozilla::ipc::FileDescriptor;
-@@ -413,71 +446,68 @@ TypeUtils::SerializeCacheStream(nsIInput
+@@ -408,71 +441,68 @@ TypeUtils::SerializeCacheStream(nsIInput
                                  PCacheReadStreamOrVoid* aStreamOut,
                                  ErrorResult& aRv)
  {
@@ -1587,9 +1587,9 @@ diff --git a/dom/cache/moz.build b/dom/cache/moz.build
      'Context.h',
      'DBAction.h',
      'DBSchema.h',
-@@ -31,23 +33,26 @@ EXPORTS.mozilla.dom.cache += [
-     'ReadStream.h',
+@@ -32,23 +34,26 @@ EXPORTS.mozilla.dom.cache += [
      'SavedTypes.h',
+     'StreamControl.h',
      'StreamList.h',
      'StreamUtils.h',
      'Types.h',
@@ -1615,7 +1615,7 @@ diff --git a/dom/cache/moz.build b/dom/cache/moz.build
      'Context.cpp',
      'DBAction.cpp',
      'DBSchema.cpp',
-@@ -62,16 +67,17 @@ UNIFIED_SOURCES += [
+@@ -64,16 +69,17 @@ UNIFIED_SOURCES += [
      'StreamList.cpp',
      'StreamUtils.cpp',
      'TypeUtils.cpp',
@@ -1636,21 +1636,22 @@ diff --git a/dom/cache/moz.build b/dom/cache/moz.build
 diff --git a/dom/cache/test/mochitest/mochitest.ini b/dom/cache/test/mochitest/mochitest.ini
 --- a/dom/cache/test/mochitest/mochitest.ini
 +++ b/dom/cache/test/mochitest/mochitest.ini
-@@ -5,13 +5,15 @@ support-files =
-   worker_driver.js
-   worker_wrapper.js
+@@ -7,14 +7,16 @@ support-files =
    frame.html
    message_receiver.html
    driver.js
    serviceworker_driver.js
    test_cache_match_request.js
    test_cache_matchAll_request.js
+   test_cache_overwrite.js
+   mirror.sjs
 +  test_cache_put.js
  
  [test_cache.html]
  [test_cache_add.html]
  [test_cache_match_request.html]
  [test_cache_matchAll_request.html]
+ [test_cache_overwrite.html]
 +[test_cache_put.html]
 diff --git a/dom/cache/test/mochitest/test_cache_put.html b/dom/cache/test/mochitest/test_cache_put.html
 new file mode 100644
