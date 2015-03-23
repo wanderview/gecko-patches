@@ -1,0 +1,450 @@
+# HG changeset patch
+# Parent 6815e135a14f5ed243ba989d4a15c0ad5ef1e80d
+# User Ben Kelly <ben@wanderview.com>
+Bug 1110487 P3 interdiff 001 optimize synchronous resolve
+
+
+diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
+--- a/dom/cache/Context.cpp
++++ b/dom/cache/Context.cpp
+@@ -1,16 +1,17 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/Context.h"
+ 
++#include "mozilla/AutoRestore.h"
+ #include "mozilla/DebugOnly.h"
+ #include "mozilla/dom/cache/Action.h"
+ #include "mozilla/dom/cache/Manager.h"
+ #include "mozilla/dom/cache/ManagerId.h"
+ #include "mozilla/dom/cache/OfflineStorage.h"
+ #include "mozilla/dom/quota/OriginOrPatternString.h"
+ #include "mozilla/dom/quota/QuotaManager.h"
+ #include "nsIFile.h"
+@@ -78,16 +79,17 @@ public:
+     : mContext(aContext)
+     , mThreadsafeHandle(aContext->CreateThreadsafeHandle())
+     , mManager(aManager)
+     , mQuotaIOThreadAction(aQuotaIOThreadAction)
+     , mInitiatingThread(NS_GetCurrentThread())
+     , mResult(NS_OK)
+     , mState(STATE_INIT)
+     , mNeedsQuotaRelease(false)
++    , mExecutingRun(false)
+   {
+     MOZ_ASSERT(mContext);
+     MOZ_ASSERT(mManager);
+     MOZ_ASSERT(mInitiatingThread);
+   }
+ 
+   nsresult Dispatch()
+   {
+@@ -106,28 +108,28 @@ public:
+   virtual void Resolve(nsresult aRv) override
+   {
+     // Depending on the error or success path, this can run on either the
+     // main thread or the QuotaManager IO thread.  The IO thread is an
+     // idle thread which may be destroyed and recreated, so its hard to
+     // assert on.
+     MOZ_ASSERT(mState == STATE_RUNNING || NS_FAILED(aRv));
+ 
++    // QuotaInitRunnable only supports resolving synchronously while within
++    // its Run() method.  This is mainly because the QM IO LazyIdleThread does
++    // not support self-dispatch, but also because it means we don't need
++    // to do a thread bounce to ensure the Action is done running before
++    // completion.
++    MOZ_ASSERT(mExecutingRun);
++
++    MOZ_ASSERT(NS_SUCCEEDED(mResult));
+     mResult = aRv;
+ 
+-    // Always bounce back through the current thread to ensure that the
+-    // resolving methods stack is cleaned up.  We don't want to delete
+-    // any objects out from under it.
++    // The end of the Run() method will then transition to completing.
+     mState = STATE_RESOLVING;
+-
+-    // Unfortunately we cannot dispatch to the QM IO thread from anywhere
+-    // except the main thread.  So bounce through the main thread and then
+-    // back through the IO thread to ensure all methods have returned
+-    // before completing.
+-    MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(this)));
+   }
+ 
+ private:
+   ~QuotaInitRunnable()
+   {
+     MOZ_ASSERT(mState == STATE_COMPLETE);
+     MOZ_ASSERT(!mContext);
+     MOZ_ASSERT(!mQuotaIOThreadAction);
+@@ -159,16 +161,17 @@ private:
+   nsRefPtr<Manager> mManager;
+   nsRefPtr<Action> mQuotaIOThreadAction;
+   nsCOMPtr<nsIThread> mInitiatingThread;
+   nsresult mResult;
+   QuotaInfo mQuotaInfo;
+   nsMainThreadPtrHandle<OfflineStorage> mOfflineStorage;
+   State mState;
+   bool mNeedsQuotaRelease;
++  bool mExecutingRun;
+ 
+ public:
+   NS_DECL_ISUPPORTS_INHERITED
+   NS_DECL_NSIRUNNABLE
+ };
+ 
+ NS_IMPL_ISUPPORTS_INHERITED(mozilla::dom::cache::Context::QuotaInitRunnable,
+                             Action::Resolver, nsIRunnable);
+@@ -190,65 +193,56 @@ NS_IMPL_ISUPPORTS_INHERITED(mozilla::dom
+ //   |  (Main Thread)   +-------------------+
+ //   +--------+---------+                   |
+ //            |                             |
+ // +----------v------------+                |
+ // |EnsureOriginInitialized| Resolve(error) |
+ // |   (Quota IO Thread)   +----------------+
+ // +----------+------------+                |
+ //            |                             |
+-//  +---------v---------+                   |
+-//  |      Running      |    Resolve()      |
+-//  | (Quota IO Thread) +-------------------+
+-//  +-------------------+                   |
+-//            |                             |
+-//  +---------v---------+                   |
+-//  |      Resolving    <-------------------+
+-//  |    (Main Thread)  |
+-//  +-------------------+
+-//            |
+-//  +---------v---------+                           +-------------+
+-//  |      Resolving    |                           |  Completing |
+-//  | (Quota IO Thread) +--------------------------->(Orig Thread)|
+-//  +-------------------+                           +------+------+
+-//                                                         |
+-//                                                   +-----v----+
+-//                                                   | Complete |
+-//                                                   +----------+
++//  +---------v---------+            +------v------+
++//  |      Running      |            |  Completing |
++//  | (Quota IO Thread) +------------>(Orig Thread)|
++//  +-------------------+            +------+------+
++//                                          |
++//                                    +-----v----+
++//                                    | Complete |
++//                                    +----------+
+ //
+ // The initialization process proceeds through the main states.  If an error
+ // occurs, then we transition to Completing state back on the original thread.
+-// We must always first bounce through the main and IO threads to ensure that
+-// the method that triggered the Resolve() is complete, however.
+ NS_IMETHODIMP
+ Context::QuotaInitRunnable::Run()
+ {
+   // May run on different threads depending on the state.  See individual
+   // state cases for thread assertions.
+ 
++  AutoRestore<bool> executingRun(mExecutingRun);
++  mExecutingRun = true;
++
+   switch(mState) {
+     // -----------------------------------
+     case STATE_CALL_WAIT_FOR_OPEN_ALLOWED:
+     {
+       MOZ_ASSERT(NS_IsMainThread());
+       QuotaManager* qm = QuotaManager::GetOrCreate();
+       if (!qm) {
+         Resolve(NS_ERROR_FAILURE);
+-        return NS_OK;
++        break;
+       }
+ 
+       nsRefPtr<ManagerId> managerId = mManager->GetManagerId();
+       nsCOMPtr<nsIPrincipal> principal = managerId->Principal();
+       nsresult rv = qm->GetInfoFromPrincipal(principal,
+                                              &mQuotaInfo.mGroup,
+                                              &mQuotaInfo.mOrigin,
+                                              &mQuotaInfo.mIsApp);
+       if (NS_WARN_IF(NS_FAILED(rv))) {
+         Resolve(rv);
+-        return NS_OK;
++        break;
+       }
+ 
+       QuotaManager::GetStorageId(PERSISTENCE_TYPE_DEFAULT,
+                                  mQuotaInfo.mOrigin,
+                                  Client::DOMCACHE,
+                                  NS_LITERAL_STRING("cache"),
+                                  mQuotaInfo.mStorageId);
+ 
+@@ -256,17 +250,17 @@ Context::QuotaInitRunnable::Run()
+       // a callback.  We will then get executed again on the main thread when
+       // it is safe to open the quota directory.
+       mState = STATE_WAIT_FOR_OPEN_ALLOWED;
+       rv = qm->WaitForOpenAllowed(OriginOrPatternString::FromOrigin(mQuotaInfo.mOrigin),
+                                   Nullable<PersistenceType>(PERSISTENCE_TYPE_DEFAULT),
+                                   mQuotaInfo.mStorageId, this);
+       if (NS_FAILED(rv)) {
+         Resolve(rv);
+-        return NS_OK;
++        break;
+       }
+       break;
+     }
+     // ------------------------------
+     case STATE_WAIT_FOR_OPEN_ALLOWED:
+     {
+       MOZ_ASSERT(NS_IsMainThread());
+ 
+@@ -278,17 +272,17 @@ Context::QuotaInitRunnable::Run()
+       nsRefPtr<OfflineStorage> offlineStorage =
+         OfflineStorage::Register(mThreadsafeHandle, mQuotaInfo);
+       mOfflineStorage = new nsMainThreadPtrHolder<OfflineStorage>(offlineStorage);
+ 
+       mState = STATE_ENSURE_ORIGIN_INITIALIZED;
+       nsresult rv = qm->IOThread()->Dispatch(this, nsIThread::DISPATCH_NORMAL);
+       if (NS_WARN_IF(NS_FAILED(rv))) {
+         Resolve(rv);
+-        return NS_OK;
++        break;
+       }
+       break;
+     }
+     // ----------------------------------
+     case STATE_ENSURE_ORIGIN_INITIALIZED:
+     {
+       // Can't assert quota IO thread because its an idle thread that can get
+       // recreated.  At least assert we're not on main thread or owning thread.
+@@ -299,67 +293,34 @@ Context::QuotaInitRunnable::Run()
+       MOZ_ASSERT(qm);
+       nsresult rv = qm->EnsureOriginIsInitialized(PERSISTENCE_TYPE_DEFAULT,
+                                                   mQuotaInfo.mGroup,
+                                                   mQuotaInfo.mOrigin,
+                                                   mQuotaInfo.mIsApp,
+                                                   getter_AddRefs(mQuotaInfo.mDir));
+       if (NS_FAILED(rv)) {
+         Resolve(rv);
+-        return NS_OK;
++        break;
+       }
+ 
+       mState = STATE_RUNNING;
+ 
+       if (!mQuotaIOThreadAction) {
+         Resolve(NS_OK);
+-        return NS_OK;
++        break;
+       }
+ 
+       // Execute the provided initialization Action.  We pass ourselves as the
+       // Resolver.  The Action must either call Resolve() immediately or hold
+       // a ref to us and call Resolve() later.
+       mQuotaIOThreadAction->RunOnTarget(this, mQuotaInfo);
+ 
+       break;
+     }
+     // -------------------
+-    case STATE_RESOLVING:
+-    {
+-      // This can happen on the main thread or the IO thread depending on where
+-      // Resolve() was called.
+-
+-      // If QuotaManager doesn't exist, then it means we never got to the IO
+-      // thread.  So we can complete immediately.
+-      QuotaManager* qm = QuotaManager::Get();
+-      if (!qm) {
+-        MOZ_ASSERT(NS_IsMainThread());
+-        mState = STATE_COMPLETING;
+-        MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
+-          mInitiatingThread->Dispatch(this, nsIThread::DISPATCH_NORMAL)));
+-        break;
+-      }
+-
+-      // Otherwise, if we are on the main thread, then we must bounce through
+-      // the QuotaManager IO thread to be sure we don't delete state out
+-      // from under the setup action.
+-      if (NS_IsMainThread()) {
+-        MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
+-          qm->IOThread()->Dispatch(this, nsIThread::DISPATCH_NORMAL)));
+-        break;
+-      }
+-
+-      // Finally, if we are on the IO thread here we can complete the
+-      // initialization process.
+-      mState = STATE_COMPLETING;
+-      MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
+-        mInitiatingThread->Dispatch(this, nsIThread::DISPATCH_NORMAL)));
+-      break;
+-    }
+-    // -------------------
+     case STATE_COMPLETING:
+     {
+       NS_ASSERT_OWNINGTHREAD(Action::Resolver);
+       if (mQuotaIOThreadAction) {
+         mQuotaIOThreadAction->CompleteOnInitiatingThread(mResult);
+       }
+       mContext->OnQuotaInit(mResult, mQuotaInfo, mOfflineStorage);
+       mState = STATE_COMPLETE;
+@@ -374,20 +335,25 @@ Context::QuotaInitRunnable::Run()
+       // the threads we have bounced through.
+       Clear();
+       break;
+     }
+     // -----
+     default:
+     {
+       MOZ_CRASH("unexpected state in QuotaInitRunnable");
+-      break;
+     }
+   }
+ 
++  if (mState == STATE_RESOLVING) {
++    mState = STATE_COMPLETING;
++    MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
++      mInitiatingThread->Dispatch(this, nsIThread::DISPATCH_NORMAL)));
++  }
++
+   return NS_OK;
+ }
+ 
+ // Runnable wrapper around Action objects dispatched on the Context.  This
+ // runnable executes the Action on the appropriate threads while the Context
+ // is initialized.
+ class Context::ActionRunnable final : public nsIRunnable
+                                     , public Action::Resolver
+@@ -398,16 +364,17 @@ public:
+                  const QuotaInfo& aQuotaInfo)
+     : mContext(aContext)
+     , mTarget(aTarget)
+     , mAction(aAction)
+     , mQuotaInfo(aQuotaInfo)
+     , mInitiatingThread(NS_GetCurrentThread())
+     , mState(STATE_INIT)
+     , mResult(NS_OK)
++    , mExecutingRunOnTarget(false)
+   {
+     MOZ_ASSERT(mContext);
+     MOZ_ASSERT(mTarget);
+     MOZ_ASSERT(mAction);
+     MOZ_ASSERT(mQuotaInfo.mDir);
+     MOZ_ASSERT(mInitiatingThread);
+   }
+ 
+@@ -438,23 +405,34 @@ public:
+     NS_ASSERT_OWNINGTHREAD(Action::Resolver);
+     mAction->CancelOnInitiatingThread();
+   }
+ 
+   virtual void Resolve(nsresult aRv) override
+   {
+     MOZ_ASSERT(mTarget == NS_GetCurrentThread());
+     MOZ_ASSERT(mState == STATE_RUNNING);
++
+     mResult = aRv;
+-    // We ultimately must complete on the initiating thread, but bounce threw
++
++    // We ultimately must complete on the initiating thread, but bounce through
+     // the current thread again to ensure that we don't destroy objects and
+     // state out from under the currently running action's stack.
+     mState = STATE_RESOLVING;
+-    // Shutdown must be delayed until all Contexts are destroyed.  Crash
+-    // for this invariant violation.
++
++    // If we were resolved synchronously within Action::RunOnTarget() then we
++    // can avoid a thread bounce and just resolve once RunOnTarget() returns.
++    // The Run() method will handle this by looking at mState after
++    // RunOnTarget() returns.
++    if (mExecutingRunOnTarget) {
++      return;
++    }
++
++    // Otherwise we are in an asynchronous resolve.  And must perform a thread
++    // bounce to run on the target thread again.
+     MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
+       mTarget->Dispatch(this, nsIThread::DISPATCH_NORMAL)));
+   }
+ 
+ private:
+   ~ActionRunnable()
+   {
+     MOZ_ASSERT(mState == STATE_COMPLETE);
+@@ -485,16 +463,19 @@ private:
+   nsRefPtr<Context> mContext;
+   nsCOMPtr<nsIEventTarget> mTarget;
+   nsRefPtr<Action> mAction;
+   const QuotaInfo mQuotaInfo;
+   nsCOMPtr<nsIThread> mInitiatingThread;
+   State mState;
+   nsresult mResult;
+ 
++  // Only accessible on target thread;
++  bool mExecutingRunOnTarget;
++
+ public:
+   NS_DECL_ISUPPORTS_INHERITED
+   NS_DECL_NSIRUNNABLE
+ };
+ 
+ NS_IMPL_ISUPPORTS_INHERITED(mozilla::dom::cache::Context::ActionRunnable,
+                             Action::Resolver, nsIRunnable);
+ 
+@@ -534,18 +515,35 @@ NS_IMPL_ISUPPORTS_INHERITED(mozilla::dom
+ NS_IMETHODIMP
+ Context::ActionRunnable::Run()
+ {
+   switch(mState) {
+     // ----------------------
+     case STATE_RUN_ON_TARGET:
+     {
+       MOZ_ASSERT(NS_GetCurrentThread() == mTarget);
++      MOZ_ASSERT(!mExecutingRunOnTarget);
++
++      // Note that we are calling RunOnTarget().  This lets us detect
++      // if Resolve() is called synchronously.
++      AutoRestore<bool> executingRunOnTarget(mExecutingRunOnTarget);
++      mExecutingRunOnTarget = true;
++
+       mState = STATE_RUNNING;
+       mAction->RunOnTarget(this, mQuotaInfo);
++
++      // Resolve was called synchronously from RunOnTarget().  We can
++      // immediately move to completing now since we are sure RunOnTarget()
++      // completed.
++      if (mState == STATE_RESOLVING) {
++        // Use recursion instead of switch case fall-through...  Seems slightly
++        // easier to understand.
++        Run();
++      }
++
+       break;
+     }
+     // -----------------
+     case STATE_RESOLVING:
+     {
+       MOZ_ASSERT(NS_GetCurrentThread() == mTarget);
+       // The call to Action::RunOnTarget() must have returned now if we
+       // are running on the target thread again.  We may now proceed
+diff --git a/dom/cache/Context.h b/dom/cache/Context.h
+--- a/dom/cache/Context.h
++++ b/dom/cache/Context.h
+@@ -102,16 +102,19 @@ public:
+   // cancel any outstanding Activity work when the Context is cancelled.
+   class Activity
+   {
+   public:
+     virtual void Cancel() = 0;
+     virtual bool MatchesCacheId(CacheId aCacheId) const = 0;
+   };
+ 
++  // Create a Context attached to the given Manager.  The given Action
++  // will run on the QuotaManager IO thread.  Note, this Action must
++  // be execute synchronously.
+   static already_AddRefed<Context>
+   Create(Manager* aManager, Action* aQuotaIOThreadAction);
+ 
+   // Execute given action on the target once the quota manager has been
+   // initialized.
+   //
+   // Only callable from the thread that created the Context.
+   void Dispatch(nsIEventTarget* aTarget, Action* aAction);
