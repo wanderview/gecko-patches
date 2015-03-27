@@ -160,7 +160,7 @@ diff --git a/dom/cache/CacheOpParent.cpp b/dom/cache/CacheOpParent.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/CacheOpParent.cpp
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,100 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -182,19 +182,35 @@ new file mode 100644
 +
 +CacheOpParent::~CacheOpParent()
 +{
++  NS_ASSERT_OWNINGTHREAD(CacheOpParent);
 +}
 +
 +void
-+CacheOpParent::ExecuteNow(ManagerId* aManagerId)
++CacheOpParent::Execute(ManagerId* aManagerId)
 +{
++  NS_ASSERT_OWNINGTHREAD(CacheOpParent);
 +  MOZ_ASSERT(!mManager);
 +  MOZ_ASSERT(!mVerifier);
 +
-+  nsresult rv = Manager::GetOrCreate(aManagerId, getter_AddRefs(mManager));
++  nsRefPtr<Manager> manager;
++  nsresult rv = Manager::GetOrCreate(aManagerId, getter_AddRefs(manager));
 +  if (NS_WARN_IF(NS_FAILED(rv))) {
 +    unused << Send__delete__(this, rv, void_t());
 +    return;
 +  }
++
++  Execute(manager);
++}
++
++
++void
++CacheOpParent::Execute(Manager* aManager)
++{
++  NS_ASSERT_OWNINGTHREAD(CacheOpParent);
++  MOZ_ASSERT(!mManager);
++  MOZ_ASSERT(!mVerifier);
++
++  mManager = aManager;
 +
 +  // TODO
 +}
@@ -202,18 +218,44 @@ new file mode 100644
 +void
 +CacheOpParent::WaitForVerification(PrincipalVerifier* aVerifier)
 +{
++  NS_ASSERT_OWNINGTHREAD(CacheOpParent);
 +  MOZ_ASSERT(!mManager);
 +  MOZ_ASSERT(!mVerifier);
 +
 +  mVerifier = aVerifier;
-+  // TODO: add ourself to the verifier
++  mVerifier->AddListener(this);
 +}
 +
 +void
 +CacheOpParent::ActorDestroy(ActorDestroyReason aReason)
 +{
-+  // TODO: remove ourself from the Manager
-+  // TODO: remove ourself from the Verifier
++  NS_ASSERT_OWNINGTHREAD(CacheOpParent);
++
++  if (mVerifier) {
++    mVerifier->RemoveListener(this);
++    mVerifier = nullptr;
++  }
++
++  if (mManager) {
++    mManager->RemoveListener(this);
++    mManager = nullptr;
++  }
++}
++
++void
++CacheOpParent::OnPrincipalVerified(nsresult aRv, ManagerId* aManagerId)
++{
++  NS_ASSERT_OWNINGTHREAD(CacheOpParent);
++
++  mVerifier->RemoveListener(this);
++  mVerifier = nullptr;
++
++  if (NS_WARN_IF(NS_FAILED(aRv))) {
++    unused << Send__delete__(this, aRv, void_t());
++    return;
++  }
++
++  Execute(aManagerId);
 +}
 +
 +} // namespace cache
@@ -223,7 +265,7 @@ diff --git a/dom/cache/CacheOpParent.h b/dom/cache/CacheOpParent.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/cache/CacheOpParent.h
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,55 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -242,15 +284,18 @@ new file mode 100644
 +namespace cache {
 +
 +class CacheOpParent final : public PCacheOpParent
-+                          , public Manager::Listener
 +                          , public PrincipalVerifier::Listener
++                          , public Manager::Listener
 +{
 +public:
 +  CacheOpParent(OpType aOpType, const CacheOpArgs& aOpArgs);
 +  ~CacheOpParent();
 +
 +  void
-+  ExecuteNow(ManagerId* aManagerId);
++  Execute(ManagerId* aManagerId);
++
++  void
++  Execute(Manager* aManager);
 +
 +  void
 +  WaitForVerification(PrincipalVerifier* aVerifier);
@@ -259,10 +304,16 @@ new file mode 100644
 +  virtual void
 +  ActorDestroy(ActorDestroyReason aReason) override;
 +
++  // PrincipalVerifier::Listener methods
++  virtual void
++  OnPrincipalVerified(nsresult aRv, ManagerId* aManagerId) override;
++
 +  const OpType mOpType;
 +  const CacheOpArgs mOpArgs;
 +  nsRefPtr<Manager> mManager;
 +  nsRefPtr<PrincipalVerifier> mVerifier;
++
++  NS_DECL_OWNINGTHREAD
 +};
 +
 +} // namespace cache
@@ -273,7 +324,43 @@ new file mode 100644
 diff --git a/dom/cache/CacheParent.cpp b/dom/cache/CacheParent.cpp
 --- a/dom/cache/CacheParent.cpp
 +++ b/dom/cache/CacheParent.cpp
-@@ -57,16 +57,30 @@ CacheParent::ActorDestroy(ActorDestroyRe
+@@ -3,16 +3,17 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/CacheParent.h"
+ 
+ #include "mozilla/DebugOnly.h"
+ #include "mozilla/dom/cache/AutoUtils.h"
++#include "mozilla/dom/cache/CacheOpParent.h"
+ #include "mozilla/dom/cache/CachePushStreamParent.h"
+ #include "mozilla/dom/cache/CacheStreamControlParent.h"
+ #include "mozilla/dom/cache/ReadStream.h"
+ #include "mozilla/dom/cache/SavedTypes.h"
+ #include "mozilla/dom/cache/StreamList.h"
+ #include "mozilla/ipc/InputStreamUtils.h"
+ #include "mozilla/ipc/PBackgroundParent.h"
+ #include "mozilla/ipc/FileDescriptorSetParent.h"
+@@ -35,16 +36,17 @@ DeallocPCacheParent(PCacheParent* aActor
+ 
+ CacheParent::CacheParent(cache::Manager* aManager, CacheId aCacheId)
+   : mManager(aManager)
+   , mCacheId(aCacheId)
+ {
+   MOZ_COUNT_CTOR(cache::CacheParent);
+   MOZ_ASSERT(mManager);
+   mManager->AddRefCacheId(mCacheId);
++  // TODO: add Manager listener immediately
+ }
+ 
+ CacheParent::~CacheParent()
+ {
+   MOZ_COUNT_DTOR(cache::CacheParent);
+   MOZ_ASSERT(!mManager);
+   MOZ_ASSERT(mFetchPutList.IsEmpty());
+ }
+@@ -57,16 +59,49 @@ CacheParent::ActorDestroy(ActorDestroyRe
      mFetchPutList[i]->ClearListener();
    }
    mFetchPutList.Clear();
@@ -285,15 +372,34 @@ diff --git a/dom/cache/CacheParent.cpp b/dom/cache/CacheParent.cpp
 +PCacheOpParent*
 +CacheParent::AllocPCacheOpParent(const OpType& aOpType, const CacheOpArgs& aOpArgs)
 +{
-+  // TODO
-+  return nullptr;
++  if (aOpType != CacheMatch ||
++      aOpType != CacheMatchAll ||
++      aOpType != CacheAddAll ||
++      aOpType != CachePut ||
++      aOpType != CacheDelete ||
++      aOpType != CacheKeys)
++  {
++    MOZ_CRASH("Invalid operation sent to Cache actor!");
++  }
++
++  return new CacheOpParent(aOpType, aOpArgs);
 +}
 +
 +bool
 +CacheParent::DeallocPCacheOpParent(PCacheOpParent* aActor)
 +{
-+  // TODO
-+  return false;
++  delete aActor;
++  return true;
++}
++
++bool
++CacheParent::RecvPCacheOpConstructor(PCacheOpParent* aActor,
++                                     const OpType& aOpType,
++                                     const CacheOpArgs& aOpArgs)
++{
++  auto actor = static_cast<CacheOpParent*>(aActor);
++  actor->Execute(mManager);
++  return true;
 +}
 +
  PCachePushStreamParent*
@@ -307,7 +413,7 @@ diff --git a/dom/cache/CacheParent.cpp b/dom/cache/CacheParent.cpp
 diff --git a/dom/cache/CacheParent.h b/dom/cache/CacheParent.h
 --- a/dom/cache/CacheParent.h
 +++ b/dom/cache/CacheParent.h
-@@ -27,16 +27,23 @@ class CacheParent final : public PCacheP
+@@ -27,16 +27,27 @@ class CacheParent final : public PCacheP
  {
  public:
    CacheParent(cache::Manager* aManager, CacheId aCacheId);
@@ -322,6 +428,10 @@ diff --git a/dom/cache/CacheParent.h b/dom/cache/CacheParent.h
 +
 +  virtual bool
 +  DeallocPCacheOpParent(PCacheOpParent* aActor) override;
++
++  virtual bool
++  RecvPCacheOpConstructor(PCacheOpParent* actor, const OpType& aOpType,
++                          const CacheOpArgs& aOpArgs) override;
 +
    virtual PCachePushStreamParent* AllocPCachePushStreamParent() override;
    virtual bool DeallocPCachePushStreamParent(PCachePushStreamParent* aActor) override;
@@ -395,7 +505,37 @@ diff --git a/dom/cache/CacheStorageChild.h b/dom/cache/CacheStorageChild.h
 diff --git a/dom/cache/CacheStorageParent.cpp b/dom/cache/CacheStorageParent.cpp
 --- a/dom/cache/CacheStorageParent.cpp
 +++ b/dom/cache/CacheStorageParent.cpp
-@@ -78,16 +78,31 @@ CacheStorageParent::ActorDestroy(ActorDe
+@@ -4,16 +4,17 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/CacheStorageParent.h"
+ 
+ #include "mozilla/dom/ContentParent.h"
+ #include "mozilla/dom/cache/ActorUtils.h"
+ #include "mozilla/dom/cache/AutoUtils.h"
++#include "mozilla/dom/cache/CacheOpParent.h"
+ #include "mozilla/dom/cache/CacheParent.h"
+ #include "mozilla/dom/cache/CacheStreamControlParent.h"
+ #include "mozilla/dom/cache/Manager.h"
+ #include "mozilla/dom/cache/ManagerId.h"
+ #include "mozilla/dom/cache/ReadStream.h"
+ #include "mozilla/dom/cache/SavedTypes.h"
+ #include "mozilla/dom/cache/StreamList.h"
+ #include "mozilla/ipc/PBackgroundParent.h"
+@@ -67,27 +68,68 @@ CacheStorageParent::~CacheStorageParent(
+   MOZ_ASSERT(!mVerifier);
+   MOZ_ASSERT(!mManager);
+ }
+ 
+ void
+ CacheStorageParent::ActorDestroy(ActorDestroyReason aReason)
+ {
+   if (mVerifier) {
+-    mVerifier->ClearListener();
++    mVerifier->RemoveListener(this);
+     mVerifier = nullptr;
+   }
  
    if (mManager) {
      MOZ_ASSERT(!mActiveRequests.IsEmpty());
@@ -408,15 +548,41 @@ diff --git a/dom/cache/CacheStorageParent.cpp b/dom/cache/CacheStorageParent.cpp
 +CacheStorageParent::AllocPCacheOpParent(const OpType& aOpType,
 +                                        const CacheOpArgs& aOpArgs)
 +{
-+  // TODO
-+  return nullptr;
++  if (aOpType != StorageMatch ||
++      aOpType != StorageHas ||
++      aOpType != StorageOpen ||
++      aOpType != StorageDelete ||
++      aOpType != StorageKeys)
++  {
++    MOZ_CRASH("Invalid operation sent to CacheStorage actor!");
++  }
++
++  return new CacheOpParent(aOpType, aOpArgs);
 +}
 +
 +bool
 +CacheStorageParent::DeallocPCacheOpParent(PCacheOpParent* aActor)
 +{
-+  // TODO
-+  return false;
++  delete aActor;
++  return true;
++}
++
++bool
++CacheStorageParent::RecvPCacheOpConstructor(PCacheOpParent* aActor,
++                                            const OpType& aOpType,
++                                            const CacheOpArgs& aOpArgs)
++{
++  auto actor = static_cast<CacheOpParent*>(aActor);
++
++  if (mVerifier) {
++    MOZ_ASSERT(!mManagerId);
++    actor->WaitForVerification(mVerifier);
++    return true;
++  }
++
++  MOZ_ASSERT(mManagerId);
++  actor->Execute(mManagerId);
++  return true;
 +}
 +
  bool
@@ -427,10 +593,29 @@ diff --git a/dom/cache/CacheStorageParent.cpp b/dom/cache/CacheStorageParent.cpp
      NS_WARNING("CacheStorage failed to delete actor.");
    }
    return true;
+@@ -279,17 +321,17 @@ CacheStorageParent::OnPrincipalVerified(
+   MOZ_ASSERT(!mManager);
+   MOZ_ASSERT(NS_SUCCEEDED(mVerifiedStatus));
+ 
+   if (NS_WARN_IF(NS_FAILED(aRv))) {
+     mVerifiedStatus = aRv;
+   }
+ 
+   mManagerId = aManagerId;
+-  mVerifier->ClearListener();
++  mVerifier->RemoveListener(this);
+   mVerifier = nullptr;
+ 
+   RetryPendingRequests();
+ }
+ 
+ void
+ CacheStorageParent::OnStorageMatch(RequestId aRequestId, nsresult aRv,
+                                    const SavedResponse* aSavedResponse,
 diff --git a/dom/cache/CacheStorageParent.h b/dom/cache/CacheStorageParent.h
 --- a/dom/cache/CacheStorageParent.h
 +++ b/dom/cache/CacheStorageParent.h
-@@ -29,16 +29,23 @@ class CacheStorageParent final : public 
+@@ -29,16 +29,27 @@ class CacheStorageParent final : public 
  public:
    CacheStorageParent(PBackgroundParent* aManagingActor, Namespace aNamespace,
                       const mozilla::ipc::PrincipalInfo& aPrincipalInfo);
@@ -445,6 +630,10 @@ diff --git a/dom/cache/CacheStorageParent.h b/dom/cache/CacheStorageParent.h
 +
 +  virtual bool
 +  DeallocPCacheOpParent(PCacheOpParent* aActor) override;
++
++  virtual bool
++  RecvPCacheOpConstructor(PCacheOpParent* actor, const OpType& aOpType,
++                          const CacheOpArgs& aOpArgs) override;
 +
    virtual bool RecvTeardown() override;
    virtual bool RecvMatch(const RequestId& aRequestId,
@@ -666,10 +855,194 @@ diff --git a/dom/cache/PCacheTypes.ipdlh b/dom/cache/PCacheTypes.ipdlh
  } // namespace cache
  } // namespace dom
  } // namespace mozilla
+diff --git a/dom/cache/PrincipalVerifier.cpp b/dom/cache/PrincipalVerifier.cpp
+--- a/dom/cache/PrincipalVerifier.cpp
++++ b/dom/cache/PrincipalVerifier.cpp
+@@ -41,44 +41,54 @@ PrincipalVerifier::CreateAndDispatch(Lis
+                                                                aPrincipalInfo);
+ 
+   MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(verifier)));
+ 
+   return verifier.forget();
+ }
+ 
+ void
+-PrincipalVerifier::ClearListener()
++PrincipalVerifier::AddListener(Listener* aListener)
+ {
+   AssertIsOnBackgroundThread();
+-  MOZ_ASSERT(mListener);
+-  mListener = nullptr;
++  MOZ_ASSERT(aListener);
++  MOZ_ASSERT(!mListenerList.Contains(aListener));
++  mListenerList.AppendElement(aListener);
++}
++
++void
++PrincipalVerifier::RemoveListener(Listener* aListener)
++{
++  AssertIsOnBackgroundThread();
++  MOZ_ASSERT(aListener);
++  MOZ_ALWAYS_TRUE(mListenerList.RemoveElement(aListener));
+ }
+ 
+ PrincipalVerifier::PrincipalVerifier(Listener* aListener,
+                                      PBackgroundParent* aActor,
+                                      const PrincipalInfo& aPrincipalInfo)
+-  : mListener(aListener)
+-  , mActor(BackgroundParent::GetContentParent(aActor))
++  : mActor(BackgroundParent::GetContentParent(aActor))
+   , mPrincipalInfo(aPrincipalInfo)
+   , mInitiatingThread(NS_GetCurrentThread())
+   , mResult(NS_OK)
+ {
+   AssertIsOnBackgroundThread();
+-  MOZ_ASSERT(mListener);
+   MOZ_ASSERT(mInitiatingThread);
++  MOZ_ASSERT(aListener);
++
++  mListenerList.AppendElement(aListener);
+ }
+ 
+ PrincipalVerifier::~PrincipalVerifier()
+ {
+   // Since the PrincipalVerifier is a Runnable that executes on multiple
+   // threads, its a race to see which thread de-refs us last.  Therefore
+   // we cannot guarantee which thread we destruct on.
+ 
+-  MOZ_ASSERT(!mListener);
++  MOZ_ASSERT(mListenerList.IsEmpty());
+ 
+   // We should always be able to explicitly release the actor on the main
+   // thread.
+   MOZ_ASSERT(!mActor);
+ }
+ 
+ NS_IMETHODIMP
+ PrincipalVerifier::Run()
+@@ -167,27 +177,23 @@ PrincipalVerifier::VerifyOnMainThread()
+ 
+   DispatchToInitiatingThread(NS_OK);
+ }
+ 
+ void
+ PrincipalVerifier::CompleteOnInitiatingThread()
+ {
+   AssertIsOnBackgroundThread();
+-
+-  // This can happen if the listener is destroyed before we finish.  For
+-  // example, if the child process OOMs and the actor is destroyed.
+-  if (!mListener) {
+-    return;
++  ListenerList::ForwardIterator iter(mListenerList);
++  while (iter.HasMore()) {
++    iter.GetNext()->OnPrincipalVerified(mResult, mManagerId);
+   }
+ 
+-  mListener->OnPrincipalVerified(mResult, mManagerId);
+-
+-  // The listener must clear their reference in OnPrincipalVerified()
+-  MOZ_ASSERT(!mListener);
++  // The listener must clear its reference in OnPrincipalVerified()
++  MOZ_ASSERT(mListenerList.IsEmpty());
+ }
+ 
+ void
+ PrincipalVerifier::DispatchToInitiatingThread(nsresult aRv)
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+ 
+   mResult = aRv;
+diff --git a/dom/cache/PrincipalVerifier.h b/dom/cache/PrincipalVerifier.h
+--- a/dom/cache/PrincipalVerifier.h
++++ b/dom/cache/PrincipalVerifier.h
+@@ -4,16 +4,17 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_cache_PrincipalVerifier_h
+ #define mozilla_dom_cache_PrincipalVerifier_h
+ 
+ #include "mozilla/ipc/PBackgroundSharedTypes.h"
+ #include "nsThreadUtils.h"
++#include "nsTObserverArray.h"
+ 
+ namespace mozilla {
+ 
+ namespace ipc {
+   class PBackgroundParent;
+ }
+ 
+ namespace dom {
+@@ -21,44 +22,47 @@ namespace cache {
+ 
+ class ManagerId;
+ 
+ class PrincipalVerifier final : public nsRunnable
+ {
+ public:
+   // An interface to be implemented by code wishing to use the
+   // PrincipalVerifier.  Note, the Listener implementation is responsible
+-  // for calling ClearListener() on the PrincipalVerifier to clear the
++  // for calling RemoveListener() on the PrincipalVerifier to clear the
+   // weak reference.
+   class Listener
+   {
+   public:
+     virtual void OnPrincipalVerified(nsresult aRv, ManagerId* aManagerId) = 0;
+   };
+ 
+   static already_AddRefed<PrincipalVerifier>
+   CreateAndDispatch(Listener* aListener, mozilla::ipc::PBackgroundParent* aActor,
+                     const mozilla::ipc::PrincipalInfo& aPrincipalInfo);
+ 
+-  // The Listener must call ClearListener() when OnPrincipalVerified() is
++  void AddListener(Listener* aListener);
++
++  // The Listener must call RemoveListener() when OnPrincipalVerified() is
+   // called or when the Listener is destroyed.
+-  void ClearListener();
++  void RemoveListener(Listener* aListener);
+ 
+ private:
+   PrincipalVerifier(Listener* aListener, mozilla::ipc::PBackgroundParent* aActor,
+                     const mozilla::ipc::PrincipalInfo& aPrincipalInfo);
+   virtual ~PrincipalVerifier();
+ 
+   void VerifyOnMainThread();
+   void CompleteOnInitiatingThread();
+ 
+   void DispatchToInitiatingThread(nsresult aRv);
+ 
+-  // Weak reference cleared by ClearListener()
+-  Listener* mListener;
++  // Weak reference cleared by RemoveListener()
++  typedef nsTObserverArray<Listener*> ListenerList;
++  ListenerList mListenerList;
+ 
+   // set in originating thread at construction, but must be accessed and
+   // released on main thread
+   nsRefPtr<ContentParent> mActor;
+ 
+   const mozilla::ipc::PrincipalInfo mPrincipalInfo;
+   nsCOMPtr<nsIThread> mInitiatingThread;
+   nsresult mResult;
 diff --git a/dom/cache/Types.h b/dom/cache/Types.h
 --- a/dom/cache/Types.h
 +++ b/dom/cache/Types.h
-@@ -33,13 +33,29 @@ struct QuotaInfo
+@@ -22,24 +22,41 @@ enum Namespace
+   CHROME_ONLY_NAMESPACE,
+   NUMBER_OF_NAMESPACES
+ };
+ 
+ typedef uintptr_t RequestId;
+ static const RequestId INVALID_REQUEST_ID = 0;
+ 
+ typedef int32_t CacheId;
++static const CacheId INVALID_CACHE_ID = -1;
+ 
+ struct QuotaInfo
+ {
    QuotaInfo() : mIsApp(false) { }
    nsCOMPtr<nsIFile> mDir;
    nsCString mGroup;
