@@ -3,7 +3,6 @@
 # User Ben Kelly <ben@wanderview.com>
 Bug 1110485 P4 Keep Cache Actors alive during async operations. r=baku
 
-
 diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
 --- a/dom/cache/Cache.cpp
 +++ b/dom/cache/Cache.cpp
@@ -658,7 +657,25 @@ diff --git a/dom/cache/CacheStorageChild.h b/dom/cache/CacheStorageChild.h
 diff --git a/dom/cache/CacheStreamControlChild.cpp b/dom/cache/CacheStreamControlChild.cpp
 --- a/dom/cache/CacheStreamControlChild.cpp
 +++ b/dom/cache/CacheStreamControlChild.cpp
-@@ -58,16 +58,19 @@ CacheStreamControlChild::StartDestroy()
+@@ -36,16 +36,17 @@ AllocPCacheStreamControlChild()
+ void
+ DeallocPCacheStreamControlChild(PCacheStreamControlChild* aActor)
+ {
+   delete aActor;
+ }
+ 
+ CacheStreamControlChild::CacheStreamControlChild()
+   : mDestroyStarted(false)
++  , mDestroyDelayed(false)
+ {
+   MOZ_COUNT_CTOR(cache::CacheStreamControlChild);
+ }
+ 
+ CacheStreamControlChild::~CacheStreamControlChild()
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+   MOZ_COUNT_DTOR(cache::CacheStreamControlChild);
+@@ -58,16 +59,31 @@ CacheStreamControlChild::StartDestroy()
    // This can get called twice under some circumstances.  For example, if the
    // actor is added to a Feature that has already been notified and the Cache
    // actor has no mListener.
@@ -667,8 +684,20 @@ diff --git a/dom/cache/CacheStreamControlChild.cpp b/dom/cache/CacheStreamContro
    }
    mDestroyStarted = true;
  
-+  // TODO: only allow StartDestroy() to close the stream if it no data has
-+  //       been read from it
++  // If any of the streams have started to be read, then wait for them to close
++  // naturally.
++  if (HasEverBeenRead()) {
++    // Note that we are delaying so that we can re-check for active streams
++    // in NoteClosedAfterForget().
++    mDestroyDelayed = true;
++    return;
++  }
++
++  // Otherwise, if the streams have not been touched then just pre-emptively
++  // close them now.  This handles the case where someone retrieves a Response
++  // from the Cache, but never accesses the body.  We should not keep the
++  // Worker alive until that Response is GC'd just because of its ignored
++  // body stream.
 +
    // Begin shutting down all streams.  This is the same as if the parent had
    // asked us to shutdown.  So simulate the CloseAll IPC message.
@@ -678,3 +707,230 @@ diff --git a/dom/cache/CacheStreamControlChild.cpp b/dom/cache/CacheStreamContro
  void
  CacheStreamControlChild::SerializeControl(CacheReadStream* aReadStreamOut)
  {
+@@ -115,16 +131,25 @@ CacheStreamControlChild::DeserializeFds(
+   unused << fdSetActor->Send__delete__(fdSetActor);
+ }
+ 
+ void
+ CacheStreamControlChild::NoteClosedAfterForget(const nsID& aId)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+   unused << SendNoteClosed(aId);
++
++  // A stream has closed.  If we delayed StartDestry() due to this stream
++  // being read, then we should check to see if any of the remaining streams
++  // are active.  If none of our other streams have been read, then we can
++  // proceed with the shutdown now.
++  if (mDestroyDelayed && !HasEverBeenRead()) {
++    mDestroyDelayed = false;
++    RecvCloseAll();
++  }
+ }
+ 
+ #ifdef DEBUG
+ void
+ CacheStreamControlChild::AssertOwningThread()
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+ }
+diff --git a/dom/cache/CacheStreamControlChild.h b/dom/cache/CacheStreamControlChild.h
+--- a/dom/cache/CacheStreamControlChild.h
++++ b/dom/cache/CacheStreamControlChild.h
+@@ -51,16 +51,17 @@ private:
+ #endif
+ 
+   // PCacheStreamControlChild methods
+   virtual void ActorDestroy(ActorDestroyReason aReason) override;
+   virtual bool RecvClose(const nsID& aId) override;
+   virtual bool RecvCloseAll() override;
+ 
+   bool mDestroyStarted;
++  bool mDestroyDelayed;
+ 
+   NS_DECL_OWNINGTHREAD
+ };
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+ 
+diff --git a/dom/cache/ReadStream.cpp b/dom/cache/ReadStream.cpp
+--- a/dom/cache/ReadStream.cpp
++++ b/dom/cache/ReadStream.cpp
+@@ -45,16 +45,19 @@ public:
+   CloseStream() override;
+ 
+   virtual void
+   CloseStreamWithoutReporting() override;
+ 
+   virtual bool
+   MatchId(const nsID& aId) const override;
+ 
++  virtual bool
++  HasEverBeenRead() const override;
++
+   // Simulate nsIInputStream methods, but we don't actually inherit from it
+   NS_METHOD
+   Close();
+ 
+   NS_METHOD
+   Available(uint64_t *aNumAvailableOut);
+ 
+   NS_METHOD
+@@ -98,16 +101,17 @@ private:
+ 
+   enum State
+   {
+     Open,
+     Closed,
+     NumStates
+   };
+   Atomic<State> mState;
++  Atomic<bool> mHasEverBeenRead;
+ 
+   NS_INLINE_DECL_THREADSAFE_REFCOUNTING(cache::ReadStream::Inner, override)
+ };
+ 
+ // ----------------------------------------------------------------------------
+ 
+ // Runnable to notify actors that the ReadStream has closed.  This must
+ // be done on the thread associated with the PBackground actor.  Must be
+@@ -244,16 +248,23 @@ ReadStream::Inner::CloseStreamWithoutRep
+ 
+ bool
+ ReadStream::Inner::MatchId(const nsID& aId) const
+ {
+   MOZ_ASSERT(NS_GetCurrentThread() == mOwningThread);
+   return mId.Equals(aId);
+ }
+ 
++bool
++ReadStream::Inner::HasEverBeenRead() const
++{
++  MOZ_ASSERT(NS_GetCurrentThread() == mOwningThread);
++  return mHasEverBeenRead;
++}
++
+ NS_IMETHODIMP
+ ReadStream::Inner::Close()
+ {
+   // stream ops can happen on any thread
+   nsresult rv = mStream->Close();
+   NoteClosed();
+   return rv;
+ }
+@@ -272,16 +283,20 @@ ReadStream::Inner::Available(uint64_t* a
+ }
+ 
+ NS_IMETHODIMP
+ ReadStream::Inner::Read(char* aBuf, uint32_t aCount, uint32_t* aNumReadOut)
+ {
+   // stream ops can happen on any thread
+   MOZ_ASSERT(aNumReadOut);
+ 
++  if (aCount) {
++    mHasEverBeenRead = true;
++  }
++
+   nsresult rv = mSnappyStream->Read(aBuf, aCount, aNumReadOut);
+ 
+   if ((NS_FAILED(rv) && rv != NS_BASE_STREAM_WOULD_BLOCK) ||
+       *aNumReadOut == 0) {
+     Close();
+   }
+ 
+   return rv;
+@@ -289,16 +304,20 @@ ReadStream::Inner::Read(char* aBuf, uint
+ 
+ NS_IMETHODIMP
+ ReadStream::Inner::ReadSegments(nsWriteSegmentFun aWriter, void* aClosure,
+                                 uint32_t aCount, uint32_t* aNumReadOut)
+ {
+   // stream ops can happen on any thread
+   MOZ_ASSERT(aNumReadOut);
+ 
++  if (aCount) {
++    mHasEverBeenRead = true;
++  }
++
+   nsresult rv = mSnappyStream->ReadSegments(aWriter, aClosure, aCount,
+                                             aNumReadOut);
+ 
+   if ((NS_FAILED(rv) && rv != NS_BASE_STREAM_WOULD_BLOCK &&
+                         rv != NS_ERROR_NOT_IMPLEMENTED) || *aNumReadOut == 0) {
+     Close();
+   }
+ 
+diff --git a/dom/cache/ReadStream.h b/dom/cache/ReadStream.h
+--- a/dom/cache/ReadStream.h
++++ b/dom/cache/ReadStream.h
+@@ -58,16 +58,19 @@ public:
+     // Closes the stream and then forgets the stream control.  Does not
+     // notify.
+     virtual void
+     CloseStreamWithoutReporting() = 0;
+ 
+     virtual bool
+     MatchId(const nsID& aId) const = 0;
+ 
++    virtual bool
++    HasEverBeenRead() const = 0;
++
+     NS_IMETHOD_(MozExternalRefCountType)
+     AddRef(void) = 0;
+ 
+     NS_IMETHOD_(MozExternalRefCountType)
+     Release(void) = 0;
+   };
+ 
+   static already_AddRefed<ReadStream>
+diff --git a/dom/cache/StreamControl.cpp b/dom/cache/StreamControl.cpp
+--- a/dom/cache/StreamControl.cpp
++++ b/dom/cache/StreamControl.cpp
+@@ -79,11 +79,23 @@ StreamControl::CloseAllReadStreamsWithou
+   while (iter.HasMore()) {
+     nsRefPtr<ReadStream::Controllable> stream = iter.GetNext();
+     // Note, we cannot trigger IPC traffic here.  So use
+     // CloseStreamWithoutReporting().
+     stream->CloseStreamWithoutReporting();
+   }
+ }
+ 
++bool
++StreamControl::HasEverBeenRead() const
++{
++  ReadStreamList::ForwardIterator iter(mReadStreamList);
++  while (iter.HasMore()) {
++    if (iter.GetNext()->HasEverBeenRead()) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/StreamControl.h b/dom/cache/StreamControl.h
+--- a/dom/cache/StreamControl.h
++++ b/dom/cache/StreamControl.h
+@@ -63,16 +63,19 @@ protected:
+   CloseReadStreams(const nsID& aId);
+ 
+   void
+   CloseAllReadStreams();
+ 
+   void
+   CloseAllReadStreamsWithoutReporting();
+ 
++  bool
++  HasEverBeenRead() const;
++
+   // protected parts of the abstract interface
+   virtual void
+   NoteClosedAfterForget(const nsID& aId) = 0;
+ 
+ #ifdef DEBUG
+   virtual void
+   AssertOwningThread() = 0;
+ #else
