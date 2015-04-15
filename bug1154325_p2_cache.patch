@@ -1,0 +1,162 @@
+# HG changeset patch
+# Parent 1524a1c6474188da54e923ba6b313c171bfc6159
+# User Ben Kelly <ben@wanderview.com>
+Bug 1154325 P2 Use Blobs for Cache strings to avoid encoding issues. r=ehsan
+
+
+diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
+--- a/dom/cache/DBSchema.cpp
++++ b/dom/cache/DBSchema.cpp
+@@ -23,21 +23,21 @@
+ #include "mozilla/dom/ResponseBinding.h"
+ #include "nsIContentPolicy.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ namespace db {
+ 
+-const int32_t kMaxWipeSchemaVersion = 6;
++const int32_t kMaxWipeSchemaVersion = 7;
+ 
+ namespace {
+ 
+-const int32_t kLatestSchemaVersion = 6;
++const int32_t kLatestSchemaVersion = 7;
+ const int32_t kMaxEntriesPerStatement = 255;
+ 
+ } // anonymous namespace
+ 
+ // If any of the static_asserts below fail, it means that you have changed
+ // the corresponding WebIDL enum in a way that may be incompatible with the
+ // existing data stored in the DOM Cache.  You would need to update the Cache
+ // database schema accordingly and adjust the failing static_assert.
+@@ -191,16 +191,18 @@ nsresult
+ CreateSchema(mozIStorageConnection* aConn)
+ {
+   MOZ_ASSERT(!NS_IsMainThread());
+   MOZ_ASSERT(aConn);
+ 
+   nsAutoCString pragmas(
+     // Enable auto-vaccum but in incremental mode in order to avoid doing a lot
+     // of work at the end of each transaction.
++    // NOTE: This must be done here instead of InitializeConnection() because it
++    //       only works when the database is empty.
+     "PRAGMA auto_vacuum = INCREMENTAL; "
+   );
+ 
+   nsresult rv = aConn->ExecuteSimpleSQL(pragmas);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   int32_t schemaVersion;
+   rv = aConn->GetSchemaVersion(&schemaVersion);
+@@ -302,17 +304,17 @@ CreateSchema(mozIStorageConnection* aCon
+       "CREATE INDEX response_headers_name_index "
+                 "ON response_headers (name);"
+     ));
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+     rv = aConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING(
+       "CREATE TABLE storage ("
+         "namespace INTEGER NOT NULL, "
+-        "key TEXT NOT NULL, "
++        "key BLOB NOT NULL, "
+         "cache_id INTEGER NOT NULL REFERENCES caches(id), "
+         "PRIMARY KEY(namespace, key) "
+       ");"
+     ));
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+     rv = aConn->SetSchemaVersion(kLatestSchemaVersion);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+@@ -689,17 +691,19 @@ StorageGetCacheId(mozIStorageConnection*
+   nsresult rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
+     "SELECT cache_id FROM storage WHERE namespace=?1 AND key=?2 ORDER BY rowid;"
+   ), getter_AddRefs(state));
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   rv = state->BindInt32Parameter(0, aNamespace);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+-  rv = state->BindStringParameter(1, aKey);
++  rv = state->BindBlobParameter(1, reinterpret_cast<const uint8_t*>
++                                  (aKey.BeginReading()),
++                                aKey.Length() * sizeof(char16_t));
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   bool hasMoreData = false;
+   rv = state->ExecuteStep(&hasMoreData);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   if (!hasMoreData) {
+     return rv;
+@@ -723,17 +727,19 @@ StoragePutCache(mozIStorageConnection* a
+   nsresult rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
+     "INSERT INTO storage (namespace, key, cache_id) VALUES(?1, ?2, ?3);"
+   ), getter_AddRefs(state));
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   rv = state->BindInt32Parameter(0, aNamespace);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+-  rv = state->BindStringParameter(1, aKey);
++  rv = state->BindBlobParameter(1, reinterpret_cast<const uint8_t*>
++                                  (aKey.BeginReading()),
++                                aKey.Length() * sizeof(char16_t));
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   rv = state->BindInt64Parameter(2, aCacheId);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   rv = state->Execute();
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+@@ -751,17 +757,19 @@ StorageForgetCache(mozIStorageConnection
+   nsresult rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
+     "DELETE FROM storage WHERE namespace=?1 AND key=?2;"
+   ), getter_AddRefs(state));
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   rv = state->BindInt32Parameter(0, aNamespace);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+-  rv = state->BindStringParameter(1, aKey);
++  rv = state->BindBlobParameter(1, reinterpret_cast<const uint8_t*>
++                                  (aKey.BeginReading()),
++                                aKey.Length() * sizeof(char16_t));
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   rv = state->Execute();
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   return rv;
+ }
+ 
+@@ -778,20 +786,24 @@ StorageGetKeys(mozIStorageConnection* aC
+   ), getter_AddRefs(state));
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   rv = state->BindInt32Parameter(0, aNamespace);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   bool hasMoreData = false;
+   while (NS_SUCCEEDED(state->ExecuteStep(&hasMoreData)) && hasMoreData) {
+-    nsAutoString key;
+-    rv = state->GetString(0, key);
++    uint8_t* data = nullptr;
++    uint32_t dataLength = 0;
++    rv = state->GetBlob(0, &dataLength, &data);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+-    aKeysOut.AppendElement(key);
++
++    aKeysOut.AppendElement();
++    aKeysOut.LastElement().Adopt(reinterpret_cast<char16_t*>(data),
++                                 dataLength / sizeof(char16_t));
+   }
+ 
+   return rv;
+ }
+ 
+ namespace {
+ 
+ nsresult
