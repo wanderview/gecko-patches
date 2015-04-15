@@ -1,0 +1,337 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  9d01374a97ed9bcdc90e76d4a49de50252009142
+Bug 1110485 P1 interdiff 004 add feature to stream control
+
+diff --git a/dom/cache/ActorChild.cpp b/dom/cache/ActorChild.cpp
+--- a/dom/cache/ActorChild.cpp
++++ b/dom/cache/ActorChild.cpp
+@@ -2,16 +2,17 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/ActorChild.h"
+ 
+ #include "mozilla/dom/cache/Feature.h"
++#include "nsThreadUtils.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ void
+ ActorChild::SetFeature(Feature* aFeature)
+ {
+@@ -27,16 +28,17 @@ ActorChild::SetFeature(Feature* aFeature
+   if (mFeature) {
+     mFeature->AddActor(this);
+   }
+ }
+ 
+ void
+ ActorChild::RemoveFeature()
+ {
++  MOZ_ASSERT_IF(!NS_IsMainThread(), mFeature);
+   if (mFeature) {
+     mFeature->RemoveActor(this);
+     mFeature = nullptr;
+   }
+ }
+ 
+ Feature*
+ ActorChild::GetFeature() const
+diff --git a/dom/cache/CacheOpChild.cpp b/dom/cache/CacheOpChild.cpp
+--- a/dom/cache/CacheOpChild.cpp
++++ b/dom/cache/CacheOpChild.cpp
+@@ -6,16 +6,17 @@
+ 
+ #include "mozilla/dom/cache/CacheOpChild.h"
+ 
+ #include "mozilla/dom/Promise.h"
+ #include "mozilla/dom/Request.h"
+ #include "mozilla/dom/Response.h"
+ #include "mozilla/dom/cache/Cache.h"
+ #include "mozilla/dom/cache/CacheChild.h"
++#include "mozilla/dom/cache/StreamUtils.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ CacheOpChild::CacheOpChild(Feature* aFeature, nsIGlobalObject* aGlobal,
+                            Promise* aPromise)
+   : mGlobal(aGlobal)
+@@ -50,17 +51,29 @@ CacheOpChild::ActorDestroy(ActorDestroyR
+ }
+ 
+ bool
+ CacheOpChild::Recv__delete__(const nsresult& aStatus,
+                              const CacheOpResult& aResult)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheOpChild);
+ 
++  // We must do this before checking for errors in case a stream actor
++  // was sent with the error.  In that case we still need to keep the
++  // worker thread alive until the actor is gracefully terminated from
++  // the parent side.
++  AddFeatureToStreamChild(aResult, GetFeature());
++
+   if (NS_FAILED(aStatus)) {
++    // Cleanup any actors that might have been sent with the error.  In theory
++    // this could instead assert we do not have an actor.  To be safe, though,
++    // just check for an actor and clean it up.  This seems more robust right
++    // now.
++    StartDestroyStreamChild(aResult);
++
+     mPromise->MaybeReject(aStatus);
+     mPromise = nullptr;
+     return true;
+   }
+ 
+   switch (aResult.type()) {
+     case CacheOpResult::TCacheMatchResult:
+     {
+diff --git a/dom/cache/CacheTypes.ipdlh b/dom/cache/CacheTypes.ipdlh
+--- a/dom/cache/CacheTypes.ipdlh
++++ b/dom/cache/CacheTypes.ipdlh
+@@ -220,17 +220,16 @@ struct StorageDeleteResult
+ 
+ struct StorageKeysResult
+ {
+   nsString[] keyList;
+ };
+ 
+ union CacheOpResult
+ {
+-  void_t;
+   CacheMatchResult;
+   CacheMatchAllResult;
+   CacheAddAllResult;
+   CachePutAllResult;
+   CacheDeleteResult;
+   CacheKeysResult;
+   StorageMatchResult;
+   StorageHasResult;
+diff --git a/dom/cache/StreamUtils.cpp b/dom/cache/StreamUtils.cpp
+--- a/dom/cache/StreamUtils.cpp
++++ b/dom/cache/StreamUtils.cpp
+@@ -47,48 +47,36 @@ StartDestroyStreamChild(const CacheReadS
+     fdSetActor->ForgetFileDescriptors(fds);
+     MOZ_ASSERT(!fds.IsEmpty());
+ 
+     unused << fdSetActor->Send__delete__(fdSetActor);
+   }
+ }
+ 
+ void
+-AddFeatureToStreamChild(const CacheReadStream& aReadStream, Feature* aFeature)
++StartDestroyStreamChild(const CacheResponse& aResponse)
+ {
+-  CacheStreamControlChild* cacheControl =
+-    static_cast<CacheStreamControlChild*>(aReadStream.controlChild());
+-  if (cacheControl) {
+-    cacheControl->SetFeature(aFeature);
++  if (aResponse.body().type() == CacheReadStreamOrVoid::Tvoid_t) {
++    return;
+   }
++
++  StartDestroyStreamChild(aResponse.body().get_CacheReadStream());
+ }
+ 
+-} // anonymous namespace
+-
+ void
+ StartDestroyStreamChild(const CacheResponseOrVoid& aResponseOrVoid)
+ {
+   if (aResponseOrVoid.type() == CacheResponseOrVoid::Tvoid_t) {
+     return;
+   }
+ 
+   StartDestroyStreamChild(aResponseOrVoid.get_CacheResponse());
+ }
+ 
+ void
+-StartDestroyStreamChild(const CacheResponse& aResponse)
+-{
+-  if (aResponse.body().type() == CacheReadStreamOrVoid::Tvoid_t) {
+-    return;
+-  }
+-
+-  StartDestroyStreamChild(aResponse.body().get_CacheReadStream());
+-}
+-
+-void
+ StartDestroyStreamChild(const nsTArray<CacheResponse>& aResponses)
+ {
+   for (uint32_t i = 0; i < aResponses.Length(); ++i) {
+     StartDestroyStreamChild(aResponses[i]);
+   }
+ }
+ 
+ void
+@@ -98,38 +86,48 @@ StartDestroyStreamChild(const nsTArray<C
+     if (aRequests[i].body().type() == CacheReadStreamOrVoid::Tvoid_t) {
+       continue;
+     }
+     StartDestroyStreamChild(aRequests[i].body().get_CacheReadStream());
+   }
+ }
+ 
+ void
+-AddFeatureToStreamChild(const CacheResponseOrVoid& aResponseOrVoid,
+-                        Feature* aFeature)
++AddFeatureToStreamChild(const CacheReadStream& aReadStream, Feature* aFeature)
+ {
+-  if (aResponseOrVoid.type() == CacheResponseOrVoid::Tvoid_t) {
+-    return;
++  CacheStreamControlChild* cacheControl =
++    static_cast<CacheStreamControlChild*>(aReadStream.controlChild());
++  if (cacheControl) {
++    cacheControl->SetFeature(aFeature);
+   }
+-
+-  AddFeatureToStreamChild(aResponseOrVoid.get_CacheResponse(), aFeature);
+ }
+ 
+ void
+ AddFeatureToStreamChild(const CacheResponse& aResponse,
+                         Feature* aFeature)
+ {
+   if (aResponse.body().type() == CacheReadStreamOrVoid::Tvoid_t) {
+     return;
+   }
+ 
+   AddFeatureToStreamChild(aResponse.body().get_CacheReadStream(), aFeature);
+ }
+ 
+ void
++AddFeatureToStreamChild(const CacheResponseOrVoid& aResponseOrVoid,
++                        Feature* aFeature)
++{
++  if (aResponseOrVoid.type() == CacheResponseOrVoid::Tvoid_t) {
++    return;
++  }
++
++  AddFeatureToStreamChild(aResponseOrVoid.get_CacheResponse(), aFeature);
++}
++
++void
+ AddFeatureToStreamChild(const nsTArray<CacheResponse>& aResponses,
+                          Feature* aFeature)
+ {
+   for (uint32_t i = 0; i < aResponses.Length(); ++i) {
+     AddFeatureToStreamChild(aResponses[i], aFeature);
+   }
+ }
+ 
+@@ -141,11 +139,61 @@ AddFeatureToStreamChild(const nsTArray<C
+     if (aRequests[i].body().type() == CacheReadStreamOrVoid::Tvoid_t) {
+       continue;
+     }
+     AddFeatureToStreamChild(aRequests[i].body().get_CacheReadStream(),
+                             aFeature);
+   }
+ }
+ 
++} // anonymous namespace
++
++void
++StartDestroyStreamChild(const CacheOpResult& aResult)
++{
++  switch (aResult.type()) {
++    case CacheOpResult::TCacheMatchResult:
++      StartDestroyStreamChild(aResult.get_CacheMatchResult().responseOrVoid());
++      break;
++    case CacheOpResult::TCacheMatchAllResult:
++      StartDestroyStreamChild(aResult.get_CacheMatchAllResult().responseList());
++      break;
++    case CacheOpResult::TCacheKeysResult:
++      StartDestroyStreamChild(aResult.get_CacheKeysResult().requestList());
++      break;
++    case CacheOpResult::TStorageMatchResult:
++      StartDestroyStreamChild(aResult.get_StorageMatchResult().responseOrVoid());
++      break;
++    default:
++      // ignore other types
++      break;
++  }
++}
++
++void
++AddFeatureToStreamChild(const CacheOpResult& aResult, Feature* aFeature)
++{
++  switch (aResult.type()) {
++    case CacheOpResult::TCacheMatchResult:
++      AddFeatureToStreamChild(aResult.get_CacheMatchResult().responseOrVoid(),
++                              aFeature);
++      break;
++    case CacheOpResult::TCacheMatchAllResult:
++      AddFeatureToStreamChild(aResult.get_CacheMatchAllResult().responseList(),
++                              aFeature);
++      break;
++    case CacheOpResult::TCacheKeysResult:
++      AddFeatureToStreamChild(aResult.get_CacheKeysResult().requestList(),
++                              aFeature);
++      break;
++    case CacheOpResult::TStorageMatchResult:
++      AddFeatureToStreamChild(aResult.get_StorageMatchResult().responseOrVoid(),
++                              aFeature);
++      break;
++    default:
++      // ignore other types
++      break;
++  }
++}
++
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/StreamUtils.h b/dom/cache/StreamUtils.h
+--- a/dom/cache/StreamUtils.h
++++ b/dom/cache/StreamUtils.h
+@@ -2,38 +2,26 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_cache_StreamUtils_h
+ #define mozilla_dom_cache_StreamUtils_h
+ 
+-#include "nsTArrayForwardDeclare.h"
+-
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ class Feature;
+-class CacheRequest;
+-class CacheResponse;
+-class CacheResponseOrVoid;
++class CacheOpResult;
+ 
+-void StartDestroyStreamChild(const CacheResponseOrVoid& aResponseOrVoid);
+-void StartDestroyStreamChild(const CacheResponse& aResponse);
+-void StartDestroyStreamChild(const nsTArray<CacheResponse>& aResponses);
+-void StartDestroyStreamChild(const nsTArray<CacheRequest>& aRequests);
++void
++StartDestroyStreamChild(const CacheOpResult& aResult);
+ 
+-void AddFeatureToStreamChild(const CacheResponseOrVoid& aResponseOrVoid,
+-                             Feature* aFeature);
+-void AddFeatureToStreamChild(const CacheResponse& aResponse,
+-                             Feature* aFeature);
+-void AddFeatureToStreamChild(const nsTArray<CacheResponse>& aResponses,
+-                              Feature* aFeature);
+-void AddFeatureToStreamChild(const nsTArray<CacheRequest>& aRequests,
+-                              Feature* aFeature);
++void
++AddFeatureToStreamChild(const CacheOpResult& aResult, Feature* aFeature);
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_cache_StreamUtils_h
