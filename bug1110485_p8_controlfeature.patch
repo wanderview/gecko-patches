@@ -1,0 +1,1206 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent a9a650cab30a6e06d5ef6df862c3b326a808deda
+Bug 1110485 P8 Make sure the Feature is added to the control child actor.  Unify error reporting. r=baku
+
+diff --git a/dom/cache/ActorChild.cpp b/dom/cache/ActorChild.cpp
+--- a/dom/cache/ActorChild.cpp
++++ b/dom/cache/ActorChild.cpp
+@@ -2,16 +2,17 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/ActorChild.h"
+ 
+ #include "mozilla/dom/cache/Feature.h"
++#include "nsThreadUtils.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ void
+ ActorChild::SetFeature(Feature* aFeature)
+ {
+@@ -27,16 +28,17 @@ ActorChild::SetFeature(Feature* aFeature
+   if (mFeature) {
+     mFeature->AddActor(this);
+   }
+ }
+ 
+ void
+ ActorChild::RemoveFeature()
+ {
++  MOZ_ASSERT_IF(!NS_IsMainThread(), mFeature);
+   if (mFeature) {
+     mFeature->RemoveActor(this);
+     mFeature = nullptr;
+   }
+ }
+ 
+ Feature*
+ ActorChild::GetFeature() const
+diff --git a/dom/cache/CacheChild.cpp b/dom/cache/CacheChild.cpp
+--- a/dom/cache/CacheChild.cpp
++++ b/dom/cache/CacheChild.cpp
+@@ -6,17 +6,16 @@
+ 
+ #include "mozilla/dom/cache/CacheChild.h"
+ 
+ #include "mozilla/unused.h"
+ #include "mozilla/dom/cache/ActorUtils.h"
+ #include "mozilla/dom/cache/Cache.h"
+ #include "mozilla/dom/cache/CacheOpChild.h"
+ #include "mozilla/dom/cache/CachePushStreamChild.h"
+-#include "mozilla/dom/cache/StreamUtils.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ // Declared in ActorUtils.h
+ PCacheChild*
+ AllocPCacheChild()
+diff --git a/dom/cache/CacheOpChild.cpp b/dom/cache/CacheOpChild.cpp
+--- a/dom/cache/CacheOpChild.cpp
++++ b/dom/cache/CacheOpChild.cpp
+@@ -6,21 +6,68 @@
+ 
+ #include "mozilla/dom/cache/CacheOpChild.h"
+ 
+ #include "mozilla/dom/Promise.h"
+ #include "mozilla/dom/Request.h"
+ #include "mozilla/dom/Response.h"
+ #include "mozilla/dom/cache/Cache.h"
+ #include "mozilla/dom/cache/CacheChild.h"
++#include "mozilla/dom/cache/CacheStreamControlChild.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
++namespace {
++
++void
++AddFeatureToStreamChild(const CacheReadStream& aReadStream, Feature* aFeature)
++{
++  CacheStreamControlChild* cacheControl =
++    static_cast<CacheStreamControlChild*>(aReadStream.controlChild());
++  if (cacheControl) {
++    cacheControl->SetFeature(aFeature);
++  }
++}
++
++void
++AddFeatureToStreamChild(const CacheResponse& aResponse, Feature* aFeature)
++{
++  if (aResponse.body().type() == CacheReadStreamOrVoid::Tvoid_t) {
++    return;
++  }
++
++  AddFeatureToStreamChild(aResponse.body().get_CacheReadStream(), aFeature);
++}
++
++void
++AddFeatureToStreamChild(const CacheResponseOrVoid& aResponseOrVoid,
++                        Feature* aFeature)
++{
++  if (aResponseOrVoid.type() == CacheResponseOrVoid::Tvoid_t) {
++    return;
++  }
++
++  AddFeatureToStreamChild(aResponseOrVoid.get_CacheResponse(), aFeature);
++}
++
++void
++AddFeatureToStreamChild(const CacheRequest& aRequest, Feature* aFeature)
++{
++  if (aRequest.body().type() == CacheReadStreamOrVoid::Tvoid_t) {
++    return;
++  }
++
++  AddFeatureToStreamChild(aRequest.body().get_CacheReadStream(),
++                          aFeature);
++}
++
++} // anonymous namespace
++
+ CacheOpChild::CacheOpChild(Feature* aFeature, nsIGlobalObject* aGlobal,
+                            Promise* aPromise)
+   : mGlobal(aGlobal)
+   , mPromise(aPromise)
+ {
+   MOZ_ASSERT(mGlobal);
+   MOZ_ASSERT(mPromise);
+ 
+@@ -45,28 +92,26 @@ CacheOpChild::ActorDestroy(ActorDestroyR
+     mPromise->MaybeReject(NS_ERROR_FAILURE);
+     mPromise = nullptr;
+   }
+ 
+   RemoveFeature();
+ }
+ 
+ bool
+-CacheOpChild::Recv__delete__(const nsresult& aStatus,
+-                             const CacheOpResult& aResult)
++CacheOpChild::Recv__delete__(const CacheOpResult& aResult)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheOpChild);
+ 
+-  if (NS_FAILED(aStatus)) {
+-    mPromise->MaybeReject(aStatus);
+-    mPromise = nullptr;
+-    return true;
+-  }
+-
+   switch (aResult.type()) {
++    case CacheOpResult::TCacheErrorResult:
++    {
++      mPromise->MaybeReject(aResult.get_CacheErrorResult().rv());
++      break;
++    }
+     case CacheOpResult::TCacheMatchResult:
+     {
+       HandleResponse(aResult.get_CacheMatchResult().responseOrVoid());
+       break;
+     }
+     case CacheOpResult::TCacheMatchAllResult:
+     {
+       HandleResponseList(aResult.get_CacheMatchAllResult().responseList());
+@@ -155,16 +200,17 @@ CacheOpChild::CreatePushStream(nsIAsyncI
+   MOZ_CRASH("CacheOpChild should never create a push stream actor!");
+ }
+ 
+ void
+ CacheOpChild::HandleResponse(const CacheResponseOrVoid& aResponseOrVoid)
+ {
+   nsRefPtr<Response> response;
+   if (aResponseOrVoid.type() == CacheResponseOrVoid::TCacheResponse) {
++    AddFeatureToStreamChild(aResponseOrVoid, GetFeature());
+     response = ToResponse(aResponseOrVoid);
+   }
+ 
+   if (!response) {
+     mPromise->MaybeResolve(JS::UndefinedHandleValue);
+     return;
+   }
+ 
+@@ -173,29 +219,31 @@ CacheOpChild::HandleResponse(const Cache
+ 
+ void
+ CacheOpChild::HandleResponseList(const nsTArray<CacheResponse>& aResponseList)
+ {
+   nsAutoTArray<nsRefPtr<Response>, 256> responses;
+   responses.SetCapacity(aResponseList.Length());
+ 
+   for (uint32_t i = 0; i < aResponseList.Length(); ++i) {
++    AddFeatureToStreamChild(aResponseList[i], GetFeature());
+     responses.AppendElement(ToResponse(aResponseList[i]));
+   }
+ 
+   mPromise->MaybeResolve(responses);
+ }
+ 
+ void
+ CacheOpChild::HandleRequestList(const nsTArray<CacheRequest>& aRequestList)
+ {
+   nsAutoTArray<nsRefPtr<Request>, 256> requests;
+   requests.SetCapacity(aRequestList.Length());
+ 
+   for (uint32_t i = 0; i < aRequestList.Length(); ++i) {
++    AddFeatureToStreamChild(aRequestList[i], GetFeature());
+     requests.AppendElement(ToRequest(aRequestList[i]));
+   }
+ 
+   mPromise->MaybeResolve(requests);
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+diff --git a/dom/cache/CacheOpChild.h b/dom/cache/CacheOpChild.h
+--- a/dom/cache/CacheOpChild.h
++++ b/dom/cache/CacheOpChild.h
+@@ -34,17 +34,17 @@ private:
+   CacheOpChild(Feature* aFeature, nsIGlobalObject* aGlobal, Promise* aPromise);
+   ~CacheOpChild();
+ 
+   // PCacheOpChild methods
+   virtual void
+   ActorDestroy(ActorDestroyReason aReason) override;
+ 
+   virtual bool
+-  Recv__delete__(const nsresult& aStatus, const CacheOpResult& aResult) override;
++  Recv__delete__(const CacheOpResult& aResult) override;
+ 
+   // ActorChild methods
+   virtual void
+   StartDestroy() override;
+ 
+   // TypeUtils methods
+   virtual nsIGlobalObject*
+   GetGlobalObject() const override;
+diff --git a/dom/cache/CacheOpParent.cpp b/dom/cache/CacheOpParent.cpp
+--- a/dom/cache/CacheOpParent.cpp
++++ b/dom/cache/CacheOpParent.cpp
+@@ -51,17 +51,17 @@ CacheOpParent::Execute(ManagerId* aManag
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheOpParent);
+   MOZ_ASSERT(!mManager);
+   MOZ_ASSERT(!mVerifier);
+ 
+   nsRefPtr<Manager> manager;
+   nsresult rv = Manager::GetOrCreate(aManagerId, getter_AddRefs(manager));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    unused << Send__delete__(this, rv, void_t());
++    unused << Send__delete__(this, CacheErrorResult(rv));
+     return;
+   }
+ 
+   Execute(manager);
+ }
+ 
+ void
+ CacheOpParent::Execute(Manager* aManager)
+@@ -83,17 +83,17 @@ CacheOpParent::Execute(Manager* aManager
+     for (uint32_t i = 0; i < list.Length(); ++i) {
+       requestStreamList.AppendElement(DeserializeCacheStream(list[i].body()));
+     }
+ 
+     nsRefPtr<FetchPut> fetchPut;
+     nsresult rv = FetchPut::Create(this, mManager, mCacheId, list,
+                                    requestStreamList, getter_AddRefs(fetchPut));
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+-      OnOpComplete(rv, CacheAddAllResult());
++      OnOpComplete(CacheErrorResult(rv));
+       return;
+     }
+ 
+     mFetchPutList.AppendElement(fetchPut.forget());
+     return;
+   }
+ 
+   // Handle put op
+@@ -168,25 +168,25 @@ void
+ CacheOpParent::OnPrincipalVerified(nsresult aRv, ManagerId* aManagerId)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheOpParent);
+ 
+   mVerifier->RemoveListener(this);
+   mVerifier = nullptr;
+ 
+   if (NS_WARN_IF(NS_FAILED(aRv))) {
+-    unused << Send__delete__(this, aRv, void_t());
++    unused << Send__delete__(this, CacheErrorResult(aRv));
+     return;
+   }
+ 
+   Execute(aManagerId);
+ }
+ 
+ void
+-CacheOpParent::OnOpComplete(nsresult aRv, const CacheOpResult& aResult,
++CacheOpParent::OnOpComplete(const CacheOpResult& aResult,
+                             CacheId aOpenedCacheId,
+                             const nsTArray<SavedResponse>& aSavedResponseList,
+                             const nsTArray<SavedRequest>& aSavedRequestList,
+                             StreamList* aStreamList)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheOpParent);
+   MOZ_ASSERT(mIpcManager);
+   MOZ_ASSERT(mManager);
+@@ -194,46 +194,50 @@ CacheOpParent::OnOpComplete(nsresult aRv
+   // The result must contain the appropriate type at this point.  It may
+   // or may not contain the additional result data yet.  For types that
+   // do not need special processing, it should already be set.  If the
+   // result requires actor-specific operations, then we do that below.
+   // If the type and data types don't match, then we will trigger an
+   // assertion in AutoParentOpResult::Add().
+   AutoParentOpResult result(mIpcManager, aResult);
+ 
+-  if (NS_FAILED(aRv)) {
+-    unused << Send__delete__(this, aRv, result.SendAsOpResult());
++  if (aResult.type() == CacheOpResult::TCacheErrorResult) {
++    unused << Send__delete__(this, result.SendAsOpResult());
+     return;
+   }
+ 
+   if (aOpenedCacheId != INVALID_CACHE_ID) {
+     result.Add(aOpenedCacheId, mManager);
+   }
+ 
+   for (uint32_t i = 0; i < aSavedResponseList.Length(); ++i) {
+     result.Add(aSavedResponseList[i], aStreamList);
+   }
+ 
+   for (uint32_t i = 0; i < aSavedRequestList.Length(); ++i) {
+     result.Add(aSavedRequestList[i], aStreamList);
+   }
+ 
+-  unused << Send__delete__(this, aRv, result.SendAsOpResult());
++  unused << Send__delete__(this, result.SendAsOpResult());
+ }
+ 
+ void
+ CacheOpParent::OnFetchPut(FetchPut* aFetchPut, nsresult aRv)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheOpParent);
+   MOZ_ASSERT(aFetchPut);
+ 
+   aFetchPut->ClearListener();
+   MOZ_ALWAYS_TRUE(mFetchPutList.RemoveElement(aFetchPut));
+ 
+-  OnOpComplete(aRv, CacheAddAllResult());
++  if (NS_FAILED(aRv)) {
++    OnOpComplete(CacheErrorResult(aRv));
++  }
++
++  OnOpComplete(CacheAddAllResult());
+ }
+ 
+ already_AddRefed<nsIInputStream>
+ CacheOpParent::DeserializeCacheStream(const CacheReadStreamOrVoid& aStreamOrVoid)
+ {
+   if (aStreamOrVoid.type() == CacheReadStreamOrVoid::Tvoid_t) {
+     return nullptr;
+   }
+diff --git a/dom/cache/CacheOpParent.h b/dom/cache/CacheOpParent.h
+--- a/dom/cache/CacheOpParent.h
++++ b/dom/cache/CacheOpParent.h
+@@ -50,17 +50,17 @@ private:
+   ActorDestroy(ActorDestroyReason aReason) override;
+ 
+   // PrincipalVerifier::Listener methods
+   virtual void
+   OnPrincipalVerified(nsresult aRv, ManagerId* aManagerId) override;
+ 
+   // Manager::Listener methods
+   virtual void
+-  OnOpComplete(nsresult aRv, const CacheOpResult& aResult,
++  OnOpComplete(const CacheOpResult& aResult,
+                CacheId aOpenedCacheId,
+                const nsTArray<SavedResponse>& aSavedResponseList,
+                const nsTArray<SavedRequest>& aSavedRequestList,
+                StreamList* aStreamList) override;
+ 
+   // FetchPut::Listener methods
+   virtual void
+   OnFetchPut(FetchPut* aFetchPut, nsresult aRv) override;
+diff --git a/dom/cache/CacheStorageChild.cpp b/dom/cache/CacheStorageChild.cpp
+--- a/dom/cache/CacheStorageChild.cpp
++++ b/dom/cache/CacheStorageChild.cpp
+@@ -5,17 +5,16 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/CacheStorageChild.h"
+ 
+ #include "mozilla/unused.h"
+ #include "mozilla/dom/cache/CacheChild.h"
+ #include "mozilla/dom/cache/CacheOpChild.h"
+ #include "mozilla/dom/cache/CacheStorage.h"
+-#include "mozilla/dom/cache/StreamUtils.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ // declared in ActorUtils.h
+ void
+ DeallocPCacheStorageChild(PCacheStorageChild* aActor)
+diff --git a/dom/cache/CacheStorageParent.cpp b/dom/cache/CacheStorageParent.cpp
+--- a/dom/cache/CacheStorageParent.cpp
++++ b/dom/cache/CacheStorageParent.cpp
+@@ -96,17 +96,18 @@ CacheStorageParent::RecvPCacheOpConstruc
+ 
+   if (mVerifier) {
+     MOZ_ASSERT(!mManagerId);
+     actor->WaitForVerification(mVerifier);
+     return true;
+   }
+ 
+   if (NS_FAILED(mVerifiedStatus)) {
+-    unused << CacheOpParent::Send__delete__(actor, mVerifiedStatus, void_t());
++    unused <<
++      CacheOpParent::Send__delete__(actor, CacheErrorResult(mVerifiedStatus));
+     return true;
+   }
+ 
+   MOZ_ASSERT(mManagerId);
+   actor->Execute(mManagerId);
+   return true;
+ }
+ 
+diff --git a/dom/cache/CacheTypes.ipdlh b/dom/cache/CacheTypes.ipdlh
+--- a/dom/cache/CacheTypes.ipdlh
++++ b/dom/cache/CacheTypes.ipdlh
+@@ -165,16 +165,21 @@ union CacheOpArgs
+   CacheKeysArgs;
+   StorageMatchArgs;
+   StorageHasArgs;
+   StorageOpenArgs;
+   StorageDeleteArgs;
+   StorageKeysArgs;
+ };
+ 
++struct CacheErrorResult
++{
++  nsresult rv;
++};
++
+ struct CacheMatchResult
+ {
+   CacheResponseOrVoid responseOrVoid;
+ };
+ 
+ struct CacheMatchAllResult
+ {
+   CacheResponse[] responseList;
+@@ -220,17 +225,17 @@ struct StorageDeleteResult
+ 
+ struct StorageKeysResult
+ {
+   nsString[] keyList;
+ };
+ 
+ union CacheOpResult
+ {
+-  void_t;
++  CacheErrorResult;
+   CacheMatchResult;
+   CacheMatchAllResult;
+   CacheAddAllResult;
+   CachePutAllResult;
+   CacheDeleteResult;
+   CacheKeysResult;
+   StorageMatchResult;
+   StorageHasResult;
+diff --git a/dom/cache/FetchPut.cpp b/dom/cache/FetchPut.cpp
+--- a/dom/cache/FetchPut.cpp
++++ b/dom/cache/FetchPut.cpp
+@@ -409,25 +409,27 @@ FetchPut::MatchInPutList(const CacheRequ
+       return true;
+     }
+   }
+ 
+   return false;
+ }
+ 
+ void
+-FetchPut::OnOpComplete(nsresult aRv, const CacheOpResult& aResult,
++FetchPut::OnOpComplete(const CacheOpResult& aResult,
+                        CacheId aOpenedCacheId,
+                        const nsTArray<SavedResponse>& aSavedResponseList,
+                        const nsTArray<SavedRequest>& aSavedRequestList,
+                        StreamList* aStreamList)
+ {
+   MOZ_ASSERT(mInitiatingThread == NS_GetCurrentThread());
+   MOZ_ASSERT(aResult.type() == CacheOpResult::TCachePutAllResult);
+-  MaybeSetError(aRv);
++  if (aResult.type() == CacheOpResult::TCacheErrorResult) {
++    MaybeSetError(aResult.get_CacheErrorResult().rv());
++  }
+   MaybeNotifyListener();
+ }
+ 
+ void
+ FetchPut::MaybeSetError(nsresult aRv)
+ {
+   if (NS_FAILED(mResult) || NS_SUCCEEDED(aRv)) {
+     return;
+diff --git a/dom/cache/FetchPut.h b/dom/cache/FetchPut.h
+--- a/dom/cache/FetchPut.h
++++ b/dom/cache/FetchPut.h
+@@ -78,17 +78,17 @@ private:
+                      InternalResponse* aInternalResponse);
+   void MaybeCompleteOnMainThread();
+ 
+   void DoPutOnWorkerThread();
+   static bool MatchInPutList(const CacheRequest& aRequest,
+                              const nsTArray<CacheRequestResponse>& aPutList);
+ 
+   virtual void
+-  OnOpComplete(nsresult aRv, const CacheOpResult& aResult,
++  OnOpComplete(const CacheOpResult& aResult,
+                CacheId aOpenedCacheId,
+                const nsTArray<SavedResponse>& aSavedResponseList,
+                const nsTArray<SavedRequest>& aSavedRequestList,
+                StreamList* aStreamList) override;
+ 
+   void MaybeSetError(nsresult aRv);
+   void MaybeNotifyListener();
+ 
+diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
+--- a/dom/cache/Manager.cpp
++++ b/dom/cache/Manager.cpp
+@@ -516,21 +516,23 @@ public:
+     mStreamList->Add(mResponse.mBodyId, stream);
+ 
+     return rv;
+   }
+ 
+   virtual void
+   Complete(Listener* aListener, nsresult aRv) override
+   {
+-    if (!mFoundResponse) {
+-      aListener->OnOpComplete(aRv, CacheMatchResult(void_t()));
++    if (NS_FAILED(aRv)) {
++      aListener->OnOpComplete(CacheErrorResult(aRv));
++    } else if (!mFoundResponse) {
++      aListener->OnOpComplete(CacheMatchResult(void_t()));
+     } else {
+       mStreamList->Activate(mCacheId);
+-      aListener->OnOpComplete(aRv, CacheMatchResult(void_t()), mResponse,
++      aListener->OnOpComplete(CacheMatchResult(void_t()), mResponse,
+                               mStreamList);
+     }
+     mStreamList = nullptr;
+   }
+ 
+   virtual bool MatchesCacheId(CacheId aCacheId) const override
+   {
+     return aCacheId == mCacheId;
+@@ -582,18 +584,22 @@ public:
+ 
+     return rv;
+   }
+ 
+   virtual void
+   Complete(Listener* aListener, nsresult aRv) override
+   {
+     mStreamList->Activate(mCacheId);
+-    aListener->OnOpComplete(aRv, CacheMatchAllResult(), mSavedResponses,
+-                            mStreamList);
++    if (NS_FAILED(aRv)) {
++      aListener->OnOpComplete(CacheErrorResult(aRv));
++    } else {
++      aListener->OnOpComplete(CacheMatchAllResult(), mSavedResponses,
++                              mStreamList);
++    }
+     mStreamList = nullptr;
+   }
+ 
+   virtual bool MatchesCacheId(CacheId aCacheId) const override
+   {
+     return aCacheId == mCacheId;
+   }
+ 
+@@ -798,18 +804,20 @@ private:
+       mList[i].mRequestStream = nullptr;
+       mList[i].mResponseStream = nullptr;
+     }
+ 
+     mManager->NoteOrphanedBodyIdList(mDeletedBodyIdList);
+ 
+     Listener* listener = mManager->GetListener(mListenerId);
+     mManager = nullptr;
+-    if (listener) {
+-      listener->OnOpComplete(aRv, CachePutAllResult());
++    if (NS_FAILED(aRv)) {
++      listener->OnOpComplete(CacheErrorResult(aRv));
++    } else if (listener) {
++      listener->OnOpComplete(CachePutAllResult());
+     }
+   }
+ 
+   virtual void
+   CancelOnInitiatingThread() override
+   {
+     NS_ASSERT_OWNINGTHREAD(Action);
+     Action::CancelOnInitiatingThread();
+@@ -1013,17 +1021,21 @@ public:
+ 
+     return rv;
+   }
+ 
+   virtual void
+   Complete(Listener* aListener, nsresult aRv) override
+   {
+     mManager->NoteOrphanedBodyIdList(mDeletedBodyIdList);
+-    aListener->OnOpComplete(aRv, CacheDeleteResult(mSuccess));
++    if (NS_FAILED(aRv)) {
++      aListener->OnOpComplete(CacheErrorResult(aRv));
++    } else {
++      aListener->OnOpComplete(CacheDeleteResult(mSuccess));
++    }
+   }
+ 
+   virtual bool MatchesCacheId(CacheId aCacheId) const override
+   {
+     return aCacheId == mCacheId;
+   }
+ 
+ private:
+@@ -1071,18 +1083,22 @@ public:
+ 
+     return rv;
+   }
+ 
+   virtual void
+   Complete(Listener* aListener, nsresult aRv) override
+   {
+     mStreamList->Activate(mCacheId);
+-    aListener->OnOpComplete(aRv, CacheKeysResult(), mSavedRequests,
+-                            mStreamList);
++    if (NS_FAILED(aRv)) {
++      aListener->OnOpComplete(CacheErrorResult(aRv));
++    } else {
++      aListener->OnOpComplete(CacheKeysResult(), mSavedRequests,
++                              mStreamList);
++    }
+     mStreamList = nullptr;
+   }
+ 
+   virtual bool MatchesCacheId(CacheId aCacheId) const override
+   {
+     return aCacheId == mCacheId;
+   }
+ 
+@@ -1131,21 +1147,23 @@ public:
+     mStreamList->Add(mSavedResponse.mBodyId, stream);
+ 
+     return rv;
+   }
+ 
+   virtual void
+   Complete(Listener* aListener, nsresult aRv) override
+   {
+-    if (!mFoundResponse) {
+-      aListener->OnOpComplete(aRv, StorageMatchResult(void_t()));
++    if (NS_FAILED(aRv)) {
++      aListener->OnOpComplete(CacheErrorResult(aRv));
++    } else if (!mFoundResponse) {
++      aListener->OnOpComplete(StorageMatchResult(void_t()));
+     } else {
+       mStreamList->Activate(mSavedResponse.mCacheId);
+-      aListener->OnOpComplete(aRv, StorageMatchResult(void_t()), mSavedResponse,
++      aListener->OnOpComplete(StorageMatchResult(void_t()), mSavedResponse,
+                               mStreamList);
+     }
+     mStreamList = nullptr;
+   }
+ 
+ private:
+   const Namespace mNamespace;
+   const StorageMatchArgs mArgs;
+@@ -1174,17 +1192,21 @@ public:
+     CacheId cacheId;
+     return db::StorageGetCacheId(aConn, mNamespace, mArgs.key(),
+                                  &mCacheFound, &cacheId);
+   }
+ 
+   virtual void
+   Complete(Listener* aListener, nsresult aRv) override
+   {
+-    aListener->OnOpComplete(aRv, StorageHasResult(mCacheFound));
++    if (NS_FAILED(aRv)) {
++      aListener->OnOpComplete(CacheErrorResult(aRv));
++    } else {
++      aListener->OnOpComplete(StorageHasResult(mCacheFound));
++    }
+   }
+ 
+ private:
+   const Namespace mNamespace;
+   const StorageHasArgs mArgs;
+   bool mCacheFound;
+ };
+ 
+@@ -1228,17 +1250,21 @@ public:
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+     return rv;
+   }
+ 
+   virtual void
+   Complete(Listener* aListener, nsresult aRv) override
+   {
+-    aListener->OnOpComplete(aRv, StorageOpenResult(), mCacheId);
++    if (NS_FAILED(aRv)) {
++      aListener->OnOpComplete(CacheErrorResult(aRv));
++    } else {
++      aListener->OnOpComplete(StorageOpenResult(), mCacheId);
++    }
+   }
+ 
+ private:
+   const Namespace mNamespace;
+   const StorageOpenArgs mArgs;
+   CacheId mCacheId;
+ };
+ 
+@@ -1295,17 +1321,21 @@ public:
+         nsRefPtr<Context> context = mManager->CurrentContext();
+         context->CancelForCacheId(mCacheId);
+         nsRefPtr<Action> action =
+           new DeleteOrphanedCacheAction(mManager, mCacheId);
+         context->Dispatch(mManager->mIOThread, action);
+       }
+     }
+ 
+-    aListener->OnOpComplete(aRv, StorageDeleteResult(mCacheDeleted));
++    if (NS_FAILED(aRv)) {
++      aListener->OnOpComplete(CacheErrorResult(aRv));
++    } else {
++      aListener->OnOpComplete(StorageDeleteResult(mCacheDeleted));
++    }
+   }
+ 
+ private:
+   const Namespace mNamespace;
+   const StorageDeleteArgs mArgs;
+   bool mCacheDeleted;
+   CacheId mCacheId;
+ };
+@@ -1327,72 +1357,73 @@ public:
+   {
+     return db::StorageGetKeys(aConn, mNamespace, mKeys);
+   }
+ 
+   virtual void
+   Complete(Listener* aListener, nsresult aRv) override
+   {
+     if (NS_FAILED(aRv)) {
+-      mKeys.Clear();
++      aListener->OnOpComplete(CacheErrorResult(aRv));
++    } else {
++      aListener->OnOpComplete(StorageKeysResult(mKeys));
+     }
+-    aListener->OnOpComplete(aRv, StorageKeysResult(mKeys));
+   }
+ 
+ private:
+   const Namespace mNamespace;
+   nsTArray<nsString> mKeys;
+ };
+ 
+ // ----------------------------------------------------------------------------
+ 
+ //static
+ Manager::ListenerId Manager::sNextListenerId = 0;
+ 
+ void
+-Manager::Listener::OnOpComplete(nsresult aRv, const CacheOpResult& aResult)
++Manager::Listener::OnOpComplete(const CacheOpResult& aResult)
+ {
+-  OnOpComplete(aRv, aResult, INVALID_CACHE_ID, nsTArray<SavedResponse>(),
++  OnOpComplete(aResult, INVALID_CACHE_ID, nsTArray<SavedResponse>(),
+                nsTArray<SavedRequest>(), nullptr);
+ }
+ 
+ void
+-Manager::Listener::OnOpComplete(nsresult aRv, const CacheOpResult& aResult,
++Manager::Listener::OnOpComplete(const CacheOpResult& aResult,
+                                 CacheId aOpenedCacheId)
+ {
+-  OnOpComplete(aRv, aResult, aOpenedCacheId, nsTArray<SavedResponse>(),
++  OnOpComplete(aResult, aOpenedCacheId, nsTArray<SavedResponse>(),
+                nsTArray<SavedRequest>(), nullptr);
+ }
+ 
+ void
+-Manager::Listener::OnOpComplete(nsresult aRv, const CacheOpResult& aResult,
++Manager::Listener::OnOpComplete(const CacheOpResult& aResult,
+                                 const SavedResponse& aSavedResponse,
+                                 StreamList* aStreamList)
+ {
+   nsAutoTArray<SavedResponse, 1> responseList;
+   responseList.AppendElement(aSavedResponse);
+-  OnOpComplete(aRv, aResult, INVALID_CACHE_ID, responseList,
++  OnOpComplete(aResult, INVALID_CACHE_ID, responseList,
+                nsTArray<SavedRequest>(), aStreamList);
+ }
+ 
+ void
+-Manager::Listener::OnOpComplete(nsresult aRv, const CacheOpResult& aResult,
++Manager::Listener::OnOpComplete(const CacheOpResult& aResult,
+                                 const nsTArray<SavedResponse>& aSavedResponseList,
+                                 StreamList* aStreamList)
+ {
+-  OnOpComplete(aRv, aResult, INVALID_CACHE_ID, aSavedResponseList,
++  OnOpComplete(aResult, INVALID_CACHE_ID, aSavedResponseList,
+                nsTArray<SavedRequest>(), aStreamList);
+ }
+ 
+ void
+-Manager::Listener::OnOpComplete(nsresult aRv, const CacheOpResult& aResult,
++Manager::Listener::OnOpComplete(const CacheOpResult& aResult,
+                                 const nsTArray<SavedRequest>& aSavedRequestList,
+                                 StreamList* aStreamList)
+ {
+-  OnOpComplete(aRv, aResult, INVALID_CACHE_ID, nsTArray<SavedResponse>(),
++  OnOpComplete(aResult, INVALID_CACHE_ID, nsTArray<SavedResponse>(),
+                aSavedRequestList, aStreamList);
+ }
+ 
+ // static
+ nsresult
+ Manager::GetOrCreate(ManagerId* aManagerId, Manager** aManagerOut)
+ {
+   mozilla::ipc::AssertIsOnBackgroundThread();
+@@ -1585,17 +1616,17 @@ Manager::ExecuteCacheOp(Listener* aListe
+                         const CacheOpArgs& aOpArgs)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(aListener);
+   MOZ_ASSERT(aOpArgs.type() != CacheOpArgs::TCacheAddAllArgs);
+   MOZ_ASSERT(aOpArgs.type() != CacheOpArgs::TCachePutAllArgs);
+ 
+   if (mShuttingDown || !mValid) {
+-    aListener->OnOpComplete(NS_ERROR_FAILURE, void_t());
++    aListener->OnOpComplete(CacheErrorResult(NS_ERROR_FAILURE));
+     return;
+   }
+ 
+   nsRefPtr<Context> context = CurrentContext();
+   nsRefPtr<StreamList> streamList = new StreamList(this, context);
+   ListenerId listenerId = SaveListener(aListener);
+ 
+   nsRefPtr<Action> action;
+@@ -1627,17 +1658,17 @@ Manager::ExecuteCacheOp(Listener* aListe
+ void
+ Manager::ExecuteStorageOp(Listener* aListener, Namespace aNamespace,
+                           const CacheOpArgs& aOpArgs)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(aListener);
+ 
+   if (mShuttingDown || !mValid) {
+-    aListener->OnOpComplete(NS_ERROR_FAILURE, void_t());
++    aListener->OnOpComplete(CacheErrorResult(NS_ERROR_FAILURE));
+     return;
+   }
+ 
+   nsRefPtr<Context> context = CurrentContext();
+   nsRefPtr<StreamList> streamList = new StreamList(this, context);
+   ListenerId listenerId = SaveListener(aListener);
+ 
+   nsRefPtr<Action> action;
+@@ -1674,17 +1705,17 @@ Manager::ExecutePutAll(Listener* aListen
+                        const nsTArray<CacheRequestResponse>& aPutList,
+                        const nsTArray<nsCOMPtr<nsIInputStream>>& aRequestStreamList,
+                        const nsTArray<nsCOMPtr<nsIInputStream>>& aResponseStreamList)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(aListener);
+ 
+   if (mShuttingDown || !mValid) {
+-    aListener->OnOpComplete(NS_ERROR_FAILURE, CachePutAllResult());
++    aListener->OnOpComplete(CacheErrorResult(NS_ERROR_FAILURE));
+     return;
+   }
+ 
+   nsRefPtr<Context> context = CurrentContext();
+   ListenerId listenerId = SaveListener(aListener);
+ 
+   nsRefPtr<Action> action = new CachePutAllAction(this, listenerId, aCacheId,
+                                                   aPutList, aRequestStreamList,
+diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
+--- a/dom/cache/Manager.h
++++ b/dom/cache/Manager.h
+@@ -81,40 +81,40 @@ public:
+   //
+   // All public methods should be invoked on the same thread used to create
+   // the Manager.
+   class Listener
+   {
+   public:
+     // convenience routines
+     void
+-    OnOpComplete(nsresult aRv, const CacheOpResult& aResult);
++    OnOpComplete(const CacheOpResult& aResult);
+ 
+     void
+-    OnOpComplete(nsresult aRv, const CacheOpResult& aResult,
++    OnOpComplete(const CacheOpResult& aResult,
+                  CacheId aOpenedCacheId);
+ 
+     void
+-    OnOpComplete(nsresult aRv, const CacheOpResult& aResult,
++    OnOpComplete(const CacheOpResult& aResult,
+                  const SavedResponse& aSavedResponse,
+                  StreamList* aStreamList);
+ 
+     void
+-    OnOpComplete(nsresult aRv, const CacheOpResult& aResult,
++    OnOpComplete(const CacheOpResult& aResult,
+                  const nsTArray<SavedResponse>& aSavedResponseList,
+                  StreamList* aStreamList);
+ 
+     void
+-    OnOpComplete(nsresult aRv, const CacheOpResult& aResult,
++    OnOpComplete(const CacheOpResult& aResult,
+                  const nsTArray<SavedRequest>& aSavedRequestList,
+                  StreamList* aStreamList);
+ 
+     // interface to be implemented
+     virtual void
+-    OnOpComplete(nsresult aRv, const CacheOpResult& aResult,
++    OnOpComplete(const CacheOpResult& aResult,
+                  CacheId aOpenedCacheId,
+                  const nsTArray<SavedResponse>& aSavedResponseList,
+                  const nsTArray<SavedRequest>& aSavedRequestList,
+                  StreamList* aStreamList) { }
+ 
+   protected:
+     ~Listener() { }
+   };
+diff --git a/dom/cache/PCacheOp.ipdl b/dom/cache/PCacheOp.ipdl
+--- a/dom/cache/PCacheOp.ipdl
++++ b/dom/cache/PCacheOp.ipdl
+@@ -14,14 +14,14 @@ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ protocol PCacheOp
+ {
+   manager PCache or PCacheStorage;
+ 
+ child:
+-  __delete__(nsresult aStatus, CacheOpResult aResult);
++  __delete__(CacheOpResult aResult);
+ };
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/StreamUtils.cpp b/dom/cache/StreamUtils.cpp
+deleted file mode 100644
+--- a/dom/cache/StreamUtils.cpp
++++ /dev/null
+@@ -1,151 +0,0 @@
+-/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+-/* vim: set ts=8 sts=2 et sw=2 tw=80: */
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-#include "mozilla/dom/cache/StreamUtils.h"
+-
+-#include "mozilla/unused.h"
+-#include "mozilla/dom/cache/CacheStreamControlChild.h"
+-#include "mozilla/dom/cache/CacheTypes.h"
+-#include "mozilla/ipc/FileDescriptor.h"
+-#include "mozilla/ipc/FileDescriptorSetChild.h"
+-
+-namespace mozilla {
+-namespace dom {
+-namespace cache {
+-
+-namespace {
+-
+-using mozilla::unused;
+-using mozilla::void_t;
+-using mozilla::dom::cache::CacheStreamControlChild;
+-using mozilla::dom::cache::Feature;
+-using mozilla::dom::cache::CacheReadStream;
+-using mozilla::ipc::FileDescriptor;
+-using mozilla::ipc::FileDescriptorSetChild;
+-using mozilla::ipc::OptionalFileDescriptorSet;
+-
+-void
+-StartDestroyStreamChild(const CacheReadStream& aReadStream)
+-{
+-  CacheStreamControlChild* cacheControl =
+-    static_cast<CacheStreamControlChild*>(aReadStream.controlChild());
+-  if (cacheControl) {
+-    cacheControl->StartDestroy();
+-  }
+-
+-  if (aReadStream.fds().type() ==
+-      OptionalFileDescriptorSet::TPFileDescriptorSetChild) {
+-    nsAutoTArray<FileDescriptor, 4> fds;
+-
+-    FileDescriptorSetChild* fdSetActor =
+-      static_cast<FileDescriptorSetChild*>(aReadStream.fds().get_PFileDescriptorSetChild());
+-    MOZ_ASSERT(fdSetActor);
+-
+-    fdSetActor->ForgetFileDescriptors(fds);
+-    MOZ_ASSERT(!fds.IsEmpty());
+-
+-    unused << fdSetActor->Send__delete__(fdSetActor);
+-  }
+-}
+-
+-void
+-AddFeatureToStreamChild(const CacheReadStream& aReadStream, Feature* aFeature)
+-{
+-  CacheStreamControlChild* cacheControl =
+-    static_cast<CacheStreamControlChild*>(aReadStream.controlChild());
+-  if (cacheControl) {
+-    cacheControl->SetFeature(aFeature);
+-  }
+-}
+-
+-} // anonymous namespace
+-
+-void
+-StartDestroyStreamChild(const CacheResponseOrVoid& aResponseOrVoid)
+-{
+-  if (aResponseOrVoid.type() == CacheResponseOrVoid::Tvoid_t) {
+-    return;
+-  }
+-
+-  StartDestroyStreamChild(aResponseOrVoid.get_CacheResponse());
+-}
+-
+-void
+-StartDestroyStreamChild(const CacheResponse& aResponse)
+-{
+-  if (aResponse.body().type() == CacheReadStreamOrVoid::Tvoid_t) {
+-    return;
+-  }
+-
+-  StartDestroyStreamChild(aResponse.body().get_CacheReadStream());
+-}
+-
+-void
+-StartDestroyStreamChild(const nsTArray<CacheResponse>& aResponses)
+-{
+-  for (uint32_t i = 0; i < aResponses.Length(); ++i) {
+-    StartDestroyStreamChild(aResponses[i]);
+-  }
+-}
+-
+-void
+-StartDestroyStreamChild(const nsTArray<CacheRequest>& aRequests)
+-{
+-  for (uint32_t i = 0; i < aRequests.Length(); ++i) {
+-    if (aRequests[i].body().type() == CacheReadStreamOrVoid::Tvoid_t) {
+-      continue;
+-    }
+-    StartDestroyStreamChild(aRequests[i].body().get_CacheReadStream());
+-  }
+-}
+-
+-void
+-AddFeatureToStreamChild(const CacheResponseOrVoid& aResponseOrVoid,
+-                        Feature* aFeature)
+-{
+-  if (aResponseOrVoid.type() == CacheResponseOrVoid::Tvoid_t) {
+-    return;
+-  }
+-
+-  AddFeatureToStreamChild(aResponseOrVoid.get_CacheResponse(), aFeature);
+-}
+-
+-void
+-AddFeatureToStreamChild(const CacheResponse& aResponse,
+-                        Feature* aFeature)
+-{
+-  if (aResponse.body().type() == CacheReadStreamOrVoid::Tvoid_t) {
+-    return;
+-  }
+-
+-  AddFeatureToStreamChild(aResponse.body().get_CacheReadStream(), aFeature);
+-}
+-
+-void
+-AddFeatureToStreamChild(const nsTArray<CacheResponse>& aResponses,
+-                         Feature* aFeature)
+-{
+-  for (uint32_t i = 0; i < aResponses.Length(); ++i) {
+-    AddFeatureToStreamChild(aResponses[i], aFeature);
+-  }
+-}
+-
+-void
+-AddFeatureToStreamChild(const nsTArray<CacheRequest>& aRequests,
+-                         Feature* aFeature)
+-{
+-  for (uint32_t i = 0; i < aRequests.Length(); ++i) {
+-    if (aRequests[i].body().type() == CacheReadStreamOrVoid::Tvoid_t) {
+-      continue;
+-    }
+-    AddFeatureToStreamChild(aRequests[i].body().get_CacheReadStream(),
+-                            aFeature);
+-  }
+-}
+-
+-} // namespace cache
+-} // namespace dom
+-} // namespace mozilla
+diff --git a/dom/cache/StreamUtils.h b/dom/cache/StreamUtils.h
+deleted file mode 100644
+--- a/dom/cache/StreamUtils.h
++++ /dev/null
+@@ -1,39 +0,0 @@
+-/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+-/* vim: set ts=8 sts=2 et sw=2 tw=80: */
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-#ifndef mozilla_dom_cache_StreamUtils_h
+-#define mozilla_dom_cache_StreamUtils_h
+-
+-#include "nsTArrayForwardDeclare.h"
+-
+-namespace mozilla {
+-namespace dom {
+-namespace cache {
+-
+-class Feature;
+-class CacheRequest;
+-class CacheResponse;
+-class CacheResponseOrVoid;
+-
+-void StartDestroyStreamChild(const CacheResponseOrVoid& aResponseOrVoid);
+-void StartDestroyStreamChild(const CacheResponse& aResponse);
+-void StartDestroyStreamChild(const nsTArray<CacheResponse>& aResponses);
+-void StartDestroyStreamChild(const nsTArray<CacheRequest>& aRequests);
+-
+-void AddFeatureToStreamChild(const CacheResponseOrVoid& aResponseOrVoid,
+-                             Feature* aFeature);
+-void AddFeatureToStreamChild(const CacheResponse& aResponse,
+-                             Feature* aFeature);
+-void AddFeatureToStreamChild(const nsTArray<CacheResponse>& aResponses,
+-                              Feature* aFeature);
+-void AddFeatureToStreamChild(const nsTArray<CacheRequest>& aRequests,
+-                              Feature* aFeature);
+-
+-} // namespace cache
+-} // namespace dom
+-} // namespace mozilla
+-
+-#endif // mozilla_dom_cache_StreamUtils_h
+diff --git a/dom/cache/moz.build b/dom/cache/moz.build
+--- a/dom/cache/moz.build
++++ b/dom/cache/moz.build
+@@ -32,17 +32,16 @@ EXPORTS.mozilla.dom.cache += [
+     'ManagerId.h',
+     'OfflineStorage.h',
+     'PrincipalVerifier.h',
+     'QuotaClient.h',
+     'ReadStream.h',
+     'SavedTypes.h',
+     'StreamControl.h',
+     'StreamList.h',
+-    'StreamUtils.h',
+     'Types.h',
+     'TypeUtils.h',
+ ]
+ 
+ UNIFIED_SOURCES += [
+     'Action.cpp',
+     'ActorChild.cpp',
+     'AutoUtils.cpp',
+@@ -67,17 +66,16 @@ UNIFIED_SOURCES += [
+     'Manager.cpp',
+     'ManagerId.cpp',
+     'OfflineStorage.cpp',
+     'PrincipalVerifier.cpp',
+     'QuotaClient.cpp',
+     'ReadStream.cpp',
+     'StreamControl.cpp',
+     'StreamList.cpp',
+-    'StreamUtils.cpp',
+     'TypeUtils.cpp',
+ ]
+ 
+ IPDL_SOURCES += [
+     'CacheTypes.ipdlh',
+     'PCache.ipdl',
+     'PCacheOp.ipdl',
+     'PCachePushStream.ipdl',
