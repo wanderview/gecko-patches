@@ -1,0 +1,512 @@
+# HG changeset patch
+# Parent 96d4433d1c053d8bf234167b7daf80f78d285a59
+# User Ben Kelly <ben@wanderview.com>
+Bug 1151974 Delay Cache Context start until previous Context has completed. r=ehsan
+
+
+diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
+--- a/dom/cache/Context.cpp
++++ b/dom/cache/Context.cpp
+@@ -696,36 +696,37 @@ Context::ThreadsafeHandle::ContextDestro
+   MOZ_ASSERT(!mStrongRef);
+   MOZ_ASSERT(mWeakRef);
+   MOZ_ASSERT(mWeakRef == aContext);
+   mWeakRef = nullptr;
+ }
+ 
+ // static
+ already_AddRefed<Context>
+-Context::Create(Manager* aManager, Action* aQuotaIOThreadAction)
++Context::Create(Manager* aManager, Action* aQuotaIOThreadAction,
++                Context* aOldContext)
+ {
+   nsRefPtr<Context> context = new Context(aManager);
+-
++  // TODO: move this into the constructor
+   context->mInitRunnable = new QuotaInitRunnable(context, aManager,
+                                                  aQuotaIOThreadAction);
+-  nsresult rv = context->mInitRunnable->Dispatch();
+-  if (NS_FAILED(rv)) {
+-    // Shutdown must be delayed until all Contexts are destroyed.  Shutdown
+-    // must also prevent any new Contexts from being constructed.  Crash
+-    // for this invariant violation.
+-    MOZ_CRASH("Failed to dispatch QuotaInitRunnable.");
++
++  if (aOldContext) {
++    MOZ_ASSERT(false);
++    aOldContext->SetNextContext(context);
++  } else {
++    context->Start();
+   }
+ 
+   return context.forget();
+ }
+ 
+ Context::Context(Manager* aManager)
+   : mManager(aManager)
+-  , mState(STATE_CONTEXT_INIT)
++  , mState(STATE_CONTEXT_PREINIT)
+ {
+   MOZ_ASSERT(mManager);
+ }
+ 
+ void
+ Context::Dispatch(nsIEventTarget* aTarget, Action* aAction)
+ {
+   NS_ASSERT_OWNINGTHREAD(Context);
+@@ -748,16 +749,17 @@ Context::Dispatch(nsIEventTarget* aTarge
+ 
+ void
+ Context::CancelAll()
+ {
+   NS_ASSERT_OWNINGTHREAD(Context);
+ 
+   if (mInitRunnable) {
+     MOZ_ASSERT(mState == STATE_CONTEXT_INIT);
++    // TODO: handle PREINIT
+     mInitRunnable->Cancel();
+   }
+ 
+   mState = STATE_CONTEXT_CANCELED;
+   mPendingActions.Clear();
+   {
+     ActivityList::ForwardIterator iter(mActivityList);
+     while (iter.HasMore()) {
+@@ -818,16 +820,38 @@ Context::~Context()
+   NS_ASSERT_OWNINGTHREAD(Context);
+   MOZ_ASSERT(mManager);
+ 
+   if (mThreadsafeHandle) {
+     mThreadsafeHandle->ContextDestroyed(this);
+   }
+ 
+   mManager->RemoveContext(this);
++
++  if (mNextContext) {
++    mNextContext->Start();
++  }
++}
++
++void
++Context::Start()
++{
++  NS_ASSERT_OWNINGTHREAD(Context);
++  MOZ_ASSERT(mState == STATE_CONTEXT_PREINIT);
++  MOZ_ASSERT(mInitRunnable);
++
++  mState = STATE_CONTEXT_INIT;
++
++  nsresult rv = mInitRunnable->Dispatch();
++  if (NS_FAILED(rv)) {
++    // Shutdown must be delayed until all Contexts are destroyed.  Shutdown
++    // must also prevent any new Contexts from being constructed.  Crash
++    // for this invariant violation.
++    MOZ_CRASH("Failed to dispatch QuotaInitRunnable.");
++  }
+ }
+ 
+ void
+ Context::DispatchAction(nsIEventTarget* aTarget, Action* aAction)
+ {
+   NS_ASSERT_OWNINGTHREAD(Context);
+ 
+   nsRefPtr<ActionRunnable> runnable =
+@@ -900,11 +924,20 @@ Context::CreateThreadsafeHandle()
+   NS_ASSERT_OWNINGTHREAD(Context);
+   if (!mThreadsafeHandle) {
+     mThreadsafeHandle = new ThreadsafeHandle(this);
+   }
+   nsRefPtr<ThreadsafeHandle> ref = mThreadsafeHandle;
+   return ref.forget();
+ }
+ 
++void
++Context::SetNextContext(Context* aNextContext)
++{
++  NS_ASSERT_OWNINGTHREAD(Context);
++  MOZ_ASSERT(aNextContext);
++  MOZ_ASSERT(!mNextContext);
++  mNextContext = aNextContext;
++}
++
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/Context.h b/dom/cache/Context.h
+--- a/dom/cache/Context.h
++++ b/dom/cache/Context.h
+@@ -106,17 +106,17 @@ public:
+     virtual void Cancel() = 0;
+     virtual bool MatchesCacheId(CacheId aCacheId) const = 0;
+   };
+ 
+   // Create a Context attached to the given Manager.  The given Action
+   // will run on the QuotaManager IO thread.  Note, this Action must
+   // be execute synchronously.
+   static already_AddRefed<Context>
+-  Create(Manager* aManager, Action* aQuotaIOThreadAction);
++  Create(Manager* aManager, Action* aQuotaIOThreadAction, Context* aOldContext);
+ 
+   // Execute given action on the target once the quota manager has been
+   // initialized.
+   //
+   // Only callable from the thread that created the Context.
+   void Dispatch(nsIEventTarget* aTarget, Action* aAction);
+ 
+   // Cancel any Actions running or waiting to run.  This should allow the
+@@ -152,36 +152,41 @@ public:
+   }
+ 
+ private:
+   class QuotaInitRunnable;
+   class ActionRunnable;
+ 
+   enum State
+   {
++    STATE_CONTEXT_PREINIT,
+     STATE_CONTEXT_INIT,
+     STATE_CONTEXT_READY,
+     STATE_CONTEXT_CANCELED
+   };
+ 
+   struct PendingAction
+   {
+     nsCOMPtr<nsIEventTarget> mTarget;
+     nsRefPtr<Action> mAction;
+   };
+ 
+   explicit Context(Manager* aManager);
+   ~Context();
++  void Start();
+   void DispatchAction(nsIEventTarget* aTarget, Action* aAction);
+   void OnQuotaInit(nsresult aRv, const QuotaInfo& aQuotaInfo,
+                    nsMainThreadPtrHandle<OfflineStorage>& aOfflineStorage);
+ 
+   already_AddRefed<ThreadsafeHandle>
+   CreateThreadsafeHandle();
+ 
++  void
++  SetNextContext(Context* aNextContext);
++
+   nsRefPtr<Manager> mManager;
+   State mState;
+   QuotaInfo mQuotaInfo;
+   nsRefPtr<QuotaInitRunnable> mInitRunnable;
+   nsTArray<PendingAction> mPendingActions;
+ 
+   // Weak refs since activites must remove themselves from this list before
+   // being destroyed by calling RemoveActivity().
+@@ -189,16 +194,17 @@ private:
+   ActivityList mActivityList;
+ 
+   // The ThreadsafeHandle may have a strong ref back to us.  This creates
+   // a ref-cycle that keeps the Context alive.  The ref-cycle is broken
+   // when ThreadsafeHandle::AllowToClose() is called.
+   nsRefPtr<ThreadsafeHandle> mThreadsafeHandle;
+ 
+   nsMainThreadPtrHandle<OfflineStorage> mOfflineStorage;
++  nsRefPtr<Context> mNextContext;
+ 
+ public:
+   NS_INLINE_DECL_REFCOUNTING(cache::Context)
+ };
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
+--- a/dom/cache/Manager.cpp
++++ b/dom/cache/Manager.cpp
+@@ -152,42 +152,44 @@ public:
+     nsRefPtr<Manager> ref = Get(aManagerId);
+     if (!ref) {
+       // TODO: replace this with a thread pool (bug 1119864)
+       nsCOMPtr<nsIThread> ioThread;
+       rv = NS_NewNamedThread("DOMCacheThread", getter_AddRefs(ioThread));
+       if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+       ref = new Manager(aManagerId, ioThread);
+-      ref->Init();
++
++      // There may be an old manager for this origin in the process of
++      // cleaning up.  We need to tell the new manager about this so
++      // that it won't actually start until the old manager is done.
++      nsRefPtr<Manager> oldManager = Get(aManagerId, Closing);
++      ref->Init(oldManager);
+ 
+       MOZ_ASSERT(!sFactory->mManagerList.Contains(ref));
+       sFactory->mManagerList.AppendElement(ref);
+     }
+ 
+     ref.forget(aManagerOut);
+ 
+     return NS_OK;
+   }
+ 
+   static already_AddRefed<Manager>
+-  Get(ManagerId* aManagerId)
++  Get(ManagerId* aManagerId, State aState = Open)
+   {
+     mozilla::ipc::AssertIsOnBackgroundThread();
+ 
+     nsresult rv = MaybeCreateInstance();
+     if (NS_WARN_IF(NS_FAILED(rv))) { return nullptr; }
+ 
+     ManagerList::ForwardIterator iter(sFactory->mManagerList);
+     while (iter.HasMore()) {
+       nsRefPtr<Manager> manager = iter.GetNext();
+-      // If there is an invalid Manager finishing up and a new Manager
+-      // is created for the same origin, then the new Manager will
+-      // be blocked until QuotaManager finishes clearing the origin.
+-      if (!manager->IsClosing() && *manager->mManagerId == *aManagerId) {
++      if (aState == manager->GetState() && *manager->mManagerId == *aManagerId) {
+         return manager.forget();
+       }
+     }
+ 
+     return nullptr;
+   }
+ 
+   static void
+@@ -1445,39 +1447,39 @@ Manager::RemoveContext(Context* aContext
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(mContext);
+   MOZ_ASSERT(mContext == aContext);
+ 
+   // Whether the Context destruction was triggered from the Manager going
+   // idle or the underlying storage being invalidated, we should know we
+   // are closing before the Conext is destroyed.
+-  MOZ_ASSERT(mClosing);
++  MOZ_ASSERT(mState == Closing);
+ 
+   mContext = nullptr;
+ 
+   // Once the context is gone, we can immediately remove ourself from the
+   // Factory list.  We don't need to block shutdown by staying in the list
+   // any more.
+   Factory::Remove(this);
+ }
+ 
+ void
+ Manager::NoteClosing()
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   // This can be called more than once legitimately through different paths.
+-  mClosing = true;
++  mState = Closing;
+ }
+ 
+-bool
+-Manager::IsClosing() const
++Manager::State
++Manager::GetState() const
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+-  return mClosing;
++  return mState;
+ }
+ 
+ void
+ Manager::AddRefCacheId(CacheId aCacheId)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   for (uint32_t i = 0; i < mCacheIdRefs.Length(); ++i) {
+     if (mCacheIdRefs[i].mCacheId == aCacheId) {
+@@ -1588,17 +1590,17 @@ void
+ Manager::ExecuteCacheOp(Listener* aListener, CacheId aCacheId,
+                         const CacheOpArgs& aOpArgs)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(aListener);
+   MOZ_ASSERT(aOpArgs.type() != CacheOpArgs::TCacheAddAllArgs);
+   MOZ_ASSERT(aOpArgs.type() != CacheOpArgs::TCachePutAllArgs);
+ 
+-  if (mClosing) {
++  if (mState == Closing) {
+     aListener->OnOpComplete(ErrorResult(NS_ERROR_FAILURE), void_t());
+     return;
+   }
+ 
+   nsRefPtr<Context> context = mContext;
+   MOZ_ASSERT(!context->IsCanceled());
+ 
+   nsRefPtr<StreamList> streamList = new StreamList(this, context);
+@@ -1632,17 +1634,17 @@ Manager::ExecuteCacheOp(Listener* aListe
+ 
+ void
+ Manager::ExecuteStorageOp(Listener* aListener, Namespace aNamespace,
+                           const CacheOpArgs& aOpArgs)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(aListener);
+ 
+-  if (mClosing) {
++  if (mState == Closing) {
+     aListener->OnOpComplete(ErrorResult(NS_ERROR_FAILURE), void_t());
+     return;
+   }
+ 
+   nsRefPtr<Context> context = mContext;
+   MOZ_ASSERT(!context->IsCanceled());
+ 
+   nsRefPtr<StreamList> streamList = new StreamList(this, context);
+@@ -1681,17 +1683,17 @@ void
+ Manager::ExecutePutAll(Listener* aListener, CacheId aCacheId,
+                        const nsTArray<CacheRequestResponse>& aPutList,
+                        const nsTArray<nsCOMPtr<nsIInputStream>>& aRequestStreamList,
+                        const nsTArray<nsCOMPtr<nsIInputStream>>& aResponseStreamList)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(aListener);
+ 
+-  if (mClosing) {
++  if (mState == Closing) {
+     aListener->OnOpComplete(ErrorResult(NS_ERROR_FAILURE), CachePutAllResult());
+     return;
+   }
+ 
+   nsRefPtr<Context> context = mContext;
+   MOZ_ASSERT(!context->IsCanceled());
+ 
+   ListenerId listenerId = SaveListener(aListener);
+@@ -1703,48 +1705,53 @@ Manager::ExecutePutAll(Listener* aListen
+   context->Dispatch(mIOThread, action);
+ }
+ 
+ Manager::Manager(ManagerId* aManagerId, nsIThread* aIOThread)
+   : mManagerId(aManagerId)
+   , mIOThread(aIOThread)
+   , mContext(nullptr)
+   , mShuttingDown(false)
+-  , mClosing(false)
++  , mState(Open)
+ {
+   MOZ_ASSERT(mManagerId);
+   MOZ_ASSERT(mIOThread);
+ }
+ 
+ Manager::~Manager()
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+-  MOZ_ASSERT(mClosing);
++  MOZ_ASSERT(mState == Closing);
+   MOZ_ASSERT(!mContext);
+ 
+   nsCOMPtr<nsIThread> ioThread;
+   mIOThread.swap(ioThread);
+ 
+   // Don't spin the event loop in the destructor waiting for the thread to
+   // shutdown.  Defer this to the main thread, instead.
+   nsCOMPtr<nsIRunnable> runnable =
+     NS_NewRunnableMethod(ioThread, &nsIThread::Shutdown);
+   MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(runnable)));
+ }
+ 
+ void
+-Manager::Init()
++Manager::Init(Manager* aOldManager)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+ 
++  nsRefPtr<Context> oldContext;
++  if (aOldManager) {
++    oldContext = aOldManager->mContext;
++  }
++
+   // Create the context immediately.  Since there can at most be one Context
+   // per Manager now, this lets us cleanly call Factory::Remove() once the
+   // Context goes away.
+   nsRefPtr<Action> setupAction = new SetupAction();
+-  nsRefPtr<Context> ref = Context::Create(this, setupAction);
++  nsRefPtr<Context> ref = Context::Create(this, setupAction, oldContext);
+   mContext = ref;
+ }
+ 
+ void
+ Manager::Shutdown()
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+ 
+diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
+--- a/dom/cache/Manager.h
++++ b/dom/cache/Manager.h
+@@ -114,32 +114,39 @@ public:
+                  const nsTArray<SavedResponse>& aSavedResponseList,
+                  const nsTArray<SavedRequest>& aSavedRequestList,
+                  StreamList* aStreamList) { }
+ 
+   protected:
+     ~Listener() { }
+   };
+ 
++  enum State
++  {
++    Open,
++    Closing
++  };
++
+   static nsresult GetOrCreate(ManagerId* aManagerId, Manager** aManagerOut);
+   static already_AddRefed<Manager> Get(ManagerId* aManagerId);
+ 
+   // Synchronously shutdown from main thread.  This spins the event loop.
+   static void ShutdownAllOnMainThread();
+ 
+   // Must be called by Listener objects before they are destroyed.
+   void RemoveListener(Listener* aListener);
+ 
+   // Must be called by Context objects before they are destroyed.
+   void RemoveContext(Context* aContext);
+ 
+   // Marks the Manager "invalid".  Once the Context completes no new operations
+   // will be permitted with this Manager.  New actors will get a new Manager.
+   void NoteClosing();
+-  bool IsClosing() const;
++
++  State GetState() const;
+ 
+   // If an actor represents a long term reference to a cache or body stream,
+   // then they must call AddRefCacheId() or AddRefBodyId().  This will
+   // cause the Manager to keep the backing data store alive for the given
+   // object.  The actor must then call ReleaseCacheId() or ReleaseBodyId()
+   // exactly once for every AddRef*() call it made.  Any delayed deletion
+   // will then be performed.
+   void AddRefCacheId(CacheId aCacheId);
+@@ -180,17 +187,17 @@ private:
+   class StorageOpenAction;
+   class StorageDeleteAction;
+   class StorageKeysAction;
+ 
+   typedef uint64_t ListenerId;
+ 
+   Manager(ManagerId* aManagerId, nsIThread* aIOThread);
+   ~Manager();
+-  void Init();
++  void Init(Manager* aOldManager);
+   void Shutdown();
+   already_AddRefed<Context> CurrentContext();
+ 
+   ListenerId SaveListener(Listener* aListener);
+   Listener* GetListener(ListenerId aListenerId) const;
+ 
+   bool SetCacheIdOrphanedIfRefed(CacheId aCacheId);
+   bool SetBodyIdOrphanedIfRefed(const nsID& aBodyId);
+@@ -244,17 +251,17 @@ private:
+   typedef nsTArray<ListenerEntry> ListenerList;
+   ListenerList mListeners;
+   static ListenerId sNextListenerId;
+ 
+   // Weak references cleared by RemoveStreamList() in StreamList destructors.
+   nsTArray<StreamList*> mStreamLists;
+ 
+   bool mShuttingDown;
+-  bool mClosing;
++  State mState;
+ 
+   struct CacheIdRefCounter
+   {
+     CacheId mCacheId;
+     MozRefCountType mCount;
+     bool mOrphaned;
+   };
+   nsTArray<CacheIdRefCounter> mCacheIdRefs;
