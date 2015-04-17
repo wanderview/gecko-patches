@@ -1,8 +1,7 @@
 # HG changeset patch
-# Parent 96d4433d1c053d8bf234167b7daf80f78d285a59
+# Parent a39f63265b0bafb4f09e4d7ce4419153fd9ac6ac
 # User Ben Kelly <ben@wanderview.com>
-Bug 1151974 Delay Cache Context start until previous Context has completed. r=ehsan
-
+Bug 1151974 P1 Delay Cache Context start until previous Context has completed. r=ehsan
 
 diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
 --- a/dom/cache/Context.cpp
@@ -21,8 +20,8 @@ diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
 +                Context* aOldContext)
  {
    nsRefPtr<Context> context = new Context(aManager);
--
-+  // TODO: move this into the constructor
+ 
++  // Do this here to avoid doing an AddRef() in the constructor
    context->mInitRunnable = new QuotaInitRunnable(context, aManager,
                                                   aQuotaIOThreadAction);
 -  nsresult rv = context->mInitRunnable->Dispatch();
@@ -33,7 +32,6 @@ diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
 -    MOZ_CRASH("Failed to dispatch QuotaInitRunnable.");
 +
 +  if (aOldContext) {
-+    MOZ_ASSERT(false);
 +    aOldContext->SetNextContext(context);
 +  } else {
 +    context->Start();
@@ -54,16 +52,26 @@ diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
  Context::Dispatch(nsIEventTarget* aTarget, Action* aAction)
  {
    NS_ASSERT_OWNINGTHREAD(Context);
-@@ -748,16 +749,17 @@ Context::Dispatch(nsIEventTarget* aTarge
+@@ -746,18 +747,25 @@ Context::Dispatch(nsIEventTarget* aTarge
+   DispatchAction(aTarget, aAction);
+ }
  
  void
  Context::CancelAll()
  {
    NS_ASSERT_OWNINGTHREAD(Context);
  
-   if (mInitRunnable) {
-     MOZ_ASSERT(mState == STATE_CONTEXT_INIT);
-+    // TODO: handle PREINIT
+-  if (mInitRunnable) {
+-    MOZ_ASSERT(mState == STATE_CONTEXT_INIT);
++  // In PREINIT state we have not dispatch the init runnable yet.  Just
++  // forget it.
++  if (mState == STATE_CONTEXT_PREINIT) {
++    mInitRunnable = nullptr;
++
++  // In INIT state we have dispatched the runnable, but not received the
++  // async completion yet.  Cancel the runnable, but don't forget about it
++  // until we get OnQuotaInit() callback.
++  } else if (mState == STATE_CONTEXT_INIT) {
      mInitRunnable->Cancel();
    }
  
@@ -72,7 +80,7 @@ diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
    {
      ActivityList::ForwardIterator iter(mActivityList);
      while (iter.HasMore()) {
-@@ -818,16 +820,38 @@ Context::~Context()
+@@ -818,16 +826,37 @@ Context::~Context()
    NS_ASSERT_OWNINGTHREAD(Context);
    MOZ_ASSERT(mManager);
  
@@ -92,7 +100,6 @@ diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
 +{
 +  NS_ASSERT_OWNINGTHREAD(Context);
 +  MOZ_ASSERT(mState == STATE_CONTEXT_PREINIT);
-+  MOZ_ASSERT(mInitRunnable);
 +
 +  mState = STATE_CONTEXT_INIT;
 +
@@ -111,7 +118,7 @@ diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
    NS_ASSERT_OWNINGTHREAD(Context);
  
    nsRefPtr<ActionRunnable> runnable =
-@@ -900,11 +924,20 @@ Context::CreateThreadsafeHandle()
+@@ -900,11 +929,20 @@ Context::CreateThreadsafeHandle()
    NS_ASSERT_OWNINGTHREAD(Context);
    if (!mThreadsafeHandle) {
      mThreadsafeHandle = new ThreadsafeHandle(this);
@@ -217,7 +224,7 @@ diff --git a/dom/cache/Context.h b/dom/cache/Context.h
 diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
 --- a/dom/cache/Manager.cpp
 +++ b/dom/cache/Manager.cpp
-@@ -152,42 +152,44 @@ public:
+@@ -152,42 +152,47 @@ public:
      nsRefPtr<Manager> ref = Get(aManagerId);
      if (!ref) {
        // TODO: replace this with a thread pool (bug 1119864)
@@ -252,7 +259,11 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
      nsresult rv = MaybeCreateInstance();
      if (NS_WARN_IF(NS_FAILED(rv))) { return nullptr; }
  
-     ManagerList::ForwardIterator iter(sFactory->mManagerList);
+-    ManagerList::ForwardIterator iter(sFactory->mManagerList);
++    // Iterate in reverse to find the most recent, matching Manager.  This
++    // is important when looking for a Closing Manager.  If a new Manager
++    // chains to an old Manager we want it to be the most recent one.
++    ManagerList::BackwardIterator iter(sFactory->mManagerList);
      while (iter.HasMore()) {
        nsRefPtr<Manager> manager = iter.GetNext();
 -      // If there is an invalid Manager finishing up and a new Manager
@@ -268,7 +279,7 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
    }
  
    static void
-@@ -1445,39 +1447,39 @@ Manager::RemoveContext(Context* aContext
+@@ -1445,39 +1450,39 @@ Manager::RemoveContext(Context* aContext
  {
    NS_ASSERT_OWNINGTHREAD(Manager);
    MOZ_ASSERT(mContext);
@@ -313,7 +324,7 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
    NS_ASSERT_OWNINGTHREAD(Manager);
    for (uint32_t i = 0; i < mCacheIdRefs.Length(); ++i) {
      if (mCacheIdRefs[i].mCacheId == aCacheId) {
-@@ -1588,17 +1590,17 @@ void
+@@ -1588,17 +1593,17 @@ void
  Manager::ExecuteCacheOp(Listener* aListener, CacheId aCacheId,
                          const CacheOpArgs& aOpArgs)
  {
@@ -332,7 +343,7 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
    MOZ_ASSERT(!context->IsCanceled());
  
    nsRefPtr<StreamList> streamList = new StreamList(this, context);
-@@ -1632,17 +1634,17 @@ Manager::ExecuteCacheOp(Listener* aListe
+@@ -1632,17 +1637,17 @@ Manager::ExecuteCacheOp(Listener* aListe
  
  void
  Manager::ExecuteStorageOp(Listener* aListener, Namespace aNamespace,
@@ -351,7 +362,7 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
    MOZ_ASSERT(!context->IsCanceled());
  
    nsRefPtr<StreamList> streamList = new StreamList(this, context);
-@@ -1681,17 +1683,17 @@ void
+@@ -1681,17 +1686,17 @@ void
  Manager::ExecutePutAll(Listener* aListener, CacheId aCacheId,
                         const nsTArray<CacheRequestResponse>& aPutList,
                         const nsTArray<nsCOMPtr<nsIInputStream>>& aRequestStreamList,
@@ -370,7 +381,7 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
    MOZ_ASSERT(!context->IsCanceled());
  
    ListenerId listenerId = SaveListener(aListener);
-@@ -1703,48 +1705,53 @@ Manager::ExecutePutAll(Listener* aListen
+@@ -1703,48 +1708,53 @@ Manager::ExecutePutAll(Listener* aListen
    context->Dispatch(mIOThread, action);
  }
  
