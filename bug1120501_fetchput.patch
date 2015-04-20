@@ -1,0 +1,1206 @@
+# HG changeset patch
+# Parent a5d9ddafd045b18b1db09f6f46a534593d3ba082
+# User Ben Kelly <ben@wanderview.com>
+Bug 1120501 Move Cache Add/AddAll logic to child process. r=ehsan
+
+
+diff --git a/dom/cache/AutoUtils.cpp b/dom/cache/AutoUtils.cpp
+--- a/dom/cache/AutoUtils.cpp
++++ b/dom/cache/AutoUtils.cpp
+@@ -163,25 +163,16 @@ AutoChildOpArgs::~AutoChildOpArgs()
+     {
+       CacheMatchAllArgs& args = mOpArgs.get_CacheMatchAllArgs();
+       if (args.requestOrVoid().type() == CacheRequestOrVoid::Tvoid_t) {
+         break;
+       }
+       CleanupChild(args.requestOrVoid().get_CacheRequest().body(), action);
+       break;
+     }
+-    case CacheOpArgs::TCacheAddAllArgs:
+-    {
+-      CacheAddAllArgs& args = mOpArgs.get_CacheAddAllArgs();
+-      auto& list = args.requestList();
+-      for (uint32_t i = 0; i < list.Length(); ++i) {
+-        CleanupChild(list[i].body(), action);
+-      }
+-      break;
+-    }
+     case CacheOpArgs::TCachePutAllArgs:
+     {
+       CachePutAllArgs& args = mOpArgs.get_CachePutAllArgs();
+       auto& list = args.requestResponseList();
+       for (uint32_t i = 0; i < list.Length(); ++i) {
+         CleanupChild(list[i].request().body(), action);
+         CleanupChild(list[i].response().body(), action);
+       }
+@@ -234,36 +225,16 @@ AutoChildOpArgs::Add(InternalRequest* aR
+       CacheMatchAllArgs& args = mOpArgs.get_CacheMatchAllArgs();
+       MOZ_ASSERT(args.requestOrVoid().type() == CacheRequestOrVoid::Tvoid_t);
+       args.requestOrVoid() = CacheRequest();
+       mTypeUtils->ToCacheRequest(args.requestOrVoid().get_CacheRequest(),
+                                   aRequest, aBodyAction, aReferrerAction,
+                                   aSchemeAction, aRv);
+       break;
+     }
+-    case CacheOpArgs::TCacheAddAllArgs:
+-    {
+-      CacheAddAllArgs& args = mOpArgs.get_CacheAddAllArgs();
+-
+-      // The FileDescriptorSetChild asserts in its destructor that all fds have
+-      // been removed.  The copy constructor, however, simply duplicates the
+-      // fds without removing any.  This means each temporary and copy must be
+-      // explicitly cleaned up.
+-      //
+-      // Avoid a lot of this hassle by making sure we only create one here.  On
+-      // error we remove it.
+-      CacheRequest& request = *args.requestList().AppendElement();
+-
+-      mTypeUtils->ToCacheRequest(request, aRequest, aBodyAction,
+-                                  aReferrerAction, aSchemeAction, aRv);
+-      if (aRv.Failed()) {
+-        args.requestList().RemoveElementAt(args.requestList().Length() - 1);
+-      }
+-      break;
+-    }
+     case CacheOpArgs::TCacheDeleteArgs:
+     {
+       CacheDeleteArgs& args = mOpArgs.get_CacheDeleteArgs();
+       mTypeUtils->ToCacheRequest(args.request(), aRequest, aBodyAction,
+                                   aReferrerAction, aSchemeAction, aRv);
+       break;
+     }
+     case CacheOpArgs::TCacheKeysArgs:
+diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
+--- a/dom/cache/Cache.cpp
++++ b/dom/cache/Cache.cpp
+@@ -10,16 +10,17 @@
+ #include "mozilla/dom/InternalResponse.h"
+ #include "mozilla/dom/Promise.h"
+ #include "mozilla/dom/Response.h"
+ #include "mozilla/dom/WorkerPrivate.h"
+ #include "mozilla/dom/CacheBinding.h"
+ #include "mozilla/dom/cache/AutoUtils.h"
+ #include "mozilla/dom/cache/CacheChild.h"
+ #include "mozilla/dom/cache/CachePushStreamChild.h"
++#include "mozilla/dom/cache/FetchPut.h"
+ #include "mozilla/dom/cache/ReadStream.h"
+ #include "mozilla/ErrorResult.h"
+ #include "mozilla/Preferences.h"
+ #include "mozilla/unused.h"
+ #include "nsIGlobalObject.h"
+ #include "nsNetUtil.h"
+ 
+ namespace {
+@@ -50,25 +51,27 @@ IsValidPutRequestMethod(const RequestOrU
+   // If the provided request is a string URL, then it will default to
+   // a valid http method automatically.
+   if (!aRequest.IsRequest()) {
+     return true;
+   }
+   return IsValidPutRequestMethod(aRequest.GetAsRequest(), aRv);
+ }
+ 
++/* TODO
+ static bool
+ IsValidPutRequestMethod(const OwningRequestOrUSVString& aRequest,
+                         ErrorResult& aRv)
+ {
+   if (!aRequest.IsRequest()) {
+     return true;
+   }
+   return IsValidPutRequestMethod(*aRequest.GetAsRequest().get(), aRv);
+ }
++*/
+ 
+ } // anonymous namespace
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ using mozilla::ErrorResult;
+@@ -144,34 +147,17 @@ Cache::MatchAll(const Optional<RequestOr
+ 
+   return ExecuteOp(args, aRv);
+ }
+ 
+ already_AddRefed<Promise>
+ Cache::Add(const RequestOrUSVString& aRequest, ErrorResult& aRv)
+ {
+   MOZ_ASSERT(mActor);
+-
+-  if (!IsValidPutRequestMethod(aRequest, aRv)) {
+-    return nullptr;
+-  }
+-
+-  nsRefPtr<InternalRequest> ir = ToInternalRequest(aRequest, ReadBody, aRv);
+-  if (aRv.Failed()) {
+-    return nullptr;
+-  }
+-
+-  AutoChildOpArgs args(this, CacheAddAllArgs());
+-
+-  args.Add(ir, ReadBody, ExpandReferrer, NetworkErrorOnInvalidScheme, aRv);
+-  if (aRv.Failed()) {
+-    return nullptr;
+-  }
+-
+-  return ExecuteOp(args, aRv);
++  return FetchPut(this, aRequest, aRv);
+ }
+ 
+ already_AddRefed<Promise>
+ Cache::AddAll(const Sequence<OwningRequestOrUSVString>& aRequests,
+               ErrorResult& aRv)
+ {
+   MOZ_ASSERT(mActor);
+ 
+@@ -181,36 +167,17 @@ Cache::AddAll(const Sequence<OwningReque
+     if (!promise) {
+       return nullptr;
+     }
+ 
+     promise->MaybeResolve(JS::UndefinedHandleValue);
+     return promise.forget();
+   }
+ 
+-  AutoChildOpArgs args(this, CacheAddAllArgs());
+-
+-  for (uint32_t i = 0; i < aRequests.Length(); ++i) {
+-    if (!IsValidPutRequestMethod(aRequests[i], aRv)) {
+-      return nullptr;
+-    }
+-
+-    nsRefPtr<InternalRequest> ir = ToInternalRequest(aRequests[i], ReadBody,
+-                                                     aRv);
+-    if (aRv.Failed()) {
+-      return nullptr;
+-    }
+-
+-    args.Add(ir, ReadBody, ExpandReferrer, NetworkErrorOnInvalidScheme, aRv);
+-    if (aRv.Failed()) {
+-      return nullptr;
+-    }
+-  }
+-
+-  return ExecuteOp(args, aRv);
++  return FetchPut(this, aRequests, aRv);
+ }
+ 
+ already_AddRefed<Promise>
+ Cache::Put(const RequestOrUSVString& aRequest, Response& aResponse,
+            ErrorResult& aRv)
+ {
+   MOZ_ASSERT(mActor);
+ 
+diff --git a/dom/cache/CacheOpChild.cpp b/dom/cache/CacheOpChild.cpp
+--- a/dom/cache/CacheOpChild.cpp
++++ b/dom/cache/CacheOpChild.cpp
+@@ -111,17 +111,16 @@ CacheOpChild::Recv__delete__(const Error
+       HandleResponse(aResult.get_CacheMatchResult().responseOrVoid());
+       break;
+     }
+     case CacheOpResult::TCacheMatchAllResult:
+     {
+       HandleResponseList(aResult.get_CacheMatchAllResult().responseList());
+       break;
+     }
+-    case CacheOpResult::TCacheAddAllResult:
+     case CacheOpResult::TCachePutAllResult:
+     {
+       mPromise->MaybeResolve(JS::UndefinedHandleValue);
+       break;
+     }
+     case CacheOpResult::TCacheDeleteResult:
+     {
+       mPromise->MaybeResolve(aResult.get_CacheDeleteResult().success());
+diff --git a/dom/cache/CacheOpParent.cpp b/dom/cache/CacheOpParent.cpp
+--- a/dom/cache/CacheOpParent.cpp
++++ b/dom/cache/CacheOpParent.cpp
+@@ -67,40 +67,16 @@ void
+ CacheOpParent::Execute(Manager* aManager)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheOpParent);
+   MOZ_ASSERT(!mManager);
+   MOZ_ASSERT(!mVerifier);
+ 
+   mManager = aManager;
+ 
+-  // Handle add/addAll op with a FetchPut object
+-  if (mOpArgs.type() == CacheOpArgs::TCacheAddAllArgs) {
+-    MOZ_ASSERT(mCacheId != INVALID_CACHE_ID);
+-
+-    const CacheAddAllArgs& args = mOpArgs.get_CacheAddAllArgs();
+-    const nsTArray<CacheRequest>& list = args.requestList();
+-
+-    nsAutoTArray<nsCOMPtr<nsIInputStream>, 256> requestStreamList;
+-    for (uint32_t i = 0; i < list.Length(); ++i) {
+-      requestStreamList.AppendElement(DeserializeCacheStream(list[i].body()));
+-    }
+-
+-    nsRefPtr<FetchPut> fetchPut;
+-    nsresult rv = FetchPut::Create(this, mManager, mCacheId, list,
+-                                   requestStreamList, getter_AddRefs(fetchPut));
+-    if (NS_WARN_IF(NS_FAILED(rv))) {
+-      OnOpComplete(ErrorResult(rv), CacheAddAllResult());
+-      return;
+-    }
+-
+-    mFetchPutList.AppendElement(fetchPut.forget());
+-    return;
+-  }
+-
+   // Handle put op
+   if (mOpArgs.type() == CacheOpArgs::TCachePutAllArgs) {
+     MOZ_ASSERT(mCacheId != INVALID_CACHE_ID);
+ 
+     const CachePutAllArgs& args = mOpArgs.get_CachePutAllArgs();
+     const nsTArray<CacheRequestResponse>& list = args.requestResponseList();
+ 
+     nsAutoTArray<nsCOMPtr<nsIInputStream>, 256> requestStreamList;
+@@ -146,21 +122,16 @@ CacheOpParent::ActorDestroy(ActorDestroy
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheOpParent);
+ 
+   if (mVerifier) {
+     mVerifier->RemoveListener(this);
+     mVerifier = nullptr;
+   }
+ 
+-  for (uint32_t i = 0; i < mFetchPutList.Length(); ++i) {
+-    mFetchPutList[i]->ClearListener();
+-  }
+-  mFetchPutList.Clear();
+-
+   if (mManager) {
+     mManager->RemoveListener(this);
+     mManager = nullptr;
+   }
+ 
+   mIpcManager = nullptr;
+ }
+ 
+@@ -217,28 +188,16 @@ CacheOpParent::OnOpComplete(ErrorResult&
+ 
+   for (uint32_t i = 0; i < aSavedRequestList.Length(); ++i) {
+     result.Add(aSavedRequestList[i], aStreamList);
+   }
+ 
+   unused << Send__delete__(this, aRv, result.SendAsOpResult());
+ }
+ 
+-void
+-CacheOpParent::OnFetchPut(FetchPut* aFetchPut, ErrorResult&& aRv)
+-{
+-  NS_ASSERT_OWNINGTHREAD(CacheOpParent);
+-  MOZ_ASSERT(aFetchPut);
+-
+-  aFetchPut->ClearListener();
+-  MOZ_ALWAYS_TRUE(mFetchPutList.RemoveElement(aFetchPut));
+-
+-  OnOpComplete(Move(aRv), CacheAddAllResult());
+-}
+-
+ already_AddRefed<nsIInputStream>
+ CacheOpParent::DeserializeCacheStream(const CacheReadStreamOrVoid& aStreamOrVoid)
+ {
+   if (aStreamOrVoid.type() == CacheReadStreamOrVoid::Tvoid_t) {
+     return nullptr;
+   }
+ 
+   nsCOMPtr<nsIInputStream> stream;
+diff --git a/dom/cache/CacheOpParent.h b/dom/cache/CacheOpParent.h
+--- a/dom/cache/CacheOpParent.h
++++ b/dom/cache/CacheOpParent.h
+@@ -2,33 +2,31 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_cache_CacheOpParent_h
+ #define mozilla_dom_cache_CacheOpParent_h
+ 
+-#include "mozilla/dom/cache/FetchPut.h"
+ #include "mozilla/dom/cache/Manager.h"
+ #include "mozilla/dom/cache/PCacheOpParent.h"
+ #include "mozilla/dom/cache/PrincipalVerifier.h"
+ #include "nsTArray.h"
+ 
+ namespace mozilla {
+ namespace ipc {
+ class PBackgroundParent;
+ }
+ namespace dom {
+ namespace cache {
+ 
+ class CacheOpParent final : public PCacheOpParent
+                           , public PrincipalVerifier::Listener
+                           , public Manager::Listener
+-                          , public FetchPut::Listener
+ {
+   // to allow use of convenience overrides
+   using Manager::Listener::OnOpComplete;
+ 
+ public:
+   CacheOpParent(mozilla::ipc::PBackgroundParent* aIpcManager, CacheId aCacheId,
+                 const CacheOpArgs& aOpArgs);
+   CacheOpParent(mozilla::ipc::PBackgroundParent* aIpcManager,
+@@ -56,31 +54,26 @@ private:
+   // Manager::Listener methods
+   virtual void
+   OnOpComplete(ErrorResult&& aRv, const CacheOpResult& aResult,
+                CacheId aOpenedCacheId,
+                const nsTArray<SavedResponse>& aSavedResponseList,
+                const nsTArray<SavedRequest>& aSavedRequestList,
+                StreamList* aStreamList) override;
+ 
+-  // FetchPut::Listener methods
+-  virtual void
+-  OnFetchPut(FetchPut* aFetchPut, ErrorResult&& aRv) override;
+-
+   // utility methods
+   already_AddRefed<nsIInputStream>
+   DeserializeCacheStream(const CacheReadStreamOrVoid& aStreamOrVoid);
+ 
+   mozilla::ipc::PBackgroundParent* mIpcManager;
+   const CacheId mCacheId;
+   const Namespace mNamespace;
+   const CacheOpArgs mOpArgs;
+   nsRefPtr<Manager> mManager;
+   nsRefPtr<PrincipalVerifier> mVerifier;
+-  nsTArray<nsRefPtr<FetchPut>> mFetchPutList;
+ 
+   NS_DECL_OWNINGTHREAD
+ };
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+ 
+diff --git a/dom/cache/CacheParent.cpp b/dom/cache/CacheParent.cpp
+--- a/dom/cache/CacheParent.cpp
++++ b/dom/cache/CacheParent.cpp
+@@ -44,17 +44,16 @@ CacheParent::ActorDestroy(ActorDestroyRe
+   mManager = nullptr;
+ }
+ 
+ PCacheOpParent*
+ CacheParent::AllocPCacheOpParent(const CacheOpArgs& aOpArgs)
+ {
+   if (aOpArgs.type() != CacheOpArgs::TCacheMatchArgs &&
+       aOpArgs.type() != CacheOpArgs::TCacheMatchAllArgs &&
+-      aOpArgs.type() != CacheOpArgs::TCacheAddAllArgs &&
+       aOpArgs.type() != CacheOpArgs::TCachePutAllArgs &&
+       aOpArgs.type() != CacheOpArgs::TCacheDeleteArgs &&
+       aOpArgs.type() != CacheOpArgs::TCacheKeysArgs)
+   {
+     MOZ_CRASH("Invalid operation sent to Cache actor!");
+   }
+ 
+   return new CacheOpParent(Manager(), mCacheId, aOpArgs);
+diff --git a/dom/cache/CacheTypes.ipdlh b/dom/cache/CacheTypes.ipdlh
+--- a/dom/cache/CacheTypes.ipdlh
++++ b/dom/cache/CacheTypes.ipdlh
+@@ -103,21 +103,16 @@ struct CacheMatchArgs
+ };
+ 
+ struct CacheMatchAllArgs
+ {
+   CacheRequestOrVoid requestOrVoid;
+   CacheQueryParams params;
+ };
+ 
+-struct CacheAddAllArgs
+-{
+-  CacheRequest[] requestList;
+-};
+-
+ struct CachePutAllArgs
+ {
+   CacheRequestResponse[] requestResponseList;
+ };
+ 
+ struct CacheDeleteArgs
+ {
+   CacheRequest request;
+@@ -154,17 +149,16 @@ struct StorageDeleteArgs
+ struct StorageKeysArgs
+ {
+ };
+ 
+ union CacheOpArgs
+ {
+   CacheMatchArgs;
+   CacheMatchAllArgs;
+-  CacheAddAllArgs;
+   CachePutAllArgs;
+   CacheDeleteArgs;
+   CacheKeysArgs;
+   StorageMatchArgs;
+   StorageHasArgs;
+   StorageOpenArgs;
+   StorageDeleteArgs;
+   StorageKeysArgs;
+@@ -175,20 +169,16 @@ struct CacheMatchResult
+   CacheResponseOrVoid responseOrVoid;
+ };
+ 
+ struct CacheMatchAllResult
+ {
+   CacheResponse[] responseList;
+ };
+ 
+-struct CacheAddAllResult
+-{
+-};
+-
+ struct CachePutAllResult
+ {
+ };
+ 
+ struct CacheDeleteResult
+ {
+   bool success;
+ };
+@@ -223,17 +213,16 @@ struct StorageKeysResult
+   nsString[] keyList;
+ };
+ 
+ union CacheOpResult
+ {
+   void_t;
+   CacheMatchResult;
+   CacheMatchAllResult;
+-  CacheAddAllResult;
+   CachePutAllResult;
+   CacheDeleteResult;
+   CacheKeysResult;
+   StorageMatchResult;
+   StorageHasResult;
+   StorageOpenResult;
+   StorageDeleteResult;
+   StorageKeysResult;
+diff --git a/dom/cache/FetchPut.cpp b/dom/cache/FetchPut.cpp
+--- a/dom/cache/FetchPut.cpp
++++ b/dom/cache/FetchPut.cpp
+@@ -2,481 +2,59 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/FetchPut.h"
+ 
+ #include "mozilla/dom/Fetch.h"
+-#include "mozilla/dom/FetchDriver.h"
+-#include "mozilla/dom/Headers.h"
+-#include "mozilla/dom/Promise.h"
+-#include "mozilla/dom/PromiseNativeHandler.h"
+-#include "mozilla/dom/Request.h"
+-#include "mozilla/dom/Response.h"
+-#include "mozilla/dom/ResponseBinding.h"
+-#include "mozilla/dom/UnionTypes.h"
+-#include "mozilla/dom/cache/ManagerId.h"
+-#include "nsContentUtils.h"
+-#include "nsNetUtil.h"
+-#include "nsThreadUtils.h"
+-#include "nsCRT.h"
+-#include "nsHttp.h"
++#include "mozilla/dom/cache/Cache.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+-class FetchPut::Runnable final : public nsRunnable
++
++already_AddRefed<Promise>
++FetchPut(Cache* aCache, const RequestOrUSVString& aRequest, ErrorResult& aRv)
+ {
+-public:
+-  explicit Runnable(FetchPut* aFetchPut)
+-    : mFetchPut(aFetchPut)
+-  {
+-    MOZ_ASSERT(mFetchPut);
++  // TODO: do !IsValidPutRequestMethod(aRequest, aRv) logic
++
++  nsRefPtr<Promise> fetch = FetchRequest(aCache->GetGlobalObject(), aRequest,
++                                         RequestInit(), aRv);
++  if (aRv.Failed()) {
++    return nullptr;
+   }
+ 
+-  NS_IMETHOD Run() override
+-  {
+-    if (NS_IsMainThread())
+-    {
+-      mFetchPut->DoFetchOnMainThread();
+-      return NS_OK;
++  return nullptr;
++}
++
++already_AddRefed<Promise>
++FetchPut(Cache* aCache, const Sequence<OwningRequestOrUSVString>& aRequestList,
++         ErrorResult& aRv)
++{
++  for (uint32_t i = 0; i < aRequestList.Length(); ++i) {
++    RequestOrUSVString requestOrString;
++
++    if (aRequestList[i].IsRequest()) {
++      // TODO: do !IsValidPutRequestMethod(aRequest, aRv) logic
++      requestOrString.GetAsRequest() = aRequestList[i].GetAsRequest();
++    } else {
++      requestOrString.GetAsUSVString().Rebind(
++        aRequestList[i].GetAsUSVString().Data(),
++        aRequestList[i].GetAsUSVString().Length());
+     }
+ 
+-    MOZ_ASSERT(mFetchPut->mInitiatingThread == NS_GetCurrentThread());
+-
+-    mFetchPut->DoPutOnWorkerThread();
+-
+-    // The FetchPut object must ultimately be freed on the worker thread,
+-    // so make sure we release our reference here.  The runnable may end
+-    // up getting deleted on the main thread.
+-    mFetchPut = nullptr;
+-
+-    return NS_OK;
+-  }
+-
+-private:
+-  nsRefPtr<FetchPut> mFetchPut;
+-};
+-
+-class FetchPut::FetchObserver final : public FetchDriverObserver
+-{
+-public:
+-  explicit FetchObserver(FetchPut* aFetchPut)
+-    : mFetchPut(aFetchPut)
+-  {
+-  }
+-
+-  virtual void OnResponseAvailable(InternalResponse* aResponse) override
+-  {
+-    MOZ_ASSERT(!mInternalResponse);
+-    mInternalResponse = aResponse;
+-  }
+-
+-  virtual void OnResponseEnd() override
+-  {
+-    mFetchPut->FetchComplete(this, mInternalResponse);
+-    if (mFetchPut->mInitiatingThread == NS_GetCurrentThread()) {
+-      mFetchPut = nullptr;
+-    } else {
+-      nsCOMPtr<nsIThread> initiatingThread(mFetchPut->mInitiatingThread);
+-      nsCOMPtr<nsIRunnable> runnable =
+-        NS_NewNonOwningRunnableMethod(mFetchPut.forget().take(), &FetchPut::Release);
+-      MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
+-        initiatingThread->Dispatch(runnable, nsIThread::DISPATCH_NORMAL)));
++    nsRefPtr<Promise> fetch = FetchRequest(aCache->GetGlobalObject(),
++                                           requestOrString, RequestInit(), aRv);
++    if (aRv.Failed()) {
++      // TODO: cancel previous fetches
++      return nullptr;
+     }
+   }
+ 
+-protected:
+-  virtual ~FetchObserver() { }
+-
+-private:
+-  nsRefPtr<FetchPut> mFetchPut;
+-  nsRefPtr<InternalResponse> mInternalResponse;
+-};
+-
+-// static
+-nsresult
+-FetchPut::Create(Listener* aListener, Manager* aManager, CacheId aCacheId,
+-                 const nsTArray<CacheRequest>& aRequests,
+-                 const nsTArray<nsCOMPtr<nsIInputStream>>& aRequestStreams,
+-                 FetchPut** aFetchPutOut)
+-{
+-  MOZ_ASSERT(aRequests.Length() == aRequestStreams.Length());
+-
+-  // The FetchDriver requires that all requests have a referrer already set.
+-#ifdef DEBUG
+-  for (uint32_t i = 0; i < aRequests.Length(); ++i) {
+-    if (aRequests[i].referrer() == EmptyString()) {
+-      return NS_ERROR_UNEXPECTED;
+-    }
+-  }
+-#endif
+-
+-  nsRefPtr<FetchPut> ref = new FetchPut(aListener, aManager, aCacheId,
+-                                        aRequests, aRequestStreams);
+-
+-  nsresult rv = ref->DispatchToMainThread();
+-  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+-
+-  ref.forget(aFetchPutOut);
+-
+-  return NS_OK;
+-}
+-
+-void
+-FetchPut::ClearListener()
+-{
+-  MOZ_ASSERT(mListener);
+-  mListener = nullptr;
+-}
+-
+-FetchPut::FetchPut(Listener* aListener, Manager* aManager, CacheId aCacheId,
+-                   const nsTArray<CacheRequest>& aRequests,
+-                   const nsTArray<nsCOMPtr<nsIInputStream>>& aRequestStreams)
+-  : mListener(aListener)
+-  , mManager(aManager)
+-  , mCacheId(aCacheId)
+-  , mInitiatingThread(NS_GetCurrentThread())
+-  , mStateList(aRequests.Length())
+-  , mPendingCount(0)
+-{
+-  MOZ_ASSERT(mListener);
+-  MOZ_ASSERT(mManager);
+-  MOZ_ASSERT(aRequests.Length() == aRequestStreams.Length());
+-
+-  for (uint32_t i = 0; i < aRequests.Length(); ++i) {
+-    State* s = mStateList.AppendElement();
+-    s->mCacheRequest = aRequests[i];
+-    s->mRequestStream = aRequestStreams[i];
+-  }
+-
+-  mManager->AddRefCacheId(mCacheId);
+-}
+-
+-FetchPut::~FetchPut()
+-{
+-  MOZ_ASSERT(mInitiatingThread == NS_GetCurrentThread());
+-  MOZ_ASSERT(!mListener);
+-  mManager->RemoveListener(this);
+-  mManager->ReleaseCacheId(mCacheId);
+-  mResult.ClearMessage(); // This may contain a TypeError.
+-}
+-
+-nsresult
+-FetchPut::DispatchToMainThread()
+-{
+-  MOZ_ASSERT(!mRunnable);
+-
+-  nsCOMPtr<nsIRunnable> runnable = new Runnable(this);
+-
+-  nsresult rv = NS_DispatchToMainThread(runnable, nsIThread::DISPATCH_NORMAL);
+-  if (NS_WARN_IF(NS_FAILED(rv))) {
+-    return rv;
+-  }
+-
+-  MOZ_ASSERT(!mRunnable);
+-  mRunnable = runnable.forget();
+-
+-  return NS_OK;
+-}
+-
+-void
+-FetchPut::DispatchToInitiatingThread()
+-{
+-  MOZ_ASSERT(mRunnable);
+-
+-  nsresult rv = mInitiatingThread->Dispatch(mRunnable,
+-                                            nsIThread::DISPATCH_NORMAL);
+-  if (NS_FAILED(rv)) {
+-    MOZ_CRASH("Failed to dispatch to worker thread after fetch completion.");
+-  }
+-
+-  mRunnable = nullptr;
+-}
+-
+-void
+-FetchPut::DoFetchOnMainThread()
+-{
+-  MOZ_ASSERT(NS_IsMainThread());
+-
+-  nsRefPtr<ManagerId> managerId = mManager->GetManagerId();
+-  nsCOMPtr<nsIPrincipal> principal = managerId->Principal();
+-  mPendingCount = mStateList.Length();
+-
+-  nsCOMPtr<nsILoadGroup> loadGroup;
+-  nsresult rv = NS_NewLoadGroup(getter_AddRefs(loadGroup), principal);
+-  if (NS_WARN_IF(NS_FAILED(rv))) {
+-    MaybeSetError(ErrorResult(rv));
+-    MaybeCompleteOnMainThread();
+-    return;
+-  }
+-
+-  for (uint32_t i = 0; i < mStateList.Length(); ++i) {
+-    nsRefPtr<InternalRequest> internalRequest =
+-      ToInternalRequest(mStateList[i].mCacheRequest);
+-
+-    // If there is a stream we must clone it so that its still available
+-    // to store in the cache later;
+-    if (mStateList[i].mRequestStream) {
+-      internalRequest->SetBody(mStateList[i].mRequestStream);
+-      nsRefPtr<InternalRequest> clone = internalRequest->Clone();
+-
+-      // The copy construction clone above can change the source stream,
+-      // so get it back out to use when we put this in the cache.
+-      internalRequest->GetBody(getter_AddRefs(mStateList[i].mRequestStream));
+-
+-      internalRequest = clone;
+-    }
+-
+-    nsRefPtr<FetchDriver> fetchDriver = new FetchDriver(internalRequest,
+-                                                        principal,
+-                                                        loadGroup);
+-
+-    mStateList[i].mFetchObserver = new FetchObserver(this);
+-    rv = fetchDriver->Fetch(mStateList[i].mFetchObserver);
+-    if (NS_WARN_IF(NS_FAILED(rv))) {
+-      MaybeSetError(ErrorResult(rv));
+-      mStateList[i].mFetchObserver = nullptr;
+-      mPendingCount -= 1;
+-      continue;
+-    }
+-  }
+-
+-  // If they all failed, then we might need to complete main thread immediately
+-  MaybeCompleteOnMainThread();
+-}
+-
+-void
+-FetchPut::FetchComplete(FetchObserver* aObserver,
+-                        InternalResponse* aInternalResponse)
+-{
+-  MOZ_ASSERT(NS_IsMainThread());
+-
+-  if (aInternalResponse->IsError() && !mResult.Failed()) {
+-    MaybeSetError(ErrorResult(NS_ERROR_FAILURE));
+-  }
+-
+-  for (uint32_t i = 0; i < mStateList.Length(); ++i) {
+-    if (mStateList[i].mFetchObserver == aObserver) {
+-      ErrorResult rv;
+-      ToCacheResponseWithoutBody(mStateList[i].mCacheResponse,
+-                                  *aInternalResponse, rv);
+-      if (rv.Failed()) {
+-        MaybeSetError(Move(rv));
+-      } else {
+-        aInternalResponse->GetBody(getter_AddRefs(mStateList[i].mResponseStream));
+-      }
+-      mStateList[i].mFetchObserver = nullptr;
+-      MOZ_ASSERT(mPendingCount > 0);
+-      mPendingCount -= 1;
+-      MaybeCompleteOnMainThread();
+-      return;
+-    }
+-  }
+-
+-  MOZ_ASSERT_UNREACHABLE("Should never get called by unknown fetch observer.");
+-}
+-
+-void
+-FetchPut::MaybeCompleteOnMainThread()
+-{
+-  MOZ_ASSERT(NS_IsMainThread());
+-
+-  if (mPendingCount > 0) {
+-    return;
+-  }
+-
+-  DispatchToInitiatingThread();
+-}
+-
+-void
+-FetchPut::DoPutOnWorkerThread()
+-{
+-  MOZ_ASSERT(mInitiatingThread == NS_GetCurrentThread());
+-
+-  if (mResult.Failed()) {
+-    MaybeNotifyListener();
+-    return;
+-  }
+-
+-  // These allocate ~4.5k combined on the stack
+-  nsAutoTArray<CacheRequestResponse, 16> putList;
+-  nsAutoTArray<nsCOMPtr<nsIInputStream>, 16> requestStreamList;
+-  nsAutoTArray<nsCOMPtr<nsIInputStream>, 16> responseStreamList;
+-
+-  putList.SetCapacity(mStateList.Length());
+-  requestStreamList.SetCapacity(mStateList.Length());
+-  responseStreamList.SetCapacity(mStateList.Length());
+-
+-  for (uint32_t i = 0; i < mStateList.Length(); ++i) {
+-    // The spec requires us to catch if content tries to insert a set of
+-    // requests that would overwrite each other.
+-    if (MatchInPutList(mStateList[i].mCacheRequest, putList)) {
+-      MaybeSetError(ErrorResult(NS_ERROR_DOM_INVALID_STATE_ERR));
+-      MaybeNotifyListener();
+-      return;
+-    }
+-
+-    CacheRequestResponse* entry = putList.AppendElement();
+-    entry->request() = mStateList[i].mCacheRequest;
+-    entry->response() = mStateList[i].mCacheResponse;
+-    requestStreamList.AppendElement(mStateList[i].mRequestStream.forget());
+-    responseStreamList.AppendElement(mStateList[i].mResponseStream.forget());
+-  }
+-  mStateList.Clear();
+-
+-  mManager->ExecutePutAll(this, mCacheId, putList, requestStreamList,
+-                          responseStreamList);
+-}
+-
+-// static
+-bool
+-FetchPut::MatchInPutList(const CacheRequest& aRequest,
+-                         const nsTArray<CacheRequestResponse>& aPutList)
+-{
+-  // This method implements the SW spec QueryCache algorithm against an
+-  // in memory array of Request/Response objects.  This essentially the
+-  // same algorithm that is implemented in DBSchema.cpp.  Unfortunately
+-  // we cannot unify them because when operating against the real database
+-  // we don't want to load all request/response objects into memory.
+-
+-  if (!aRequest.method().LowerCaseEqualsLiteral("get") &&
+-      !aRequest.method().LowerCaseEqualsLiteral("head")) {
+-    return false;
+-  }
+-
+-  nsRefPtr<InternalHeaders> requestHeaders =
+-    ToInternalHeaders(aRequest.headers());
+-
+-  for (uint32_t i = 0; i < aPutList.Length(); ++i) {
+-    const CacheRequest& cachedRequest = aPutList[i].request();
+-    const CacheResponse& cachedResponse = aPutList[i].response();
+-
+-    // If the URLs don't match, then just skip to the next entry.
+-    if (aRequest.url() != cachedRequest.url()) {
+-      continue;
+-    }
+-
+-    nsRefPtr<InternalHeaders> cachedRequestHeaders =
+-      ToInternalHeaders(cachedRequest.headers());
+-
+-    nsRefPtr<InternalHeaders> cachedResponseHeaders =
+-      ToInternalHeaders(cachedResponse.headers());
+-
+-    nsAutoTArray<nsCString, 16> varyHeaders;
+-    ErrorResult rv;
+-    cachedResponseHeaders->GetAll(NS_LITERAL_CSTRING("vary"), varyHeaders, rv);
+-    MOZ_ALWAYS_TRUE(!rv.Failed());
+-
+-    // Assume the vary headers match until we find a conflict
+-    bool varyHeadersMatch = true;
+-
+-    for (uint32_t j = 0; j < varyHeaders.Length(); ++j) {
+-      // Extract the header names inside the Vary header value.
+-      nsAutoCString varyValue(varyHeaders[j]);
+-      char* rawBuffer = varyValue.BeginWriting();
+-      char* token = nsCRT::strtok(rawBuffer, NS_HTTP_HEADER_SEPS, &rawBuffer);
+-      bool bailOut = false;
+-      for (; token;
+-           token = nsCRT::strtok(rawBuffer, NS_HTTP_HEADER_SEPS, &rawBuffer)) {
+-        nsDependentCString header(token);
+-        MOZ_ASSERT(!header.EqualsLiteral("*"),
+-                   "We should have already caught this in "
+-                   "TypeUtils::ToPCacheResponseWithoutBody()");
+-
+-        ErrorResult headerRv;
+-        nsAutoCString value;
+-        requestHeaders->Get(header, value, headerRv);
+-        if (NS_WARN_IF(headerRv.Failed())) {
+-          headerRv.ClearMessage();
+-          MOZ_ASSERT(value.IsEmpty());
+-        }
+-
+-        nsAutoCString cachedValue;
+-        cachedRequestHeaders->Get(header, value, headerRv);
+-        if (NS_WARN_IF(headerRv.Failed())) {
+-          headerRv.ClearMessage();
+-          MOZ_ASSERT(cachedValue.IsEmpty());
+-        }
+-
+-        if (value != cachedValue) {
+-          varyHeadersMatch = false;
+-          bailOut = true;
+-          break;
+-        }
+-      }
+-
+-      if (bailOut) {
+-        break;
+-      }
+-    }
+-
+-    // URL was equal and all vary headers match!
+-    if (varyHeadersMatch) {
+-      return true;
+-    }
+-  }
+-
+-  return false;
+-}
+-
+-void
+-FetchPut::OnOpComplete(ErrorResult&& aRv, const CacheOpResult& aResult,
+-                       CacheId aOpenedCacheId,
+-                       const nsTArray<SavedResponse>& aSavedResponseList,
+-                       const nsTArray<SavedRequest>& aSavedRequestList,
+-                       StreamList* aStreamList)
+-{
+-  MOZ_ASSERT(mInitiatingThread == NS_GetCurrentThread());
+-  MOZ_ASSERT(aResult.type() == CacheOpResult::TCachePutAllResult);
+-  MaybeSetError(Move(aRv));
+-  MaybeNotifyListener();
+-}
+-
+-void
+-FetchPut::MaybeSetError(ErrorResult&& aRv)
+-{
+-  if (mResult.Failed() || !aRv.Failed()) {
+-    return;
+-  }
+-  mResult = Move(aRv);
+-}
+-
+-void
+-FetchPut::MaybeNotifyListener()
+-{
+-  MOZ_ASSERT(mInitiatingThread == NS_GetCurrentThread());
+-  if (!mListener) {
+-    return;
+-  }
+-  // CacheParent::OnFetchPut can lead to the destruction of |this| when the
+-  // object is removed from CacheParent::mFetchPutList, so make sure that
+-  // doesn't happen until this method returns.
+-  nsRefPtr<FetchPut> kungFuDeathGrip(this);
+-  mListener->OnFetchPut(this, Move(mResult));
+-}
+-
+-nsIGlobalObject*
+-FetchPut::GetGlobalObject() const
+-{
+-  MOZ_CRASH("No global object in parent-size FetchPut operation!");
+-}
+-
+-#ifdef DEBUG
+-void
+-FetchPut::AssertOwningThread() const
+-{
+-  MOZ_ASSERT(mInitiatingThread == NS_GetCurrentThread());
+-}
+-#endif
+-
+-CachePushStreamChild*
+-FetchPut::CreatePushStream(nsIAsyncInputStream* aStream)
+-{
+-  MOZ_CRASH("FetchPut should never create a push stream!");
++  return nullptr;
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/FetchPut.h b/dom/cache/FetchPut.h
+--- a/dom/cache/FetchPut.h
++++ b/dom/cache/FetchPut.h
+@@ -3,121 +3,36 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_cache_FetchPut_h
+ #define mozilla_dom_cache_FetchPut_h
+ 
+ #include "mozilla/AlreadyAddRefed.h"
+-#include "mozilla/Attributes.h"
+-#include "mozilla/ErrorResult.h"
+-#include "mozilla/dom/cache/Manager.h"
+-#include "mozilla/dom/cache/CacheTypes.h"
+-#include "mozilla/dom/cache/Types.h"
+-#include "mozilla/dom/cache/TypeUtils.h"
+-#include "nsRefPtr.h"
+-#include "nsTArray.h"
+-#include <utility>
+-
+-class nsIInputStream;
+-class nsIRunnable;
+-class nsIThread;
+ 
+ namespace mozilla {
++
++class ErrorResult;
++
+ namespace dom {
+ 
+-class Request;
+-class Response;
++class Promise;
++class OwningRequestOrUSVString;
++class RequestOrUSVString;
++template<typename T> class Sequence;
+ 
+ namespace cache {
+ 
+-class FetchPut final : public Manager::Listener
+-                     , public TypeUtils
+-{
+-public:
+-  typedef std::pair<nsRefPtr<Request>, nsRefPtr<Response>> PutPair;
++class Cache;
+ 
+-  class Listener
+-  {
+-  public:
+-    virtual void
+-    OnFetchPut(FetchPut* aFetchPut, ErrorResult&& aRv) = 0;
+-  };
++already_AddRefed<Promise>
++FetchPut(Cache* aCache, const RequestOrUSVString& aRequest, ErrorResult& aRv);
+ 
+-  static nsresult
+-  Create(Listener* aListener, Manager* aManager, CacheId aCacheId,
+-         const nsTArray<CacheRequest>& aRequests,
+-         const nsTArray<nsCOMPtr<nsIInputStream>>& aRequestStreams,
+-         FetchPut** aFetchPutOut);
+-
+-  void ClearListener();
+-
+-private:
+-  class Runnable;
+-  class FetchObserver;
+-  friend class FetchObserver;
+-  struct State
+-  {
+-    CacheRequest mCacheRequest;
+-    nsCOMPtr<nsIInputStream> mRequestStream;
+-    nsRefPtr<FetchObserver> mFetchObserver;
+-    CacheResponse mCacheResponse;
+-    nsCOMPtr<nsIInputStream> mResponseStream;
+-
+-    nsRefPtr<Request> mRequest;
+-    nsRefPtr<Response> mResponse;
+-  };
+-
+-  FetchPut(Listener* aListener, Manager* aManager, CacheId aCacheId,
+-           const nsTArray<CacheRequest>& aRequests,
+-           const nsTArray<nsCOMPtr<nsIInputStream>>& aRequestStreams);
+-  ~FetchPut();
+-
+-  nsresult DispatchToMainThread();
+-  void DispatchToInitiatingThread();
+-
+-  void DoFetchOnMainThread();
+-  void FetchComplete(FetchObserver* aObserver,
+-                     InternalResponse* aInternalResponse);
+-  void MaybeCompleteOnMainThread();
+-
+-  void DoPutOnWorkerThread();
+-  static bool MatchInPutList(const CacheRequest& aRequest,
+-                             const nsTArray<CacheRequestResponse>& aPutList);
+-
+-  virtual void
+-  OnOpComplete(ErrorResult&& aRv, const CacheOpResult& aResult,
+-               CacheId aOpenedCacheId,
+-               const nsTArray<SavedResponse>& aSavedResponseList,
+-               const nsTArray<SavedRequest>& aSavedRequestList,
+-               StreamList* aStreamList) override;
+-
+-  void MaybeSetError(ErrorResult&& aRv);
+-  void MaybeNotifyListener();
+-
+-  // TypeUtils methods
+-  virtual nsIGlobalObject* GetGlobalObject() const override;
+-#ifdef DEBUG
+-  virtual void AssertOwningThread() const override;
+-#endif
+-
+-  virtual CachePushStreamChild*
+-  CreatePushStream(nsIAsyncInputStream* aStream) override;
+-
+-  Listener* mListener;
+-  nsRefPtr<Manager> mManager;
+-  const CacheId mCacheId;
+-  nsCOMPtr<nsIThread> mInitiatingThread;
+-  nsTArray<State> mStateList;
+-  uint32_t mPendingCount;
+-  ErrorResult mResult;
+-  nsCOMPtr<nsIRunnable> mRunnable;
+-
+-public:
+-  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(mozilla::dom::cache::FetchPut)
+-};
++already_AddRefed<Promise>
++FetchPut(Cache* aCache, const Sequence<OwningRequestOrUSVString>& aRequestList,
++         ErrorResult& aRv);
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_cache_FetchPut_h
+diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
+--- a/dom/cache/Manager.cpp
++++ b/dom/cache/Manager.cpp
+@@ -1590,17 +1590,16 @@ Manager::RemoveStreamList(StreamList* aS
+ }
+ 
+ void
+ Manager::ExecuteCacheOp(Listener* aListener, CacheId aCacheId,
+                         const CacheOpArgs& aOpArgs)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(aListener);
+-  MOZ_ASSERT(aOpArgs.type() != CacheOpArgs::TCacheAddAllArgs);
+   MOZ_ASSERT(aOpArgs.type() != CacheOpArgs::TCachePutAllArgs);
+ 
+   if (mState == Closing) {
+     aListener->OnOpComplete(ErrorResult(NS_ERROR_FAILURE), void_t());
+     return;
+   }
+ 
+   nsRefPtr<Context> context = mContext;
+diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
+--- a/dom/cache/Manager.h
++++ b/dom/cache/Manager.h
+@@ -13,16 +13,19 @@
+ #include "nsRefPtr.h"
+ #include "nsString.h"
+ #include "nsTArray.h"
+ 
+ class nsIInputStream;
+ class nsIThread;
+ 
+ namespace mozilla {
++
++class ErrorResult;
++
+ namespace dom {
+ namespace cache {
+ 
+ class CacheOpArgs;
+ class CacheOpResult;
+ class CacheRequestResponse;
+ class Context;
+ class ManagerId;
+diff --git a/dom/cache/moz.build b/dom/cache/moz.build
+--- a/dom/cache/moz.build
++++ b/dom/cache/moz.build
+@@ -36,17 +36,18 @@ EXPORTS.mozilla.dom.cache += [
+     'ReadStream.h',
+     'SavedTypes.h',
+     'StreamControl.h',
+     'StreamList.h',
+     'Types.h',
+     'TypeUtils.h',
+ ]
+ 
+-UNIFIED_SOURCES += [
++#UNIFIED_SOURCES += [
++SOURCES += [
+     'Action.cpp',
+     'ActorChild.cpp',
+     'AutoUtils.cpp',
+     'Cache.cpp',
+     'CacheChild.cpp',
+     'CacheOpChild.cpp',
+     'CacheOpParent.cpp',
+     'CacheParent.cpp',
