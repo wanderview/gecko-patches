@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent 381b7bc2f892190352a5906f2ddcbe6cbedea5a9
+# Parent c430e2162967d70779b273878fbb7dc1cb1900f2
 # User Ben Kelly <ben@wanderview.com>
 Bug 1120501 P2 Move Cache Add/AddAll logic to child process. r=ehsan
 
@@ -27,7 +27,38 @@ diff --git a/dom/bindings/Bindings.conf b/dom/bindings/Bindings.conf
 diff --git a/dom/cache/AutoUtils.cpp b/dom/cache/AutoUtils.cpp
 --- a/dom/cache/AutoUtils.cpp
 +++ b/dom/cache/AutoUtils.cpp
-@@ -163,25 +163,16 @@ AutoChildOpArgs::~AutoChildOpArgs()
+@@ -2,26 +2,30 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/AutoUtils.h"
+ 
+ #include "mozilla/unused.h"
++#include "mozilla/dom/InternalHeaders.h"
++#include "mozilla/dom/InternalRequest.h"
+ #include "mozilla/dom/cache/CacheParent.h"
+ #include "mozilla/dom/cache/CachePushStreamChild.h"
+ #include "mozilla/dom/cache/CacheStreamControlParent.h"
+ #include "mozilla/dom/cache/ReadStream.h"
+ #include "mozilla/dom/cache/SavedTypes.h"
+ #include "mozilla/dom/cache/StreamList.h"
+ #include "mozilla/dom/cache/TypeUtils.h"
+ #include "mozilla/ipc/FileDescriptorSetChild.h"
+ #include "mozilla/ipc/FileDescriptorSetParent.h"
+ #include "mozilla/ipc/PBackgroundParent.h"
++#include "nsCRT.h"
++#include "nsHttp.h"
+ 
+ namespace {
+ 
+ using mozilla::unused;
+ using mozilla::dom::cache::CachePushStreamChild;
+ using mozilla::dom::cache::CacheReadStream;
+ using mozilla::dom::cache::CacheReadStreamOrVoid;
+ using mozilla::ipc::FileDescriptor;
+@@ -163,25 +167,16 @@ AutoChildOpArgs::~AutoChildOpArgs()
      {
        CacheMatchAllArgs& args = mOpArgs.get_CacheMatchAllArgs();
        if (args.requestOrVoid().type() == CacheRequestOrVoid::Tvoid_t) {
@@ -53,15 +84,40 @@ diff --git a/dom/cache/AutoUtils.cpp b/dom/cache/AutoUtils.cpp
          CleanupChild(list[i].request().body(), action);
          CleanupChild(list[i].response().body(), action);
        }
-@@ -234,36 +225,16 @@ AutoChildOpArgs::Add(InternalRequest* aR
+@@ -211,113 +206,192 @@ AutoChildOpArgs::~AutoChildOpArgs()
+     default:
+       // Other types do not need cleanup
+       break;
+   }
+ }
+ 
+ void
+ AutoChildOpArgs::Add(InternalRequest* aRequest, BodyAction aBodyAction,
+-                     ReferrerAction aReferrerAction, SchemeAction aSchemeAction,
+-                     ErrorResult& aRv)
++                     SchemeAction aSchemeAction, ErrorResult& aRv)
+ {
+   MOZ_ASSERT(!mSent);
+ 
+   switch(mOpArgs.type()) {
+     case CacheOpArgs::TCacheMatchArgs:
+     {
+       CacheMatchArgs& args = mOpArgs.get_CacheMatchArgs();
+       mTypeUtils->ToCacheRequest(args.request(), aRequest, aBodyAction,
+-                                  aReferrerAction, aSchemeAction, aRv);
++                                 aSchemeAction, aRv);
+       break;
+     }
+     case CacheOpArgs::TCacheMatchAllArgs:
+     {
        CacheMatchAllArgs& args = mOpArgs.get_CacheMatchAllArgs();
        MOZ_ASSERT(args.requestOrVoid().type() == CacheRequestOrVoid::Tvoid_t);
        args.requestOrVoid() = CacheRequest();
        mTypeUtils->ToCacheRequest(args.requestOrVoid().get_CacheRequest(),
-                                   aRequest, aBodyAction, aReferrerAction,
-                                   aSchemeAction, aRv);
-       break;
-     }
+-                                  aRequest, aBodyAction, aReferrerAction,
+-                                  aSchemeAction, aRv);
+-      break;
+-    }
 -    case CacheOpArgs::TCacheAddAllArgs:
 -    {
 -      CacheAddAllArgs& args = mOpArgs.get_CacheAddAllArgs();
@@ -80,20 +136,217 @@ diff --git a/dom/cache/AutoUtils.cpp b/dom/cache/AutoUtils.cpp
 -      if (aRv.Failed()) {
 -        args.requestList().RemoveElementAt(args.requestList().Length() - 1);
 -      }
--      break;
--    }
++                                  aRequest, aBodyAction, aSchemeAction, aRv);
+       break;
+     }
      case CacheOpArgs::TCacheDeleteArgs:
      {
        CacheDeleteArgs& args = mOpArgs.get_CacheDeleteArgs();
        mTypeUtils->ToCacheRequest(args.request(), aRequest, aBodyAction,
-                                   aReferrerAction, aSchemeAction, aRv);
+-                                  aReferrerAction, aSchemeAction, aRv);
++                                 aSchemeAction, aRv);
        break;
      }
      case CacheOpArgs::TCacheKeysArgs:
+     {
+       CacheKeysArgs& args = mOpArgs.get_CacheKeysArgs();
+       MOZ_ASSERT(args.requestOrVoid().type() == CacheRequestOrVoid::Tvoid_t);
+       args.requestOrVoid() = CacheRequest();
+       mTypeUtils->ToCacheRequest(args.requestOrVoid().get_CacheRequest(),
+-                                  aRequest, aBodyAction, aReferrerAction,
+-                                  aSchemeAction, aRv);
++                                  aRequest, aBodyAction, aSchemeAction, aRv);
+       break;
+     }
+     case CacheOpArgs::TStorageMatchArgs:
+     {
+       StorageMatchArgs& args = mOpArgs.get_StorageMatchArgs();
+       mTypeUtils->ToCacheRequest(args.request(), aRequest, aBodyAction,
+-                                  aReferrerAction, aSchemeAction, aRv);
++                                 aSchemeAction, aRv);
+       break;
+     }
+     default:
+       MOZ_CRASH("Cache args type cannot send a Request!");
+   }
+ }
+ 
++namespace {
++
++bool
++MatchInPutList(InternalRequest* aRequest,
++               const nsTArray<CacheRequestResponse>& aPutList)
++{
++  // This method implements the SW spec QueryCache algorithm against an
++  // in memory array of Request/Response objects.  This essentially the
++  // same algorithm that is implemented in DBSchema.cpp.  Unfortunately
++  // we cannot unify them because when operating against the real database
++  // we don't want to load all request/response objects into memory.
++
++  // Note, we can skip the check for a invalid request method because
++  // Cache will only call into here with a GET or HEAD.
++
++  nsRefPtr<InternalHeaders> requestHeaders = aRequest->Headers();
++
++  for (uint32_t i = 0; i < aPutList.Length(); ++i) {
++    const CacheRequest& cachedRequest = aPutList[i].request();
++    const CacheResponse& cachedResponse = aPutList[i].response();
++
++    nsAutoCString url;
++    aRequest->GetURL(url);
++
++    // If the URLs don't match, then just skip to the next entry.
++    if (NS_ConvertUTF8toUTF16(url) != cachedRequest.url()) {
++      continue;
++    }
++
++    nsRefPtr<InternalHeaders> cachedRequestHeaders =
++      TypeUtils::ToInternalHeaders(cachedRequest.headers());
++
++    nsRefPtr<InternalHeaders> cachedResponseHeaders =
++      TypeUtils::ToInternalHeaders(cachedResponse.headers());
++
++    nsAutoTArray<nsCString, 16> varyHeaders;
++    ErrorResult rv;
++    cachedResponseHeaders->GetAll(NS_LITERAL_CSTRING("vary"), varyHeaders, rv);
++    MOZ_ALWAYS_TRUE(!rv.Failed());
++
++    // Assume the vary headers match until we find a conflict
++    bool varyHeadersMatch = true;
++
++    for (uint32_t j = 0; j < varyHeaders.Length(); ++j) {
++      // Extract the header names inside the Vary header value.
++      nsAutoCString varyValue(varyHeaders[j]);
++      char* rawBuffer = varyValue.BeginWriting();
++      char* token = nsCRT::strtok(rawBuffer, NS_HTTP_HEADER_SEPS, &rawBuffer);
++      bool bailOut = false;
++      for (; token;
++           token = nsCRT::strtok(rawBuffer, NS_HTTP_HEADER_SEPS, &rawBuffer)) {
++        nsDependentCString header(token);
++        MOZ_ASSERT(!header.EqualsLiteral("*"),
++                   "We should have already caught this in "
++                   "TypeUtils::ToPCacheResponseWithoutBody()");
++
++        ErrorResult headerRv;
++        nsAutoCString value;
++        requestHeaders->Get(header, value, headerRv);
++        if (NS_WARN_IF(headerRv.Failed())) {
++          headerRv.ClearMessage();
++          MOZ_ASSERT(value.IsEmpty());
++        }
++
++        nsAutoCString cachedValue;
++        cachedRequestHeaders->Get(header, value, headerRv);
++        if (NS_WARN_IF(headerRv.Failed())) {
++          headerRv.ClearMessage();
++          MOZ_ASSERT(cachedValue.IsEmpty());
++        }
++
++        if (value != cachedValue) {
++          varyHeadersMatch = false;
++          bailOut = true;
++          break;
++        }
++      }
++
++      if (bailOut) {
++        break;
++      }
++    }
++
++    // URL was equal and all vary headers match!
++    if (varyHeadersMatch) {
++      return true;
++    }
++  }
++
++  return false;
++}
++
++} // anonymous namespace
++
+ void
+ AutoChildOpArgs::Add(InternalRequest* aRequest, BodyAction aBodyAction,
+-                     ReferrerAction aReferrerAction, SchemeAction aSchemeAction,
+-                     Response& aResponse, ErrorResult& aRv)
++                     SchemeAction aSchemeAction, Response& aResponse,
++                     ErrorResult& aRv)
+ {
+   MOZ_ASSERT(!mSent);
+ 
+   switch(mOpArgs.type()) {
+     case CacheOpArgs::TCachePutAllArgs:
+     {
+       CachePutAllArgs& args = mOpArgs.get_CachePutAllArgs();
+ 
++      // Throw an error if a request/response pair would mask another
++      // request/response pair in the same PutAll operation.  This is
++      // step 2.3.2.3 from the "Batch Cache Operations" spec algorithm.
++      if (MatchInPutList(aRequest, args.requestResponseList())) {
++        aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
++        return;
++      }
++
+       // The FileDescriptorSetChild asserts in its destructor that all fds have
+       // been removed.  The copy constructor, however, simply duplicates the
+       // fds without removing any.  This means each temporary and copy must be
+       // explicitly cleaned up.
+       //
+       // Avoid a lot of this hassle by making sure we only create one here.  On
+       // error we remove it.
+       CacheRequestResponse& pair = *args.requestResponseList().AppendElement();
+       pair.request().body() = void_t();
+       pair.response().body() = void_t();
+ 
+       mTypeUtils->ToCacheRequest(pair.request(), aRequest, aBodyAction,
+-                                  aReferrerAction, aSchemeAction, aRv);
++                                 aSchemeAction, aRv);
+       if (!aRv.Failed()) {
+         mTypeUtils->ToCacheResponse(pair.response(), aResponse, aRv);
+       }
+ 
+       if (aRv.Failed()) {
+         CleanupChild(pair.request().body(), Delete);
+         args.requestResponseList().RemoveElementAt(
+           args.requestResponseList().Length() - 1);
+diff --git a/dom/cache/AutoUtils.h b/dom/cache/AutoUtils.h
+--- a/dom/cache/AutoUtils.h
++++ b/dom/cache/AutoUtils.h
+@@ -42,28 +42,25 @@ class StreamList;
+ //
+ // Note, these should only be used when *sending* streams across IPC.  The
+ // deserialization case is handled by creating a ReadStream object.
+ 
+ class MOZ_STACK_CLASS AutoChildOpArgs final
+ {
+ public:
+   typedef TypeUtils::BodyAction BodyAction;
+-  typedef TypeUtils::ReferrerAction ReferrerAction;
+   typedef TypeUtils::SchemeAction SchemeAction;
+ 
+   AutoChildOpArgs(TypeUtils* aTypeUtils, const CacheOpArgs& aOpArgs);
+   ~AutoChildOpArgs();
+ 
+   void Add(InternalRequest* aRequest, BodyAction aBodyAction,
+-           ReferrerAction aReferrerAction, SchemeAction aSchemeAction,
+-           ErrorResult& aRv);
++           SchemeAction aSchemeAction, ErrorResult& aRv);
+   void Add(InternalRequest* aRequest, BodyAction aBodyAction,
+-           ReferrerAction aReferrerAction, SchemeAction aSchemeAction,
+-           Response& aResponse, ErrorResult& aRv);
++           SchemeAction aSchemeAction, Response& aResponse, ErrorResult& aRv);
+ 
+   const CacheOpArgs& SendAsOpArgs();
+ 
+ private:
+   TypeUtils* mTypeUtils;
+   CacheOpArgs mOpArgs;
+   bool mSent;
+ };
 diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
 --- a/dom/cache/Cache.cpp
 +++ b/dom/cache/Cache.cpp
-@@ -4,16 +4,17 @@
+@@ -4,82 +4,201 @@
   * License, v. 2.0. If a copy of the MPL was not distributed with this
   * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
  
@@ -109,9 +362,72 @@ diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
  #include "mozilla/dom/cache/AutoUtils.h"
  #include "mozilla/dom/cache/CacheChild.h"
  #include "mozilla/dom/cache/CachePushStreamChild.h"
++#include "mozilla/dom/cache/Feature.h"
  #include "mozilla/dom/cache/ReadStream.h"
  #include "mozilla/ErrorResult.h"
-@@ -50,37 +51,137 @@ IsValidPutRequestMethod(const RequestOrU
+ #include "mozilla/Preferences.h"
+ #include "mozilla/unused.h"
+ #include "nsIGlobalObject.h"
+ #include "nsNetUtil.h"
+ 
++namespace mozilla {
++namespace dom {
++namespace cache {
++
++using mozilla::dom::workers::GetCurrentThreadWorkerPrivate;
++using mozilla::dom::workers::WorkerPrivate;
++
+ namespace {
+ 
+-using mozilla::ErrorResult;
+-using mozilla::dom::MSG_INVALID_REQUEST_METHOD;
+-using mozilla::dom::OwningRequestOrUSVString;
+-using mozilla::dom::Request;
+-using mozilla::dom::RequestOrUSVString;
++bool
++IsValidPutRequestURL(const nsAString& aUrl, ErrorResult& aRv)
++{
++  bool validScheme = false;
++
++  // make a copy because ProcessURL strips the fragmet
++  nsAutoString url(aUrl);
++
++  TypeUtils::ProcessURL(url, &validScheme, nullptr, aRv);
++  if (aRv.Failed()) {
++    return false;
++  }
++
++  if (!validScheme) {
++    NS_NAMED_LITERAL_STRING(label, "Request");
++    aRv.ThrowTypeError(MSG_INVALID_URL_SCHEME, &label, &url);
++    return false;
++  }
++
++  return true;
++}
+ 
+ static bool
+ IsValidPutRequestMethod(const Request& aRequest, ErrorResult& aRv)
+ {
+   nsAutoCString method;
+   aRequest.GetMethod(method);
+-  bool valid = method.LowerCaseEqualsLiteral("get");
+-  if (!valid) {
++  if (!method.LowerCaseEqualsLiteral("get")) {
+     NS_ConvertASCIItoUTF16 label(method);
+     aRv.ThrowTypeError(MSG_INVALID_REQUEST_METHOD, &label);
++    return false;
+   }
+-  return valid;
++
++  return true;
+ }
+ 
+ static bool
+-IsValidPutRequestMethod(const RequestOrUSVString& aRequest,
+-                        ErrorResult& aRv)
++IsValidPutRequestMethod(const RequestOrUSVString& aRequest, ErrorResult& aRv)
+ {
    // If the provided request is a string URL, then it will default to
    // a valid http method automatically.
    if (!aRequest.IsRequest()) {
@@ -120,89 +436,88 @@ diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
    return IsValidPutRequestMethod(aRequest.GetAsRequest(), aRv);
  }
  
-+/* TODO
- static bool
- IsValidPutRequestMethod(const OwningRequestOrUSVString& aRequest,
-                         ErrorResult& aRv)
- {
-   if (!aRequest.IsRequest()) {
-     return true;
-   }
-   return IsValidPutRequestMethod(*aRequest.GetAsRequest().get(), aRv);
- }
-+*/
- 
+-static bool
+-IsValidPutRequestMethod(const OwningRequestOrUSVString& aRequest,
+-                        ErrorResult& aRv)
+-{
+-  if (!aRequest.IsRequest()) {
+-    return true;
+-  }
+-  return IsValidPutRequestMethod(*aRequest.GetAsRequest().get(), aRv);
+-}
+-
  } // anonymous namespace
  
- namespace mozilla {
- namespace dom {
- namespace cache {
- 
- using mozilla::ErrorResult;
- using mozilla::unused;
- using mozilla::dom::workers::GetCurrentThreadWorkerPrivate;
- using mozilla::dom::workers::WorkerPrivate;
- 
+-namespace mozilla {
+-namespace dom {
+-namespace cache {
++// Helper class to wait for Add()/AddAll() fetch requests to complete and
++// then perform a PutAll() with the responses.  This class holds a Feature
++// to keep the Worker thread alive.  This is mainly to ensure that Add/AddAll
++// act the same as other Cache operations that directly create a CacheOpChild
++// actor.
 +class Cache::FetchHandler final : public PromiseNativeHandler
 +{
 +public:
-+  FetchHandler(Cache* aCache, Promise* aPromise)
-+    : mCache(aCache)
++  FetchHandler(Feature* aFeature, Cache* aCache,
++               nsTArray<nsRefPtr<Request>>&& aRequestList, Promise* aPromise)
++    : mFeature(aFeature)
++    , mCache(aCache)
++    , mRequestList(Move(aRequestList))
 +    , mPromise(aPromise)
 +  {
++    MOZ_ASSERT_IF(!NS_IsMainThread(), mFeature);
 +    MOZ_ASSERT(mCache);
 +    MOZ_ASSERT(mPromise);
 +  }
-+
+ 
+-using mozilla::ErrorResult;
+-using mozilla::unused;
+-using mozilla::dom::workers::GetCurrentThreadWorkerPrivate;
+-using mozilla::dom::workers::WorkerPrivate;
 +  virtual void
 +  ResolvedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue) override
 +  {
-+    nsTArray<nsRefPtr<Response>> responseList;
++    NS_ASSERT_OWNINGTHREAD(FetchHandler);
++
++    // Stop holding the worker alive when we leave this method.
++    nsRefPtr<Feature> feature;
++    feature.swap(mFeature);
++
++    nsAutoTArray<nsRefPtr<Response>, 256> responseList;
++    responseList.SetCapacity(mRequestList.Length());
 +
 +    JS::Rooted<JSObject*> obj(aCx, &aValue.toObject());
 +
-+    if (JS_IsArrayObject(aCx, obj)) {
-+      uint32_t length;
-+      if (NS_WARN_IF(!JS_GetArrayLength(aCx, obj, &length))) {
++    if (NS_WARN_IF(!JS_IsArrayObject(aCx, obj))) {
++      Fail();
++      return;
++    }
++
++    uint32_t length;
++    if (NS_WARN_IF(!JS_GetArrayLength(aCx, obj, &length))) {
++      Fail();
++      return;
++    }
++
++    for (uint32_t i = 0; i < length; ++i) {
++      JS::RootedValue value(aCx);
++
++      if (NS_WARN_IF(!JS_GetElement(aCx, obj, i, &value))) {
 +        Fail();
 +        return;
 +      }
 +
-+      for (uint32_t i = 0; i < length; ++i) {
-+        JS::RootedValue value(aCx);
++      JS::Rooted<JSObject*> responseObj(aCx, &value.toObject());
 +
-+        if (NS_WARN_IF(!JS_GetElement(aCx, obj, i, &value))) {
-+          Fail();
-+          return;
-+        }
-+
-+        JS::Rooted<JSObject*> responseObj(aCx, &value.toObject());
-+
-+        Response* r = nullptr;
-+        nsresult rv = UNWRAP_OBJECT(Response, responseObj, r);
-+        if (NS_WARN_IF(NS_FAILED(rv))) {
-+          Fail();
-+          return;
-+        }
-+
-+        nsRefPtr<Response> response = r;
-+        if (!response->Ok()) {
-+          Fail();
-+          return;
-+        }
-+
-+        responseList.AppendElement(Move(response));
-+      }
-+    } else {
-+      Response* r = nullptr;
-+      nsresult rv = UNWRAP_OBJECT(Response, obj, r);
++      nsRefPtr<Response> response = nullptr;
++      nsresult rv = UNWRAP_OBJECT(Response, responseObj, response);
 +      if (NS_WARN_IF(NS_FAILED(rv))) {
 +        Fail();
 +        return;
 +      }
 +
-+      nsRefPtr<Response> response = r;
-+      if (!response->Ok()) {
++      if (NS_WARN_IF(response->Type() == ResponseType::Error)) {
 +        Fail();
 +        return;
 +      }
@@ -210,7 +525,17 @@ diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
 +      responseList.AppendElement(Move(response));
 +    }
 +
-+    // TODO: call Cache::PutAll() or something
++    MOZ_ASSERT(mRequestList.Length() == responseList.Length());
++
++    ErrorResult result;
++    nsRefPtr<Promise> put = mCache->PutAll(mRequestList, responseList, result);
++    if (NS_WARN_IF(result.Failed())) {
++      // TODO: abort the fetch requests we have running (bug 1157434)
++      mPromise->MaybeReject(result);
++      return;
++    }
++
++    mPromise->MaybeResolve(put);
 +  }
 +
 +  virtual void
@@ -233,14 +558,16 @@ diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
 +    mPromise->MaybeReject(rv);
 +  }
 +
++  nsRefPtr<Feature> mFeature;
 +  nsRefPtr<Cache> mCache;
++  nsTArray<nsRefPtr<Request>> mRequestList;
 +  nsRefPtr<Promise> mPromise;
 +
 +  NS_DECL_ISUPPORTS
 +};
 +
 +NS_IMPL_ISUPPORTS0(Cache::FetchHandler)
-+
+ 
  NS_IMPL_CYCLE_COLLECTING_ADDREF(mozilla::dom::cache::Cache);
  NS_IMPL_CYCLE_COLLECTING_RELEASE(mozilla::dom::cache::Cache);
  NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(mozilla::dom::cache::Cache, mGlobal);
@@ -248,8 +575,37 @@ diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
  NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Cache)
    NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
    NS_INTERFACE_MAP_ENTRY(nsISupports)
- NS_INTERFACE_MAP_END
-@@ -141,76 +242,91 @@ Cache::MatchAll(const Optional<RequestOr
+@@ -105,17 +224,17 @@ Cache::Match(const RequestOrUSVString& a
+     return nullptr;
+   }
+ 
+   CacheQueryParams params;
+   ToCacheQueryParams(params, aOptions);
+ 
+   AutoChildOpArgs args(this, CacheMatchArgs(CacheRequest(), params));
+ 
+-  args.Add(ir, IgnoreBody, PassThroughReferrer, IgnoreInvalidScheme, aRv);
++  args.Add(ir, IgnoreBody, IgnoreInvalidScheme, aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return nullptr;
+   }
+ 
+   return ExecuteOp(args, aRv);
+ }
+ 
+ already_AddRefed<Promise>
+@@ -131,86 +250,92 @@ Cache::MatchAll(const Optional<RequestOr
+ 
+   if (aRequest.WasPassed()) {
+     nsRefPtr<InternalRequest> ir = ToInternalRequest(aRequest.Value(),
+                                                      IgnoreBody, aRv);
+     if (aRv.Failed()) {
+       return nullptr;
+     }
+ 
+-    args.Add(ir, IgnoreBody, PassThroughReferrer, IgnoreInvalidScheme, aRv);
++    args.Add(ir, IgnoreBody, IgnoreInvalidScheme, aRv);
+     if (aRv.Failed()) {
        return nullptr;
      }
    }
@@ -262,27 +618,36 @@ diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
 +Cache::Add(JSContext* aContext, const RequestOrUSVString& aRequest,
 +           ErrorResult& aRv)
  {
-   MOZ_ASSERT(mActor);
- 
--  if (!IsValidPutRequestMethod(aRequest, aRv)) {
--    return nullptr;
--  }
-+  // TODO
+-  MOZ_ASSERT(mActor);
+-
+   if (!IsValidPutRequestMethod(aRequest, aRv)) {
+     return nullptr;
+   }
  
 -  nsRefPtr<InternalRequest> ir = ToInternalRequest(aRequest, ReadBody, aRv);
--  if (aRv.Failed()) {
--    return nullptr;
--  }
--
++  GlobalObject global(aContext, mGlobal->GetGlobalJSObject());
++  MOZ_ASSERT(!global.Failed());
++
++  nsTArray<nsRefPtr<Request>> requestList(1);
++  nsRefPtr<Request> request = Request::Constructor(global, aRequest,
++                                                   RequestInit(), aRv);
+   if (aRv.Failed()) {
+     return nullptr;
+   }
+ 
 -  AutoChildOpArgs args(this, CacheAddAllArgs());
 -
 -  args.Add(ir, ReadBody, ExpandReferrer, NetworkErrorOnInvalidScheme, aRv);
 -  if (aRv.Failed()) {
--    return nullptr;
--  }
--
++  nsAutoString url;
++  request->GetUrl(url);
++  if (!IsValidPutRequestURL(url, aRv)) {
+     return nullptr;
+   }
+ 
 -  return ExecuteOp(args, aRv);
-+  return nullptr;
++  requestList.AppendElement(Move(request));
++  return AddAll(global, Move(requestList), aRv);
  }
  
  already_AddRefed<Promise>
@@ -291,78 +656,62 @@ diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
 +              const Sequence<OwningRequestOrUSVString>& aRequestList,
                ErrorResult& aRv)
  {
-   MOZ_ASSERT(mActor);
+-  MOZ_ASSERT(mActor);
++  GlobalObject global(aContext, mGlobal->GetGlobalJSObject());
++  MOZ_ASSERT(!global.Failed());
  
-   // If there is no work to do, then resolve immediately
+-  // If there is no work to do, then resolve immediately
 -  if (aRequests.IsEmpty()) {
-+  if (aRequestList.IsEmpty()) {
-     nsRefPtr<Promise> promise = Promise::Create(mGlobal, aRv);
-     if (!promise) {
-       return nullptr;
-     }
- 
-     promise->MaybeResolve(JS::UndefinedHandleValue);
-     return promise.forget();
-   }
- 
--  AutoChildOpArgs args(this, CacheAddAllArgs());
-+  nsTArray<nsRefPtr<Promise>> fetchList(aRequestList.Length());
- 
--  for (uint32_t i = 0; i < aRequests.Length(); ++i) {
--    if (!IsValidPutRequestMethod(aRequests[i], aRv)) {
+-    nsRefPtr<Promise> promise = Promise::Create(mGlobal, aRv);
+-    if (!promise) {
 -      return nullptr;
-+  // Begin fetching each request in parallel.  For now, if an error occurs just
-+  // abandon our previous fetch calls.  In theory we could cancel them in the
-+  // future once fetch supports it.
-+
++  nsTArray<nsRefPtr<Request>> requestList(aRequestList.Length());
 +  for (uint32_t i = 0; i < aRequestList.Length(); ++i) {
 +    RequestOrUSVString requestOrString;
 +
 +    if (aRequestList[i].IsRequest()) {
-+      requestOrString.GetAsRequest() = aRequestList[i].GetAsRequest();
++      requestOrString.SetAsRequest() = aRequestList[i].GetAsRequest();
 +      if (!IsValidPutRequestMethod(requestOrString.GetAsRequest(), aRv)) {
 +        return nullptr;
 +      }
 +    } else {
-+      requestOrString.GetAsUSVString().Rebind(
++      requestOrString.SetAsUSVString().Rebind(
 +        aRequestList[i].GetAsUSVString().Data(),
 +        aRequestList[i].GetAsUSVString().Length());
      }
  
+-    promise->MaybeResolve(JS::UndefinedHandleValue);
+-    return promise.forget();
+-  }
+-
+-  AutoChildOpArgs args(this, CacheAddAllArgs());
+-
+-  for (uint32_t i = 0; i < aRequests.Length(); ++i) {
+-    if (!IsValidPutRequestMethod(aRequests[i], aRv)) {
+-      return nullptr;
+-    }
+-
 -    nsRefPtr<InternalRequest> ir = ToInternalRequest(aRequests[i], ReadBody,
 -                                                     aRv);
-+    nsRefPtr<Promise> fetch = FetchRequest(mGlobal, requestOrString,
-+                                           RequestInit(), aRv);
++    nsRefPtr<Request> request = Request::Constructor(global, requestOrString,
++                                                     RequestInit(), aRv);
      if (aRv.Failed()) {
        return nullptr;
      }
  
 -    args.Add(ir, ReadBody, ExpandReferrer, NetworkErrorOnInvalidScheme, aRv);
 -    if (aRv.Failed()) {
--      return nullptr;
--    }
-+    fetchList.AppendElement(Move(fetch));
++    nsAutoString url;
++    request->GetUrl(url);
++    if (!IsValidPutRequestURL(url, aRv)) {
+       return nullptr;
+     }
++
++    requestList.AppendElement(Move(request));
    }
  
 -  return ExecuteOp(args, aRv);
-+  nsRefPtr<Promise> promise = Promise::Create(mGlobal, aRv);
-+  if (aRv.Failed()) {
-+    return nullptr;
-+  }
-+
-+  GlobalObject global(aContext, mGlobal->GetGlobalJSObject());
-+  MOZ_ASSERT(!global.Failed());
-+
-+  nsRefPtr<Promise> fetchPromise = Promise::All(global, fetchList, aRv);
-+  if (aRv.Failed()) {
-+    return nullptr;
-+  }
-+
-+  // TODO: save requests
-+  nsRefPtr<FetchHandler> handler = new FetchHandler(this, promise);
-+  fetchPromise->AppendNativeHandler(handler);
-+
-+  return promise.forget();
++  return AddAll(global, Move(requestList), aRv);
  }
  
  already_AddRefed<Promise>
@@ -371,7 +720,64 @@ diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
  {
    MOZ_ASSERT(mActor);
  
-@@ -370,11 +486,20 @@ Cache::ExecuteOp(AutoChildOpArgs& aOpArg
+@@ -220,17 +345,17 @@ Cache::Put(const RequestOrUSVString& aRe
+ 
+   nsRefPtr<InternalRequest> ir = ToInternalRequest(aRequest, ReadBody, aRv);
+   if (aRv.Failed()) {
+     return nullptr;
+   }
+ 
+   AutoChildOpArgs args(this, CachePutAllArgs());
+ 
+-  args.Add(ir, ReadBody, PassThroughReferrer, TypeErrorOnInvalidScheme,
++  args.Add(ir, ReadBody, TypeErrorOnInvalidScheme,
+            aResponse, aRv);
+   if (aRv.Failed()) {
+     return nullptr;
+   }
+ 
+   return ExecuteOp(args, aRv);
+ }
+ 
+@@ -245,17 +370,17 @@ Cache::Delete(const RequestOrUSVString& 
+     return nullptr;
+   }
+ 
+   CacheQueryParams params;
+   ToCacheQueryParams(params, aOptions);
+ 
+   AutoChildOpArgs args(this, CacheDeleteArgs(CacheRequest(), params));
+ 
+-  args.Add(ir, IgnoreBody, PassThroughReferrer, IgnoreInvalidScheme, aRv);
++  args.Add(ir, IgnoreBody, IgnoreInvalidScheme, aRv);
+   if (aRv.Failed()) {
+     return nullptr;
+   }
+ 
+   return ExecuteOp(args, aRv);
+ }
+ 
+ already_AddRefed<Promise>
+@@ -271,17 +396,17 @@ Cache::Keys(const Optional<RequestOrUSVS
+ 
+   if (aRequest.WasPassed()) {
+     nsRefPtr<InternalRequest> ir = ToInternalRequest(aRequest.Value(),
+                                                      IgnoreBody, aRv);
+     if (aRv.Failed()) {
+       return nullptr;
+     }
+ 
+-    args.Add(ir, IgnoreBody, PassThroughReferrer, IgnoreInvalidScheme, aRv);
++    args.Add(ir, IgnoreBody, IgnoreInvalidScheme, aRv);
+     if (aRv.Failed()) {
+       return nullptr;
+     }
+   }
+ 
+   return ExecuteOp(args, aRv);
+ }
+ 
+@@ -370,11 +495,85 @@ Cache::ExecuteOp(AutoChildOpArgs& aOpArg
    if (!promise) {
      return nullptr;
    }
@@ -381,12 +787,77 @@ diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
  }
  
 +already_AddRefed<Promise>
-+Cache::PutAll(const nsTArray<nsRefPtr<InternalRequest>>& aRequestList,
++Cache::AddAll(const GlobalObject& aGlobal,
++              nsTArray<nsRefPtr<Request>>&& aRequestList, ErrorResult& aRv)
++{
++  MOZ_ASSERT(mActor);
++
++  // If there is no work to do, then resolve immediately
++  if (aRequestList.IsEmpty()) {
++    nsRefPtr<Promise> promise = Promise::Create(mGlobal, aRv);
++    if (!promise) {
++      return nullptr;
++    }
++
++    promise->MaybeResolve(JS::UndefinedHandleValue);
++    return promise.forget();
++  }
++
++  nsAutoTArray<nsRefPtr<Promise>, 256> fetchList;
++  fetchList.SetCapacity(aRequestList.Length());
++
++  // Begin fetching each request in parallel.  For now, if an error occurs just
++  // abandon our previous fetch calls.  In theory we could cancel them in the
++  // future once fetch supports it.
++
++  for (uint32_t i = 0; i < aRequestList.Length(); ++i) {
++    RequestOrUSVString requestOrString;
++    requestOrString.SetAsRequest() = aRequestList[i];
++    nsRefPtr<Promise> fetch = FetchRequest(mGlobal, requestOrString,
++                                           RequestInit(), aRv);
++    if (aRv.Failed()) {
++      return nullptr;
++    }
++
++    fetchList.AppendElement(Move(fetch));
++  }
++
++  nsRefPtr<Promise> promise = Promise::Create(mGlobal, aRv);
++  if (aRv.Failed()) {
++    return nullptr;
++  }
++
++  nsRefPtr<FetchHandler> handler = new FetchHandler(mActor->GetFeature(), this,
++                                                    Move(aRequestList), promise);
++
++  nsRefPtr<Promise> fetchPromise = Promise::All(aGlobal, fetchList, aRv);
++  if (aRv.Failed()) {
++    return nullptr;
++  }
++  fetchPromise->AppendNativeHandler(handler);
++
++  return promise.forget();
++}
++
++already_AddRefed<Promise>
++Cache::PutAll(const nsTArray<nsRefPtr<Request>>& aRequestList,
 +              const nsTArray<nsRefPtr<Response>>& aResponseList,
 +              ErrorResult& aRv)
 +{
-+  // TODO
-+  return nullptr;
++  MOZ_ASSERT(mActor);
++  MOZ_ASSERT(aRequestList.Length() == aResponseList.Length());
++
++  AutoChildOpArgs args(this, CachePutAllArgs());
++
++  for (uint32_t i = 0; i < aRequestList.Length(); ++i) {
++    nsRefPtr<InternalRequest> ir = aRequestList[i]->GetInternalRequest();
++    args.Add(ir, ReadBody, TypeErrorOnInvalidScheme, *aResponseList[i], aRv);
++    if (aRv.Failed()) {
++      return nullptr;
++    }
++  }
++
++  return ExecuteOp(args, aRv);
 +}
 +
  } // namespace cache
@@ -420,7 +891,7 @@ diff --git a/dom/cache/Cache.h b/dom/cache/Cache.h
           ErrorResult& aRv);
    already_AddRefed<Promise>
    Keys(const Optional<RequestOrUSVString>& aRequest,
-@@ -80,24 +81,31 @@ public:
+@@ -80,24 +81,35 @@ public:
  #ifdef DEBUG
    virtual void AssertOwningThread() const override;
  #endif
@@ -440,7 +911,11 @@ diff --git a/dom/cache/Cache.h b/dom/cache/Cache.h
    ExecuteOp(AutoChildOpArgs& aOpArgs, ErrorResult& aRv);
  
 +  already_AddRefed<Promise>
-+  PutAll(const nsTArray<nsRefPtr<InternalRequest>>& aRequestList,
++  AddAll(const GlobalObject& aGlobal, nsTArray<nsRefPtr<Request>>&& aRequestList,
++         ErrorResult& aRv);
++
++  already_AddRefed<Promise>
++  PutAll(const nsTArray<nsRefPtr<Request>>& aRequestList,
 +         const nsTArray<nsRefPtr<Response>>& aResponseList,
 +         ErrorResult& aRv);
 +
@@ -658,6 +1133,29 @@ diff --git a/dom/cache/CacheParent.cpp b/dom/cache/CacheParent.cpp
    }
  
    return new CacheOpParent(Manager(), mCacheId, aOpArgs);
+diff --git a/dom/cache/CacheStorage.cpp b/dom/cache/CacheStorage.cpp
+--- a/dom/cache/CacheStorage.cpp
++++ b/dom/cache/CacheStorage.cpp
+@@ -427,18 +427,17 @@ CacheStorage::MaybeRunPendingRequests()
+     return;
+   }
+ 
+   for (uint32_t i = 0; i < mPendingRequests.Length(); ++i) {
+     ErrorResult rv;
+     nsAutoPtr<Entry> entry(mPendingRequests[i].forget());
+     AutoChildOpArgs args(this, entry->mArgs);
+     if (entry->mRequest) {
+-      args.Add(entry->mRequest, IgnoreBody, PassThroughReferrer,
+-               IgnoreInvalidScheme, rv);
++      args.Add(entry->mRequest, IgnoreBody, IgnoreInvalidScheme, rv);
+     }
+     if (rv.Failed()) {
+       entry->mPromise->MaybeReject(rv);
+       continue;
+     }
+     mActor->ExecuteOp(mGlobal, entry->mPromise, args.SendAsOpArgs());
+   }
+   mPendingRequests.Clear();
 diff --git a/dom/cache/CacheTypes.ipdlh b/dom/cache/CacheTypes.ipdlh
 --- a/dom/cache/CacheTypes.ipdlh
 +++ b/dom/cache/CacheTypes.ipdlh
@@ -1399,10 +1897,363 @@ diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
  class CacheRequestResponse;
  class Context;
  class ManagerId;
+diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
+--- a/dom/cache/TypeUtils.cpp
++++ b/dom/cache/TypeUtils.cpp
+@@ -10,109 +10,40 @@
+ #include "mozilla/dom/CacheBinding.h"
+ #include "mozilla/dom/InternalRequest.h"
+ #include "mozilla/dom/Request.h"
+ #include "mozilla/dom/Response.h"
+ #include "mozilla/dom/cache/CachePushStreamChild.h"
+ #include "mozilla/dom/cache/CacheTypes.h"
+ #include "mozilla/dom/cache/ReadStream.h"
+ #include "mozilla/ipc/BackgroundChild.h"
+-#include "mozilla/ipc/FileDescriptorSetChild.h"
+ #include "mozilla/ipc/PBackgroundChild.h"
+ #include "mozilla/ipc/PFileDescriptorSetChild.h"
+ #include "mozilla/ipc/InputStreamUtils.h"
+ #include "nsCOMPtr.h"
+ #include "nsIAsyncInputStream.h"
+ #include "nsIAsyncOutputStream.h"
+ #include "nsIIPCSerializableInputStream.h"
+ #include "nsQueryObject.h"
+ #include "nsStreamUtils.h"
+ #include "nsString.h"
+ #include "nsURLParsers.h"
+ #include "nsCRT.h"
+ #include "nsHttp.h"
+ 
+-namespace {
++namespace mozilla {
++namespace dom {
++namespace cache {
+ 
+-using mozilla::ErrorResult;
+-using mozilla::unused;
+-using mozilla::void_t;
+-using mozilla::dom::InternalHeaders;
+-using mozilla::dom::cache::CacheReadStream;
+-using mozilla::dom::cache::HeadersEntry;
+ using mozilla::ipc::BackgroundChild;
+ using mozilla::ipc::FileDescriptor;
+ using mozilla::ipc::PBackgroundChild;
+ using mozilla::ipc::PFileDescriptorSetChild;
+ 
+-// Utility function to remove the fragment from a URL, check its scheme, and optionally
+-// provide a URL without the query.  We're not using nsIURL or URL to do this because
+-// they require going to the main thread.
+-static void
+-ProcessURL(nsAString& aUrl, bool* aSchemeValidOut,
+-           nsAString* aUrlWithoutQueryOut, ErrorResult& aRv)
+-{
+-  NS_ConvertUTF16toUTF8 flatURL(aUrl);
+-  const char* url = flatURL.get();
+-
+-  // off the main thread URL parsing using nsStdURLParser.
+-  nsCOMPtr<nsIURLParser> urlParser = new nsStdURLParser();
+-
+-  uint32_t pathPos;
+-  int32_t pathLen;
+-  uint32_t schemePos;
+-  int32_t schemeLen;
+-  aRv = urlParser->ParseURL(url, flatURL.Length(), &schemePos, &schemeLen,
+-                            nullptr, nullptr,       // ignore authority
+-                            &pathPos, &pathLen);
+-  if (NS_WARN_IF(aRv.Failed())) { return; }
+-
+-  if (aSchemeValidOut) {
+-    nsAutoCString scheme(Substring(flatURL, schemePos, schemeLen));
+-    *aSchemeValidOut = scheme.LowerCaseEqualsLiteral("http") ||
+-                       scheme.LowerCaseEqualsLiteral("https");
+-  }
+-
+-  uint32_t queryPos;
+-  int32_t queryLen;
+-  uint32_t refPos;
+-  int32_t refLen;
+-
+-  aRv = urlParser->ParsePath(url + pathPos, flatURL.Length() - pathPos,
+-                             nullptr, nullptr,               // ignore filepath
+-                             &queryPos, &queryLen,
+-                             &refPos, &refLen);
+-  if (NS_WARN_IF(aRv.Failed())) {
+-    return;
+-  }
+-
+-  // TODO: Remove this once Request/Response properly strip the fragment (bug 1110476)
+-  if (refLen >= 0) {
+-    // ParsePath gives us ref position relative to the start of the path
+-    refPos += pathPos;
+-
+-    aUrl = Substring(aUrl, 0, refPos - 1);
+-  }
+-
+-  if (!aUrlWithoutQueryOut) {
+-    return;
+-  }
+-
+-  if (queryLen < 0) {
+-    *aUrlWithoutQueryOut = aUrl;
+-    return;
+-  }
+-
+-  // ParsePath gives us query position relative to the start of the path
+-  queryPos += pathPos;
+-
+-  // We want everything before the query sine we already removed the trailing
+-  // fragment
+-  *aUrlWithoutQueryOut = Substring(aUrl, 0, queryPos - 1);
+-}
++namespace {
+ 
+ static bool
+ HasVaryStar(mozilla::dom::InternalHeaders* aHeaders)
+ {
+   nsAutoTArray<nsCString, 16> varyHeaders;
+   ErrorResult rv;
+   aHeaders->GetAll(NS_LITERAL_CSTRING("vary"), varyHeaders, rv);
+   MOZ_ALWAYS_TRUE(!rv.Failed());
+@@ -168,28 +99,16 @@ ToHeadersEntryList(nsTArray<HeadersEntry
+   for (uint32_t i = 0; i < entryList.Length(); ++i) {
+     InternalHeaders::Entry& entry = entryList[i];
+     aOut.AppendElement(HeadersEntry(entry.mName, entry.mValue));
+   }
+ }
+ 
+ } // anonymous namespace
+ 
+-namespace mozilla {
+-namespace dom {
+-namespace cache {
+-
+-using mozilla::ipc::BackgroundChild;
+-using mozilla::ipc::FileDescriptor;
+-using mozilla::ipc::FileDescriptorSetChild;
+-using mozilla::ipc::PFileDescriptorSetChild;
+-using mozilla::ipc::PBackgroundChild;
+-using mozilla::ipc::OptionalFileDescriptorSet;
+-
+-
+ already_AddRefed<InternalRequest>
+ TypeUtils::ToInternalRequest(const RequestOrUSVString& aIn,
+                              BodyAction aBodyAction, ErrorResult& aRv)
+ {
+   if (aIn.IsRequest()) {
+     Request& request = aIn.GetAsRequest();
+ 
+     // Check and set bodyUsed flag immediately because its on Request
+@@ -219,19 +138,18 @@ TypeUtils::ToInternalRequest(const Ownin
+     return request->GetInternalRequest();
+   }
+ 
+   return ToInternalRequest(aIn.GetAsUSVString(), aRv);
+ }
+ 
+ void
+ TypeUtils::ToCacheRequest(CacheRequest& aOut, InternalRequest* aIn,
+-                          BodyAction aBodyAction,
+-                          ReferrerAction aReferrerAction,
+-                          SchemeAction aSchemeAction, ErrorResult& aRv)
++                          BodyAction aBodyAction, SchemeAction aSchemeAction,
++                          ErrorResult& aRv)
+ {
+   MOZ_ASSERT(aIn);
+ 
+   aIn->GetMethod(aOut.method());
+ 
+   nsAutoCString url;
+   aIn->GetURL(url);
+   CopyUTF8toUTF16(url, aOut.url());
+@@ -243,26 +161,18 @@ TypeUtils::ToCacheRequest(CacheRequest& 
+   }
+ 
+   if (!schemeValid) {
+     if (aSchemeAction == TypeErrorOnInvalidScheme) {
+       NS_NAMED_LITERAL_STRING(label, "Request");
+       aRv.ThrowTypeError(MSG_INVALID_URL_SCHEME, &label, &aOut.url());
+       return;
+     }
+-
+-    if (aSchemeAction == NetworkErrorOnInvalidScheme) {
+-      aRv.Throw(NS_ERROR_DOM_NETWORK_ERR);
+-      return;
+-    }
+   }
+ 
+-  if (aReferrerAction == ExpandReferrer) {
+-    UpdateRequestReferrer(GetGlobalObject(), aIn);
+-  }
+   aIn->GetReferrer(aOut.referrer());
+ 
+   nsRefPtr<InternalHeaders> headers = aIn->Headers();
+   MOZ_ASSERT(headers);
+   ToHeadersEntryList(aOut.headers(), headers);
+   aOut.headersGuard() = headers->Guard();
+   aOut.mode() = aIn->Mode();
+   aOut.credentials() = aIn->GetCredentialsMode();
+@@ -459,16 +369,83 @@ TypeUtils::ToInternalHeaders(const nsTAr
+     entryList.AppendElement(InternalHeaders::Entry(headersEntry.name(),
+                                                    headersEntry.value()));
+   }
+ 
+   nsRefPtr<InternalHeaders> ref = new InternalHeaders(Move(entryList), aGuard);
+   return ref.forget();
+ }
+ 
++// Utility function to remove the fragment from a URL, check its scheme, and optionally
++// provide a URL without the query.  We're not using nsIURL or URL to do this because
++// they require going to the main thread.
++// static
++void
++TypeUtils::ProcessURL(nsAString& aUrl, bool* aSchemeValidOut,
++                      nsAString* aUrlWithoutQueryOut, ErrorResult& aRv)
++{
++  NS_ConvertUTF16toUTF8 flatURL(aUrl);
++  const char* url = flatURL.get();
++
++  // off the main thread URL parsing using nsStdURLParser.
++  nsCOMPtr<nsIURLParser> urlParser = new nsStdURLParser();
++
++  uint32_t pathPos;
++  int32_t pathLen;
++  uint32_t schemePos;
++  int32_t schemeLen;
++  aRv = urlParser->ParseURL(url, flatURL.Length(), &schemePos, &schemeLen,
++                            nullptr, nullptr,       // ignore authority
++                            &pathPos, &pathLen);
++  if (NS_WARN_IF(aRv.Failed())) { return; }
++
++  if (aSchemeValidOut) {
++    nsAutoCString scheme(Substring(flatURL, schemePos, schemeLen));
++    *aSchemeValidOut = scheme.LowerCaseEqualsLiteral("http") ||
++                       scheme.LowerCaseEqualsLiteral("https");
++  }
++
++  uint32_t queryPos;
++  int32_t queryLen;
++  uint32_t refPos;
++  int32_t refLen;
++
++  aRv = urlParser->ParsePath(url + pathPos, flatURL.Length() - pathPos,
++                             nullptr, nullptr,               // ignore filepath
++                             &queryPos, &queryLen,
++                             &refPos, &refLen);
++  if (NS_WARN_IF(aRv.Failed())) {
++    return;
++  }
++
++  // TODO: Remove this once Request/Response properly strip the fragment (bug 1110476)
++  if (refLen >= 0) {
++    // ParsePath gives us ref position relative to the start of the path
++    refPos += pathPos;
++
++    aUrl = Substring(aUrl, 0, refPos - 1);
++  }
++
++  if (!aUrlWithoutQueryOut) {
++    return;
++  }
++
++  if (queryLen < 0) {
++    *aUrlWithoutQueryOut = aUrl;
++    return;
++  }
++
++  // ParsePath gives us query position relative to the start of the path
++  queryPos += pathPos;
++
++  // We want everything before the query sine we already removed the trailing
++  // fragment
++  *aUrlWithoutQueryOut = Substring(aUrl, 0, queryPos - 1);
++}
++
+ void
+ TypeUtils::CheckAndSetBodyUsed(Request* aRequest, BodyAction aBodyAction,
+                                ErrorResult& aRv)
+ {
+   MOZ_ASSERT(aRequest);
+ 
+   if (aBodyAction == IgnoreBody) {
+     return;
+diff --git a/dom/cache/TypeUtils.h b/dom/cache/TypeUtils.h
+--- a/dom/cache/TypeUtils.h
++++ b/dom/cache/TypeUtils.h
+@@ -41,27 +41,20 @@ class TypeUtils
+ {
+ public:
+   enum BodyAction
+   {
+     IgnoreBody,
+     ReadBody
+   };
+ 
+-  enum ReferrerAction
+-  {
+-    PassThroughReferrer,
+-    ExpandReferrer
+-  };
+-
+   enum SchemeAction
+   {
+     IgnoreInvalidScheme,
+-    TypeErrorOnInvalidScheme,
+-    NetworkErrorOnInvalidScheme
++    TypeErrorOnInvalidScheme
+   };
+ 
+   ~TypeUtils() { }
+   virtual nsIGlobalObject* GetGlobalObject() const = 0;
+ #ifdef DEBUG
+   virtual void AssertOwningThread() const = 0;
+ #else
+   inline void AssertOwningThread() const { }
+@@ -75,18 +68,18 @@ public:
+                     ErrorResult& aRv);
+ 
+   already_AddRefed<InternalRequest>
+   ToInternalRequest(const OwningRequestOrUSVString& aIn, BodyAction aBodyAction,
+                     ErrorResult& aRv);
+ 
+   void
+   ToCacheRequest(CacheRequest& aOut, InternalRequest* aIn,
+-                 BodyAction aBodyAction, ReferrerAction aReferrerAction,
+-                 SchemeAction aSchemeAction, ErrorResult& aRv);
++                 BodyAction aBodyAction, SchemeAction aSchemeAction,
++                 ErrorResult& aRv);
+ 
+   void
+   ToCacheResponseWithoutBody(CacheResponse& aOut, InternalResponse& aIn,
+                              ErrorResult& aRv);
+ 
+   void
+   ToCacheResponse(CacheResponse& aOut, Response& aIn, ErrorResult& aRv);
+ 
+@@ -102,16 +95,20 @@ public:
+   already_AddRefed<Request>
+   ToRequest(const CacheRequest& aIn);
+ 
+   // static methods
+   static already_AddRefed<InternalHeaders>
+   ToInternalHeaders(const nsTArray<HeadersEntry>& aHeadersEntryList,
+                     HeadersGuardEnum aGuard = HeadersGuardEnum::None);
+ 
++  static void
++  ProcessURL(nsAString& aUrl, bool* aSchemeValidOut,
++             nsAString* aUrlWithoutQueryOut, ErrorResult& aRv);
++
+ private:
+   void
+   CheckAndSetBodyUsed(Request* aRequest, BodyAction aBodyAction,
+                       ErrorResult& aRv);
+ 
+   already_AddRefed<InternalRequest>
+   ToInternalRequest(const nsAString& aIn, ErrorResult& aRv);
+ 
 diff --git a/dom/cache/moz.build b/dom/cache/moz.build
 --- a/dom/cache/moz.build
 +++ b/dom/cache/moz.build
-@@ -20,33 +20,33 @@ EXPORTS.mozilla.dom.cache += [
+@@ -20,17 +20,16 @@ EXPORTS.mozilla.dom.cache += [
      'CacheStorageChild.h',
      'CacheStorageParent.h',
      'CacheStreamControlChild.h',
@@ -1420,25 +2271,7 @@ diff --git a/dom/cache/moz.build b/dom/cache/moz.build
      'PrincipalVerifier.h',
      'QuotaClient.h',
      'ReadStream.h',
-     'SavedTypes.h',
-     'StreamControl.h',
-     'StreamList.h',
-     'Types.h',
-     'TypeUtils.h',
- ]
- 
--UNIFIED_SOURCES += [
-+#UNIFIED_SOURCES += [
-+SOURCES += [
-     'Action.cpp',
-     'ActorChild.cpp',
-     'AutoUtils.cpp',
-     'Cache.cpp',
-     'CacheChild.cpp',
-     'CacheOpChild.cpp',
-     'CacheOpParent.cpp',
-     'CacheParent.cpp',
-@@ -56,17 +56,16 @@ UNIFIED_SOURCES += [
+@@ -56,17 +55,16 @@ UNIFIED_SOURCES += [
      'CacheStorageChild.cpp',
      'CacheStorageParent.cpp',
      'CacheStreamControlChild.cpp',
@@ -1456,10 +2289,36 @@ diff --git a/dom/cache/moz.build b/dom/cache/moz.build
      'QuotaClient.cpp',
      'ReadStream.cpp',
      'StreamControl.cpp',
+diff --git a/dom/cache/test/mochitest/test_cache_add.js b/dom/cache/test/mochitest/test_cache_add.js
+--- a/dom/cache/test/mochitest/test_cache_add.js
++++ b/dom/cache/test/mochitest/test_cache_add.js
+@@ -5,20 +5,20 @@ var urlList = [
+   './test_cache.js'
+ ];
+ var cache;
+ var name = "adder" + context;
+ caches.open(name).then(function(openCache) {
+   cache = openCache;
+   return cache.add('ftp://example.com/invalid' + context);
+ }).catch(function (err) {
+-  is(err.name, 'NetworkError', 'add() should throw NetworkError for invalid scheme');
++  is(err.name, 'TypeError', 'add() should throw TypeError for invalid scheme');
+   return cache.addAll(['http://example.com/valid' + context, 'ftp://example.com/invalid' + context]);
+ }).catch(function (err) {
+-  is(err.name, 'NetworkError', 'addAll() should throw NetworkError for invalid scheme');
++  is(err.name, 'TypeError', 'addAll() should throw TypeError for invalid scheme');
+   var promiseList = urlList.map(function(url) {
+     return cache.match(url);
+   });
+   promiseList.push(cache.match(singleUrl));
+   return Promise.all(promiseList);
+ }).then(function(resultList) {
+   is(urlList.length + 1, resultList.length, 'Expected number of results');
+   resultList.every(function(result) {
 diff --git a/dom/fetch/Response.h b/dom/fetch/Response.h
 --- a/dom/fetch/Response.h
 +++ b/dom/fetch/Response.h
-@@ -7,16 +7,17 @@
+@@ -7,23 +7,23 @@
  #define mozilla_dom_Response_h
  
  #include "nsWrapperCache.h"
@@ -1471,9 +2330,16 @@ diff --git a/dom/fetch/Response.h b/dom/fetch/Response.h
 +#include "InternalHeaders.h"
  #include "InternalResponse.h"
  
- class nsPIDOMWindow;
- 
  namespace mozilla {
  namespace dom {
  
- class ArrayBufferOrArrayBufferViewOrUSVStringOrURLSearchParams;
+ class Headers;
+-class InternalHeaders;
+ 
+ class Response final : public nsISupports
+                      , public FetchBody<Response>
+                      , public nsWrapperCache
+ {
+   NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+   NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS(Response)
+ 
