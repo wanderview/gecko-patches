@@ -1,0 +1,230 @@
+# HG changeset patch
+# Parent 60349cbc3d4eb0423b20303a7c4384d9f715a133
+# User Ben Kelly <ben@wanderview.com>
+Bug 1134671 Keep sqlite connection open between Cache API operations. r=ehsan
+
+diff --git a/dom/cache/Action.h b/dom/cache/Action.h
+--- a/dom/cache/Action.h
++++ b/dom/cache/Action.h
+@@ -6,16 +6,18 @@
+ 
+ #ifndef mozilla_dom_cache_Action_h
+ #define mozilla_dom_cache_Action_h
+ 
+ #include "mozilla/Atomics.h"
+ #include "mozilla/dom/cache/Types.h"
+ #include "nsISupportsImpl.h"
+ 
++class mozIStorageConnection;
++
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ class Action
+ {
+ public:
+   class Resolver
+@@ -28,22 +30,37 @@ public:
+ 
+     NS_IMETHOD_(MozExternalRefCountType)
+     AddRef(void) = 0;
+ 
+     NS_IMETHOD_(MozExternalRefCountType)
+     Release(void) = 0;
+   };
+ 
++  // Class containing data that can be opportunistically shared between
++  // multiple Actions running on the same thread/Context.  In theory
++  // this could be abstracted to a generic key/value map, but for now
++  // just explicitly provide accessors for the data we need.
++  class Data
++  {
++  public:
++    virtual mozIStorageConnection*
++    GetConnection() const = 0;
++
++    virtual void
++    SetConnection(mozIStorageConnection* aConn) = 0;
++  };
++
+   // Execute operations on the target thread.  Once complete call
+   // Resolver::Resolve().  This can be done sync or async.
+   // Note: Action should hold Resolver ref until its ready to call Resolve().
+   // Note: The "target" thread is determined when the Action is scheduled on
+   //       Context.  The Action should not assume any particular thread is used.
+-  virtual void RunOnTarget(Resolver* aResolver, const QuotaInfo& aQuotaInfo) = 0;
++  virtual void RunOnTarget(Resolver* aResolver, const QuotaInfo& aQuotaInfo,
++                           Data* aOptionalData) = 0;
+ 
+   // Called on initiating thread when the Action is canceled.  The Action is
+   // responsible for calling Resolver::Resolve() as normal; either with a
+   // normal error code or NS_ERROR_ABORT.  If CancelOnInitiatingThread() is
+   // called after Resolve() has already occurred, then the cancel can be
+   // ignored.
+   //
+   // Cancellation is a best effort to stop processing as soon as possible, but
+diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
+--- a/dom/cache/Context.cpp
++++ b/dom/cache/Context.cpp
+@@ -331,17 +331,18 @@ Context::QuotaInitRunnable::Run()
+ 
+       if (!mQuotaIOThreadAction) {
+         resolver->Resolve(NS_OK);
+         break;
+       }
+ 
+       // Execute the provided initialization Action.  The Action must Resolve()
+       // before returning.
+-      mQuotaIOThreadAction->RunOnTarget(resolver, mQuotaInfo);
++      // TODO: pass optional Data
++      mQuotaIOThreadAction->RunOnTarget(resolver, mQuotaInfo, nullptr);
+       MOZ_ASSERT(resolver->Resolved());
+ 
+       break;
+     }
+     // -------------------
+     case STATE_COMPLETING:
+     {
+       NS_ASSERT_OWNINGTHREAD(QuotaInitRunnable);
+@@ -553,17 +554,18 @@ Context::ActionRunnable::Run()
+       MOZ_ASSERT(!mExecutingRunOnTarget);
+ 
+       // Note that we are calling RunOnTarget().  This lets us detect
+       // if Resolve() is called synchronously.
+       AutoRestore<bool> executingRunOnTarget(mExecutingRunOnTarget);
+       mExecutingRunOnTarget = true;
+ 
+       mState = STATE_RUNNING;
+-      mAction->RunOnTarget(this, mQuotaInfo);
++      // TODO: pass optional Data
++      mAction->RunOnTarget(this, mQuotaInfo, nullptr);
+ 
+       // Resolve was called synchronously from RunOnTarget().  We can
+       // immediately move to completing now since we are sure RunOnTarget()
+       // completed.
+       if (mState == STATE_RESOLVING) {
+         // Use recursion instead of switch case fall-through...  Seems slightly
+         // easier to understand.
+         Run();
+diff --git a/dom/cache/DBAction.cpp b/dom/cache/DBAction.cpp
+--- a/dom/cache/DBAction.cpp
++++ b/dom/cache/DBAction.cpp
+@@ -30,17 +30,18 @@ DBAction::DBAction(Mode aMode)
+ {
+ }
+ 
+ DBAction::~DBAction()
+ {
+ }
+ 
+ void
+-DBAction::RunOnTarget(Resolver* aResolver, const QuotaInfo& aQuotaInfo)
++DBAction::RunOnTarget(Resolver* aResolver, const QuotaInfo& aQuotaInfo,
++                      Data* aOptionalData)
+ {
+   MOZ_ASSERT(!NS_IsMainThread());
+   MOZ_ASSERT(aResolver);
+   MOZ_ASSERT(aQuotaInfo.mDir);
+ 
+   if (IsCanceled()) {
+     aResolver->Resolve(NS_ERROR_ABORT);
+     return;
+@@ -48,29 +49,42 @@ DBAction::RunOnTarget(Resolver* aResolve
+ 
+   nsCOMPtr<nsIFile> dbDir;
+   nsresult rv = aQuotaInfo.mDir->Clone(getter_AddRefs(dbDir));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     aResolver->Resolve(rv);
+     return;
+   }
+ 
+-  rv = dbDir->Append(NS_LITERAL_STRING("cache"));
+-  if (NS_WARN_IF(NS_FAILED(rv))) {
+-    aResolver->Resolve(rv);
+-    return;
++  nsCOMPtr<mozIStorageConnection> conn;
++
++  // Attempt to reuse the connection opened by a previous Action.
++  if (aOptionalData) {
++    conn = aOptionalData->GetConnection();
+   }
+ 
+-  nsCOMPtr<mozIStorageConnection> conn;
+-  rv = OpenConnection(aQuotaInfo, dbDir, getter_AddRefs(conn));
+-  if (NS_WARN_IF(NS_FAILED(rv))) {
+-    aResolver->Resolve(rv);
+-    return;
++  // If there is no previous Action, then we must open one.
++  if (!conn) {
++    rv = dbDir->Append(NS_LITERAL_STRING("cache"));
++    if (NS_WARN_IF(NS_FAILED(rv))) {
++      aResolver->Resolve(rv);
++      return;
++    }
++
++    rv = OpenConnection(aQuotaInfo, dbDir, getter_AddRefs(conn));
++    if (NS_WARN_IF(NS_FAILED(rv))) {
++      aResolver->Resolve(rv);
++      return;
++    }
++    MOZ_ASSERT(conn);
++
++    // Save this connection in the shared Data object so later Actions can
++    // use it.  This avoids opening a new connection for every Action.
++    aOptionalData->SetConnection(conn);
+   }
+-  MOZ_ASSERT(conn);
+ 
+   RunWithDBOnTarget(aResolver, aQuotaInfo, dbDir, conn);
+ }
+ 
+ nsresult
+ DBAction::OpenConnection(const QuotaInfo& aQuotaInfo, nsIFile* aDBDir,
+                          mozIStorageConnection** aConnOut)
+ {
+diff --git a/dom/cache/DBAction.h b/dom/cache/DBAction.h
+--- a/dom/cache/DBAction.h
++++ b/dom/cache/DBAction.h
+@@ -38,17 +38,18 @@ protected:
+   // ref the DB connection.  The connection can only be referenced from the
+   // target thread and must be released upon resolve.
+   virtual void
+   RunWithDBOnTarget(Resolver* aResolver, const QuotaInfo& aQuotaInfo,
+                     nsIFile* aDBDir, mozIStorageConnection* aConn) = 0;
+ 
+ private:
+   virtual void
+-  RunOnTarget(Resolver* aResolver, const QuotaInfo& aQuotaInfo) override;
++  RunOnTarget(Resolver* aResolver, const QuotaInfo& aQuotaInfo,
++              Data* aOptionalData) override;
+ 
+   nsresult OpenConnection(const QuotaInfo& aQuotaInfo, nsIFile* aQuotaDir,
+                           mozIStorageConnection** aConnOut);
+ 
+   nsresult WipeDatabase(nsIFile* aDBFile, nsIFile* aDBDir);
+ 
+   const Mode mMode;
+ };
+diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
+--- a/dom/cache/Manager.cpp
++++ b/dom/cache/Manager.cpp
+@@ -88,17 +88,17 @@ public:
+   { }
+ 
+   explicit DeleteOrphanedBodyAction(const nsID& aBodyId)
+   {
+     mDeletedBodyIdList.AppendElement(aBodyId);
+   }
+ 
+   virtual void
+-  RunOnTarget(Resolver* aResolver, const QuotaInfo& aQuotaInfo) override
++  RunOnTarget(Resolver* aResolver, const QuotaInfo& aQuotaInfo, Data*) override
+   {
+     MOZ_ASSERT(aResolver);
+     MOZ_ASSERT(aQuotaInfo.mDir);
+ 
+     // Note that since DeleteOrphanedBodyAction isn't used while the context is
+     // being initialized, we don't need to check for cancellation here.
+ 
+     nsCOMPtr<nsIFile> dbDir;
