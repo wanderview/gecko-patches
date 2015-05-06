@@ -67,7 +67,118 @@ diff --git a/dom/cache/Action.h b/dom/cache/Action.h
 diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
 --- a/dom/cache/Context.cpp
 +++ b/dom/cache/Context.cpp
-@@ -331,17 +331,18 @@ Context::QuotaInitRunnable::Run()
+@@ -9,24 +9,26 @@
+ #include "mozilla/AutoRestore.h"
+ #include "mozilla/DebugOnly.h"
+ #include "mozilla/dom/cache/Action.h"
+ #include "mozilla/dom/cache/Manager.h"
+ #include "mozilla/dom/cache/ManagerId.h"
+ #include "mozilla/dom/cache/OfflineStorage.h"
+ #include "mozilla/dom/quota/OriginOrPatternString.h"
+ #include "mozilla/dom/quota/QuotaManager.h"
++#include "mozIStorageConnection.h"
+ #include "nsIFile.h"
+ #include "nsIPrincipal.h"
+ #include "nsIRunnable.h"
+ #include "nsThreadUtils.h"
+ 
+ namespace {
+ 
+ using mozilla::dom::Nullable;
++using mozilla::dom::cache::Action;
+ using mozilla::dom::cache::QuotaInfo;
+ using mozilla::dom::quota::Client;
+ using mozilla::dom::quota::OriginOrPatternString;
+ using mozilla::dom::quota::QuotaManager;
+ using mozilla::dom::quota::PERSISTENCE_TYPE_DEFAULT;
+ using mozilla::dom::quota::PersistenceType;
+ 
+ // Release our lock on the QuotaManager directory asynchronously.
+@@ -49,28 +51,83 @@ public:
+   }
+ 
+ private:
+   ~QuotaReleaseRunnable() { }
+ 
+   const QuotaInfo mQuotaInfo;
+ };
+ 
++class NullAction final : public Action
++{
++public:
++  NullAction()
++  {
++  }
++
++  virtual void
++  RunOnTarget(Resolver* aResolver, const QuotaInfo&, Data*) override
++  {
++    // Resolve success immediately.  This Action does no actual work.
++    MOZ_ASSERT(aResolver);
++    aResolver->Resolve(NS_OK);
++  }
++};
++
+ } // anonymous namespace
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ using mozilla::DebugOnly;
+ using mozilla::dom::quota::OriginOrPatternString;
+ using mozilla::dom::quota::QuotaManager;
+ using mozilla::dom::quota::PERSISTENCE_TYPE_DEFAULT;
+ using mozilla::dom::quota::PersistenceType;
+ 
++class Context::Data final : public Action::Data
++{
++public:
++  Data(nsIThread* aTarget)
++    : mTarget(aTarget)
++  {
++    MOZ_ASSERT(mTarget);
++  }
++
++  virtual mozIStorageConnection*
++  GetConnection() const
++  {
++    MOZ_ASSERT(mTarget == NS_GetCurrentThread());
++    return mConnection;
++  }
++
++  virtual void
++  SetConnection(mozIStorageConnection* aConn) override
++  {
++    MOZ_ASSERT(mTarget == NS_GetCurrentThread());
++    MOZ_ASSERT(!mConnection);
++    mConnection = aConn;
++    MOZ_ASSERT(mConnection);
++  }
++
++private:
++  ~Data()
++  {
++    if (mConnection) {
++      NS_ProxyRelease(mTarget, mConnection);
++    }
++  }
++
++  nsCOMPtr<nsIThread> mTarget;
++  nsCOMPtr<mozIStorageConnection> mConnection;
++
++  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(Context::Data)
++};
++
+ // Executed to perform the complicated dance of steps necessary to initialize
+ // the QuotaManager.  This must be performed for each origin before any disk
+ // IO occurrs.
+ class Context::QuotaInitRunnable final : public nsIRunnable
+ {
+ public:
+   QuotaInitRunnable(Context* aContext,
+                     Manager* aManager,
+@@ -331,17 +388,17 @@ Context::QuotaInitRunnable::Run()
  
        if (!mQuotaIOThreadAction) {
          resolver->Resolve(NS_OK);
@@ -77,7 +188,6 @@ diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
        // Execute the provided initialization Action.  The Action must Resolve()
        // before returning.
 -      mQuotaIOThreadAction->RunOnTarget(resolver, mQuotaInfo);
-+      // TODO: pass optional Data
 +      mQuotaIOThreadAction->RunOnTarget(resolver, mQuotaInfo, nullptr);
        MOZ_ASSERT(resolver->Resolved());
  
@@ -87,7 +197,59 @@ diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
      case STATE_COMPLETING:
      {
        NS_ASSERT_OWNINGTHREAD(QuotaInitRunnable);
-@@ -553,17 +554,18 @@ Context::ActionRunnable::Run()
+@@ -386,28 +443,30 @@ Context::QuotaInitRunnable::Run()
+ // Runnable wrapper around Action objects dispatched on the Context.  This
+ // runnable executes the Action on the appropriate threads while the Context
+ // is initialized.
+ class Context::ActionRunnable final : public nsIRunnable
+                                     , public Action::Resolver
+                                     , public Context::Activity
+ {
+ public:
+-  ActionRunnable(Context* aContext, nsIEventTarget* aTarget, Action* aAction,
+-                 const QuotaInfo& aQuotaInfo)
++  ActionRunnable(Context* aContext, Data* aData, nsIEventTarget* aTarget,
++                 Action* aAction, const QuotaInfo& aQuotaInfo)
+     : mContext(aContext)
++    , mData(aData)
+     , mTarget(aTarget)
+     , mAction(aAction)
+     , mQuotaInfo(aQuotaInfo)
+     , mInitiatingThread(NS_GetCurrentThread())
+     , mState(STATE_INIT)
+     , mResult(NS_OK)
+     , mExecutingRunOnTarget(false)
+   {
+     MOZ_ASSERT(mContext);
++    // mData may be nullptr
+     MOZ_ASSERT(mTarget);
+     MOZ_ASSERT(mAction);
+     MOZ_ASSERT(mQuotaInfo.mDir);
+     MOZ_ASSERT(mInitiatingThread);
+   }
+ 
+   nsresult Dispatch()
+   {
+@@ -487,16 +546,17 @@ private:
+     STATE_RUN_ON_TARGET,
+     STATE_RUNNING,
+     STATE_RESOLVING,
+     STATE_COMPLETING,
+     STATE_COMPLETE
+   };
+ 
+   nsRefPtr<Context> mContext;
++  nsRefPtr<Data> mData;
+   nsCOMPtr<nsIEventTarget> mTarget;
+   nsRefPtr<Action> mAction;
+   const QuotaInfo mQuotaInfo;
+   nsCOMPtr<nsIThread> mInitiatingThread;
+   State mState;
+   nsresult mResult;
+ 
+   // Only accessible on target thread;
+@@ -552,18 +612,21 @@ Context::ActionRunnable::Run()
+       MOZ_ASSERT(NS_GetCurrentThread() == mTarget);
        MOZ_ASSERT(!mExecutingRunOnTarget);
  
        // Note that we are calling RunOnTarget().  This lets us detect
@@ -95,10 +257,12 @@ diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
        AutoRestore<bool> executingRunOnTarget(mExecutingRunOnTarget);
        mExecutingRunOnTarget = true;
  
++      nsRefPtr<Data> data;
++      data.swap(mData);
++
        mState = STATE_RUNNING;
 -      mAction->RunOnTarget(this, mQuotaInfo);
-+      // TODO: pass optional Data
-+      mAction->RunOnTarget(this, mQuotaInfo, nullptr);
++      mAction->RunOnTarget(this, mQuotaInfo, data);
  
        // Resolve was called synchronously from RunOnTarget().  We can
        // immediately move to completing now since we are sure RunOnTarget()
@@ -107,7 +271,40 @@ diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
          // Use recursion instead of switch case fall-through...  Seems slightly
          // easier to understand.
          Run();
-@@ -696,36 +698,37 @@ Context::ThreadsafeHandle::ContextDestro
+@@ -662,20 +725,32 @@ Context::ThreadsafeHandle::~ThreadsafeHa
+   MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
+     mOwningThread->Dispatch(runnable, nsIThread::DISPATCH_NORMAL)));
+ }
+ 
+ void
+ Context::ThreadsafeHandle::AllowToCloseOnOwningThread()
+ {
+   MOZ_ASSERT(mOwningThread == NS_GetCurrentThread());
++
+   // A Context "closes" when its ref count drops to zero.  Dropping this
+   // strong ref is necessary, but not sufficient for the close to occur.
+   // Any outstanding IO will continue and keep the Context alive.  Once
+   // the Context is idle, it will be destroyed.
++
++  // First, tell the context to flush any target thread shared data.  This
++  // data must be released on the target thread prior to running the Context
++  // destructor.  This will schedule an Action which ensures that the
++  // ~Context() is not immediately executed when we drop the strong ref.
++  if (mStrongRef) {
++    mStrongRef->DoomTargetData();
++  }
++
++  // Now drop our strong ref and let Context finish running any outstanding
++  // Actions.
+   mStrongRef = nullptr;
+ }
+ 
+ void
+ Context::ThreadsafeHandle::InvalidateAndAllowToCloseOnOwningThread()
+ {
+   MOZ_ASSERT(mOwningThread == NS_GetCurrentThread());
+   // Cancel the Context through the weak reference.  This means we can
+@@ -696,61 +771,61 @@ Context::ThreadsafeHandle::ContextDestro
    MOZ_ASSERT(!mStrongRef);
    MOZ_ASSERT(mWeakRef);
    MOZ_ASSERT(mWeakRef == aContext);
@@ -141,18 +338,128 @@ diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
 +Context::Context(Manager* aManager, nsIThread* aTarget)
    : mManager(aManager)
 +  , mTarget(aTarget)
++  , mData(new Data(aTarget))
    , mState(STATE_CONTEXT_PREINIT)
  {
    MOZ_ASSERT(mManager);
  }
  
  void
- Context::Dispatch(nsIEventTarget* aTarget, Action* aAction)
+-Context::Dispatch(nsIEventTarget* aTarget, Action* aAction)
++Context::Dispatch(Action* aAction)
  {
+   NS_ASSERT_OWNINGTHREAD(Context);
+-  MOZ_ASSERT(aTarget);
+   MOZ_ASSERT(aAction);
+ 
+   MOZ_ASSERT(mState != STATE_CONTEXT_CANCELED);
+   if (mState == STATE_CONTEXT_CANCELED) {
+     return;
+   } else if (mState == STATE_CONTEXT_INIT ||
+              mState == STATE_CONTEXT_PREINIT) {
+     PendingAction* pending = mPendingActions.AppendElement();
+-    pending->mTarget = aTarget;
+     pending->mAction = aAction;
+     return;
+   }
+ 
+   MOZ_ASSERT(STATE_CONTEXT_READY);
+-  DispatchAction(aTarget, aAction);
++  DispatchAction(aAction);
+ }
+ 
+ void
+ Context::CancelAll()
+ {
+   NS_ASSERT_OWNINGTHREAD(Context);
+ 
+   // In PREINIT state we have not dispatch the init runnable yet.  Just
+@@ -858,22 +933,28 @@ Context::Start()
+     // Shutdown must be delayed until all Contexts are destroyed.  Shutdown
+     // must also prevent any new Contexts from being constructed.  Crash
+     // for this invariant violation.
+     MOZ_CRASH("Failed to dispatch QuotaInitRunnable.");
+   }
+ }
+ 
+ void
+-Context::DispatchAction(nsIEventTarget* aTarget, Action* aAction)
++Context::DispatchAction(Action* aAction, bool aDoomData)
+ {
+   NS_ASSERT_OWNINGTHREAD(Context);
+ 
+   nsRefPtr<ActionRunnable> runnable =
+-    new ActionRunnable(this, aTarget, aAction, mQuotaInfo);
++    new ActionRunnable(this, mData, mTarget, aAction, mQuotaInfo);
++
++  if (aDoomData) {
++    nsRefPtr<Data> data;
++    data.swap(mData);
++  }
++
+   nsresult rv = runnable->Dispatch();
+   if (NS_FAILED(rv)) {
+     // Shutdown must be delayed until all Contexts are destroyed.  Crash
+     // for this invariant violation.
+     MOZ_CRASH("Failed to dispatch ActionRunnable to target thread.");
+   }
+   AddActivity(runnable);
+ }
+@@ -903,17 +984,17 @@ Context::OnQuotaInit(nsresult aRv, const
+     // Context will destruct after return here and last ref is released.
+     return;
+   }
+ 
+   MOZ_ASSERT(mState == STATE_CONTEXT_INIT);
+   mState = STATE_CONTEXT_READY;
+ 
+   for (uint32_t i = 0; i < mPendingActions.Length(); ++i) {
+-    DispatchAction(mPendingActions[i].mTarget, mPendingActions[i].mAction);
++    DispatchAction(mPendingActions[i].mAction);
+   }
+   mPendingActions.Clear();
+ }
+ 
+ void
+ Context::AddActivity(Activity* aActivity)
+ {
+   NS_ASSERT_OWNINGTHREAD(Context);
+@@ -946,11 +1027,31 @@ void
+ Context::SetNextContext(Context* aNextContext)
+ {
+   NS_ASSERT_OWNINGTHREAD(Context);
+   MOZ_ASSERT(aNextContext);
+   MOZ_ASSERT(!mNextContext);
+   mNextContext = aNextContext;
+ }
+ 
++void
++Context::DoomTargetData()
++{
++  NS_ASSERT_OWNINGTHREAD(Context);
++  MOZ_ASSERT(mData);
++
++  // We are about to drop our reference to the Data.  We need to ensure that
++  // the ~Context() destructor does not run until contents of Data have been
++  // released on the Target thread.
++
++  // Dispatch a no-op Action.  This will hold the Context alive through a
++  // roundtrip to the target thread and back to the owning thread.  The
++  // ref to the Data object is cleared on the owning thread after creating
++  // the ActionRunnable, but before dispatching it.
++  nsRefPtr<Action> action = new NullAction();
++  DispatchAction(action, true /* doomed data */);
++
++  MOZ_ASSERT(!mData);
++}
++
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
 diff --git a/dom/cache/Context.h b/dom/cache/Context.h
 --- a/dom/cache/Context.h
 +++ b/dom/cache/Context.h
-@@ -106,17 +106,18 @@ public:
+@@ -106,23 +106,24 @@ public:
      virtual void Cancel() = 0;
      virtual bool MatchesCacheId(CacheId aCacheId) const = 0;
    };
@@ -169,10 +476,35 @@ diff --git a/dom/cache/Context.h b/dom/cache/Context.h
    // initialized.
    //
    // Only callable from the thread that created the Context.
-   void Dispatch(nsIEventTarget* aTarget, Action* aAction);
+-  void Dispatch(nsIEventTarget* aTarget, Action* aAction);
++  void Dispatch(Action* aAction);
  
    // Cancel any Actions running or waiting to run.  This should allow the
-@@ -164,30 +165,31 @@ private:
+   // Context to be released and Listener::RemoveContext() will be called
+   // when complete.
+   //
+   // Only callable from the thread that created the Context.
+   void CancelAll();
+ 
+@@ -147,16 +148,17 @@ public:
+ 
+   const QuotaInfo&
+   GetQuotaInfo() const
+   {
+     return mQuotaInfo;
+   }
+ 
+ private:
++  class Data;
+   class QuotaInitRunnable;
+   class ActionRunnable;
+ 
+   enum State
+   {
+     STATE_CONTEXT_PREINIT,
+     STATE_CONTEXT_INIT,
+     STATE_CONTEXT_READY,
+@@ -164,30 +166,35 @@ private:
    };
  
    struct PendingAction
@@ -185,7 +517,8 @@ diff --git a/dom/cache/Context.h b/dom/cache/Context.h
 +  Context(Manager* aManager, nsIThread* aTarget);
    ~Context();
    void Start();
-   void DispatchAction(nsIEventTarget* aTarget, Action* aAction);
+-  void DispatchAction(nsIEventTarget* aTarget, Action* aAction);
++  void DispatchAction(Action* aAction, bool aDoomData = false);
    void OnQuotaInit(nsresult aRv, const QuotaInfo& aQuotaInfo,
                     nsMainThreadPtrHandle<OfflineStorage>& aOfflineStorage);
  
@@ -195,8 +528,12 @@ diff --git a/dom/cache/Context.h b/dom/cache/Context.h
    void
    SetNextContext(Context* aNextContext);
  
++  void
++  DoomTargetData();
++
    nsRefPtr<Manager> mManager;
 +  nsCOMPtr<nsIThread> mTarget;
++  nsRefPtr<Data> mData;
    State mState;
    QuotaInfo mQuotaInfo;
    nsRefPtr<QuotaInitRunnable> mInitRunnable;
@@ -228,7 +565,7 @@ diff --git a/dom/cache/DBAction.cpp b/dom/cache/DBAction.cpp
    if (IsCanceled()) {
      aResolver->Resolve(NS_ERROR_ABORT);
      return;
-@@ -48,29 +49,42 @@ DBAction::RunOnTarget(Resolver* aResolve
+@@ -48,29 +49,44 @@ DBAction::RunOnTarget(Resolver* aResolve
  
    nsCOMPtr<nsIFile> dbDir;
    nsresult rv = aQuotaInfo.mDir->Clone(getter_AddRefs(dbDir));
@@ -270,7 +607,9 @@ diff --git a/dom/cache/DBAction.cpp b/dom/cache/DBAction.cpp
 +
 +    // Save this connection in the shared Data object so later Actions can
 +    // use it.  This avoids opening a new connection for every Action.
-+    aOptionalData->SetConnection(conn);
++    if (aOptionalData) {
++      aOptionalData->SetConnection(conn);
++    }
    }
 -  MOZ_ASSERT(conn);
  
@@ -326,6 +665,120 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
      // being initialized, we don't need to check for cancellation here.
  
      nsCOMPtr<nsIFile> dbDir;
+@@ -1326,17 +1326,17 @@ public:
+         // no outstanding references, delete immediately
+         nsRefPtr<Context> context = mManager->mContext;
+ 
+         // TODO: note that we need to check this cache for staleness on startup (bug 1110446)
+         if (!context->IsCanceled()) {
+           context->CancelForCacheId(mCacheId);
+           nsRefPtr<Action> action =
+             new DeleteOrphanedCacheAction(mManager, mCacheId);
+-          context->Dispatch(mManager->mIOThread, action);
++          context->Dispatch(action);
+         }
+       }
+     }
+ 
+     aListener->OnOpComplete(Move(aRv), StorageDeleteResult(mCacheDeleted));
+   }
+ 
+ private:
+@@ -1535,17 +1535,17 @@ Manager::ReleaseCacheId(CacheId aCacheId
+         bool orphaned = mCacheIdRefs[i].mOrphaned;
+         mCacheIdRefs.RemoveElementAt(i);
+         // TODO: note that we need to check this cache for staleness on startup (bug 1110446)
+         nsRefPtr<Context> context = mContext;
+         if (orphaned && context && !context->IsCanceled()) {
+           context->CancelForCacheId(aCacheId);
+           nsRefPtr<Action> action = new DeleteOrphanedCacheAction(this,
+                                                                   aCacheId);
+-          context->Dispatch(mIOThread, action);
++          context->Dispatch(action);
+         }
+       }
+       MaybeAllowContextToClose();
+       return;
+     }
+   }
+   MOZ_ASSERT_UNREACHABLE("Attempt to release CacheId that is not referenced!");
+ }
+@@ -1577,17 +1577,17 @@ Manager::ReleaseBodyId(const nsID& aBody
+       MOZ_ASSERT(mBodyIdRefs[i].mCount < oldRef);
+       if (mBodyIdRefs[i].mCount < 1) {
+         bool orphaned = mBodyIdRefs[i].mOrphaned;
+         mBodyIdRefs.RemoveElementAt(i);
+         // TODO: note that we need to check this body for staleness on startup (bug 1110446)
+         nsRefPtr<Context> context = mContext;
+         if (orphaned && context && !context->IsCanceled()) {
+           nsRefPtr<Action> action = new DeleteOrphanedBodyAction(aBodyId);
+-          context->Dispatch(mIOThread, action);
++          context->Dispatch(action);
+         }
+       }
+       MaybeAllowContextToClose();
+       return;
+     }
+   }
+   MOZ_ASSERT_UNREACHABLE("Attempt to release BodyId that is not referenced!");
+ }
+@@ -1652,17 +1652,17 @@ Manager::ExecuteCacheOp(Listener* aListe
+     case CacheOpArgs::TCacheKeysArgs:
+       action = new CacheKeysAction(this, listenerId, aCacheId,
+                                    aOpArgs.get_CacheKeysArgs(), streamList);
+       break;
+     default:
+       MOZ_CRASH("Unknown Cache operation!");
+   }
+ 
+-  context->Dispatch(mIOThread, action);
++  context->Dispatch(action);
+ }
+ 
+ void
+ Manager::ExecuteStorageOp(Listener* aListener, Namespace aNamespace,
+                           const CacheOpArgs& aOpArgs)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(aListener);
+@@ -1699,17 +1699,17 @@ Manager::ExecuteStorageOp(Listener* aLis
+       break;
+     case CacheOpArgs::TStorageKeysArgs:
+       action = new StorageKeysAction(this, listenerId, aNamespace);
+       break;
+     default:
+       MOZ_CRASH("Unknown CacheStorage operation!");
+   }
+ 
+-  context->Dispatch(mIOThread, action);
++  context->Dispatch(action);
+ }
+ 
+ void
+ Manager::ExecutePutAll(Listener* aListener, CacheId aCacheId,
+                        const nsTArray<CacheRequestResponse>& aPutList,
+                        const nsTArray<nsCOMPtr<nsIInputStream>>& aRequestStreamList,
+                        const nsTArray<nsCOMPtr<nsIInputStream>>& aResponseStreamList)
+ {
+@@ -1725,17 +1725,17 @@ Manager::ExecutePutAll(Listener* aListen
+   MOZ_ASSERT(!context->IsCanceled());
+ 
+   ListenerId listenerId = SaveListener(aListener);
+ 
+   nsRefPtr<Action> action = new CachePutAllAction(this, listenerId, aCacheId,
+                                                   aPutList, aRequestStreamList,
+                                                   aResponseStreamList);
+ 
+-  context->Dispatch(mIOThread, action);
++  context->Dispatch(action);
+ }
+ 
+ Manager::Manager(ManagerId* aManagerId, nsIThread* aIOThread)
+   : mManagerId(aManagerId)
+   , mIOThread(aIOThread)
+   , mContext(nullptr)
+   , mShuttingDown(false)
+   , mState(Open)
 @@ -1769,17 +1769,18 @@ Manager::Init(Manager* aOldManager)
    if (aOldManager) {
      oldContext = aOldManager->mContext;
@@ -343,6 +796,25 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
  
  void
  Manager::Shutdown()
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+ 
+@@ -1887,17 +1888,17 @@ Manager::NoteOrphanedBodyIdList(const ns
+       deleteNowList.AppendElement(aDeletedBodyIdList[i]);
+     }
+   }
+ 
+   // TODO: note that we need to check these bodies for staleness on startup (bug 1110446)
+   nsRefPtr<Context> context = mContext;
+   if (!deleteNowList.IsEmpty() && context && !context->IsCanceled()) {
+     nsRefPtr<Action> action = new DeleteOrphanedBodyAction(deleteNowList);
+-    context->Dispatch(mIOThread, action);
++    context->Dispatch(action);
+   }
+ }
+ 
+ void
+ Manager::MaybeAllowContextToClose()
  {
    NS_ASSERT_OWNINGTHREAD(Manager);
  
