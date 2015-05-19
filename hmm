@@ -1,10 +1,22 @@
 # HG changeset patch
-# Parent fbd5d3bfdeb1d595e1c0dd4fee0d5a10ec3dadee
+# Parent f578b845c4b8b4b042170c74553e2cfdf879825c
 # User Ben Kelly <ben@wanderview.com>
+
 diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
 --- a/dom/cache/DBSchema.cpp
 +++ b/dom/cache/DBSchema.cpp
-@@ -23,21 +23,21 @@
+@@ -13,31 +13,32 @@
+ #include "mozilla/dom/cache/Types.h"
+ #include "mozilla/dom/cache/TypeUtils.h"
+ #include "mozIStorageConnection.h"
+ #include "mozIStorageStatement.h"
+ #include "nsCOMPtr.h"
+ #include "nsTArray.h"
+ #include "nsCRT.h"
+ #include "nsHttp.h"
++#include "nsICryptoHash.h"
+ #include "mozilla/dom/HeadersBinding.h"
+ #include "mozilla/dom/RequestBinding.h"
  #include "mozilla/dom/ResponseBinding.h"
  #include "nsIContentPolicy.h"
  
@@ -28,8 +40,26 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
  // the corresponding WebIDL enum in a way that may be incompatible with the
  // existing data stored in the DOM Cache.  You would need to update the Cache
  // database schema accordingly and adjust the failing static_assert.
-@@ -236,16 +236,24 @@ CreateSchema(mozIStorageConnection* aCon
-     // AUTOINCREMENT is necessary to prevent CacheId values from being reused.
+@@ -160,16 +161,18 @@ static nsresult QueryCache(mozIStorageCo
+                            uint32_t aMaxResults = UINT32_MAX);
+ static nsresult MatchByVaryHeader(mozIStorageConnection* aConn,
+                                   const CacheRequest& aRequest,
+                                   EntryId entryId, bool* aSuccessOut);
+ static nsresult DeleteEntries(mozIStorageConnection* aConn,
+                               const nsTArray<EntryId>& aEntryIdList,
+                               nsTArray<nsID>& aDeletedBodyIdListOut,
+                               uint32_t aPos=0, int32_t aLen=-1);
++static nsresult InsertSecurity(mozIStorageConnection* aConn, nsACString& aData,
++                               int32_t *aIdOut);
+ static nsresult InsertEntry(mozIStorageConnection* aConn, CacheId aCacheId,
+                             const CacheRequest& aRequest,
+                             const nsID* aRequestBodyId,
+                             const CacheResponse& aResponse,
+                             const nsID* aResponseBodyId);
+ static nsresult ReadResponse(mozIStorageConnection* aConn, EntryId aEntryId,
+                              SavedResponse* aSavedResponseOut);
+ static nsresult ReadRequest(mozIStorageConnection* aConn, EntryId aEntryId,
+@@ -237,16 +240,30 @@ CreateSchema(mozIStorageConnection* aCon
      rv = aConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING(
        "CREATE TABLE caches ("
          "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT "
@@ -37,15 +67,21 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
      ));
      if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
  
-+    /*
-+    rv = aConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING(
-+      "CREATE TABLE security ("
-+        "
-+      ";"
-+    ));
-+    */
-+
      rv = aConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING(
++      "CREATE TABLE security ("
++        "id INTEGER NOT NULL PRIMARY KEY, "
++        "hash BLOB NOT NULL, "  // first 8-bytes of the sha1 hash of data column
++        "data BLOB NOT NULL"    // full security info data, 1k to 4k in size
++      ");"
++    ));
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    rv = aConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING(
++      "CREATE INDEX security_hash_index ON security (hash);"
++    ));
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    rv = aConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING(
        "CREATE TABLE entries ("
          "id INTEGER NOT NULL PRIMARY KEY, "
          "request_method TEXT NOT NULL, "
@@ -53,21 +89,99 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
          "request_url_no_query TEXT NOT NULL, "
          "request_referrer TEXT NOT NULL, "
          "request_headers_guard INTEGER NOT NULL, "
-@@ -1132,16 +1140,17 @@ InsertEntry(mozIStorageConnection* aConn
-     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+         "request_mode INTEGER NOT NULL, "
+@@ -1102,16 +1119,94 @@ DeleteEntries(mozIStorageConnection* aCo
  
-     int32_t count;
-     rv = state->GetInt32(0, &count);
-     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+   rv = state->Execute();
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
  
-     printf_stderr("### ### security info of length %u already in db %d times\n",
-                   aResponse.securityInfo().Length(), count);
-+    printf_stderr("### ### %s\n", aResponse.securityInfo().get());
-   }
+   return rv;
+ }
  
-   nsCOMPtr<mozIStorageStatement> state;
-   nsresult rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
-     "INSERT INTO entries ("
-       "request_method, "
-       "request_url, "
-       "request_url_no_query, "
+ nsresult
++InsertSecurity(mozIStorageConnection* aConn, nsACString& aData,
++               int32_t *aIdOut)
++{
++  MOZ_ASSERT(aConn);
++  MOZ_ASSERT(aIdOut);
++  MOZ_ASSERT(!aData.IsEmpty());
++
++  nsresult rv;
++  nsCOMPtr<nsICryptoHash> crypto =
++    do_CreateInstance(NS_CRYPTO_HASH_CONTRACTID, &rv);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  rv = crypto->Init(nsICryptoHash::SHA1);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  rv = crypto->Update(reinterpret_cast<const uint8_t*>(aData.BeginReading()),
++                      aData.Length());
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  nsAutoCString fullHash;
++  rv = crypto->Finish(false /* based64 result */, fullHash);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  nsDependentCSubstring hash(fullHash, 0, 8);
++
++  nsCOMPtr<mozIStorageStatement> state;
++  rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
++    "SELECT id FROM security WHERE hash is :hash AND data is :data;"
++  ), getter_AddRefs(state));
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  rv = state->BindUTF8StringAsBlobByName(NS_LITERAL_CSTRING("hash"), hash);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  rv = state->BindUTF8StringAsBlobByName(NS_LITERAL_CSTRING("data"), aData);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  bool hasMoreData = false;
++  rv = state->ExecuteStep(&hasMoreData);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  if (hasMoreData) {
++    rv = state->GetInt32(0, aIdOut);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    return NS_OK;
++  }
++
++  rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
++    "INSERT INTO security (hash, data) is VALUES (:hash, :data);"
++  ), getter_AddRefs(state));
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  rv = state->BindUTF8StringAsBlobByName(NS_LITERAL_CSTRING("hash"), hash);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  rv = state->BindUTF8StringAsBlobByName(NS_LITERAL_CSTRING("data"), aData);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  rv = state->Execute();
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
++    "SELECT last_insert_rowid()"
++  ), getter_AddRefs(state));
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  hasMoreData = false;
++  rv = state->ExecuteStep(&hasMoreData);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  rv = state->GetInt32(0, aIdOut);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  return NS_OK;
++}
++
++nsresult
+ InsertEntry(mozIStorageConnection* aConn, CacheId aCacheId,
+             const CacheRequest& aRequest,
+             const nsID* aRequestBodyId,
+             const CacheResponse& aResponse,
+             const nsID* aResponseBodyId)
+ {
+   MOZ_ASSERT(!NS_IsMainThread());
+   MOZ_ASSERT(aConn);
