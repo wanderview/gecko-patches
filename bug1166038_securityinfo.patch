@@ -1,7 +1,7 @@
 # HG changeset patch
-# Parent 5d4c65b3ee2f308ef3200f2cc92a4167bfbd2542
+# Parent f6a3e11fd4e6b3cb3a21dc5f9d96dba061ce6cfb
 # User Ben Kelly <ben@wanderview.com>
-Bug 1166038 P2 De-duplicate security info stored in the Cache API. r=ehsan
+Bug 1166038 De-duplicate security info stored in the Cache API. r=ehsan
 
 diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
 --- a/dom/cache/DBSchema.cpp
@@ -53,7 +53,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
 +struct IdCount
 +{
 +  IdCount() : mId(-1), mCount(0) { }
-+  IdCount(int32_t aId) : mId(aId), mCount(1) { }
++  explicit IdCount(int32_t aId) : mId(aId), mCount(1) { }
 +  int32_t mId;
 +  int32_t mCount;
 +};
@@ -75,10 +75,10 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
                                uint32_t aPos=0, int32_t aLen=-1);
 +static nsresult InsertSecurity(mozIStorageConnection* aConn,
 +                               const nsACString& aData, int32_t *aIdOut);
-+static nsresult DeleteSecurity(mozIStorageConnection* aConn, int32_t aId,
-+                               int32_t aCount);
-+static nsresult DeleteSecurityList(mozIStorageConnection* aConn,
-+                                   const nsTArray<IdCount>& aDeletedStorageIdList);
++static nsresult DeleteSecurityInfo(mozIStorageConnection* aConn, int32_t aId,
++                                   int32_t aCount);
++static nsresult DeleteSecurityInfoList(mozIStorageConnection* aConn,
++                                       const nsTArray<IdCount>& aDeletedStorageIdList);
  static nsresult InsertEntry(mozIStorageConnection* aConn, CacheId aCacheId,
                              const CacheRequest& aRequest,
                              const nsID* aRequestBodyId,
@@ -87,7 +87,8 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
  static nsresult ReadResponse(mozIStorageConnection* aConn, EntryId aEntryId,
                               SavedResponse* aSavedResponseOut);
  static nsresult ReadRequest(mozIStorageConnection* aConn, EntryId aEntryId,
-@@ -237,16 +253,31 @@ CreateSchema(mozIStorageConnection* aCon
+@@ -236,16 +252,34 @@ CreateSchema(mozIStorageConnection* aCon
+     // AUTOINCREMENT is necessary to prevent CacheId values from being reused.
      rv = aConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING(
        "CREATE TABLE caches ("
          "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT "
@@ -95,22 +96,25 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
      ));
      if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
  
-     rv = aConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING(
-+      "CREATE TABLE security ("
++    // Security blobs are quite large and duplicated for every Response from
++    // the same https origin.  This table is used to de-duplicate this data.
++    rv = aConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING(
++      "CREATE TABLE security_info ("
 +        "id INTEGER NOT NULL PRIMARY KEY, "
 +        "hash BLOB NOT NULL, "  // first 8-bytes of the sha1 hash of data column
-+        "data BLOB NOT NULL, "  // full security info data, 1k to 4k in size
++        "data BLOB NOT NULL, "  // full security info data, usually a few KB
 +        "refcount INTEGER NOT NULL"
 +      ");"
 +    ));
 +    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
++    // Index the smaller hash value instead of the large security data blob.
 +    rv = aConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING(
-+      "CREATE INDEX security_hash_index ON security (hash);"
++      "CREATE INDEX security_info_hash_index ON security_info (hash);"
 +    ));
 +    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
-+    rv = aConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING(
+     rv = aConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING(
        "CREATE TABLE entries ("
          "id INTEGER NOT NULL PRIMARY KEY, "
          "request_method TEXT NOT NULL, "
@@ -118,8 +122,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
          "request_url_no_query TEXT NOT NULL, "
          "request_referrer TEXT NOT NULL, "
          "request_headers_guard INTEGER NOT NULL, "
-         "request_mode INTEGER NOT NULL, "
-@@ -256,17 +287,17 @@ CreateSchema(mozIStorageConnection* aCon
+@@ -256,17 +290,17 @@ CreateSchema(mozIStorageConnection* aCon
          "request_cache INTEGER NOT NULL, "
          "request_body_id TEXT NULL, "
          "response_type INTEGER NOT NULL, "
@@ -129,7 +132,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
          "response_headers_guard INTEGER NOT NULL, "
          "response_body_id TEXT NULL, "
 -        "response_security_info BLOB NULL, "
-+        "response_security_id INTEGER NULL REFERENCES security(id), "
++        "response_security_info_id INTEGER NULL REFERENCES security_info(id), "
          "cache_id INTEGER NOT NULL REFERENCES caches(id) ON DELETE CASCADE"
        ");"
      ));
@@ -138,7 +141,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
      // TODO: see if we can remove these indices on TEXT columns (bug 1110458)
      rv = aConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING(
        "CREATE INDEX entries_request_url_index "
-@@ -401,17 +432,22 @@ DeleteCacheId(mozIStorageConnection* aCo
+@@ -401,17 +435,22 @@ DeleteCacheId(mozIStorageConnection* aCo
  
    // Delete the bodies explicitly as we need to read out the body IDs
    // anyway.  These body IDs must be deleted one-by-one as content may
@@ -153,7 +156,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
 +                     deletedSecurityIdList);
 +  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
-+  rv = DeleteSecurityList(aConn, deletedSecurityIdList);
++  rv = DeleteSecurityInfoList(aConn, deletedSecurityIdList);
    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
  
    // Delete the remainder of the cache using cascade semantics.
@@ -162,7 +165,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
      "DELETE FROM caches WHERE id=:id;"
    ), getter_AddRefs(state));
    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
-@@ -533,23 +569,30 @@ CachePut(mozIStorageConnection* aConn, C
+@@ -533,23 +572,30 @@ CachePut(mozIStorageConnection* aConn, C
    MOZ_ASSERT(aConn);
  
    CacheQueryParams params(false, false, false, false,
@@ -183,7 +186,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
  
 +  // Delete the security values after doing the insert to avoid churning
 +  // the security table when its not necessary.
-+  rv = DeleteSecurityList(aConn, deletedSecurityIdList);
++  rv = DeleteSecurityInfoList(aConn, deletedSecurityIdList);
 +  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
    return rv;
@@ -194,7 +197,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
              const CacheRequest& aRequest,
              const CacheQueryParams& aParams,
              nsTArray<nsID>& aDeletedBodyIdListOut, bool* aSuccessOut)
-@@ -563,17 +606,22 @@ CacheDelete(mozIStorageConnection* aConn
+@@ -563,17 +609,22 @@ CacheDelete(mozIStorageConnection* aConn
    nsAutoTArray<EntryId, 256> matches;
    nsresult rv = QueryCache(aConn, aCacheId, aRequest, aParams, matches);
    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
@@ -209,7 +212,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
 +                     deletedSecurityIdList);
 +  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
-+  rv = DeleteSecurityList(aConn, deletedSecurityIdList);
++  rv = DeleteSecurityInfoList(aConn, deletedSecurityIdList);
    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
  
    *aSuccessOut = true;
@@ -218,7 +221,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
  }
  
  nsresult
-@@ -1019,16 +1067,17 @@ MatchByVaryHeader(mozIStorageConnection*
+@@ -1019,16 +1070,17 @@ MatchByVaryHeader(mozIStorageConnection*
    *aSuccessOut = varyHeadersMatch;
    return rv;
  }
@@ -236,7 +239,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
    if (aEntryIdList.IsEmpty()) {
      return NS_OK;
    }
-@@ -1043,28 +1092,29 @@ DeleteEntries(mozIStorageConnection* aCo
+@@ -1043,28 +1095,29 @@ DeleteEntries(mozIStorageConnection* aCo
    // so split up larger operations.
    if (aLen > kMaxEntriesPerStatement) {
      uint32_t curPos = aPos;
@@ -258,7 +261,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
    nsCOMPtr<mozIStorageStatement> state;
    nsAutoCString query(
 -    "SELECT request_body_id, response_body_id FROM entries WHERE id IN ("
-+    "SELECT request_body_id, response_body_id, response_security_id "
++    "SELECT request_body_id, response_body_id, response_security_info_id "
 +    "FROM entries WHERE id IN ("
    );
    AppendListParamsToQuery(query, aEntryIdList, aPos, aLen);
@@ -268,7 +271,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
  
    rv = BindListParamsToQuery(state, aEntryIdList, aPos, aLen);
-@@ -1081,16 +1131,43 @@ DeleteEntries(mozIStorageConnection* aCo
+@@ -1081,16 +1134,43 @@ DeleteEntries(mozIStorageConnection* aCo
  
        if (!isNull) {
          nsID id;
@@ -312,7 +315,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
      "DELETE FROM entries WHERE id IN ("
    );
    AppendListParamsToQuery(query, aEntryIdList, aPos, aLen);
-@@ -1104,27 +1181,207 @@ DeleteEntries(mozIStorageConnection* aCo
+@@ -1104,27 +1184,223 @@ DeleteEntries(mozIStorageConnection* aCo
  
    rv = state->Execute();
    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
@@ -328,6 +331,10 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
 +  MOZ_ASSERT(aIdOut);
 +  MOZ_ASSERT(!aData.IsEmpty());
 +
++  // We want to use an index to find existing security blobs, but indexing
++  // the full blob would be quite expensive.  Instead, we index a small
++  // hash value.  Calculate this hash as the first 8 bytes of the SHA1 of
++  // the full data.
 +  nsresult rv;
 +  nsCOMPtr<nsICryptoHash> crypto =
 +    do_CreateInstance(NS_CRYPTO_HASH_CONTRACTID, &rv);
@@ -346,9 +353,15 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
 +
 +  nsDependentCSubstring hash(fullHash, 0, 8);
 +
++  // Next, search for an existing entry for this blob by comparing the hash
++  // value first and then the full data.  SQLite is smart enough to use
++  // the index on the hash to search the table before doing the expensive
++  // comparison of the large data column.  (This was verified with EXPLAIN.)
 +  nsCOMPtr<mozIStorageStatement> state;
 +  rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
-+    "SELECT id, refcount FROM security WHERE hash is :hash AND data is :data;"
++    // Note that hash and data are blobs, but we can use = here since the
++    // columns are NOT NULL.
++    "SELECT id, refcount FROM security_info WHERE hash=:hash AND data=:data;"
 +  ), getter_AddRefs(state));
 +  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
@@ -376,7 +389,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
 +    refcount += 1;
 +
 +    rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
-+      "UPDATE security SET refcount=:refcount WHERE id=:id;"
++      "UPDATE security_info SET refcount=:refcount WHERE id=:id;"
 +    ), getter_AddRefs(state));
 +    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
@@ -395,7 +408,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
 +  // This is a new security info blob.  Create a new row in the security table
 +  // with an initial refcount of 1.
 +  rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
-+    "INSERT INTO security (hash, data, refcount) VALUES (:hash, :data, 1);"
++    "INSERT INTO security_info (hash, data, refcount) VALUES (:hash, :data, 1);"
 +  ), getter_AddRefs(state));
 +  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
@@ -424,11 +437,12 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
 +}
 +
 +nsresult
-+DeleteSecurity(mozIStorageConnection* aConn, int32_t aId, int32_t aCount)
++DeleteSecurityInfo(mozIStorageConnection* aConn, int32_t aId, int32_t aCount)
 +{
++  // First, we need to determine the current refcount for this security blob.
 +  nsCOMPtr<mozIStorageStatement> state;
 +  nsresult rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
-+    "SELECT refcount FROM security WHERE id=:id;"
++    "SELECT refcount FROM security_info WHERE id=:id;"
 +  ), getter_AddRefs(state));
 +  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
@@ -445,11 +459,14 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
 +
 +  MOZ_ASSERT(refcount >= aCount);
 +
++  // Next, calculate the new refcount
 +  int32_t newCount = refcount - aCount;
 +
++  // If the last reference to this security blob was removed we can
++  // just remove the entire row.
 +  if (newCount == 0) {
 +    rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
-+      "DELETE FROM security WHERE id=:id;"
++      "DELETE FROM security_info WHERE id=:id;"
 +    ), getter_AddRefs(state));
 +    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
@@ -462,8 +479,10 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
 +    return NS_OK;
 +  }
 +
++  // Otherwise update the refcount in the table to reflect the reduced
++  // number of references to the security blob.
 +  rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
-+    "UPDATE security SET refcount=:refcount WHERE id=:id;"
++    "UPDATE security_info SET refcount=:refcount WHERE id=:id;"
 +  ), getter_AddRefs(state));
 +  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
@@ -480,12 +499,12 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
 +}
 +
 +nsresult
-+DeleteSecurityList(mozIStorageConnection* aConn,
-+                   const nsTArray<IdCount>& aDeletedStorageIdList)
++DeleteSecurityInfoList(mozIStorageConnection* aConn,
++                        const nsTArray<IdCount>& aDeletedStorageIdList)
 +{
 +  for (uint32_t i = 0; i < aDeletedStorageIdList.Length(); ++i) {
-+    nsresult rv = DeleteSecurity(aConn, aDeletedStorageIdList[i].mId,
-+                                 aDeletedStorageIdList[i].mCount);
++    nsresult rv = DeleteSecurityInfo(aConn, aDeletedStorageIdList[i].mId,
++                                     aDeletedStorageIdList[i].mCount);
 +    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +  }
 +
@@ -521,7 +540,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
        "request_headers_guard, "
        "request_mode, "
        "request_credentials, "
-@@ -1133,17 +1390,17 @@ InsertEntry(mozIStorageConnection* aConn
+@@ -1133,17 +1409,17 @@ InsertEntry(mozIStorageConnection* aConn
        "request_cache, "
        "request_body_id, "
        "response_type, "
@@ -531,7 +550,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
        "response_headers_guard, "
        "response_body_id, "
 -      "response_security_info, "
-+      "response_security_id, "
++      "response_security_info_id, "
        "cache_id "
      ") VALUES ("
        ":request_method, "
@@ -540,7 +559,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
        ":request_referrer, "
        ":request_headers_guard, "
        ":request_mode, "
-@@ -1153,17 +1410,17 @@ InsertEntry(mozIStorageConnection* aConn
+@@ -1153,17 +1429,17 @@ InsertEntry(mozIStorageConnection* aConn
        ":request_cache, "
        ":request_body_id, "
        ":response_type, "
@@ -550,7 +569,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
        ":response_headers_guard, "
        ":response_body_id, "
 -      ":response_security_info, "
-+      ":response_security_id, "
++      ":response_security_info_id, "
        ":cache_id "
      ");"
    ), getter_AddRefs(state));
@@ -559,7 +578,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
    rv = state->BindUTF8StringByName(NS_LITERAL_CSTRING("request_method"),
                                     aRequest.method());
    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
-@@ -1225,18 +1482,22 @@ InsertEntry(mozIStorageConnection* aConn
+@@ -1225,18 +1501,22 @@ InsertEntry(mozIStorageConnection* aConn
  
    rv = state->BindInt32ByName(NS_LITERAL_CSTRING("response_headers_guard"),
      static_cast<int32_t>(aResponse.headersGuard()));
@@ -571,9 +590,9 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
 -  rv = state->BindUTF8StringAsBlobByName(NS_LITERAL_CSTRING("response_security_info"),
 -                                         aResponse.securityInfo());
 +  if (aResponse.securityInfo().IsEmpty()) {
-+    rv = state->BindNullByName(NS_LITERAL_CSTRING("response_security_id"));
++    rv = state->BindNullByName(NS_LITERAL_CSTRING("response_security_info_id"));
 +  } else {
-+    rv = state->BindInt32ByName(NS_LITERAL_CSTRING("response_security_id"),
++    rv = state->BindInt32ByName(NS_LITERAL_CSTRING("response_security_info_id"),
 +                                securityId);
 +  }
    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
@@ -584,7 +603,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
    rv = state->Execute();
    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
  
-@@ -1314,25 +1575,27 @@ ReadResponse(mozIStorageConnection* aCon
+@@ -1314,25 +1594,27 @@ ReadResponse(mozIStorageConnection* aCon
  {
    MOZ_ASSERT(!NS_IsMainThread());
    MOZ_ASSERT(aConn);
@@ -606,11 +625,11 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
 +      "entries.response_status_text, "
 +      "entries.response_headers_guard, "
 +      "entries.response_body_id, "
-+      "security.data "
++      "security_info.data "
      "FROM entries "
 -    "WHERE id=:id;"
-+    "LEFT OUTER JOIN security "
-+    "ON entries.response_security_id=security.id "
++    "LEFT OUTER JOIN security_info "
++    "ON entries.response_security_info_id=security_info.id "
 +    "WHERE entries.id=:id;"
    ), getter_AddRefs(state));
    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
@@ -623,7 +642,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
 diff --git a/dom/cache/test/mochitest/mochitest.ini b/dom/cache/test/mochitest/mochitest.ini
 --- a/dom/cache/test/mochitest/mochitest.ini
 +++ b/dom/cache/test/mochitest/mochitest.ini
-@@ -15,21 +15,23 @@ support-files =
+@@ -15,21 +15,24 @@ support-files =
    test_cache_match_vary.js
    vary.sjs
    test_caches.js
@@ -647,6 +666,7 @@ diff --git a/dom/cache/test/mochitest/mochitest.ini b/dom/cache/test/mochitest/m
  [test_cache_delete.html]
  [test_cache_put_reorder.html]
 +[test_cache_https.html]
++  skip-if = buildapp == 'b2g' # bug 1162353
 diff --git a/dom/cache/test/mochitest/test_cache_https.html b/dom/cache/test/mochitest/test_cache_https.html
 new file mode 100644
 --- /dev/null
