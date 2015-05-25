@@ -1,0 +1,241 @@
+# HG changeset patch
+# Parent 353c44d14a8d789e3320414230e1774758a84923
+# User Ben Kelly <ben@wanderview.com>
+Bug 1168135 P1 Execute Cache init Action on same target thread used for other Actions. r=ehsan
+
+
+diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
+--- a/dom/cache/Context.cpp
++++ b/dom/cache/Context.cpp
+@@ -126,29 +126,32 @@ private:
+ // Executed to perform the complicated dance of steps necessary to initialize
+ // the QuotaManager.  This must be performed for each origin before any disk
+ // IO occurrs.
+ class Context::QuotaInitRunnable final : public nsIRunnable
+ {
+ public:
+   QuotaInitRunnable(Context* aContext,
+                     Manager* aManager,
+-                    Action* aQuotaIOThreadAction)
++                    nsIThread* aTarget,
++                    Action* aInitAction)
+     : mContext(aContext)
+     , mThreadsafeHandle(aContext->CreateThreadsafeHandle())
+     , mManager(aManager)
+-    , mQuotaIOThreadAction(aQuotaIOThreadAction)
++    , mTarget(aTarget)
++    , mInitAction(aInitAction)
+     , mInitiatingThread(NS_GetCurrentThread())
+     , mResult(NS_OK)
+     , mState(STATE_INIT)
+     , mCanceled(false)
+     , mNeedsQuotaRelease(false)
+   {
+     MOZ_ASSERT(mContext);
+     MOZ_ASSERT(mManager);
++    MOZ_ASSERT(mTarget);
+     MOZ_ASSERT(mInitiatingThread);
+   }
+ 
+   nsresult Dispatch()
+   {
+     NS_ASSERT_OWNINGTHREAD(QuotaInitRunnable);
+     MOZ_ASSERT(mState == STATE_INIT);
+ 
+@@ -161,17 +164,17 @@ public:
+     return rv;
+   }
+ 
+   void Cancel()
+   {
+     NS_ASSERT_OWNINGTHREAD(QuotaInitRunnable);
+     MOZ_ASSERT(!mCanceled);
+     mCanceled = true;
+-    mQuotaIOThreadAction->CancelOnInitiatingThread();
++    mInitAction->CancelOnInitiatingThread();
+   }
+ 
+ private:
+   class SyncResolver final : public Action::Resolver
+   {
+   public:
+     SyncResolver()
+       : mResolved(false)
+@@ -197,43 +200,45 @@ private:
+ 
+     NS_INLINE_DECL_REFCOUNTING(Context::QuotaInitRunnable::SyncResolver, override)
+   };
+ 
+   ~QuotaInitRunnable()
+   {
+     MOZ_ASSERT(mState == STATE_COMPLETE);
+     MOZ_ASSERT(!mContext);
+-    MOZ_ASSERT(!mQuotaIOThreadAction);
++    MOZ_ASSERT(!mInitAction);
+   }
+ 
+   enum State
+   {
+     STATE_INIT,
+     STATE_CALL_WAIT_FOR_OPEN_ALLOWED,
+     STATE_WAIT_FOR_OPEN_ALLOWED,
+     STATE_ENSURE_ORIGIN_INITIALIZED,
++    STATE_RUN_ON_TARGET,
+     STATE_RUNNING,
+     STATE_COMPLETING,
+     STATE_COMPLETE
+   };
+ 
+   void Clear()
+   {
+     NS_ASSERT_OWNINGTHREAD(QuotaInitRunnable);
+     MOZ_ASSERT(mContext);
+     mContext = nullptr;
+     mManager = nullptr;
+-    mQuotaIOThreadAction = nullptr;
++    mInitAction = nullptr;
+   }
+ 
+   nsRefPtr<Context> mContext;
+   nsRefPtr<ThreadsafeHandle> mThreadsafeHandle;
+   nsRefPtr<Manager> mManager;
+-  nsRefPtr<Action> mQuotaIOThreadAction;
++  nsCOMPtr<nsIThread> mTarget;
++  nsRefPtr<Action> mInitAction;
+   nsCOMPtr<nsIThread> mInitiatingThread;
+   nsresult mResult;
+   QuotaInfo mQuotaInfo;
+   nsMainThreadPtrHandle<OfflineStorage> mOfflineStorage;
+   State mState;
+   Atomic<bool> mCanceled;
+   bool mNeedsQuotaRelease;
+ 
+@@ -261,19 +266,24 @@ NS_IMPL_ISUPPORTS(mozilla::dom::cache::C
+ //   |  (Main Thread)   +-------------------+
+ //   +--------+---------+                   |
+ //            |                             |
+ // +----------v------------+                |
+ // |EnsureOriginInitialized| Resolve(error) |
+ // |   (Quota IO Thread)   +----------------+
+ // +----------+------------+                |
+ //            |                             |
++// +----------v------------+                |
++// |     RunOnTarget       | Resolve(error) |
++// |   (Target Thread)     +----------------+
++// +----------+------------+                |
++//            |                             |
+ //  +---------v---------+            +------v------+
+ //  |      Running      |            |  Completing |
+-//  | (Quota IO Thread) +------------>(Orig Thread)|
++//  | (Target Thread)   +------------>(Orig Thread)|
+ //  +-------------------+            +------+------+
+ //                                          |
+ //                                    +-----v----+
+ //                                    | Complete |
+ //                                    +----------+
+ //
+ // The initialization process proceeds through the main states.  If an error
+ // occurs, then we transition to Completing state back on the original thread.
+@@ -379,36 +389,47 @@ Context::QuotaInitRunnable::Run()
+                                                   mQuotaInfo.mOrigin,
+                                                   mQuotaInfo.mIsApp,
+                                                   getter_AddRefs(mQuotaInfo.mDir));
+       if (NS_FAILED(rv)) {
+         resolver->Resolve(rv);
+         break;
+       }
+ 
+-      mState = STATE_RUNNING;
+-
+-      if (!mQuotaIOThreadAction) {
++      if (!mInitAction) {
+         resolver->Resolve(NS_OK);
+         break;
+       }
+ 
++      mState = STATE_RUN_ON_TARGET;
++
++      MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
++        mTarget->Dispatch(this, nsIThread::DISPATCH_NORMAL)));
++      break;
++    }
++    // -------------------
++    case STATE_RUN_ON_TARGET:
++    {
++      MOZ_ASSERT(NS_GetCurrentThread() == mTarget);
++
++      mState = STATE_RUNNING;
++
+       // Execute the provided initialization Action.  The Action must Resolve()
+       // before returning.
+-      mQuotaIOThreadAction->RunOnTarget(resolver, mQuotaInfo, nullptr);
++      mInitAction->RunOnTarget(resolver, mQuotaInfo, nullptr);
+       MOZ_ASSERT(resolver->Resolved());
+ 
+       break;
+     }
+     // -------------------
+     case STATE_COMPLETING:
+     {
+       NS_ASSERT_OWNINGTHREAD(QuotaInitRunnable);
+-      if (mQuotaIOThreadAction) {
+-        mQuotaIOThreadAction->CompleteOnInitiatingThread(mResult);
++      if (mInitAction) {
++        mInitAction->CompleteOnInitiatingThread(mResult);
+       }
+       mContext->OnQuotaInit(mResult, mQuotaInfo, mOfflineStorage);
+       mState = STATE_COMPLETE;
+ 
+       if (mNeedsQuotaRelease) {
+         // Unlock the quota dir if we locked it previously
+         nsCOMPtr<nsIRunnable> runnable = new QuotaReleaseRunnable(mQuotaInfo);
+         MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(runnable)));
+@@ -771,24 +792,24 @@ Context::ThreadsafeHandle::ContextDestro
+   MOZ_ASSERT(mWeakRef);
+   MOZ_ASSERT(mWeakRef == aContext);
+   mWeakRef = nullptr;
+ }
+ 
+ // static
+ already_AddRefed<Context>
+ Context::Create(Manager* aManager, nsIThread* aTarget,
+-                Action* aQuotaIOThreadAction, Context* aOldContext)
++                Action* aInitAction, Context* aOldContext)
+ {
+   nsRefPtr<Context> context = new Context(aManager, aTarget);
+ 
+   // Do this here to avoid doing an AddRef() in the constructor
+   // TODO: pass context->mData to allow connetion sharing with init
+   context->mInitRunnable = new QuotaInitRunnable(context, aManager,
+-                                                 aQuotaIOThreadAction);
++                                                 aTarget, aInitAction);
+ 
+   if (aOldContext) {
+     aOldContext->SetNextContext(context);
+   } else {
+     context->Start();
+   }
+ 
+   return context.forget();
+diff --git a/dom/cache/Context.h b/dom/cache/Context.h
+--- a/dom/cache/Context.h
++++ b/dom/cache/Context.h
+@@ -107,17 +107,17 @@ public:
+     virtual bool MatchesCacheId(CacheId aCacheId) const = 0;
+   };
+ 
+   // Create a Context attached to the given Manager.  The given Action
+   // will run on the QuotaManager IO thread.  Note, this Action must
+   // be execute synchronously.
+   static already_AddRefed<Context>
+   Create(Manager* aManager, nsIThread* aTarget,
+-         Action* aQuotaIOThreadAction, Context* aOldContext);
++         Action* aInitAction, Context* aOldContext);
+ 
+   // Execute given action on the target once the quota manager has been
+   // initialized.
+   //
+   // Only callable from the thread that created the Context.
+   void Dispatch(Action* aAction);
+ 
+   // Cancel any Actions running or waiting to run.  This should allow the
