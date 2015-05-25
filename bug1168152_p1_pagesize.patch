@@ -1,0 +1,104 @@
+# HG changeset patch
+# Parent 0031231395eea011bf47f4c917542381566b8267
+# User Ben Kelly <ben@wanderview.com>
+Bug 1168152 P1 Use a smaller sqlite page size and a growth increment in Cache. r=ehsan
+
+
+diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
+--- a/dom/cache/DBSchema.cpp
++++ b/dom/cache/DBSchema.cpp
+@@ -24,23 +24,33 @@
+ #include "mozilla/dom/ResponseBinding.h"
+ #include "nsIContentPolicy.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ namespace db {
+ 
+-const int32_t kMaxWipeSchemaVersion = 9;
++const int32_t kMaxWipeSchemaVersion = 10;
+ 
+ namespace {
+ 
+-const int32_t kLatestSchemaVersion = 9;
++const int32_t kLatestSchemaVersion = 10;
+ const int32_t kMaxEntriesPerStatement = 255;
+ 
++const uint32_t kPageSize = 4096;
++
++// Grow the database in 64KB chunks
++const uint32_t kGrowthPages = 16;
++const uint32_t kGrowthSize = kPageSize * kGrowthSize;
++
++// Limit WAL journal at 512KB
++const uint32_t kWalAutoCheckpointPages = 128;
++const uint32_t kWalAutoCheckpointSize = kPageSize * kWalAutoCheckpointPages;
++
+ } // anonymous namespace
+ 
+ // If any of the static_asserts below fail, it means that you have changed
+ // the corresponding WebIDL enum in a way that may be incompatible with the
+ // existing data stored in the DOM Cache.  You would need to update the Cache
+ // database schema accordingly and adjust the failing static_assert.
+ static_assert(int(HeadersGuardEnum::None) == 0 &&
+               int(HeadersGuardEnum::Request) == 1 &&
+@@ -375,34 +385,46 @@ nsresult
+ InitializeConnection(mozIStorageConnection* aConn)
+ {
+   MOZ_ASSERT(!NS_IsMainThread());
+   MOZ_ASSERT(aConn);
+ 
+   // This function needs to perform per-connection initialization tasks that
+   // need to happen regardless of the schema.
+ 
+-  nsAutoCString pragmas(
++  nsPrintfCString pragmas(
+     "PRAGMA journal_mode = WAL; "
+-    // Use default mozStorage 32kb page size for now
+-    // WAL journal can grow to 512kb before being flushed to disk
+-    "PRAGMA wal_autocheckpoint = 16; "
+-    // Always truncate the journal back to 512kb after large transactions
+-    "PRAGMA journal_size_limit = 524288; "
+-    "PRAGMA foreign_keys = ON; "
+-
+-    // Note, the default encoding of UTF-8 is preferred.  mozStorage does all
+-    // the work necessary to convert UTF-16 nsString values for us.  We don't
+-    // need ordering and the binary equality operations are correct.  So, do
+-    // NOT set PRAGMA encoding to UTF-16.
++    // Use a smaller page size to improve perf/footprint; default is too large
++    "PRAGMA page_size = %u; "
++    // WAL journal can grow to given number of *pages*
++    "PRAGMA wal_autocheckpoint = %u; "
++    // Always truncate the journal back to given number of *bytes*
++    "PRAGMA journal_size_limit = %u; "
++    "PRAGMA foreign_keys = ON; ",
++    kPageSize,
++    kWalAutoCheckpointPages,
++    kWalAutoCheckpointSize
+   );
+ 
++  // Note, the default encoding of UTF-8 is preferred.  mozStorage does all
++  // the work necessary to convert UTF-16 nsString values for us.  We don't
++  // need ordering and the binary equality operations are correct.  So, do
++  // NOT set PRAGMA encoding to UTF-16.
++
+   nsresult rv = aConn->ExecuteSimpleSQL(pragmas);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
++  // Limit fragmentation by growing the database by many pages at once.
++  rv = aConn->SetGrowthIncrement(kGrowthSize, NS_LITERAL_CSTRING(""));
++  if (rv == NS_ERROR_FILE_TOO_BIG) {
++    NS_WARNING("Not enough disk space to set sqlite growth increment.");
++    rv = NS_OK;
++  }
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
+   return NS_OK;
+ }
+ 
+ nsresult
+ CreateCacheId(mozIStorageConnection* aConn, CacheId* aCacheIdOut)
+ {
+   MOZ_ASSERT(!NS_IsMainThread());
+   MOZ_ASSERT(aConn);
