@@ -1,0 +1,220 @@
+# HG changeset patch
+# Parent 0b720cbae8ae0d3e2aaeaf81d4ed73a50b5a6c0c
+# User Ben Kelly <ben@wanderview.com>
+Bug 1168152 P3 Perform incremental vacuum at tail end of Cache db connections. r=ehsan
+
+diff --git a/dom/cache/Connection.cpp b/dom/cache/Connection.cpp
+--- a/dom/cache/Connection.cpp
++++ b/dom/cache/Connection.cpp
+@@ -1,31 +1,53 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/Connection.h"
+ 
++#include "mozilla/dom/cache/DBSchema.h"
++
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ NS_IMPL_ISUPPORTS(cache::Connection, mozIStorageAsyncConnection,
+                                      mozIStorageConnection);
+ 
+ Connection::Connection(mozIStorageConnection* aBase)
+   : mBase(aBase)
++  , mClosed(false)
+ {
+   MOZ_ASSERT(mBase);
+ }
+ 
+ Connection::~Connection()
+ {
++  NS_ASSERT_OWNINGTHREAD(Connection);
++  MOZ_ALWAYS_TRUE(NS_SUCCEEDED(Close()));
++}
++
++NS_IMETHODIMP
++Connection::Close()
++{
++  NS_ASSERT_OWNINGTHREAD(Connection);
++
++  if (mClosed) {
++    return NS_OK;
++  }
++  mClosed = true;
++
++  // If we are closing here, then Cache must not have a transaction
++  // open anywhere else.  This should be guaranteed to succeed.
++  MOZ_ALWAYS_TRUE(NS_SUCCEEDED(db::IncrementalVacuum(this)));
++
++  return mBase->Close();
+ }
+ 
+ // The following methods are all boilerplate that either forward to the
+ // base connection or block the method.  All the async execution methods
+ // are blocked because Cache does not use them and they would require more
+ // work to wrap properly.
+ 
+ // mozIStorageAsyncConnection methods
+@@ -111,22 +133,16 @@ NS_IMETHODIMP
+ Connection::RemoveProgressHandler(mozIStorageProgressHandler** aHandlerOut)
+ {
+   return mBase->RemoveProgressHandler(aHandlerOut);
+ }
+ 
+ // mozIStorageConnection methods
+ 
+ NS_IMETHODIMP
+-Connection::Close()
+-{
+-  return mBase->Close();
+-}
+-
+-NS_IMETHODIMP
+ Connection::Clone(bool aReadOnly, mozIStorageConnection** aConnectionOut)
+ {
+   nsCOMPtr<mozIStorageConnection> conn;
+   nsresult rv = mBase->Clone(aReadOnly, getter_AddRefs(conn));
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   nsCOMPtr<mozIStorageConnection> wrapped = new Connection(conn);
+   wrapped.forget(aConnectionOut);
+diff --git a/dom/cache/Connection.h b/dom/cache/Connection.h
+--- a/dom/cache/Connection.h
++++ b/dom/cache/Connection.h
+@@ -17,16 +17,17 @@ class Connection final : public mozIStor
+ {
+ public:
+   Connection(mozIStorageConnection* aBase);
+ 
+ private:
+   ~Connection();
+ 
+   nsCOMPtr<mozIStorageConnection> mBase;
++  bool mClosed;
+ 
+   NS_DECL_ISUPPORTS
+   NS_DECL_MOZISTORAGEASYNCCONNECTION
+   NS_DECL_MOZISTORAGECONNECTION
+ };
+ 
+ } // namespace cache
+ } // namespace dom
+diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
+--- a/dom/cache/DBSchema.cpp
++++ b/dom/cache/DBSchema.cpp
+@@ -39,16 +39,19 @@ const int32_t kMaxEntriesPerStatement = 
+ const uint32_t kPageSize = 4 * 1024;
+ 
+ // Grow the database in chunks to reduce fragmentation
+ const uint32_t kGrowthSize = 64 * 1024;
+ const uint32_t kGrowthPages = kGrowthSize / kPageSize;
+ static_assert(kGrowthSize % kPageSize == 0,
+               "Growth size must be multiple of page size");
+ 
++// Only release free pages when we have more than this limit
++const int32_t kMaxFreePages = kGrowthPages;
++
+ // Limit WAL journal to a reasonable size
+ const uint32_t kWalAutoCheckpointSize = 512 * 1024;
+ const uint32_t kWalAutoCheckpointPages = kWalAutoCheckpointSize / kPageSize;
+ static_assert(kWalAutoCheckpointSize % kPageSize == 0,
+               "WAL checkpoint size must be multiple of page size");
+ 
+ } // anonymous namespace
+ 
+@@ -238,22 +241,17 @@ CreateSchema(mozIStorageConnection* aCon
+   nsresult rv = aConn->ExecuteSimpleSQL(pragmas);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   int32_t schemaVersion;
+   rv = aConn->GetSchemaVersion(&schemaVersion);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   if (schemaVersion == kLatestSchemaVersion) {
+-    // We already have the correct schema, so just do an incremental vaccum and
+-    // get started.
+-    rv = aConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING(
+-      "PRAGMA incremental_vacuum;"));
+-    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+-
++    // We already have the correct schema, so just get started.
+     return rv;
+   }
+ 
+   if (!schemaVersion) {
+     // The caches table is the single source of truth about what Cache
+     // objects exist for the origin.  The contents of the Cache are stored
+     // in the entries table that references back to caches.
+     //
+@@ -1936,12 +1934,43 @@ CreateAndBindKeyStatement(mozIStorageCon
+ 
+   state.forget(aStateOut);
+ 
+   return rv;
+ }
+ 
+ } // anonymouns namespace
+ 
++nsresult
++IncrementalVacuum(mozIStorageConnection* aConn)
++{
++  nsCOMPtr<mozIStorageStatement> state;
++  nsresult rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
++    "PRAGMA freelist_count;"
++  ), getter_AddRefs(state));
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  bool hasMoreData = false;
++  rv = state->ExecuteStep(&hasMoreData);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  int32_t freePages = 0;
++  rv = state->GetInt32(0, &freePages);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  if (freePages <= kMaxFreePages) {
++    return NS_OK;
++  }
++
++  int32_t pagesToRelease = freePages - kMaxFreePages;
++
++  rv = aConn->ExecuteSimpleSQL(nsPrintfCString(
++    "PRAGMA incremental_vacuum(%d);", pagesToRelease
++  ));
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  return NS_OK;
++}
++
+ } // namespace db
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/DBSchema.h b/dom/cache/DBSchema.h
+--- a/dom/cache/DBSchema.h
++++ b/dom/cache/DBSchema.h
+@@ -99,16 +99,19 @@ StoragePutCache(mozIStorageConnection* a
+ nsresult
+ StorageForgetCache(mozIStorageConnection* aConn, Namespace aNamespace,
+                    const nsAString& aKey);
+ 
+ nsresult
+ StorageGetKeys(mozIStorageConnection* aConn, Namespace aNamespace,
+                nsTArray<nsString>& aKeysOut);
+ 
++nsresult
++IncrementalVacuum(mozIStorageConnection* aConn);
++
+ // We will wipe out databases with a schema versions less than this.
+ extern const int32_t kMaxWipeSchemaVersion;
+ 
+ } // namespace db
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+ 
