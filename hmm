@@ -1,0 +1,212 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  4634b326682e3df5ca6b8ebe8024f1383b2f21f5
+
+diff --git a/dom/cache/Connection.cpp b/dom/cache/Connection.cpp
+--- a/dom/cache/Connection.cpp
++++ b/dom/cache/Connection.cpp
+@@ -2,16 +2,17 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/Connection.h"
+ 
+ #include "mozilla/dom/cache/DBSchema.h"
++#include "mozStorageHelper.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ NS_IMPL_ISUPPORTS(cache::Connection, mozIStorageAsyncConnection,
+                                      mozIStorageConnection);
+ 
+@@ -33,19 +34,24 @@ Connection::Close()
+ {
+   NS_ASSERT_OWNINGTHREAD(Connection);
+ 
+   if (mClosed) {
+     return NS_OK;
+   }
+   mClosed = true;
+ 
+-  // If we are closing here, then Cache must not have a transaction
+-  // open anywhere else.  This should be guaranteed to succeed.
+-  MOZ_ALWAYS_TRUE(NS_SUCCEEDED(db::IncrementalVacuum(this)));
++  {
++    mozStorageTransaction trans(this, false,
++                                mozIStorageConnection::TRANSACTION_IMMEDIATE);
++
++    // If we are closing here, then Cache must not have a transaction
++    // open anywhere else.  This should be guaranteed to succeed.
++    MOZ_ALWAYS_TRUE(NS_SUCCEEDED(db::IncrementalVacuum(this)));
++  }
+ 
+   return mBase->Close();
+ }
+ 
+ // The following methods are all boilerplate that either forward to the
+ // base connection or block the method.  All the async execution methods
+ // are blocked because Cache does not use them and they would require more
+ // work to wrap properly.
+diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
+--- a/dom/cache/DBSchema.cpp
++++ b/dom/cache/DBSchema.cpp
+@@ -225,29 +225,18 @@ static nsresult CreateAndBindKeyStatemen
+ } // anonymous namespace
+ 
+ nsresult
+ CreateSchema(mozIStorageConnection* aConn)
+ {
+   MOZ_ASSERT(!NS_IsMainThread());
+   MOZ_ASSERT(aConn);
+ 
+-  nsAutoCString pragmas(
+-    // Enable auto-vaccum but in incremental mode in order to avoid doing a lot
+-    // of work at the end of each transaction.
+-    // NOTE: This must be done here instead of InitializeConnection() because it
+-    //       only works when the database is empty.
+-    "PRAGMA auto_vacuum = INCREMENTAL; "
+-  );
+-
+-  nsresult rv = aConn->ExecuteSimpleSQL(pragmas);
+-  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+-
+   int32_t schemaVersion;
+-  rv = aConn->GetSchemaVersion(&schemaVersion);
++  nsresult rv = aConn->GetSchemaVersion(&schemaVersion);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   if (schemaVersion == kLatestSchemaVersion) {
+     // We already have the correct schema, so just get started.
+     return rv;
+   }
+ 
+   if (!schemaVersion) {
+@@ -418,16 +407,60 @@ InitializeConnection(mozIStorageConnecti
+   // Limit fragmentation by growing the database by many pages at once.
+   rv = aConn->SetGrowthIncrement(kGrowthSize, EmptyCString());
+   if (rv == NS_ERROR_FILE_TOO_BIG) {
+     NS_WARNING("Not enough disk space to set sqlite growth increment.");
+     rv = NS_OK;
+   }
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
++  int32_t schemaVersion;
++  rv = aConn->GetSchemaVersion(&schemaVersion);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  // Configure vacuum mode on new databases.  We do this here instead of
++  // CreateSchema() because some of these commands cannot run in transactions
++  // with other statements.
++  if (schemaVersion == 0) {
++    rv = aConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING(
++      "PRAGMA auto_vacuum = INCREMENTAL;"
++    ));
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    // Even on a fresh database we cannot just set the auto_vacuum mode.  It
++    // seems mozStorage does something to new databases which prevents this.
++    // Any modification to the schema at all will prevent setting the mode.
++    // Rebuild the empty database to force the change on.  This should be
++    // very quick.
++    rv = aConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING(
++      "VACUUM;"
++    ));
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    // Verify that we successfully set the vacuum mode to incremental
++#ifdef DEBUG
++    nsCOMPtr<mozIStorageStatement> state;
++    rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
++      "PRAGMA auto_vacuum;"
++    ), getter_AddRefs(state));
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    bool hasMoreData = false;
++    rv = state->ExecuteStep(&hasMoreData);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    int32_t mode;
++    rv = state->GetInt32(0, &mode);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    // integer value 2 is incremental mode
++    if (NS_WARN_IF(mode != 2)) { return NS_ERROR_UNEXPECTED; }
++#endif
++  }
++
+   return NS_OK;
+ }
+ 
+ nsresult
+ CreateCacheId(mozIStorageConnection* aConn, CacheId* aCacheIdOut)
+ {
+   MOZ_ASSERT(!NS_IsMainThread());
+   MOZ_ASSERT(aConn);
+@@ -1937,40 +1970,63 @@ CreateAndBindKeyStatement(mozIStorageCon
+   return rv;
+ }
+ 
+ } // anonymouns namespace
+ 
+ nsresult
+ IncrementalVacuum(mozIStorageConnection* aConn)
+ {
++  // Determine how much free space is in the database.
+   nsCOMPtr<mozIStorageStatement> state;
+   nsresult rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
+     "PRAGMA freelist_count;"
+   ), getter_AddRefs(state));
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   bool hasMoreData = false;
+   rv = state->ExecuteStep(&hasMoreData);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   int32_t freePages = 0;
+   rv = state->GetInt32(0, &freePages);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
++  // To avoid excessive fragmentation we only want to free pages back to the
++  // OS if we have a large amount of space.  Check the threshold before
++  // proceeding.
+   if (freePages <= kMaxFreePages) {
+     return NS_OK;
+   }
+ 
++  // Release the excess pages back to the OS.
+   int32_t pagesToRelease = freePages - kMaxFreePages;
+ 
+   rv = aConn->ExecuteSimpleSQL(nsPrintfCString(
+     "PRAGMA incremental_vacuum(%d);", pagesToRelease
+   ));
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
++  // Verify that our incremental vacuum actually did something
++#ifdef DEBUG
++  rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
++    "PRAGMA freelist_count;"
++  ), getter_AddRefs(state));
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  hasMoreData = false;
++  rv = state->ExecuteStep(&hasMoreData);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  freePages = 0;
++  rv = state->GetInt32(0, &freePages);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  MOZ_ASSERT(freePages <= kMaxFreePages);
++#endif
++
+   return NS_OK;
+ }
+ 
+ } // namespace db
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
