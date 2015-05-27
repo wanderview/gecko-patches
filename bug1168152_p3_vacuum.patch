@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent d146d2ad4939e8f2247bdccd4faab61512aa5003
+# Parent f0656b0dc818878b32102e41354e6501bc2412d2
 # User Ben Kelly <ben@wanderview.com>
 Bug 1168152 P3 Perform incremental vacuum at tail end of Cache db connections. r=ehsan
 
@@ -90,7 +90,7 @@ diff --git a/dom/cache/Connection.h b/dom/cache/Connection.h
 @@ -17,16 +17,17 @@ class Connection final : public mozIStor
  {
  public:
-   Connection(mozIStorageConnection* aBase);
+   explicit Connection(mozIStorageConnection* aBase);
  
  private:
    ~Connection();
@@ -169,7 +169,37 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
      // objects exist for the origin.  The contents of the Cache are stored
      // in the entries table that references back to caches.
      //
-@@ -420,16 +407,60 @@ InitializeConnection(mozIStorageConnecti
+@@ -392,26 +379,20 @@ InitializeConnection(mozIStorageConnecti
+   MOZ_ASSERT(aConn);
+ 
+   // This function needs to perform per-connection initialization tasks that
+   // need to happen regardless of the schema.
+ 
+   nsPrintfCString pragmas(
+     // Use a smaller page size to improve perf/footprint; default is too large
+     "PRAGMA page_size = %u; "
+-    // WAL journal can grow to given number of *pages*
+-    "PRAGMA wal_autocheckpoint = %u; "
+-    // Always truncate the journal back to given number of *bytes*
+-    "PRAGMA journal_size_limit = %u; "
+-    // WAL must be enabled at the end to allow page size to be changed, etc.
+-    "PRAGMA journal_mode = WAL; "
++    // Enable auto_vacuum; this must happen after page_size and before WAL
++    "PRAGMA auto_vacuum = INCREMENTAL; "
+     "PRAGMA foreign_keys = ON; ",
+-    kPageSize,
+-    kWalAutoCheckpointPages,
+-    kWalAutoCheckpointSize
++    kPageSize
+   );
+ 
+   // Note, the default encoding of UTF-8 is preferred.  mozStorage does all
+   // the work necessary to convert UTF-16 nsString values for us.  We don't
+   // need ordering and the binary equality operations are correct.  So, do
+   // NOT set PRAGMA encoding to UTF-16.
+ 
+   nsresult rv = aConn->ExecuteSimpleSQL(pragmas);
+@@ -420,16 +401,54 @@ InitializeConnection(mozIStorageConnecti
    // Limit fragmentation by growing the database by many pages at once.
    rv = aConn->SetGrowthIncrement(kGrowthSize, EmptyCString());
    if (rv == NS_ERROR_FILE_TOO_BIG) {
@@ -178,49 +208,43 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
    }
    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
  
-+  int32_t schemaVersion;
-+  rv = aConn->GetSchemaVersion(&schemaVersion);
++  // Enable WAL journaling.  This must be performed in a separate transaction
++  // after changing the page_size and enabling auto_vacuum.
++  nsPrintfCString wal(
++    // WAL journal can grow to given number of *pages*
++    "PRAGMA wal_autocheckpoint = %u; "
++    // Always truncate the journal back to given number of *bytes*
++    "PRAGMA journal_size_limit = %u; "
++    // WAL must be enabled at the end to allow page size to be changed, etc.
++    "PRAGMA journal_mode = WAL; ",
++    kWalAutoCheckpointPages,
++    kWalAutoCheckpointSize
++  );
++
++  rv = aConn->ExecuteSimpleSQL(wal);
 +  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
-+  // Configure vacuum mode on new databases.  We do this here instead of
-+  // CreateSchema() because some of these commands cannot run in transactions
-+  // with other statements.
-+  if (schemaVersion == 0) {
-+    rv = aConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING(
-+      "PRAGMA auto_vacuum = INCREMENTAL;"
-+    ));
-+    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
-+
-+    // Even on a fresh database we cannot just set the auto_vacuum mode.  It
-+    // seems mozStorage does something to new databases which prevents this.
-+    // Any modification to the schema at all will prevent setting the mode.
-+    // Rebuild the empty database to force the change on.  This should be
-+    // very quick.  See bug 1168682.
-+    rv = aConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING(
-+      "VACUUM;"
-+    ));
-+    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
-+
-+    // Verify that we successfully set the vacuum mode to incremental
++  // Verify that we successfully set the vacuum mode to incremental.  It
++  // is very easy to put the database in a state where the auto_vacuum
++  // pragma above fails silently.
 +#ifdef DEBUG
-+    nsCOMPtr<mozIStorageStatement> state;
-+    rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
-+      "PRAGMA auto_vacuum;"
-+    ), getter_AddRefs(state));
-+    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++  nsCOMPtr<mozIStorageStatement> state;
++  rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
++    "PRAGMA auto_vacuum;"
++  ), getter_AddRefs(state));
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
-+    bool hasMoreData = false;
-+    rv = state->ExecuteStep(&hasMoreData);
-+    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++  bool hasMoreData = false;
++  rv = state->ExecuteStep(&hasMoreData);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
-+    int32_t mode;
-+    rv = state->GetInt32(0, &mode);
-+    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++  int32_t mode;
++  rv = state->GetInt32(0, &mode);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
-+    // integer value 2 is incremental mode
-+    if (NS_WARN_IF(mode != 2)) { return NS_ERROR_UNEXPECTED; }
++  // integer value 2 is incremental mode
++  if (NS_WARN_IF(mode != 2)) { return NS_ERROR_UNEXPECTED; }
 +#endif
-+  }
 +
    return NS_OK;
  }
@@ -230,7 +254,7 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
  {
    MOZ_ASSERT(!NS_IsMainThread());
    MOZ_ASSERT(aConn);
-@@ -1936,12 +1967,76 @@ CreateAndBindKeyStatement(mozIStorageCon
+@@ -1936,12 +1955,76 @@ CreateAndBindKeyStatement(mozIStorageCon
  
    state.forget(aStateOut);
  
