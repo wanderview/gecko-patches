@@ -1,0 +1,132 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  e10e2e8d8bf22ee704d8b6f748a025fed5dd6ac2
+Bug 1172884 P1 Properly decode body when intercepted response redirects. r=mayhemer
+
+diff --git a/netwerk/protocol/http/HttpChannelChild.cpp b/netwerk/protocol/http/HttpChannelChild.cpp
+--- a/netwerk/protocol/http/HttpChannelChild.cpp
++++ b/netwerk/protocol/http/HttpChannelChild.cpp
+@@ -39,16 +39,19 @@
+ #endif
+ 
+ using namespace mozilla::dom;
+ using namespace mozilla::ipc;
+ 
+ namespace mozilla {
+ namespace net {
+ 
++extern bool
++WillRedirect(const nsHttpResponseHead * response);
++
+ namespace {
+ 
+ const uint32_t kMaxFileDescriptorsPerMessage = 250;
+ 
+ #ifdef OS_POSIX
+ // Keep this in sync with other platforms.
+ static_assert(FileDescriptorSet::MAX_DESCRIPTORS_PER_MESSAGE == 250,
+               "MAX_DESCRIPTORS_PER_MESSAGE mismatch!");
+@@ -2177,18 +2180,21 @@ HttpChannelChild::ResetInterception()
+   NS_ENSURE_SUCCESS_VOID(rv);
+ }
+ 
+ void
+ HttpChannelChild::OverrideWithSynthesizedResponse(nsAutoPtr<nsHttpResponseHead>& aResponseHead,
+                                                   nsIInputStream* aSynthesizedInput,
+                                                   nsIStreamListener* aStreamListener)
+ {
+-  // Intercepted responses should already be decoded.
+-  SetApplyConversion(false);
++  // Intercepted responses should already be decoded.  If its a redirect,
++  // however, we want to respect the encoding of the final result instead.
++  if (!WillRedirect(aResponseHead)) {
++    SetApplyConversion(false);
++  }
+ 
+   mResponseHead = aResponseHead;
+   mSynthesizedResponse = true;
+ 
+   uint16_t status = mResponseHead->Status();
+   if (status != 200 && status != 404) {
+     // Continue with the original cross-process request
+     nsresult rv = ContinueAsyncOpen();
+diff --git a/netwerk/protocol/http/InterceptedChannel.cpp b/netwerk/protocol/http/InterceptedChannel.cpp
+--- a/netwerk/protocol/http/InterceptedChannel.cpp
++++ b/netwerk/protocol/http/InterceptedChannel.cpp
+@@ -13,16 +13,19 @@
+ #include "nsHttpChannel.h"
+ #include "HttpChannelChild.h"
+ #include "nsHttpResponseHead.h"
+ #include "mozilla/dom/ChannelInfo.h"
+ 
+ namespace mozilla {
+ namespace net {
+ 
++extern bool
++WillRedirect(const nsHttpResponseHead * response);
++
+ extern nsresult
+ DoAddCacheEntryHeaders(nsHttpChannel *self,
+                        nsICacheEntry *entry,
+                        nsHttpRequestHead *requestHead,
+                        nsHttpResponseHead *responseHead,
+                        nsISupports *securityInfo);
+ 
+ NS_IMPL_ISUPPORTS(InterceptedChannelBase, nsIInterceptedChannel)
+@@ -179,16 +182,23 @@ NS_IMETHODIMP
+ InterceptedChannelChrome::FinishSynthesizedResponse()
+ {
+   if (!mChannel) {
+     return NS_ERROR_NOT_AVAILABLE;
+   }
+ 
+   EnsureSynthesizedResponse();
+ 
++  // If the synthesized response is a redirect, then we want to respect
++  // the encoding of whatever is loaded as a result.
++  if (WillRedirect(mSynthesizedResponseHead.ref())) {
++    nsresult rv = mChannel->SetApplyConversion(mOldApplyConversion);
++    NS_ENSURE_SUCCESS(rv, rv);
++  }
++
+   mChannel->MarkIntercepted();
+ 
+   // First we ensure the appropriate metadata is set on the synthesized cache entry
+   // (i.e. the flattened response head)
+ 
+   nsCOMPtr<nsISupports> securityInfo;
+   nsresult rv = mChannel->GetSecurityInfo(getter_AddRefs(securityInfo));
+   NS_ENSURE_SUCCESS(rv, rv);
+diff --git a/netwerk/protocol/http/nsHttpChannel.cpp b/netwerk/protocol/http/nsHttpChannel.cpp
+--- a/netwerk/protocol/http/nsHttpChannel.cpp
++++ b/netwerk/protocol/http/nsHttpChannel.cpp
+@@ -152,27 +152,27 @@ Hash(const char *buf, nsACString &hash)
+ 
+ bool IsRedirectStatus(uint32_t status)
+ {
+     // 305 disabled as a security measure (see bug 187996).
+     return status == 300 || status == 301 || status == 302 || status == 303 ||
+            status == 307 || status == 308;
+ }
+ 
++} // unnamed namespace
++
+ // We only treat 3xx responses as redirects if they have a Location header and
+ // the status code is in a whitelist.
+ bool
+ WillRedirect(const nsHttpResponseHead * response)
+ {
+     return IsRedirectStatus(response->Status()) &&
+            response->PeekHeader(nsHttp::Location);
+ }
+ 
+-} // unnamed namespace
+-
+ nsresult
+ StoreAuthorizationMetaData(nsICacheEntry *entry, nsHttpRequestHead *requestHead);
+ 
+ class AutoRedirectVetoNotifier
+ {
+ public:
+     explicit AutoRedirectVetoNotifier(nsHttpChannel* channel) : mChannel(channel)
+     {
