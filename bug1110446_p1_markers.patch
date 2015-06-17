@@ -3,7 +3,6 @@
 # User Ben Kelly <ben@wanderview.com>
 Bug 1110446 P1 Create marker files when Cache API context is open. r=ehsan
 
-
 diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
 --- a/dom/cache/Context.cpp
 +++ b/dom/cache/Context.cpp
@@ -25,21 +24,48 @@ diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
  #include "mozIStorageConnection.h"
  #include "nsIFile.h"
  #include "nsIPrincipal.h"
-@@ -415,16 +416,22 @@ Context::QuotaInitRunnable::Run()
+@@ -150,16 +151,17 @@ public:
+     , mCanceled(false)
+     , mNeedsQuotaRelease(false)
+   {
+     MOZ_ASSERT(mContext);
+     MOZ_ASSERT(mManager);
+     MOZ_ASSERT(mData);
+     MOZ_ASSERT(mTarget);
+     MOZ_ASSERT(mInitiatingThread);
++    MOZ_ASSERT(mInitAction);
+   }
+ 
+   nsresult Dispatch()
+   {
+     NS_ASSERT_OWNINGTHREAD(QuotaInitRunnable);
+     MOZ_ASSERT(mState == STATE_INIT);
+ 
+     mState = STATE_CALL_WAIT_FOR_OPEN_ALLOWED;
+@@ -397,21 +399,16 @@ Context::QuotaInitRunnable::Run()
+                                                   mQuotaInfo.mOrigin,
+                                                   mQuotaInfo.mIsApp,
+                                                   getter_AddRefs(mQuotaInfo.mDir));
+       if (NS_FAILED(rv)) {
+         resolver->Resolve(rv);
+         break;
+       }
+ 
+-      if (!mInitAction) {
+-        resolver->Resolve(NS_OK);
+-        break;
+-      }
+-
+       mState = STATE_RUN_ON_TARGET;
+ 
+       MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
+         mTarget->Dispatch(this, nsIThread::DISPATCH_NORMAL)));
+       break;
      }
      // -------------------
      case STATE_RUN_ON_TARGET:
-     {
-       MOZ_ASSERT(NS_GetCurrentThread() == mTarget);
+@@ -422,25 +419,30 @@ Context::QuotaInitRunnable::Run()
  
-       mState = STATE_RUNNING;
- 
-+      nsresult rv = CreateMarkerFile(mQuotaInfo);
-+      if (NS_FAILED(rv)) {
-+        resolver->Resolve(rv);
-+        break;
-+      }
-+
        // Execute the provided initialization Action.  The Action must Resolve()
        // before returning.
        mInitAction->RunOnTarget(resolver, mQuotaInfo, mData);
@@ -47,8 +73,50 @@ diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
  
        mData = nullptr;
  
++      // If the database was opened, then we should always succeed when creating
++      // the marker file.  If it wasn't opened successfully, then no need to
++      // create a marker file anyway.
++      if (NS_SUCCEEDED(resolver->Result())) {
++        MOZ_ALWAYS_TRUE(NS_SUCCEEDED(CreateMarkerFile(mQuotaInfo)));
++      }
++
        break;
-@@ -922,16 +929,20 @@ Context::~Context()
+     }
+     // -------------------
+     case STATE_COMPLETING:
+     {
+       NS_ASSERT_OWNINGTHREAD(QuotaInitRunnable);
+-      if (mInitAction) {
+-        mInitAction->CompleteOnInitiatingThread(mResult);
+-      }
++      mInitAction->CompleteOnInitiatingThread(mResult);
+       mContext->OnQuotaInit(mResult, mQuotaInfo, mOfflineStorage);
+       mState = STATE_COMPLETE;
+ 
+       if (mNeedsQuotaRelease) {
+         // Unlock the quota dir if we locked it previously
+         nsCOMPtr<nsIRunnable> runnable = new QuotaReleaseRunnable(mQuotaInfo);
+         MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(runnable)));
+       }
+@@ -814,16 +816,17 @@ Context::Create(Manager* aManager, nsITh
+   return context.forget();
+ }
+ 
+ Context::Context(Manager* aManager, nsIThread* aTarget)
+   : mManager(aManager)
+   , mTarget(aTarget)
+   , mData(new Data(aTarget))
+   , mState(STATE_CONTEXT_PREINIT)
++  , mOrphanedData(false)
+ {
+   MOZ_ASSERT(mManager);
+ }
+ 
+ void
+ Context::Dispatch(Action* aAction)
+ {
+   NS_ASSERT_OWNINGTHREAD(Context);
+@@ -922,18 +925,23 @@ Context::~Context()
    NS_ASSERT_OWNINGTHREAD(Context);
    MOZ_ASSERT(mManager);
    MOZ_ASSERT(!mData);
@@ -57,18 +125,89 @@ diff --git a/dom/cache/Context.cpp b/dom/cache/Context.cpp
      mThreadsafeHandle->ContextDestroyed(this);
    }
  
-+  if (mQuotaInfo.mDir) {
++  // Note, this may set the mOrphanedData flag.
+   mManager->RemoveContext(this);
+ 
++  if (mQuotaInfo.mDir && !mOrphanedData) {
 +    MOZ_ALWAYS_TRUE(NS_SUCCEEDED(DeleteMarkerFile(mQuotaInfo)));
 +  }
 +
-   mManager->RemoveContext(this);
- 
    if (mNextContext) {
      mNextContext->Start();
    }
  }
  
  void
+ Context::Init(Action* aInitAction, Context* aOldContext)
+ {
+@@ -1045,16 +1053,24 @@ void
+ Context::RemoveActivity(Activity* aActivity)
+ {
+   NS_ASSERT_OWNINGTHREAD(Context);
+   MOZ_ASSERT(aActivity);
+   MOZ_ALWAYS_TRUE(mActivityList.RemoveElement(aActivity));
+   MOZ_ASSERT(!mActivityList.Contains(aActivity));
+ }
+ 
++void
++Context::NoteOrphanedData()
++{
++  NS_ASSERT_OWNINGTHREAD(Context);
++  // This may be called more than once
++  mOrphanedData = true;
++}
++
+ already_AddRefed<Context::ThreadsafeHandle>
+ Context::CreateThreadsafeHandle()
+ {
+   NS_ASSERT_OWNINGTHREAD(Context);
+   if (!mThreadsafeHandle) {
+     mThreadsafeHandle = new ThreadsafeHandle(this);
+   }
+   nsRefPtr<ThreadsafeHandle> ref = mThreadsafeHandle;
+diff --git a/dom/cache/Context.h b/dom/cache/Context.h
+--- a/dom/cache/Context.h
++++ b/dom/cache/Context.h
+@@ -147,16 +147,21 @@ public:
+   void RemoveActivity(Activity* aActivity);
+ 
+   const QuotaInfo&
+   GetQuotaInfo() const
+   {
+     return mQuotaInfo;
+   }
+ 
++  // Tell the Context that some state information has been orphaned in the
++  // data store and won't be cleaned up.  The Context will leave the marker
++  // in place to trigger cleanup the next times its opened.
++  void NoteOrphanedData();
++
+ private:
+   class Data;
+   class QuotaInitRunnable;
+   class ActionRunnable;
+ 
+   enum State
+   {
+     STATE_CONTEXT_PREINIT,
+@@ -187,16 +192,17 @@ private:
+ 
+   void
+   DoomTargetData();
+ 
+   nsRefPtr<Manager> mManager;
+   nsCOMPtr<nsIThread> mTarget;
+   nsRefPtr<Data> mData;
+   State mState;
++  bool mOrphanedData;
+   QuotaInfo mQuotaInfo;
+   nsRefPtr<QuotaInitRunnable> mInitRunnable;
+   nsTArray<PendingAction> mPendingActions;
+ 
+   // Weak refs since activites must remove themselves from this list before
+   // being destroyed by calling RemoveActivity().
+   typedef nsTObserverArray<Activity*> ActivityList;
+   ActivityList mActivityList;
 diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
 --- a/dom/cache/FileUtils.cpp
 +++ b/dom/cache/FileUtils.cpp
@@ -144,3 +283,159 @@ diff --git a/dom/cache/FileUtils.h b/dom/cache/FileUtils.h
  } // namespace mozilla
  
  #endif // mozilla_dom_cache_FileUtils_h
+diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
+--- a/dom/cache/Manager.cpp
++++ b/dom/cache/Manager.cpp
+@@ -1321,18 +1321,19 @@ public:
+     if (mCacheDeleted) {
+       // If content is referencing this cache, mark it orphaned to be
+       // deleted later.
+       if (!mManager->SetCacheIdOrphanedIfRefed(mCacheId)) {
+ 
+         // no outstanding references, delete immediately
+         nsRefPtr<Context> context = mManager->mContext;
+ 
+-        // TODO: note that we need to check this cache for staleness on startup (bug 1110446)
+-        if (!context->IsCanceled()) {
++        if (context->IsCanceled()) {
++          context->NoteOrphanedData();
++        } else {
+           context->CancelForCacheId(mCacheId);
+           nsRefPtr<Action> action =
+             new DeleteOrphanedCacheAction(mManager, mCacheId);
+           context->Dispatch(action);
+         }
+       }
+     }
+ 
+@@ -1475,19 +1476,36 @@ void
+ Manager::RemoveContext(Context* aContext)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_ASSERT(mContext);
+   MOZ_ASSERT(mContext == aContext);
+ 
+   // Whether the Context destruction was triggered from the Manager going
+   // idle or the underlying storage being invalidated, we should know we
+-  // are closing before the Conext is destroyed.
++  // are closing before the Context is destroyed.
+   MOZ_ASSERT(mState == Closing);
+ 
++  // Before forgetting the Context, check to see if we have any outstanding
++  // cache or body objects waiting for deletion.  If so, note that we've
++  // orphaned data so it will be cleaned up on the next open.
++  for (uint32_t i = 0; i < mCacheIdRefs.Length(); ++i) {
++    if(mCacheIdRefs[i].mOrphaned) {
++      aContext->NoteOrphanedData();
++      break;
++    }
++  }
++
++  for (uint32_t i = 0; i < mBodyIdRefs.Length(); ++i) {
++    if(mBodyIdRefs[i].mOrphaned) {
++      aContext->NoteOrphanedData();
++      break;
++    }
++  }
++
+   mContext = nullptr;
+ 
+   // Once the context is gone, we can immediately remove ourself from the
+   // Factory list.  We don't need to block shutdown by staying in the list
+   // any more.
+   Factory::Remove(this);
+ }
+ 
+@@ -1529,23 +1547,28 @@ Manager::ReleaseCacheId(CacheId aCacheId
+   for (uint32_t i = 0; i < mCacheIdRefs.Length(); ++i) {
+     if (mCacheIdRefs[i].mCacheId == aCacheId) {
+       DebugOnly<uint32_t> oldRef = mCacheIdRefs[i].mCount;
+       mCacheIdRefs[i].mCount -= 1;
+       MOZ_ASSERT(mCacheIdRefs[i].mCount < oldRef);
+       if (mCacheIdRefs[i].mCount == 0) {
+         bool orphaned = mCacheIdRefs[i].mOrphaned;
+         mCacheIdRefs.RemoveElementAt(i);
+-        // TODO: note that we need to check this cache for staleness on startup (bug 1110446)
+         nsRefPtr<Context> context = mContext;
+-        if (orphaned && context && !context->IsCanceled()) {
+-          context->CancelForCacheId(aCacheId);
+-          nsRefPtr<Action> action = new DeleteOrphanedCacheAction(this,
+-                                                                  aCacheId);
+-          context->Dispatch(action);
++        // If the context is already gone, then orphan flag should have been
++        // set in RemoveContext().
++        if (orphaned && context) {
++          if (context->IsCanceled()) {
++            context->NoteOrphanedData();
++          } else {
++            context->CancelForCacheId(aCacheId);
++            nsRefPtr<Action> action = new DeleteOrphanedCacheAction(this,
++                                                                    aCacheId);
++            context->Dispatch(action);
++          }
+         }
+       }
+       MaybeAllowContextToClose();
+       return;
+     }
+   }
+   MOZ_ASSERT_UNREACHABLE("Attempt to release CacheId that is not referenced!");
+ }
+@@ -1573,21 +1596,26 @@ Manager::ReleaseBodyId(const nsID& aBody
+   for (uint32_t i = 0; i < mBodyIdRefs.Length(); ++i) {
+     if (mBodyIdRefs[i].mBodyId == aBodyId) {
+       DebugOnly<uint32_t> oldRef = mBodyIdRefs[i].mCount;
+       mBodyIdRefs[i].mCount -= 1;
+       MOZ_ASSERT(mBodyIdRefs[i].mCount < oldRef);
+       if (mBodyIdRefs[i].mCount < 1) {
+         bool orphaned = mBodyIdRefs[i].mOrphaned;
+         mBodyIdRefs.RemoveElementAt(i);
+-        // TODO: note that we need to check this body for staleness on startup (bug 1110446)
+         nsRefPtr<Context> context = mContext;
+-        if (orphaned && context && !context->IsCanceled()) {
+-          nsRefPtr<Action> action = new DeleteOrphanedBodyAction(aBodyId);
+-          context->Dispatch(action);
++        // If the context is already gone, then orphan flag should have been
++        // set in RemoveContext().
++        if (orphaned && context) {
++          if(context->IsCanceled()) {
++            context->NoteOrphanedData();
++          } else {
++            nsRefPtr<Action> action = new DeleteOrphanedBodyAction(aBodyId);
++            context->Dispatch(action);
++          }
+         }
+       }
+       MaybeAllowContextToClose();
+       return;
+     }
+   }
+   MOZ_ASSERT_UNREACHABLE("Attempt to release BodyId that is not referenced!");
+ }
+diff --git a/dom/cache/QuotaClient.cpp b/dom/cache/QuotaClient.cpp
+--- a/dom/cache/QuotaClient.cpp
++++ b/dom/cache/QuotaClient.cpp
+@@ -164,20 +164,21 @@ public:
+           if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+         } else {
+           NS_WARNING("Unknown Cache directory found!");
+         }
+ 
+         continue;
+       }
+ 
+-      // Ignore transient sqlite files
++      // Ignore transient sqlite files and marker files
+       if (leafName.EqualsLiteral("caches.sqlite-journal") ||
+           leafName.EqualsLiteral("caches.sqlite-shm") ||
+-          leafName.Find(NS_LITERAL_CSTRING("caches.sqlite-mj"), false, 0, 0) == 0) {
++          leafName.Find(NS_LITERAL_CSTRING("caches.sqlite-mj"), false, 0, 0) == 0 ||
++          leafName.EqualsLiteral("context_open.marker")) {
+         continue;
+       }
+ 
+       if (leafName.EqualsLiteral("caches.sqlite") ||
+           leafName.EqualsLiteral("caches.sqlite-wal")) {
+         int64_t fileSize;
+         rv = file->GetFileSize(&fileSize);
+         if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
