@@ -1,40 +1,12 @@
 # HG changeset patch
-# Parent 0b146f95dfad80a8bc446676a9efaf25181ea6bf
+# Parent 0de88075f364ccae85c6e0d81fa248f766b771eb
 # User Ben Kelly <ben@wanderview.com>
 Bug 1110446 P2 Cleanup stale caches/bodies if last session didn't shutdown cleanly. r=ehsan
 
 diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
 --- a/dom/cache/DBSchema.cpp
 +++ b/dom/cache/DBSchema.cpp
-@@ -181,22 +181,24 @@ static nsresult InsertEntry(mozIStorageC
-                             const nsID* aRequestBodyId,
-                             const CacheResponse& aResponse,
-                             const nsID* aResponseBodyId);
- static nsresult ReadResponse(mozIStorageConnection* aConn, EntryId aEntryId,
-                              SavedResponse* aSavedResponseOut);
- static nsresult ReadRequest(mozIStorageConnection* aConn, EntryId aEntryId,
-                             SavedRequest* aSavedRequestOut);
- 
--static void AppendListParamsToQuery(nsACString& aQuery,
--                                    const nsTArray<EntryId>& aEntryIdList,
--                                    uint32_t aPos, int32_t aLen);
-+static void AppendListParamsToQuery(nsACString& aQuery, uint32_t aPos,
-+                                    int32_t aLen);
- static nsresult BindListParamsToQuery(mozIStorageStatement* aState,
-                                       const nsTArray<EntryId>& aEntryIdList,
-                                       uint32_t aPos, int32_t aLen);
-+static nsresult BindListParamsToQuery(mozIStorageStatement* aState,
-+                                      const nsTArray<nsID>& aBodyIdList,
-+                                      uint32_t aPos, int32_t aLen);
- static nsresult BindId(mozIStorageStatement* aState, const nsACString& aName,
-                        const nsID* aId);
- static nsresult ExtractId(mozIStorageStatement* aState, uint32_t aPos,
-                           nsID* aIdOut);
- static nsresult CreateAndBindKeyStatement(mozIStorageConnection* aConn,
-                                           const char* aQueryFormat,
-                                           const nsAString& aKey,
-                                           mozIStorageStatement** aStateOut);
-@@ -531,16 +533,116 @@ IsCacheOrphaned(mozIStorageConnection* a
+@@ -531,16 +531,72 @@ IsCacheOrphaned(mozIStorageConnection* a
    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
  
    *aOrphanedOut = refCount == 0;
@@ -64,80 +36,36 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
 +  return rv;
 +}
 +
-+namespace {
-+
 +nsresult
-+FindOrphanedBodyIdsByColumnName(mozIStorageConnection* aConn,
-+                                const nsTArray<nsID>& aBodyFileIdList,
-+                                const nsACString& aColumnName,
-+                                nsTArray<nsID>& aOrphanedListOut)
++GetKnownBodyIds(mozIStorageConnection* aConn, nsTArray<nsID>& aBodyIdListOut)
 +{
-+  nsAutoCString query("SELECT ");
-+  query.Append(aColumnName);
-+  query.AppendLiteral(" FROM entries WHERE ");
-+  query.Append(aColumnName);
-+  query.AppendLiteral(" NOT IN (");
-+
-+  // Sqlite limits how many parameters may be bound in a statement.  This
-+  // means we can only filter out the first kMaxEntriesPerStatement bodies
-+  // using the sql query.
-+  int32_t numToBind = std::min(static_cast<int32_t>(aBodyFileIdList.Length()),
-+                               kMaxEntriesPerStatement);
-+
-+  AppendListParamsToQuery(query, 0, numToBind);
-+
-+  query.AppendLiteral(");");
++  MOZ_ASSERT(!NS_IsMainThread());
++  MOZ_ASSERT(aConn);
 +
 +  nsCOMPtr<mozIStorageStatement> state;
-+  nsresult rv = aConn->CreateStatement(query, getter_AddRefs(state));
-+  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
-+
-+  rv = BindListParamsToQuery(state, aBodyFileIdList, 0, numToBind);
++  nsresult rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
++    "SELECT request_body_id, response_body_id FROM entries;"
++  ), getter_AddRefs(state));
 +  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
 +  bool hasMoreData = false;
 +  while (NS_SUCCEEDED(state->ExecuteStep(&hasMoreData)) && hasMoreData) {
-+    nsID id;
-+    rv = ExtractId(state, 0, &id);
-+    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++    // extract 0 to 2 nsID structs per row
++    for (uint32_t i = 0; i < 2; ++i) {
++      bool isNull = false;
 +
-+    bool orphaned = true;
++      rv = state->GetIsNull(i, &isNull);
++      if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
-+    // If there are more than kMaxEntriesPerStatement, then our SQL query
-+    // may return body IDs that are not orphaned.  We must iterate over
-+    // the remaining body IDs in memory to find a match.
-+    for (uint32_t i = numToBind; i < aBodyFileIdList.Length(); ++i) {
-+      if (id.Equals(aBodyFileIdList[i])) {
-+        orphaned = false;
-+        break;
++      if (!isNull) {
++        nsID id;
++        rv = ExtractId(state, i, &id);
++        if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++        aBodyIdListOut.AppendElement(id);
 +      }
 +    }
-+
-+    if (orphaned) {
-+      aOrphanedListOut.AppendElement(id);
-+    }
 +  }
-+
-+  return rv;
-+}
-+
-+} // anonymous namespace
-+
-+nsresult
-+FindOrphanedBodyIds(mozIStorageConnection* aConn,
-+                    const nsTArray<nsID>& aBodyFileIdList,
-+                    nsTArray<nsID>& aOrphanedListOut)
-+{
-+  nsresult rv =
-+    FindOrphanedBodyIdsByColumnName(aConn, aBodyFileIdList,
-+                                    NS_LITERAL_CSTRING("request_body_id"),
-+                                    aOrphanedListOut);
-+  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
-+
-+  rv = FindOrphanedBodyIdsByColumnName(aConn, aBodyFileIdList,
-+                                       NS_LITERAL_CSTRING("response_body_id"),
-+                                       aOrphanedListOut);
-+  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
 +  return rv;
 +}
@@ -151,105 +79,10 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
  {
    MOZ_ASSERT(!NS_IsMainThread());
    MOZ_ASSERT(aConn);
-@@ -1177,17 +1279,17 @@ DeleteEntries(mozIStorageConnection* aCo
-     return NS_OK;
-   }
- 
-   nsCOMPtr<mozIStorageStatement> state;
-   nsAutoCString query(
-     "SELECT request_body_id, response_body_id, response_security_info_id "
-     "FROM entries WHERE id IN ("
-   );
--  AppendListParamsToQuery(query, aEntryIdList, aPos, aLen);
-+  AppendListParamsToQuery(query, aPos, aLen);
-   query.AppendLiteral(")");
- 
-   nsresult rv = aConn->CreateStatement(query, getter_AddRefs(state));
-   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
- 
-   rv = BindListParamsToQuery(state, aEntryIdList, aPos, aLen);
-   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
- 
-@@ -1236,17 +1338,17 @@ DeleteEntries(mozIStorageConnection* aCo
-     }
-   }
- 
-   // Dependent records removed via ON DELETE CASCADE
- 
-   query = NS_LITERAL_CSTRING(
-     "DELETE FROM entries WHERE id IN ("
-   );
--  AppendListParamsToQuery(query, aEntryIdList, aPos, aLen);
-+  AppendListParamsToQuery(query, aPos, aLen);
-   query.AppendLiteral(")");
- 
-   rv = aConn->CreateStatement(query, getter_AddRefs(state));
-   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
- 
-   rv = BindListParamsToQuery(state, aEntryIdList, aPos, aLen);
-   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
- 
-@@ -1886,22 +1988,19 @@ ReadRequest(mozIStorageConnection* aConn
- 
-     aSavedRequestOut->mValue.headers().AppendElement(header);
-   }
- 
-   return rv;
- }
- 
- void
--AppendListParamsToQuery(nsACString& aQuery,
--                        const nsTArray<EntryId>& aEntryIdList,
--                        uint32_t aPos, int32_t aLen)
-+AppendListParamsToQuery(nsACString& aQuery, uint32_t aPos, int32_t aLen)
- {
-   MOZ_ASSERT(!NS_IsMainThread());
--  MOZ_ASSERT((aPos + aLen) <= aEntryIdList.Length());
-   for (int32_t i = aPos; i < aLen; ++i) {
-     if (i == 0) {
-       aQuery.AppendLiteral("?");
-     } else {
-       aQuery.AppendLiteral(",?");
-     }
-   }
- }
-@@ -1916,16 +2015,32 @@ BindListParamsToQuery(mozIStorageStateme
-   for (int32_t i = aPos; i < aLen; ++i) {
-     nsresult rv = aState->BindInt32ByIndex(i, aEntryIdList[i]);
-     NS_ENSURE_SUCCESS(rv, rv);
-   }
-   return NS_OK;
- }
- 
- nsresult
-+BindListParamsToQuery(mozIStorageStatement* aState,
-+                      const nsTArray<nsID>& aBodyIdList,
-+                      uint32_t aPos, int32_t aLen)
-+{
-+  MOZ_ASSERT(!NS_IsMainThread());
-+  MOZ_ASSERT((aPos + aLen) <= aBodyIdList.Length());
-+  for (int32_t i = aPos; i < aLen; ++i) {
-+    char idBuf[NSID_LENGTH];
-+    aBodyIdList[i].ToProvidedString(idBuf);
-+    nsresult rv = aState->BindUTF8StringByIndex(i, nsAutoCString(idBuf));
-+    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
-+  }
-+  return NS_OK;
-+}
-+
-+nsresult
- BindId(mozIStorageStatement* aState, const nsACString& aName, const nsID* aId)
- {
-   MOZ_ASSERT(!NS_IsMainThread());
-   MOZ_ASSERT(aState);
-   nsresult rv;
- 
-   if (!aId) {
-     rv = aState->BindNullByName(aName);
 diff --git a/dom/cache/DBSchema.h b/dom/cache/DBSchema.h
 --- a/dom/cache/DBSchema.h
 +++ b/dom/cache/DBSchema.h
-@@ -44,16 +44,25 @@ DeleteCacheId(mozIStorageConnection* aCo
+@@ -44,16 +44,23 @@ DeleteCacheId(mozIStorageConnection* aCo
                nsTArray<nsID>& aDeletedBodyIdListOut);
  
  // TODO: Consider removing unused IsCacheOrphaned after writing cleanup code. (bug 1110446)
@@ -262,9 +95,7 @@ diff --git a/dom/cache/DBSchema.h b/dom/cache/DBSchema.h
 +                     nsTArray<CacheId>& aOrphanedListOut);
 +
 +nsresult
-+FindOrphanedBodyIds(mozIStorageConnection* aConn,
-+                    const nsTArray<nsID>& aBodyFileIdList,
-+                    nsTArray<nsID>& aOrphanedListOut);
++GetKnownBodyIds(mozIStorageConnection* aConn, nsTArray<nsID>& aBodyIdListOut);
 +
 +nsresult
  CacheMatch(mozIStorageConnection* aConn, CacheId aCacheId,
@@ -278,7 +109,7 @@ diff --git a/dom/cache/DBSchema.h b/dom/cache/DBSchema.h
 diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
 --- a/dom/cache/FileUtils.cpp
 +++ b/dom/cache/FileUtils.cpp
-@@ -315,16 +315,103 @@ BodyIdToFile(nsIFile* aBaseDir, const ns
+@@ -315,16 +315,108 @@ BodyIdToFile(nsIFile* aBaseDir, const ns
    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
  
    return rv;
@@ -287,7 +118,7 @@ diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
  } // anonymous namespace
  
  nsresult
-+BodyGetFileIdList(nsIFile* aBaseDir, nsTArray<nsID>& aIdListOut)
++BodyDeleteOrphanedFiles(nsIFile* aBaseDir, nsTArray<nsID>& aKnownBodyIdList)
 +{
 +  MOZ_ASSERT(aBaseDir);
 +
@@ -322,7 +153,7 @@ diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
 +    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
 +    // If a file got in here somehow, just ignore it
-+    if (!isDir) {
++    if (NS_WARN_IF(!isDir)) {
 +      continue;
 +    }
 +
@@ -338,39 +169,44 @@ diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
 +      rv = subEntries->GetNext(getter_AddRefs(subEntry));
 +      if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
-+      nsCOMPtr<nsIFile> file = do_QueryInterface(entry);
++      nsCOMPtr<nsIFile> file = do_QueryInterface(subEntry);
 +
 +      nsAutoCString leafName;
 +      rv = file->GetNativeLeafName(leafName);
 +      if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
-+      // Body files end in either .tmp or .final.
-+      nsCString suffix;
-+      if (StringEndsWith(leafName, NS_LITERAL_CSTRING(".final"))) {
-+        suffix = NS_LITERAL_CSTRING(".final");
-+      } else if (StringEndsWith(leafName, NS_LITERAL_CSTRING(".tmp"))) {
-+        suffix = NS_LITERAL_CSTRING(".tmp");
++      // Delete all tmp files regardless of known bodies.  These are
++      // all considered orphans.
++      if (StringEndsWith(leafName, NS_LITERAL_CSTRING(".tmp"))) {
++        rv = file->Remove(false /* recursive */);
++        MOZ_ASSERT(NS_SUCCEEDED(rv));
++        continue;
 +      }
 +
-+      // If the file doesn't have the right suffix or if the length of
-+      // file name does not match a uuid, then ignore it.
-+      if (suffix.IsEmpty() ||
-+          leafName.Length() != NSID_LENGTH + suffix.Length()) {
++      nsCString suffix(NS_LITERAL_CSTRING(".final"));
++
++      // Otherwise, it must be a .final file.  If its not, then just
++      // skip it.
++      if (NS_WARN_IF(!StringEndsWith(leafName, suffix) ||
++                     leafName.Length() != NSID_LENGTH - 1 + suffix.Length())) {
 +        continue;
 +      }
 +
 +      // Finally, parse the uuid out of the name.  If its fails to parse,
 +      // the ignore the file.
 +      nsID id;
-+      if (!id.Parse(leafName.BeginReading())) {
++      if (NS_WARN_IF(!id.Parse(leafName.BeginReading()))) {
 +        continue;
 +      }
 +
-+      aIdListOut.AppendElement(id);
++      if (!aKnownBodyIdList.Contains(id)) {
++        rv = file->Remove(false /* recursive */);
++        MOZ_ASSERT(NS_SUCCEEDED(rv));
++      }
 +    }
 +  }
 +
-+  return NS_OK;
++  return rv;
 +}
 +
 +nsresult
@@ -382,7 +218,7 @@ diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
  
    rv = marker->Append(NS_LITERAL_STRING("cache"));
    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
-@@ -368,11 +455,31 @@ DeleteMarkerFile(const QuotaInfo& aQuota
+@@ -368,11 +460,31 @@ DeleteMarkerFile(const QuotaInfo& aQuota
    // Again, no fsync is necessary.  If the OS crashes before the file
    // removal is flushed, then the Cache will search for stale data on
    // startup.  This will cause the next Cache access to be a bit slow, but
@@ -426,7 +262,7 @@ diff --git a/dom/cache/FileUtils.h b/dom/cache/FileUtils.h
  BodyDeleteFiles(nsIFile* aBaseDir, const nsTArray<nsID>& aIdList);
  
  nsresult
-+BodyGetFileIdList(nsIFile* aBaseDir, nsTArray<nsID>& aIdListOut);
++BodyDeleteOrphanedFiles(nsIFile* aBaseDir, nsTArray<nsID>& aKnownBodyIdList);
 +
 +nsresult
  CreateMarkerFile(const QuotaInfo& aQuotaInfo);
@@ -445,7 +281,7 @@ diff --git a/dom/cache/FileUtils.h b/dom/cache/FileUtils.h
 diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
 --- a/dom/cache/Manager.cpp
 +++ b/dom/cache/Manager.cpp
-@@ -25,57 +25,92 @@
+@@ -25,57 +25,87 @@
  #include "nsAutoPtr.h"
  #include "nsIInputStream.h"
  #include "nsID.h"
@@ -539,15 +375,10 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
 +      }
 +
 +      // Clean up orphaned body objects
-+      nsAutoTArray<nsID, 64> bodyFileIdList;
-+      rv = BodyGetFileIdList(aDBDir, bodyFileIdList);
-+      if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++      nsAutoTArray<nsID, 64> knownBodyIdList;
++      rv = db::GetKnownBodyIds(aConn, knownBodyIdList);
 +
-+      nsAutoTArray<nsID, 64> orphanedBodyIdList;
-+      rv = db::FindOrphanedBodyIds(aConn, bodyFileIdList, orphanedBodyIdList);
-+      if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
-+
-+      rv = BodyDeleteFiles(aDBDir, orphanedBodyIdList);
++      rv = BodyDeleteOrphanedFiles(aDBDir, knownBodyIdList);
 +      if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +    }
  
@@ -558,7 +389,7 @@ diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
  // ----------------------------------------------------------------------------
  
  // Action that is executed when we determine that content has stopped using
-@@ -119,24 +154,16 @@ public:
+@@ -119,24 +149,16 @@ public:
  
      aResolver->Resolve(rv);
    }
