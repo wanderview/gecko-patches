@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent 0de88075f364ccae85c6e0d81fa248f766b771eb
+# Parent 743a6b657089201959154c3daa1431945353ff4f
 # User Ben Kelly <ben@wanderview.com>
 Bug 1110446 P2 Cleanup stale caches/bodies if last session didn't shutdown cleanly. r=ehsan
 
@@ -109,7 +109,7 @@ diff --git a/dom/cache/DBSchema.h b/dom/cache/DBSchema.h
 diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
 --- a/dom/cache/FileUtils.cpp
 +++ b/dom/cache/FileUtils.cpp
-@@ -315,16 +315,108 @@ BodyIdToFile(nsIFile* aBaseDir, const ns
+@@ -315,28 +315,142 @@ BodyIdToFile(nsIFile* aBaseDir, const ns
    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
  
    return rv;
@@ -118,8 +118,9 @@ diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
  } // anonymous namespace
  
  nsresult
+-CreateMarkerFile(const QuotaInfo& aQuotaInfo)
 +BodyDeleteOrphanedFiles(nsIFile* aBaseDir, nsTArray<nsID>& aKnownBodyIdList)
-+{
+ {
 +  MOZ_ASSERT(aBaseDir);
 +
 +  // body files are stored in a directory structure like:
@@ -140,7 +141,7 @@ diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
 +  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
 +  // Iterate over all the intermediate morgue subdirs
-+  bool hasMore;
++  bool hasMore = false;
 +  while (NS_SUCCEEDED(rv = entries->HasMoreElements(&hasMore)) && hasMore) {
 +    nsCOMPtr<nsISupports> entry;
 +    rv = entries->GetNext(getter_AddRefs(entry));
@@ -148,12 +149,14 @@ diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
 +
 +    nsCOMPtr<nsIFile> subdir = do_QueryInterface(entry);
 +
-+    bool isDir;
++    bool isDir = false;
 +    rv = subdir->IsDirectory(&isDir);
 +    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
-+    // If a file got in here somehow, just ignore it
++    // If a file got in here somehow, try to remove it and move on
 +    if (NS_WARN_IF(!isDir)) {
++      rv = subdir->Remove(false /* recursive */);
++      MOZ_ASSERT(NS_SUCCEEDED(rv));
 +      continue;
 +    }
 +
@@ -162,7 +165,7 @@ diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
 +    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
 +
 +    // Now iterate over all the files in the subdir
-+    bool subHasMore;
++    bool subHasMore = false;
 +    while(NS_SUCCEEDED(rv = subEntries->HasMoreElements(&subHasMore)) &&
 +          subHasMore) {
 +      nsCOMPtr<nsISupports> subEntry;
@@ -178,7 +181,8 @@ diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
 +      // Delete all tmp files regardless of known bodies.  These are
 +      // all considered orphans.
 +      if (StringEndsWith(leafName, NS_LITERAL_CSTRING(".tmp"))) {
-+        rv = file->Remove(false /* recursive */);
++        // remove recursively in case its somehow a directory
++        rv = file->Remove(true /* recursive */);
 +        MOZ_ASSERT(NS_SUCCEEDED(rv));
 +        continue;
 +      }
@@ -200,7 +204,8 @@ diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
 +      }
 +
 +      if (!aKnownBodyIdList.Contains(id)) {
-+        rv = file->Remove(false /* recursive */);
++        // remove recursively in case its somehow a directory
++        rv = file->Remove(true /* recursive */);
 +        MOZ_ASSERT(NS_SUCCEEDED(rv));
 +      }
 +    }
@@ -209,16 +214,70 @@ diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
 +  return rv;
 +}
 +
++namespace {
++
 +nsresult
- CreateMarkerFile(const QuotaInfo& aQuotaInfo)
- {
++GetMarkerFileHandle(const QuotaInfo& aQuotaInfo, nsIFile** aFileOut)
++{
++  MOZ_ASSERT(aFileOut);
++
    nsCOMPtr<nsIFile> marker;
    nsresult rv = aQuotaInfo.mDir->Clone(getter_AddRefs(marker));
    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
  
    rv = marker->Append(NS_LITERAL_STRING("cache"));
    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
-@@ -368,11 +460,31 @@ DeleteMarkerFile(const QuotaInfo& aQuota
+ 
+   rv = marker->Append(NS_LITERAL_STRING("context_open.marker"));
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
++  marker.forget(aFileOut);
++
++  return rv;
++}
++
++} // anonymous namespace
++
++nsresult
++CreateMarkerFile(const QuotaInfo& aQuotaInfo)
++{
++  nsCOMPtr<nsIFile> marker;
++  nsresult rv = GetMarkerFileHandle(aQuotaInfo, getter_AddRefs(marker));
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
+   rv = marker->Create(nsIFile::NORMAL_FILE_TYPE, 0644);
+   if (rv == NS_ERROR_FILE_ALREADY_EXISTS) {
+     rv = NS_OK;
+   }
+ 
+   // Note, we don't need to fsync here.  We only care about actually
+   // writing the marker if later modifications to the Cache are
+   // actually flushed to the disk.  If the OS crashes before the marker
+@@ -345,34 +459,42 @@ CreateMarkerFile(const QuotaInfo& aQuota
+ 
+   return rv;
+ }
+ 
+ nsresult
+ DeleteMarkerFile(const QuotaInfo& aQuotaInfo)
+ {
+   nsCOMPtr<nsIFile> marker;
+-  nsresult rv = aQuotaInfo.mDir->Clone(getter_AddRefs(marker));
+-  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+-
+-  rv = marker->Append(NS_LITERAL_STRING("cache"));
+-  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+-
+-  rv = marker->Append(NS_LITERAL_STRING("context_open.marker"));
++  nsresult rv = GetMarkerFileHandle(aQuotaInfo, getter_AddRefs(marker));
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   rv = marker->Remove(/* recursive = */ false);
+   if (rv == NS_ERROR_FILE_NOT_FOUND ||
+       rv == NS_ERROR_FILE_TARGET_DOES_NOT_EXIST) {
+     rv = NS_OK;
+   }
+ 
    // Again, no fsync is necessary.  If the OS crashes before the file
    // removal is flushed, then the Cache will search for stale data on
    // startup.  This will cause the next Cache access to be a bit slow, but
@@ -231,13 +290,7 @@ diff --git a/dom/cache/FileUtils.cpp b/dom/cache/FileUtils.cpp
 +MarkerFileExists(const QuotaInfo& aQuotaInfo)
 +{
 +  nsCOMPtr<nsIFile> marker;
-+  nsresult rv = aQuotaInfo.mDir->Clone(getter_AddRefs(marker));
-+  if (NS_WARN_IF(NS_FAILED(rv))) { return false; }
-+
-+  rv = marker->Append(NS_LITERAL_STRING("cache"));
-+  if (NS_WARN_IF(NS_FAILED(rv))) { return false; }
-+
-+  rv = marker->Append(NS_LITERAL_STRING("context_open.marker"));
++  nsresult rv = GetMarkerFileHandle(aQuotaInfo, getter_AddRefs(marker));
 +  if (NS_WARN_IF(NS_FAILED(rv))) { return false; }
 +
 +  bool exists = false;
