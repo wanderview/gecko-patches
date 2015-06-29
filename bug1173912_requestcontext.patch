@@ -1,0 +1,195 @@
+# HG changeset patch
+# Parent 312c68b16549de9cea1557f461d5d234bd5e0a7d
+# User Ben Kelly <ben@wanderview.com>
+Bug 1173912 Restrict opaque responses to client requests. r=ehsan
+
+
+diff --git a/dom/fetch/InternalRequest.cpp b/dom/fetch/InternalRequest.cpp
+--- a/dom/fetch/InternalRequest.cpp
++++ b/dom/fetch/InternalRequest.cpp
+@@ -184,10 +184,41 @@ InternalRequest::MapContentPolicyTypeToR
+     break;
+   default:
+     MOZ_ASSERT(false, "Unhandled nsContentPolicyType value");
+     break;
+   }
+   return context;
+ }
+ 
++// static
++bool
++InternalRequest::IsNavigationRequestContext(RequestContext aContext)
++{
++  // TODO: also RequestContext::Internal when frame type is not "none"
++  return aContext == RequestContext::Form ||
++         aContext == RequestContext::Frame ||
++         aContext == RequestContext::Hyperlink ||
++         aContext == RequestContext::Iframe ||
++         aContext == RequestContext::Location ||
++         aContext == RequestContext::Metarefresh ||
++         aContext == RequestContext::Prerender;
++}
++
++// static
++bool
++InternalRequest::IsWorkerRequestContext(RequestContext aContext)
++{
++  // TODO: also RequestContext::Serviceworker
++  return aContext == RequestContext::Sharedworker ||
++         aContext == RequestContext::Worker;
++}
++
++// static
++bool
++InternalRequest::IsClientRequestContext(RequestContext aContext)
++{
++  return IsNavigationRequestContext(aContext) ||
++         IsWorkerRequestContext(aContext);
++}
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/fetch/InternalRequest.h b/dom/fetch/InternalRequest.h
+--- a/dom/fetch/InternalRequest.h
++++ b/dom/fetch/InternalRequest.h
+@@ -352,16 +352,26 @@ public:
+   }
+ 
+   void
+   ClearCreatedByFetchEvent()
+   {
+     mCreatedByFetchEvent = false;
+   }
+ 
++  static bool
++  IsNavigationRequestContext(RequestContext aContext);
++
++  static bool
++  IsWorkerRequestContext(RequestContext aContext);
++
++  static bool
++  IsClientRequestContext(RequestContext aContext);
++
++
+ private:
+   // Does not copy mBodyStream.  Use fallible Clone() for complete copy.
+   explicit InternalRequest(const InternalRequest& aOther);
+ 
+   ~InternalRequest();
+ 
+   static RequestContext
+   MapContentPolicyTypeToRequestContext(nsContentPolicyType aContentPolicyType);
+diff --git a/dom/webidl/Request.webidl b/dom/webidl/Request.webidl
+--- a/dom/webidl/Request.webidl
++++ b/dom/webidl/Request.webidl
+@@ -37,21 +37,21 @@ dictionary RequestInit {
+   HeadersInit headers;
+   BodyInit body;
+   RequestMode mode;
+   RequestCredentials credentials;
+   RequestCache cache;
+ };
+ 
+ enum RequestContext {
+-  "audio", "beacon", "cspreport", "download", "embed", "eventsource", "favicon", "fetch",
+-  "font", "form", "frame", "hyperlink", "iframe", "image", "imageset", "import",
+-  "internal", "location", "manifest", "object", "ping", "plugin", "prefetch", "script",
+-  "sharedworker", "subresource", "style", "track", "video", "worker", "xmlhttprequest",
+-  "xslt"
++  "", "audio", "beacon", "cspreport", "download", "embed", "eventsource", "favicon",
++  "fetch", "font", "form", "frame", "hyperlink", "iframe", "image", "imageset", "import",
++  "internal", "location", "manifest", "metarefresh", "object", "ping", "plugin",
++  "prefetch", "preload", "prerender", "script", "sharedworker", "subresource", "style",
++  "track", "video", "worker", "xmlhttprequest", "xslt"
+ };
+ 
+ // cors-with-forced-preflight is internal to the Fetch spec, but adding it here
+ // allows us to use the various conversion conveniences offered by the WebIDL
+ // codegen. The Request constructor has explicit checks to prevent it being
+ // passed as a valid value, while Request.mode never returns it. Since enums
+ // are only exposed as strings to client JS, this has the same effect as not
+ // exposing it at all.
+diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEvents.cpp
+--- a/dom/workers/ServiceWorkerEvents.cpp
++++ b/dom/workers/ServiceWorkerEvents.cpp
+@@ -141,23 +141,25 @@ public:
+   }
+ };
+ 
+ class RespondWithHandler final : public PromiseNativeHandler
+ {
+   nsMainThreadPtrHandle<nsIInterceptedChannel> mInterceptedChannel;
+   nsMainThreadPtrHandle<ServiceWorker> mServiceWorker;
+   RequestMode mRequestMode;
++  RequestContext mRequestContext;
+ public:
+   RespondWithHandler(nsMainThreadPtrHandle<nsIInterceptedChannel>& aChannel,
+                      nsMainThreadPtrHandle<ServiceWorker>& aServiceWorker,
+-                     RequestMode aRequestMode)
++                     RequestMode aRequestMode, RequestContext aRequestContext)
+     : mInterceptedChannel(aChannel)
+     , mServiceWorker(aServiceWorker)
+     , mRequestMode(aRequestMode)
++    , mRequestContext(aRequestContext)
+   {
+   }
+ 
+   void ResolvedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue) override;
+ 
+   void RejectedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue) override;
+ 
+   void CancelRequest();
+@@ -227,20 +229,30 @@ RespondWithHandler::ResolvedCallback(JSC
+   }
+ 
+   nsRefPtr<Response> response;
+   nsresult rv = UNWRAP_OBJECT(Response, &aValue.toObject(), response);
+   if (NS_FAILED(rv)) {
+     return;
+   }
+ 
+-  // Section 4.2, step 2.2 "If either response's type is "opaque" and request's
+-  // mode is not "no-cors" or response's type is error, return a network error."
++  bool invalidClientRequest =
++    InternalRequest::IsClientRequestContext(mRequestContext) &&
++    response->Type() != ResponseType::Basic &&
++    response->Type() != Response::Default;
++
++  // Section 4.2, step 2.2:
++  //  If one of the following conditions is true, return a network error:
++  //    * response's type is "error".
++  //    * request's mode is not "no-cors" and response's type is "opaque".
++  //    * request is a client request and response's type is neither "basic"
++  //      nor "default".
+   if (((response->Type() == ResponseType::Opaque) && (mRequestMode != RequestMode::No_cors)) ||
+-      response->Type() == ResponseType::Error) {
++      response->Type() == ResponseType::Error ||
++      invalidClientRequest) {
+     return;
+   }
+ 
+   if (NS_WARN_IF(response->BodyUsed())) {
+     return;
+   }
+ 
+   nsRefPtr<InternalResponse> ir = response->GetInternalResponse();
+@@ -321,17 +333,18 @@ FetchEvent::RespondWith(const ResponseOr
+       return;
+     }
+     promise->MaybeResolve(res);
+   } else if (aArg.IsPromise()) {
+     promise = &aArg.GetAsPromise();
+   }
+   mWaitToRespond = true;
+   nsRefPtr<RespondWithHandler> handler =
+-    new RespondWithHandler(mChannel, mServiceWorker, mRequest->Mode());
++    new RespondWithHandler(mChannel, mServiceWorker, mRequest->Mode(),
++                           mRequest->Context());
+   promise->AppendNativeHandler(handler);
+ }
+ 
+ already_AddRefed<ServiceWorkerClient>
+ FetchEvent::GetClient()
+ {
+   if (!mClient) {
+     if (!mClientInfo) {
