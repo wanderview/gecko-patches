@@ -1,30 +1,39 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
 # Parent  cef11c3e86c3ab51adcb2a6c341d4a9864e63aff
-Bug 1173934 Show a message if a docshell fails to load due to SW intercept failure. r=ehsan
+Bug 1173934 Show a message if a docshell fails to load due to SW intercept failure. r=ehsan r=jdm
 
 diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
 --- a/docshell/base/nsDocShell.cpp
 +++ b/docshell/base/nsDocShell.cpp
-@@ -5183,16 +5183,17 @@ nsDocShell::DisplayLoadError(nsresult aE
-       case NS_ERROR_REMOTE_XUL:
-         error.AssignLiteral("remoteXUL");
-         break;
+@@ -5186,16 +5186,26 @@ nsDocShell::DisplayLoadError(nsresult aE
        case NS_ERROR_UNSAFE_CONTENT_TYPE:
          // Channel refused to load from an unrecognized content type.
          error.AssignLiteral("unsafeContentType");
          break;
        case NS_ERROR_CORRUPTED_CONTENT:
-+      case NS_ERROR_INTERCEPTION_FAILED:
          // Broken Content Detected. e.g. Content-MD5 check failure.
          error.AssignLiteral("corruptedContentError");
          break;
++      case NS_ERROR_INTERCEPTION_FAILED:
++      case NS_ERROR_OPAQUE_INTERCEPTION_DISABLED:
++      case NS_ERROR_BAD_OPAQUE_INTERCEPTION_REQUEST_MODE:
++      case NS_ERROR_INTERCEPTED_ERROR_RESPONSE:
++      case NS_ERROR_INTERCEPTED_USED_RESPONSE:
++        // ServiceWorker intercepted request, but something went wrong.
++        nsContentUtils::MaybeReportInterceptionErrorToConsole(GetDocument(),
++                                                              aError);
++        error.AssignLiteral("corruptedContentError");
++        break;
        default:
          break;
      }
    }
  
-@@ -7813,16 +7814,17 @@ nsDocShell::EndPageLoad(nsIWebProgress* 
+   // Test if the error should be displayed
+   if (error.IsEmpty()) {
+     return NS_OK;
+@@ -7813,16 +7823,21 @@ nsDocShell::EndPageLoad(nsIWebProgress* 
                 aStatus == NS_ERROR_NET_RESET ||
                 aStatus == NS_ERROR_OFFLINE ||
                 aStatus == NS_ERROR_MALWARE_URI ||
@@ -34,6 +43,10 @@ diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
                 aStatus == NS_ERROR_REMOTE_XUL ||
                 aStatus == NS_ERROR_OFFLINE ||
 +               aStatus == NS_ERROR_INTERCEPTION_FAILED ||
++               aStatus == NS_ERROR_OPAQUE_INTERCEPTION_DISABLED ||
++               aStatus == NS_ERROR_BAD_OPAQUE_INTERCEPTION_REQUEST_MODE ||
++               aStatus == NS_ERROR_INTERCEPTED_ERROR_RESPONSE ||
++               aStatus == NS_ERROR_INTERCEPTED_USED_RESPONSE ||
                 NS_ERROR_GET_MODULE(aStatus) == NS_ERROR_MODULE_SECURITY) {
        // Errors to be shown for any frame
        DisplayLoadError(aStatus, url, nullptr, aChannel);
@@ -42,12 +55,398 @@ diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
        // Caching channels would have to look at their flags to work
        // out which error to return. Or we can fix up the error here.
        if (!(mLoadType & LOAD_CMD_HISTORY)) {
+@@ -14088,17 +14103,17 @@ nsDocShell::ShouldPrepareForIntercept(ns
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsDocShell::ChannelIntercepted(nsIInterceptedChannel* aChannel)
+ {
+   nsRefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+   if (!swm) {
+-    aChannel->Cancel();
++    aChannel->Cancel(NS_ERROR_INTERCEPTION_FAILED);
+     return NS_OK;
+   }
+ 
+   bool isNavigation = false;
+   nsresult rv = aChannel->GetIsNavigation(&isNavigation);
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   nsCOMPtr<nsIDocument> doc;
+diff --git a/dom/base/nsContentUtils.cpp b/dom/base/nsContentUtils.cpp
+--- a/dom/base/nsContentUtils.cpp
++++ b/dom/base/nsContentUtils.cpp
+@@ -3409,16 +3409,44 @@ nsContentUtils::ReportToConsole(uint32_t
+   }
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   return ReportToConsoleNonLocalized(errorText, aErrorFlags, aCategory,
+                                      aDocument, aURI, aSourceLine,
+                                      aLineNumber, aColumnNumber);
+ }
+ 
++/* static */ nsresult
++nsContentUtils::MaybeReportInterceptionErrorToConsole(nsIDocument* aDocument,
++                                                      nsresult aError)
++{
++  const char* messageName = nullptr;
++  if (aError == NS_ERROR_INTERCEPTION_FAILED) {
++    messageName = "InterceptionFailed";
++  } else if (aError == NS_ERROR_OPAQUE_INTERCEPTION_DISABLED) {
++    messageName = "OpaqueInterceptionDisabled";
++  } else if (aError == NS_ERROR_BAD_OPAQUE_INTERCEPTION_REQUEST_MODE) {
++    messageName = "BadOpaqueInterceptionRequestMode";
++  } else if (aError == NS_ERROR_INTERCEPTED_ERROR_RESPONSE) {
++    messageName = "InterceptedErrorResponse";
++  } else if (aError == NS_ERROR_INTERCEPTED_USED_RESPONSE) {
++    messageName = "InterceptedUsedResponse";
++  }
++
++  if (messageName) {
++    return ReportToConsole(nsIScriptError::warningFlag,
++                           NS_LITERAL_CSTRING("Service Worker Interception"),
++                           aDocument,
++                           nsContentUtils::eDOM_PROPERTIES,
++                           messageName);
++  }
++
++  return NS_OK;
++}
++
+ 
+ /* static */ nsresult
+ nsContentUtils::ReportToConsoleNonLocalized(const nsAString& aErrorText,
+                                             uint32_t aErrorFlags,
+                                             const nsACString& aCategory,
+                                             const nsIDocument* aDocument,
+                                             nsIURI* aURI,
+                                             const nsAFlatString& aSourceLine,
+diff --git a/dom/base/nsContentUtils.h b/dom/base/nsContentUtils.h
+--- a/dom/base/nsContentUtils.h
++++ b/dom/base/nsContentUtils.h
+@@ -837,16 +837,19 @@ public:
+                                   const char16_t **aParams = nullptr,
+                                   uint32_t aParamsLength = 0,
+                                   nsIURI* aURI = nullptr,
+                                   const nsAFlatString& aSourceLine
+                                     = EmptyString(),
+                                   uint32_t aLineNumber = 0,
+                                   uint32_t aColumnNumber = 0);
+ 
++  static nsresult
++  MaybeReportInterceptionErrorToConsole(nsIDocument* aDocument, nsresult aError);
++
+   static void LogMessageToConsole(const char* aMsg, ...);
+   
+   /**
+    * Get the localized string named |aKey| in properties file |aFile|.
+    */
+   static nsresult GetLocalizedString(PropertiesFile aFile,
+                                      const char* aKey,
+                                      nsXPIDLString& aResult);
+diff --git a/dom/locales/en-US/chrome/dom/dom.properties b/dom/locales/en-US/chrome/dom/dom.properties
+--- a/dom/locales/en-US/chrome/dom/dom.properties
++++ b/dom/locales/en-US/chrome/dom/dom.properties
+@@ -161,8 +161,18 @@ IndexedDBTransactionAbortNavigation=An I
+ # LOCALIZATION NOTE (WillChangeBudgetWarning): Do not translate Will-change, %1$S,%2$S,%3$S are numbers.
+ WillChangeBudgetWarning=Will-change memory consumption is too high. Surface area covers %1$S pixels, budget is the document surface area multiplied by %2$S (%3$S pixels). All occurences of will-change in the document are ignored when over budget.
+ # LOCALIZATION NOTE: Do not translate "ServiceWorker".
+ HittingMaxWorkersPerDomain=A ServiceWorker could not be started immediately because other documents in the same origin are already using the maximum number of workers. The ServiceWorker is now queued and will be started after some of the other workers have completed.
+ # LOCALIZATION NOTE: Do no translate "setVelocity", "PannerNode", "AudioListener", "speedOfSound" and "dopplerFactor"
+ PannerNodeDopplerWarning=Use of setVelocity on the PannerNode and AudioListener, and speedOfSound and dopplerFactor on the AudioListener are deprecated and those members will be removed. For more help https://developer.mozilla.org/en-US/docs/Web/API/AudioListener#Deprecated_features
+ # LOCALIZATION NOTE: Do not translate "Worker".
+ EmptyWorkerSourceWarning=Attempting to create a Worker from an empty source. This is probably unintentional.
++# LOCALIZATION NOTE: Do not translate "ServiceWorker".
++InterceptionFailed=ServiceWorker network interception failed due to an unexpected error.
++# LOCALIZATION NOTE: Do not translate "ServiceWorker", "FetchEvent.respondWith()", "opaque", or "Response".
++OpaqueInterceptionDisabled=A ServiceWorker passed an opaque Response to FetchEvent.respondWith() while opaque interception is disabled.
++# LOCALIZATION NOTE: Do not translate "ServiceWorker", "FetchEvent.respondWith()", "FetchEvent.request.type", "same-origin", "cors", "no-cors", "opaque", "Response", or "RequestMode".
++BadOpaqueInterceptionRequestMode=A ServiceWorker passed an opaque Response to FetchEvent.respondWith() while the FetchEvent.request.type was either "same-origin" or "cors". Opaque Response objects are only valid when the RequestMode is "no-cors".
++# LOCALIZATION NOTE: Do not translate "ServiceWorker", "Error", "Response", "FetchEvent.respondWith()", or "fetch()".
++InterceptedErrorResponse=A ServiceWorker passed an Error Response to FetchEvent.respondWith(). This typically means the ServiceWorker performed an invalid fetch() call.
++# LOCALIZATION NOTE: Do not translate "ServiceWorker", "Response", "FetchEvent.respondWith()", or "Response.clone()".
++InterceptedUsedResponse=A ServiceWorker passed a used Response to FetchEvent.respondWith(). The body of a Response may only be read once. Use Response.clone() to access the body multiple times.
+diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEvents.cpp
+--- a/dom/workers/ServiceWorkerEvents.cpp
++++ b/dom/workers/ServiceWorkerEvents.cpp
+@@ -74,26 +74,29 @@ FetchEvent::Constructor(const GlobalObje
+   return e.forget();
+ }
+ 
+ namespace {
+ 
+ class CancelChannelRunnable final : public nsRunnable
+ {
+   nsMainThreadPtrHandle<nsIInterceptedChannel> mChannel;
++  const nsresult mStatus;
+ public:
+-  explicit CancelChannelRunnable(nsMainThreadPtrHandle<nsIInterceptedChannel>& aChannel)
++  explicit CancelChannelRunnable(nsMainThreadPtrHandle<nsIInterceptedChannel>& aChannel,
++                                 nsresult aStatus)
+     : mChannel(aChannel)
++    , mStatus(aStatus)
+   {
+   }
+ 
+   NS_IMETHOD Run()
+   {
+     MOZ_ASSERT(NS_IsMainThread());
+-    nsresult rv = mChannel->Cancel();
++    nsresult rv = mChannel->Cancel(mStatus);
+     NS_ENSURE_SUCCESS(rv, rv);
+     return NS_OK;
+   }
+ };
+ 
+ class FinishResponse final : public nsRunnable
+ {
+   nsMainThreadPtrHandle<nsIInterceptedChannel> mChannel;
+@@ -155,17 +158,17 @@ public:
+     , mRequestMode(aRequestMode)
+   {
+   }
+ 
+   void ResolvedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue) override;
+ 
+   void RejectedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue) override;
+ 
+-  void CancelRequest();
++  void CancelRequest(nsresult aStatus);
+ };
+ 
+ struct RespondWithClosure
+ {
+   nsMainThreadPtrHandle<nsIInterceptedChannel> mInterceptedChannel;
+   nsRefPtr<InternalResponse> mInternalResponse;
+   ChannelInfo mWorkerChannelInfo;
+ 
+@@ -183,38 +186,47 @@ void RespondWithCopyComplete(void* aClos
+ {
+   nsAutoPtr<RespondWithClosure> data(static_cast<RespondWithClosure*>(aClosure));
+   nsCOMPtr<nsIRunnable> event;
+   if (NS_SUCCEEDED(aStatus)) {
+     event = new FinishResponse(data->mInterceptedChannel,
+                                data->mInternalResponse,
+                                data->mWorkerChannelInfo);
+   } else {
+-    event = new CancelChannelRunnable(data->mInterceptedChannel);
++    event = new CancelChannelRunnable(data->mInterceptedChannel,
++                                      NS_ERROR_INTERCEPTION_FAILED);
+   }
+   MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(event)));
+ }
+ 
+ class MOZ_STACK_CLASS AutoCancel
+ {
+   nsRefPtr<RespondWithHandler> mOwner;
++  nsresult mStatus;
+ 
+ public:
+   explicit AutoCancel(RespondWithHandler* aOwner)
+     : mOwner(aOwner)
++    , mStatus(NS_ERROR_INTERCEPTION_FAILED)
+   {
+   }
+ 
+   ~AutoCancel()
+   {
+     if (mOwner) {
+-      mOwner->CancelRequest();
++      mOwner->CancelRequest(mStatus);
+     }
+   }
+ 
++  void SetCancelStatus(nsresult aStatus)
++  {
++    MOZ_ASSERT(NS_FAILED(aStatus));
++    mStatus = aStatus;
++  }
++
+   void Reset()
+   {
+     mOwner = nullptr;
+   }
+ };
+ 
+ void
+ RespondWithHandler::ResolvedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue)
+@@ -235,27 +247,34 @@ RespondWithHandler::ResolvedCallback(JSC
+   WorkerPrivate* worker = GetCurrentThreadWorkerPrivate();
+   MOZ_ASSERT(worker);
+   worker->AssertIsOnWorkerThread();
+ 
+   // Allow opaque response interception to be disabled until we can ensure the
+   // security implications are not a complete disaster.
+   if (response->Type() == ResponseType::Opaque &&
+       !worker->OpaqueInterceptionEnabled()) {
++    autoCancel.SetCancelStatus(NS_ERROR_OPAQUE_INTERCEPTION_DISABLED);
+     return;
+   }
+ 
+   // Section 4.2, step 2.2 "If either response's type is "opaque" and request's
+   // mode is not "no-cors" or response's type is error, return a network error."
+-  if (((response->Type() == ResponseType::Opaque) && (mRequestMode != RequestMode::No_cors)) ||
+-      response->Type() == ResponseType::Error) {
++  if (response->Type() == ResponseType::Opaque && mRequestMode != RequestMode::No_cors) {
++    autoCancel.SetCancelStatus(NS_ERROR_BAD_OPAQUE_INTERCEPTION_REQUEST_MODE);
++    return;
++  }
++
++  if (response->Type() == ResponseType::Error) {
++    autoCancel.SetCancelStatus(NS_ERROR_INTERCEPTED_ERROR_RESPONSE);
+     return;
+   }
+ 
+   if (NS_WARN_IF(response->BodyUsed())) {
++    autoCancel.SetCancelStatus(NS_ERROR_INTERCEPTED_USED_RESPONSE);
+     return;
+   }
+ 
+   nsRefPtr<InternalResponse> ir = response->GetInternalResponse();
+   if (NS_WARN_IF(!ir)) {
+     return;
+   }
+ 
+@@ -291,23 +310,24 @@ RespondWithHandler::ResolvedCallback(JSC
+ 
+   MOZ_ASSERT(!closure);
+   autoCancel.Reset();
+ }
+ 
+ void
+ RespondWithHandler::RejectedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue)
+ {
+-  CancelRequest();
++  CancelRequest(NS_ERROR_INTERCEPTION_FAILED);
+ }
+ 
+ void
+-RespondWithHandler::CancelRequest()
++RespondWithHandler::CancelRequest(nsresult aStatus)
+ {
+-  nsCOMPtr<nsIRunnable> runnable = new CancelChannelRunnable(mInterceptedChannel);
++  nsCOMPtr<nsIRunnable> runnable =
++    new CancelChannelRunnable(mInterceptedChannel, aStatus);
+   NS_DispatchToMainThread(runnable);
+ }
+ 
+ } // anonymous namespace
+ 
+ void
+ FetchEvent::RespondWith(const ResponseOrPromise& aArg, ErrorResult& aRv)
+ {
+diff --git a/modules/libjar/InterceptedJARChannel.cpp b/modules/libjar/InterceptedJARChannel.cpp
+--- a/modules/libjar/InterceptedJARChannel.cpp
++++ b/modules/libjar/InterceptedJARChannel.cpp
+@@ -84,23 +84,25 @@ InterceptedJARChannel::FinishSynthesized
+   mChannel->OverrideWithSynthesizedResponse(mSynthesizedInput, mContentType);
+ 
+   mResponseBody = nullptr;
+   mChannel = nullptr;
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+-InterceptedJARChannel::Cancel()
++InterceptedJARChannel::Cancel(nsresult aStatus)
+ {
++  MOZ_ASSERT(NS_FAILED(aStatus));
++
+   if (!mChannel) {
+     return NS_ERROR_FAILURE;
+   }
+ 
+-  nsresult rv = mChannel->Cancel(NS_BINDING_ABORTED);
++  nsresult rv = mChannel->Cancel(aStatus);
+   NS_ENSURE_SUCCESS(rv, rv);
+   mResponseBody = nullptr;
+   mChannel = nullptr;
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ InterceptedJARChannel::SetChannelInfo(mozilla::dom::ChannelInfo* aChannelInfo)
+diff --git a/netwerk/base/nsINetworkInterceptController.idl b/netwerk/base/nsINetworkInterceptController.idl
+--- a/netwerk/base/nsINetworkInterceptController.idl
++++ b/netwerk/base/nsINetworkInterceptController.idl
+@@ -21,17 +21,17 @@ class ChannelInfo;
+ 
+ /**
+  * Interface to allow implementors of nsINetworkInterceptController to control the behaviour
+  * of intercepted channels without tying implementation details of the interception to
+  * the actual channel. nsIInterceptedChannel is expected to be implemented by objects
+  * which do not implement nsIChannel.
+  */
+ 
+-[scriptable, uuid(f2c07a6b-366d-4ef4-85ab-a77f4bcb1646)]
++[scriptable, uuid(1062c96a-d73c-4ad5-beb7-6e803e414973)]
+ interface nsIInterceptedChannel : nsISupports
+ {
+     /**
+      * Instruct a channel that has been intercepted to continue with the original
+      * network request.
+      */
+     void resetInterception();
+ 
+@@ -54,17 +54,17 @@ interface nsIInterceptedChannel : nsISup
+      */
+     void finishSynthesizedResponse();
+ 
+     /**
+      * Cancel the pending intercepted request.
+      * @return NS_ERROR_FAILURE if the response has already been synthesized or
+      *         the original request has been instructed to continue.
+      */
+-    void cancel();
++    void cancel(in nsresult status);
+ 
+     /**
+      * The synthesized response body to be produced.
+      */
+     readonly attribute nsIOutputStream responseBody;
+ 
+     /**
+      * The underlying channel object that was intercepted.
+diff --git a/netwerk/protocol/http/HttpChannelParent.cpp b/netwerk/protocol/http/HttpChannelParent.cpp
+--- a/netwerk/protocol/http/HttpChannelParent.cpp
++++ b/netwerk/protocol/http/HttpChannelParent.cpp
+@@ -93,17 +93,17 @@ HttpChannelParent::ActorDestroy(ActorDes
+   // We may still have refcount>0 if nsHttpChannel hasn't called OnStopRequest
+   // yet, but child process has crashed.  We must not try to send any more msgs
+   // to child, or IPDL will kill chrome process, too.
+   mIPCClosed = true;
+ 
+   // If this is an intercepted channel, we need to make sure that any resources are
+   // cleaned up to avoid leaks.
+   if (mInterceptedChannel) {
+-    mInterceptedChannel->Cancel();
++    mInterceptedChannel->Cancel(NS_ERROR_INTERCEPTION_FAILED);
+     mInterceptedChannel = nullptr;
+   }
+ }
+ 
+ bool
+ HttpChannelParent::Init(const HttpChannelCreationArgs& aArgs)
+ {
+   LOG(("HttpChannelParent::Init [this=%p]\n", this));
 diff --git a/netwerk/protocol/http/InterceptedChannel.cpp b/netwerk/protocol/http/InterceptedChannel.cpp
 --- a/netwerk/protocol/http/InterceptedChannel.cpp
 +++ b/netwerk/protocol/http/InterceptedChannel.cpp
-@@ -233,17 +233,17 @@ NS_IMETHODIMP
- InterceptedChannelChrome::Cancel()
+@@ -225,25 +225,27 @@ InterceptedChannelChrome::FinishSynthesi
+     NS_ENSURE_SUCCESS(rv, rv);
+   }
+ 
+   mChannel = nullptr;
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+-InterceptedChannelChrome::Cancel()
++InterceptedChannelChrome::Cancel(nsresult aStatus)
  {
++  MOZ_ASSERT(NS_FAILED(aStatus));
++
    if (!mChannel) {
      return NS_ERROR_FAILURE;
    }
@@ -55,7 +454,7 @@ diff --git a/netwerk/protocol/http/InterceptedChannel.cpp b/netwerk/protocol/htt
    // we need to use AsyncAbort instead of Cancel since there's no active pump
    // to cancel which will provide OnStart/OnStopRequest to the channel.
 -  nsresult rv = mChannel->AsyncAbort(NS_BINDING_ABORTED);
-+  nsresult rv = mChannel->AsyncAbort(NS_ERROR_INTERCEPTION_FAILED);
++  nsresult rv = mChannel->AsyncAbort(aStatus);
    NS_ENSURE_SUCCESS(rv, rv);
    return NS_OK;
  }
@@ -64,9 +463,20 @@ diff --git a/netwerk/protocol/http/InterceptedChannel.cpp b/netwerk/protocol/htt
  InterceptedChannelChrome::SetChannelInfo(dom::ChannelInfo* aChannelInfo)
  {
    if (!mChannel) {
-@@ -338,17 +338,17 @@ NS_IMETHODIMP
- InterceptedChannelContent::Cancel()
+@@ -330,25 +332,27 @@ InterceptedChannelContent::FinishSynthes
+ 
+   mResponseBody = nullptr;
+   mChannel = nullptr;
+   mStreamListener = nullptr;
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+-InterceptedChannelContent::Cancel()
++InterceptedChannelContent::Cancel(nsresult aStatus)
  {
++  MOZ_ASSERT(NS_FAILED(aStatus));
++
    if (!mChannel) {
      return NS_ERROR_FAILURE;
    }
@@ -74,7 +484,7 @@ diff --git a/netwerk/protocol/http/InterceptedChannel.cpp b/netwerk/protocol/htt
    // we need to use AsyncAbort instead of Cancel since there's no active pump
    // to cancel which will provide OnStart/OnStopRequest to the channel.
 -  nsresult rv = mChannel->AsyncAbort(NS_BINDING_ABORTED);
-+  nsresult rv = mChannel->AsyncAbort(NS_ERROR_INTERCEPTION_FAILED);
++  nsresult rv = mChannel->AsyncAbort(aStatus);
    NS_ENSURE_SUCCESS(rv, rv);
    mChannel = nullptr;
    mStreamListener = nullptr;
@@ -83,6 +493,47 @@ diff --git a/netwerk/protocol/http/InterceptedChannel.cpp b/netwerk/protocol/htt
  
  NS_IMETHODIMP
  InterceptedChannelContent::SetChannelInfo(dom::ChannelInfo* aChannelInfo)
+diff --git a/netwerk/protocol/http/InterceptedChannel.h b/netwerk/protocol/http/InterceptedChannel.h
+--- a/netwerk/protocol/http/InterceptedChannel.h
++++ b/netwerk/protocol/http/InterceptedChannel.h
+@@ -76,17 +76,17 @@ public:
+                            nsINetworkInterceptController* aController,
+                            nsICacheEntry* aEntry);
+ 
+   NS_IMETHOD ResetInterception() override;
+   NS_IMETHOD FinishSynthesizedResponse() override;
+   NS_IMETHOD GetChannel(nsIChannel** aChannel) override;
+   NS_IMETHOD SynthesizeStatus(uint16_t aStatus, const nsACString& aReason) override;
+   NS_IMETHOD SynthesizeHeader(const nsACString& aName, const nsACString& aValue) override;
+-  NS_IMETHOD Cancel() override;
++  NS_IMETHOD Cancel(nsresult aStatus) override;
+   NS_IMETHOD SetChannelInfo(mozilla::dom::ChannelInfo* aChannelInfo) override;
+ 
+   virtual void NotifyController() override;
+ };
+ 
+ class InterceptedChannelContent : public InterceptedChannelBase
+ {
+   // The actual channel being intercepted.
+@@ -103,17 +103,17 @@ public:
+                             nsINetworkInterceptController* aController,
+                             nsIStreamListener* aListener);
+ 
+   NS_IMETHOD ResetInterception() override;
+   NS_IMETHOD FinishSynthesizedResponse() override;
+   NS_IMETHOD GetChannel(nsIChannel** aChannel) override;
+   NS_IMETHOD SynthesizeStatus(uint16_t aStatus, const nsACString& aReason) override;
+   NS_IMETHOD SynthesizeHeader(const nsACString& aName, const nsACString& aValue) override;
+-  NS_IMETHOD Cancel() override;
++  NS_IMETHOD Cancel(nsresult aStatus) override;
+   NS_IMETHOD SetChannelInfo(mozilla::dom::ChannelInfo* aChannelInfo) override;
+ 
+   virtual void NotifyController() override;
+ };
+ 
+ } // namespace net
+ } // namespace mozilla
+ 
 diff --git a/xpcom/base/ErrorList.h b/xpcom/base/ErrorList.h
 --- a/xpcom/base/ErrorList.h
 +++ b/xpcom/base/ErrorList.h
