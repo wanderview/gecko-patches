@@ -1,0 +1,361 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  e94ded4ae95f89c257d4728bf36fcf030fe7672b
+Bug 1181887 Fall back to network if ServiceWorker script fails to load. r=ehsan
+
+diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
+--- a/dom/workers/RuntimeService.cpp
++++ b/dom/workers/RuntimeService.cpp
+@@ -2407,25 +2407,26 @@ RuntimeService::CreateSharedWorkerIntern
+   WorkerLoadInfo loadInfo;
+   nsresult rv = WorkerPrivate::GetLoadInfo(cx, window, nullptr, aScriptURL,
+                                            false,
+                                            WorkerPrivate::OverrideLoadGroup,
+                                            aType, &loadInfo);
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   return CreateSharedWorkerFromLoadInfo(cx, &loadInfo, aScriptURL, aName, aType,
+-                                        aSharedWorker);
++                                        nullptr, aSharedWorker);
+ }
+ 
+ nsresult
+ RuntimeService::CreateSharedWorkerFromLoadInfo(JSContext* aCx,
+                                                WorkerLoadInfo* aLoadInfo,
+                                                const nsAString& aScriptURL,
+                                                const nsACString& aName,
+                                                WorkerType aType,
++                                               nsIRunnable* aLoadFailedRunnable,
+                                                SharedWorker** aSharedWorker)
+ {
+   AssertIsOnMainThread();
+   MOZ_ASSERT(aLoadInfo);
+   MOZ_ASSERT(aLoadInfo->mResolvedScriptURI);
+   MOZ_ASSERT_IF(aType == WorkerTypeService, aLoadInfo->mServiceWorkerID > 0);
+ 
+   nsRefPtr<WorkerPrivate> workerPrivate;
+@@ -2455,18 +2456,18 @@ RuntimeService::CreateSharedWorkerFromLo
+   // the SharedWorker object itself is created before then WorkerScriptLoaded()
+   // will reset the loadInfo's window.
+   nsCOMPtr<nsPIDOMWindow> window = aLoadInfo->mWindow;
+ 
+   bool created = false;
+   if (!workerPrivate) {
+     ErrorResult rv;
+     workerPrivate =
+-      WorkerPrivate::Constructor(aCx, aScriptURL, false,
+-                                 aType, aName, aLoadInfo, rv);
++      WorkerPrivate::Constructor(aCx, aScriptURL, false, aType, aName,
++                                 aLoadInfo, aLoadFailedRunnable, rv);
+     NS_ENSURE_TRUE(workerPrivate, rv.StealNSResult());
+ 
+     created = true;
+   } else {
+     // If we're attaching to an existing SharedWorker private, then we
+     // must update the overriden load group to account for our document's
+     // load group.
+     workerPrivate->UpdateOverridenLoadGroup(aLoadInfo->mLoadGroup);
+diff --git a/dom/workers/RuntimeService.h b/dom/workers/RuntimeService.h
+--- a/dom/workers/RuntimeService.h
++++ b/dom/workers/RuntimeService.h
+@@ -158,20 +158,22 @@ public:
+                                       WorkerTypeShared, aSharedWorker);
+   }
+ 
+   nsresult
+   CreateSharedWorkerForServiceWorkerFromLoadInfo(JSContext* aCx,
+                                                  WorkerLoadInfo* aLoadInfo,
+                                                  const nsAString& aScriptURL,
+                                                  const nsACString& aScope,
++                                                 nsIRunnable* aLoadFailedRunnable,
+                                                  SharedWorker** aSharedWorker)
+   {
+     return CreateSharedWorkerFromLoadInfo(aCx, aLoadInfo, aScriptURL, aScope,
+-                                          WorkerTypeService, aSharedWorker);
++                                          WorkerTypeService, aLoadFailedRunnable,
++                                          aSharedWorker);
+   }
+ 
+   void
+   ForgetSharedWorker(WorkerPrivate* aWorkerPrivate);
+ 
+   const NavigatorProperties&
+   GetNavigatorProperties() const
+   {
+@@ -316,14 +318,15 @@ private:
+                              SharedWorker** aSharedWorker);
+ 
+   nsresult
+   CreateSharedWorkerFromLoadInfo(JSContext* aCx,
+                                  WorkerLoadInfo* aLoadInfo,
+                                  const nsAString& aScriptURL,
+                                  const nsACString& aName,
+                                  WorkerType aType,
++                                 nsIRunnable* aLoadFailedRunnable,
+                                  SharedWorker** aSharedWorker);
+ };
+ 
+ END_WORKERS_NAMESPACE
+ 
+ #endif /* mozilla_dom_workers_runtimeservice_h__ */
+diff --git a/dom/workers/ScriptLoader.cpp b/dom/workers/ScriptLoader.cpp
+--- a/dom/workers/ScriptLoader.cpp
++++ b/dom/workers/ScriptLoader.cpp
+@@ -1694,16 +1694,17 @@ ScriptExecutorRunnable::WorkerRun(JSCont
+ 
+     NS_ASSERTION(!loadInfo.mChannel, "Should no longer have a channel!");
+     NS_ASSERTION(loadInfo.mExecutionScheduled, "Should be scheduled!");
+     NS_ASSERTION(!loadInfo.mExecutionResult, "Should not have executed yet!");
+ 
+     if (NS_FAILED(loadInfo.mLoadResult)) {
+       scriptloader::ReportLoadError(aCx, loadInfo.mURL, loadInfo.mLoadResult,
+                                     false);
++      aWorkerPrivate->MaybeDispatchLoadFailedRunnable();
+       return true;
+     }
+ 
+     NS_ConvertUTF16toUTF8 filename(loadInfo.mURL);
+ 
+     JS::CompileOptions options(aCx);
+     options.setFileAndLine(filename.get(), 1)
+            .setNoScriptRval(true);
+diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
+--- a/dom/workers/ServiceWorkerManager.cpp
++++ b/dom/workers/ServiceWorkerManager.cpp
+@@ -2717,19 +2717,21 @@ ServiceWorkerManager::CreateServiceWorke
+   loadInfo.mServiceWorkerID = aInfo->ID();
+ 
+   RuntimeService* rs = RuntimeService::GetOrCreateService();
+   if (!rs) {
+     return NS_ERROR_FAILURE;
+   }
+ 
+   nsRefPtr<SharedWorker> sharedWorker;
++  // TODO
+   rv = rs->CreateSharedWorkerForServiceWorkerFromLoadInfo(cx, &loadInfo,
+                                                           NS_ConvertUTF8toUTF16(aInfo->ScriptSpec()),
+                                                           aInfo->Scope(),
++                                                          nullptr,
+                                                           getter_AddRefs(sharedWorker));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return rv;
+   }
+ 
+   nsRefPtr<ServiceWorker> serviceWorker =
+     new ServiceWorker(aWindow, aInfo, sharedWorker);
+ 
+@@ -3788,19 +3790,21 @@ ServiceWorkerManager::CreateServiceWorke
+   RuntimeService* rs = RuntimeService::GetOrCreateService();
+   if (!rs) {
+     return NS_ERROR_FAILURE;
+   }
+ 
+   AutoJSAPI jsapi;
+   jsapi.Init();
+   nsRefPtr<SharedWorker> sharedWorker;
++  // TODO
+   rv = rs->CreateSharedWorkerForServiceWorkerFromLoadInfo(jsapi.cx(), &info,
+                                                           NS_ConvertUTF8toUTF16(aInfo->ScriptSpec()),
+                                                           aInfo->Scope(),
++                                                          nullptr,
+                                                           getter_AddRefs(sharedWorker));
+ 
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return rv;
+   }
+ 
+   nsRefPtr<ServiceWorker> serviceWorker =
+     new ServiceWorker(nullptr, aInfo, sharedWorker);
+diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
+--- a/dom/workers/WorkerPrivate.cpp
++++ b/dom/workers/WorkerPrivate.cpp
+@@ -4737,37 +4737,40 @@ WorkerDebugger::ReportErrorToDebuggerOnM
+   LogErrorToConsole(aMessage, aFilename, nsString(), aLineno, 0, 0, 0);
+ }
+ 
+ WorkerPrivate::WorkerPrivate(JSContext* aCx,
+                              WorkerPrivate* aParent,
+                              const nsAString& aScriptURL,
+                              bool aIsChromeWorker, WorkerType aWorkerType,
+                              const nsACString& aSharedWorkerName,
+-                             WorkerLoadInfo& aLoadInfo)
++                             WorkerLoadInfo& aLoadInfo,
++                             nsIRunnable* aLoadFailedRunnable)
+   : WorkerPrivateParent<WorkerPrivate>(aCx, aParent, aScriptURL,
+                                        aIsChromeWorker, aWorkerType,
+                                        aSharedWorkerName, aLoadInfo)
+   , mJSContext(nullptr)
+   , mPRThread(nullptr)
++  , mLoadFailedRunnable(aLoadFailedRunnable)
+   , mDebuggerEventLoopLevel(0)
+   , mErrorHandlerRecursionCount(0)
+   , mNextTimeoutId(1)
+   , mStatus(Pending)
+   , mFrozen(false)
+   , mTimerRunning(false)
+   , mRunningExpiredTimeouts(false)
+   , mCloseHandlerStarted(false)
+   , mCloseHandlerFinished(false)
+   , mMemoryReporterRunning(false)
+   , mBlockedForMemoryReporter(false)
+   , mCancelAllPendingRunnables(false)
+   , mPeriodicGCTimerRunning(false)
+   , mIdleGCTimerRunning(false)
+   , mWorkerScriptExecutedSuccessfully(false)
++  // TODO
+ {
+   MOZ_ASSERT_IF(!IsDedicatedWorker(), !aSharedWorkerName.IsVoid());
+   MOZ_ASSERT_IF(IsDedicatedWorker(), aSharedWorkerName.IsEmpty());
+ 
+   if (aParent) {
+     aParent->AssertIsOnWorkerThread();
+     aParent->GetAllPreferences(mPreferences);
+     mOnLine = aParent->OnLine();
+@@ -4844,26 +4847,28 @@ already_AddRefed<WorkerPrivate>
+ WorkerPrivate::Constructor(const GlobalObject& aGlobal,
+                            const nsAString& aScriptURL,
+                            bool aIsChromeWorker, WorkerType aWorkerType,
+                            const nsACString& aSharedWorkerName,
+                            WorkerLoadInfo* aLoadInfo, ErrorResult& aRv)
+ {
+   JSContext* cx = aGlobal.Context();
+   return Constructor(cx, aScriptURL, aIsChromeWorker, aWorkerType,
+-                     aSharedWorkerName, aLoadInfo, aRv);
++                     aSharedWorkerName, aLoadInfo, nullptr, aRv);
+ }
+ 
+ // static
+ already_AddRefed<WorkerPrivate>
+ WorkerPrivate::Constructor(JSContext* aCx,
+                            const nsAString& aScriptURL,
+                            bool aIsChromeWorker, WorkerType aWorkerType,
+                            const nsACString& aSharedWorkerName,
+-                           WorkerLoadInfo* aLoadInfo, ErrorResult& aRv)
++                           WorkerLoadInfo* aLoadInfo,
++                           nsIRunnable* aLoadFailedRunnable,
++                           ErrorResult& aRv)
+ {
+   WorkerPrivate* parent = NS_IsMainThread() ?
+                           nullptr :
+                           GetCurrentThreadWorkerPrivate();
+   if (parent) {
+     parent->AssertIsOnWorkerThread();
+   } else {
+     AssertIsOnMainThread();
+@@ -4906,17 +4911,18 @@ WorkerPrivate::Constructor(JSContext* aC
+   else {
+     runtimeService = RuntimeService::GetService();
+   }
+ 
+   MOZ_ASSERT(runtimeService);
+ 
+   nsRefPtr<WorkerPrivate> worker =
+     new WorkerPrivate(aCx, parent, aScriptURL, aIsChromeWorker,
+-                      aWorkerType, aSharedWorkerName, *aLoadInfo);
++                      aWorkerType, aSharedWorkerName, *aLoadInfo,
++                      aLoadFailedRunnable);
+ 
+   if (!runtimeService->RegisterWorker(aCx, worker)) {
+     aRv.Throw(NS_ERROR_UNEXPECTED);
+     return nullptr;
+   }
+ 
+   worker->EnableDebugger();
+ 
+@@ -5454,16 +5460,27 @@ WorkerPrivate::RunBeforeNextEvent(nsIRun
+       return false;
+     }
+   }
+ 
+   return true;
+ }
+ 
+ void
++WorkerPrivate::MaybeDispatchLoadFailedRunnable()
++{
++  nsCOMPtr<nsIRunnable> runnable = mLoadFailedRunnable.forget();
++  if (!runnable) {
++    return;
++  }
++
++  MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(runnable)));
++}
++
++void
+ WorkerPrivate::InitializeGCTimers()
+ {
+   AssertIsOnWorkerThread();
+ 
+   // We need a timer for GC. The basic plan is to run a non-shrinking GC
+   // periodically (PERIODIC_GC_TIMER_DELAY_SEC) while the worker is running.
+   // Once the worker goes idle we set a short (IDLE_GC_TIMER_DELAY_SEC) timer to
+   // run a shrinking GC. If the worker receives more messages then the short
+diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
+--- a/dom/workers/WorkerPrivate.h
++++ b/dom/workers/WorkerPrivate.h
+@@ -951,16 +951,19 @@ class WorkerPrivate : public WorkerPriva
+   nsCOMPtr<nsITimer> mGCTimer;
+   nsCOMPtr<nsIEventTarget> mPeriodicGCTimerTarget;
+   nsCOMPtr<nsIEventTarget> mIdleGCTimerTarget;
+ 
+   nsRefPtr<MemoryReporter> mMemoryReporter;
+ 
+   nsRefPtrHashtable<nsUint64HashKey, MessagePort> mWorkerPorts;
+ 
++  // fired on the main thread if the worker script fails to load
++  nsCOMPtr<nsIRunnable> mLoadFailedRunnable;
++
+   TimeStamp mKillTime;
+   uint32_t mErrorHandlerRecursionCount;
+   uint32_t mNextTimeoutId;
+   Status mStatus;
+   bool mFrozen;
+   bool mTimerRunning;
+   bool mRunningExpiredTimeouts;
+   bool mCloseHandlerStarted;
+@@ -986,17 +989,18 @@ public:
+   Constructor(const GlobalObject& aGlobal, const nsAString& aScriptURL,
+               bool aIsChromeWorker, WorkerType aWorkerType,
+               const nsACString& aSharedWorkerName,
+               WorkerLoadInfo* aLoadInfo, ErrorResult& aRv);
+ 
+   static already_AddRefed<WorkerPrivate>
+   Constructor(JSContext* aCx, const nsAString& aScriptURL, bool aIsChromeWorker,
+               WorkerType aWorkerType, const nsACString& aSharedWorkerName,
+-              WorkerLoadInfo* aLoadInfo, ErrorResult& aRv);
++              WorkerLoadInfo* aLoadInfo, nsIRunnable* aLoadFailedRunnable,
++              ErrorResult& aRv);
+ 
+   static bool
+   WorkerAvailable(JSContext* /* unused */, JSObject* /* unused */);
+ 
+   enum LoadGroupBehavior
+   {
+     InheritLoadGroup,
+     OverrideLoadGroup
+@@ -1362,21 +1366,24 @@ public:
+     return mWorkerScriptExecutedSuccessfully;
+   }
+ 
+   // Just like nsIAppShell::RunBeforeNextEvent. May only be called on the worker
+   // thread.
+   bool
+   RunBeforeNextEvent(nsIRunnable* aRunnable);
+ 
++  void
++  MaybeDispatchLoadFailedRunnable();
++
+ private:
+   WorkerPrivate(JSContext* aCx, WorkerPrivate* aParent,
+                 const nsAString& aScriptURL, bool aIsChromeWorker,
+                 WorkerType aWorkerType, const nsACString& aSharedWorkerName,
+-                WorkerLoadInfo& aLoadInfo);
++                WorkerLoadInfo& aLoadInfo, nsIRunnable* aLoadFailedRunnable);
+ 
+   bool
+   MayContinueRunning()
+   {
+     AssertIsOnWorkerThread();
+ 
+     Status status;
+     {
