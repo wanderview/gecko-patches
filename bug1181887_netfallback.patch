@@ -3,10 +3,58 @@
 # Parent  e94ded4ae95f89c257d4728bf36fcf030fe7672b
 Bug 1181887 Fall back to network if ServiceWorker script fails to load. r=ehsan
 
+diff --git a/dom/interfaces/base/nsIServiceWorkerManager.idl b/dom/interfaces/base/nsIServiceWorkerManager.idl
+--- a/dom/interfaces/base/nsIServiceWorkerManager.idl
++++ b/dom/interfaces/base/nsIServiceWorkerManager.idl
+@@ -4,19 +4,20 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "domstubs.idl"
+ 
+ interface nsIArray;
+ interface nsIDocument;
+ interface nsIInterceptedChannel;
+ interface nsIPrincipal;
++interface nsIRunnable;
+ interface nsIURI;
+ 
+-[scriptable, uuid(52ee2c9d-ee87-4caf-9588-23ae77ff8798)]
++[scriptable, uuid( 8d80dd18-597b-4378-b41e-768bfe48dd4f)]
+ interface nsIServiceWorkerUnregisterCallback : nsISupports
+ {
+   // aState is true if the unregistration succeded.
+   // It's false if this ServiceWorkerRegistration doesn't exist.
+   void unregisterSucceeded(in bool aState);
+   void unregisterFailed();
+ };
+ 
+@@ -88,18 +89,21 @@ interface nsIServiceWorkerManager : nsIS
+    * These are only meant to be called from ServiceWorkerRegistration instances.
+    */
+   [noscript] nsISupports GetInstalling(in nsIDOMWindow aWindow, in DOMString aScope);
+   [noscript] nsISupports GetWaiting(in nsIDOMWindow aWindow, in DOMString aScope);
+   [noscript] nsISupports GetActive(in nsIDOMWindow aWindow, in DOMString aScope);
+ 
+   /*
+    * Returns a ServiceWorker.
++   *  - aLoadFailedRunnable is an optional callback that will fire on main thread if
++   *    a ServiceWorker object is returned, but later fails to load for some reason.
+    */
+-  [noscript] nsISupports GetDocumentController(in nsIDOMWindow aWindow);
++  [noscript] nsISupports GetDocumentController(in nsIDOMWindow aWindow,
++                                               in nsIRunnable aLoadFailedRunnable);
+ 
+   /*
+    * Clears ServiceWorker registrations from memory and disk for the specified
+    * host.
+    * - All ServiceWorker instances change their state to redundant.
+    * - Existing ServiceWorker instances handling fetches will keep running.
+    * - All documents will immediately stop being controlled.
+    * - Unregister jobs will be queued for all registrations.
 diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
 --- a/dom/workers/RuntimeService.cpp
 +++ b/dom/workers/RuntimeService.cpp
-@@ -2407,25 +2407,26 @@ RuntimeService::CreateSharedWorkerIntern
+@@ -2407,25 +2407,27 @@ RuntimeService::CreateSharedWorkerIntern
    WorkerLoadInfo loadInfo;
    nsresult rv = WorkerPrivate::GetLoadInfo(cx, window, nullptr, aScriptURL,
                                             false,
@@ -15,8 +63,8 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
    NS_ENSURE_SUCCESS(rv, rv);
  
    return CreateSharedWorkerFromLoadInfo(cx, &loadInfo, aScriptURL, aName, aType,
--                                        aSharedWorker);
-+                                        nullptr, aSharedWorker);
++                                        nullptr, // load failed runnable
+                                         aSharedWorker);
  }
  
  nsresult
@@ -34,7 +82,7 @@ diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
    MOZ_ASSERT_IF(aType == WorkerTypeService, aLoadInfo->mServiceWorkerID > 0);
  
    nsRefPtr<WorkerPrivate> workerPrivate;
-@@ -2455,18 +2456,18 @@ RuntimeService::CreateSharedWorkerFromLo
+@@ -2455,18 +2457,18 @@ RuntimeService::CreateSharedWorkerFromLo
    // the SharedWorker object itself is created before then WorkerScriptLoaded()
    // will reset the loadInfo's window.
    nsCOMPtr<nsPIDOMWindow> window = aLoadInfo->mWindow;
@@ -82,9 +130,19 @@ diff --git a/dom/workers/RuntimeService.h b/dom/workers/RuntimeService.h
    const NavigatorProperties&
    GetNavigatorProperties() const
    {
-@@ -316,14 +318,15 @@ private:
+@@ -310,20 +312,25 @@ private:
+ 
+   nsresult
+   CreateSharedWorkerInternal(const GlobalObject& aGlobal,
+                              const nsAString& aScriptURL,
+                              const nsACString& aName,
+                              WorkerType aType,
                               SharedWorker** aSharedWorker);
  
++  // aLoadFailedRunnable will execute on main thread if script loading
++  // later fails during script loading.  If we fail in this method
++  // immediately and never start script loading, then the runnable is
++  // never executed.
    nsresult
    CreateSharedWorkerFromLoadInfo(JSContext* aCx,
                                   WorkerLoadInfo* aLoadInfo,
@@ -119,23 +177,271 @@ diff --git a/dom/workers/ScriptLoader.cpp b/dom/workers/ScriptLoader.cpp
      JS::CompileOptions options(aCx);
      options.setFileAndLine(filename.get(), 1)
             .setNoScriptRval(true);
+diff --git a/dom/workers/ServiceWorkerContainer.cpp b/dom/workers/ServiceWorkerContainer.cpp
+--- a/dom/workers/ServiceWorkerContainer.cpp
++++ b/dom/workers/ServiceWorkerContainer.cpp
+@@ -159,18 +159,23 @@ ServiceWorkerContainer::GetController()
+ {
+   if (!mControllerWorker) {
+     nsresult rv;
+     nsCOMPtr<nsIServiceWorkerManager> swm = mozilla::services::GetServiceWorkerManager();
+     if (!swm) {
+       return nullptr;
+     }
+ 
++    // TODO: What should we do here if the ServiceWorker script fails to load?
++    //       In theory the DOM ServiceWorker object can exist without the worker
++    //       thread running, but it seems our design does not expect that.
+     nsCOMPtr<nsISupports> serviceWorker;
+-    rv = swm->GetDocumentController(GetOwner(), getter_AddRefs(serviceWorker));
++    rv = swm->GetDocumentController(GetOwner(),
++                                    nullptr, // aLoadFailedRunnable
++                                    getter_AddRefs(serviceWorker));
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       return nullptr;
+     }
+ 
+     mControllerWorker =
+       static_cast<workers::ServiceWorker*>(serviceWorker.get());
+   }
+ 
 diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
 --- a/dom/workers/ServiceWorkerManager.cpp
 +++ b/dom/workers/ServiceWorkerManager.cpp
-@@ -2717,19 +2717,21 @@ ServiceWorkerManager::CreateServiceWorke
-   loadInfo.mServiceWorkerID = aInfo->ID();
+@@ -1056,47 +1056,63 @@ public:
+     }
  
-   RuntimeService* rs = RuntimeService::GetOrCreateService();
+     nsAutoString cacheName;
+     // We have to create a ServiceWorker here simply to ensure there are no
+     // errors. Ideally we should just pass this worker on to ContinueInstall.
+     MOZ_ASSERT(!data->mSetOfScopesBeingUpdated.Contains(mRegistration->mScope));
+     data->mSetOfScopesBeingUpdated.Put(mRegistration->mScope, true);
+ 
++    // Call FailScopeUpdate on main thread if the SW script load fails below.
++    nsCOMPtr<nsIRunnable> failRunnable = NS_NewRunnableMethodWithArgs
++      <StorensRefPtrPassByPtr<ServiceWorkerManager>, nsCString>
++      (this, &ServiceWorkerRegisterJob::FailScopeUpdate, swm, scopeKey);
++
+     MOZ_ASSERT(!mUpdateAndInstallInfo);
+     mUpdateAndInstallInfo =
+       new ServiceWorkerInfo(mRegistration, mRegistration->mScriptSpec,
+                             aNewCacheName);
+     nsRefPtr<ServiceWorker> serviceWorker;
+     rv = swm->CreateServiceWorker(mRegistration->mPrincipal,
+                                   mUpdateAndInstallInfo,
++                                  failRunnable,
+                                   getter_AddRefs(serviceWorker));
+ 
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+-      data->mSetOfScopesBeingUpdated.Remove(mRegistration->mScope);
+-      return Fail(NS_ERROR_DOM_ABORT_ERR);
++      return FailScopeUpdate(swm, scopeKey);
+     }
+ 
+     nsRefPtr<ServiceWorkerJob> upcasted = this;
+     nsMainThreadPtrHandle<nsISupports> handle(
+         new nsMainThreadPtrHolder<nsISupports>(upcasted));
+ 
+     nsMainThreadPtrHandle<ServiceWorker> serviceWorkerHandle(
+       new nsMainThreadPtrHolder<ServiceWorker>(serviceWorker));
+     nsRefPtr<CheckWorkerEvaluationAndContinueUpdateWorkerRunnable> r =
+       new CheckWorkerEvaluationAndContinueUpdateWorkerRunnable(serviceWorkerHandle, handle);
+     AutoJSAPI jsapi;
+     jsapi.Init();
+     bool ok = r->Dispatch(jsapi.cx());
+     if (NS_WARN_IF(!ok)) {
+-      data->mSetOfScopesBeingUpdated.Remove(mRegistration->mScope);
+-      return Fail(NS_ERROR_DOM_ABORT_ERR);
++      return FailScopeUpdate(swm, scopeKey);
+     }
+   }
+ 
++  void
++  FailScopeUpdate(ServiceWorkerManager* aSwm, const nsACString& aScopeKey)
++  {
++    MOZ_ASSERT(NS_IsMainThread());
++    MOZ_ASSERT(aSwm);
++    ServiceWorkerManager::RegistrationDataPerPrincipal* data;
++    if (aSwm->mRegistrationInfos.Get(aScopeKey, &data)) {
++      data->mSetOfScopesBeingUpdated.Remove(aScopeKey);
++    }
++    Fail(NS_ERROR_DOM_ABORT_ERR);
++  }
++
+   // Public so our error handling code can use it.
+   // Callers MUST hold a strong ref before calling this!
+   void
+   Fail(const ErrorEventInit& aError)
+   {
+     MOZ_ASSERT(mCallback);
+     nsRefPtr<ServiceWorkerUpdateFinishCallback> callback = mCallback.forget();
+     // With cancellation support, we may only be running with one reference
+@@ -1162,19 +1178,25 @@ public:
+     nsCOMPtr<nsIRunnable> upr =
+       NS_NewRunnableMethodWithArg<ServiceWorkerRegistrationInfo*>(
+         swm,
+         &ServiceWorkerManager::FireUpdateFoundOnServiceWorkerRegistrations,
+         mRegistration);
+ 
+     NS_DispatchToMainThread(upr);
+ 
++    // Call ContinueAfterInstallEvent(false, false) on main thread if the SW
++    // script fails to load.
++    nsCOMPtr<nsIRunnable> failRunnable = NS_NewRunnableMethodWithArgs<bool, bool>
++      (this, &ServiceWorkerRegisterJob::ContinueAfterInstallEvent, false, false);
++
+     nsRefPtr<ServiceWorker> serviceWorker;
+     rv = swm->CreateServiceWorker(mRegistration->mPrincipal,
+                                   mRegistration->mInstallingWorker,
++                                  failRunnable,
+                                   getter_AddRefs(serviceWorker));
+ 
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       ContinueAfterInstallEvent(false /* aSuccess */, false /* aActivateImmediately */);
+       return;
+     }
+ 
+     nsMainThreadPtrHandle<ContinueLifecycleTask> handle(
+@@ -1820,28 +1842,30 @@ ServiceWorkerRegistrationInfo::Activate(
+ 
+   // "Queue a task to fire a simple event named controllerchange..."
+   nsCOMPtr<nsIRunnable> controllerChangeRunnable =
+     NS_NewRunnableMethodWithArg<ServiceWorkerRegistrationInfo*>(swm,
+                                                                 &ServiceWorkerManager::FireControllerChange,
+                                                                 this);
+   NS_DispatchToMainThread(controllerChangeRunnable);
+ 
++  nsCOMPtr<nsIRunnable> failRunnable =
++    NS_NewRunnableMethodWithArg<bool>(this,
++                                      &ServiceWorkerRegistrationInfo::FinishActivate,
++                                      false /* success */);
++
+   MOZ_ASSERT(mActiveWorker);
+   nsRefPtr<ServiceWorker> serviceWorker;
+   nsresult rv =
+     swm->CreateServiceWorker(mPrincipal,
+                              mActiveWorker,
++                             failRunnable,
+                              getter_AddRefs(serviceWorker));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    nsCOMPtr<nsIRunnable> r =
+-      NS_NewRunnableMethodWithArg<bool>(this,
+-                                        &ServiceWorkerRegistrationInfo::FinishActivate,
+-                                        false /* success */);
+-    MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(r)));
++    MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(failRunnable)));
+     return;
+   }
+ 
+   nsMainThreadPtrHandle<ContinueLifecycleTask> handle(
+     new nsMainThreadPtrHolder<ContinueLifecycleTask>(new ContinueActivateTask(this)));
+ 
+   nsMainThreadPtrHandle<ServiceWorker> serviceWorkerHandle(
+     new nsMainThreadPtrHolder<ServiceWorker>(serviceWorker));
+@@ -2213,17 +2237,17 @@ ServiceWorkerManager::SendPushEvent(cons
+   return NS_ERROR_NOT_AVAILABLE;
+ #else
+   OriginAttributes attrs;
+   if (!attrs.PopulateFromSuffix(aOriginAttributes)) {
+     return NS_ERROR_INVALID_ARG;
+   }
+ 
+   nsRefPtr<ServiceWorker> serviceWorker =
+-    CreateServiceWorkerForScope(attrs, aScope);
++    CreateServiceWorkerForScope(attrs, aScope, nullptr /* failure runnable */);
+   if (!serviceWorker) {
+     return NS_ERROR_FAILURE;
+   }
+ 
+   nsMainThreadPtrHandle<ServiceWorker> serviceWorkerHandle(
+     new nsMainThreadPtrHolder<ServiceWorker>(serviceWorker));
+ 
+   nsRefPtr<SendPushEventRunnable> r =
+@@ -2248,17 +2272,17 @@ ServiceWorkerManager::SendPushSubscripti
+   return NS_ERROR_NOT_AVAILABLE;
+ #else
+   OriginAttributes attrs;
+   if (!attrs.PopulateFromSuffix(aOriginAttributes)) {
+     return NS_ERROR_INVALID_ARG;
+   }
+ 
+   nsRefPtr<ServiceWorker> serviceWorker =
+-    CreateServiceWorkerForScope(attrs, aScope);
++    CreateServiceWorkerForScope(attrs, aScope, nullptr /* fail runnable */);
+   if (!serviceWorker) {
+     return NS_ERROR_FAILURE;
+   }
+   nsMainThreadPtrHandle<ServiceWorker> serviceWorkerHandle(
+     new nsMainThreadPtrHolder<ServiceWorker>(serviceWorker));
+ 
+   nsRefPtr<SendPushSubscriptionChangeEventRunnable> r =
+     new SendPushSubscriptionChangeEventRunnable(
+@@ -2384,17 +2408,18 @@ ServiceWorkerManager::CheckReadyPromise(
+     return true;
+   }
+ 
+   return false;
+ }
+ 
+ already_AddRefed<ServiceWorker>
+ ServiceWorkerManager::CreateServiceWorkerForScope(const OriginAttributes& aOriginAttributes,
+-                                                  const nsACString& aScope)
++                                                  const nsACString& aScope,
++                                                  nsIRunnable* aLoadFailedRunnable)
+ {
+   AssertIsOnMainThread();
+ 
+   nsCOMPtr<nsIURI> scopeURI;
+   nsresult rv = NS_NewURI(getter_AddRefs(scopeURI), aScope, nullptr, nullptr);
+   if (NS_FAILED(rv)) {
+     return nullptr;
+   }
+@@ -2406,16 +2431,17 @@ ServiceWorkerManager::CreateServiceWorke
+ 
+   if (!registration->mActiveWorker) {
+     return nullptr;
+   }
+ 
+   nsRefPtr<ServiceWorker> sw;
+   rv = CreateServiceWorker(registration->mPrincipal,
+                            registration->mActiveWorker,
++                           aLoadFailedRunnable,
+                            getter_AddRefs(sw));
+ 
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return nullptr;
+   }
+ 
+   return sw.forget();
+ }
+@@ -2686,16 +2712,17 @@ ServiceWorkerRegistrationInfo::FinishAct
+     mActiveWorker->UpdateState(ServiceWorkerState::Redundant);
+     mActiveWorker = nullptr;
+   }
+ }
+ 
+ NS_IMETHODIMP
+ ServiceWorkerManager::CreateServiceWorkerForWindow(nsPIDOMWindow* aWindow,
+                                                    ServiceWorkerInfo* aInfo,
++                                                   nsIRunnable* aLoadFailedRunnable,
+                                                    ServiceWorker** aServiceWorker)
+ {
+   AssertIsOnMainThread();
+   MOZ_ASSERT(aWindow);
+   MOZ_ASSERT(aInfo);
+ 
+   AutoJSAPI jsapi;
+   jsapi.Init(aWindow);
+@@ -2720,16 +2747,17 @@ ServiceWorkerManager::CreateServiceWorke
    if (!rs) {
      return NS_ERROR_FAILURE;
    }
  
    nsRefPtr<SharedWorker> sharedWorker;
-+  // TODO
    rv = rs->CreateSharedWorkerForServiceWorkerFromLoadInfo(cx, &loadInfo,
                                                            NS_ConvertUTF8toUTF16(aInfo->ScriptSpec()),
                                                            aInfo->Scope(),
-+                                                          nullptr,
++                                                          aLoadFailedRunnable,
                                                            getter_AddRefs(sharedWorker));
    if (NS_WARN_IF(NS_FAILED(rv))) {
      return rv;
@@ -144,20 +450,144 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
    nsRefPtr<ServiceWorker> serviceWorker =
      new ServiceWorker(aWindow, aInfo, sharedWorker);
  
-@@ -3788,19 +3790,21 @@ ServiceWorkerManager::CreateServiceWorke
-   RuntimeService* rs = RuntimeService::GetOrCreateService();
-   if (!rs) {
+@@ -3277,19 +3305,23 @@ ServiceWorkerManager::GetServiceWorkerFo
+   } else {
+     MOZ_CRASH("Invalid worker type");
+   }
+ 
+   if (NS_WARN_IF(!info)) {
+     return NS_ERROR_DOM_NOT_FOUND_ERR;
+   }
+ 
++  // TODO: How should we handle async failure of SW load for getters?  In
++  //       theory getting a handle to the DOM ServiceWorker object should not
++  //       require the worker thread to actually be running.
+   nsRefPtr<ServiceWorker> serviceWorker;
+   rv = CreateServiceWorkerForWindow(window,
+                                     info,
++                                    nullptr, // load failed runnable
+                                     getter_AddRefs(serviceWorker));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return rv;
+   }
+ 
+   serviceWorker->SetState(info->State());
+   serviceWorker.forget(aServiceWorker);
+   return NS_OK;
+@@ -3549,21 +3581,27 @@ ServiceWorkerManager::DispatchFetchEvent
+   nsCOMPtr<nsISupports> serviceWorker;
+ 
+   bool isNavigation = false;
+   aRv = aChannel->GetIsNavigation(&isNavigation);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return;
+   }
+ 
++  // if the ServiceWorker script fails to load for some reason, just resume
++  // the original channel.
++  nsCOMPtr<nsIRunnable> failRunnable =
++    NS_NewRunnableMethod(aChannel, &nsIInterceptedChannel::ResetInterception);
++
+   nsAutoPtr<ServiceWorkerClientInfo> clientInfo;
+ 
+   if (!isNavigation) {
+     MOZ_ASSERT(aDoc);
+-    aRv = GetDocumentController(aDoc->GetInnerWindow(), getter_AddRefs(serviceWorker));
++    aRv = GetDocumentController(aDoc->GetInnerWindow(), failRunnable,
++                                getter_AddRefs(serviceWorker));
+     clientInfo = new ServiceWorkerClientInfo(aDoc, aDoc->GetWindow());
+   } else {
+     nsCOMPtr<nsIChannel> internalChannel;
+     aRv = aChannel->GetChannel(getter_AddRefs(internalChannel));
+     if (NS_WARN_IF(aRv.Failed())) {
+       return;
+     }
+ 
+@@ -3582,16 +3620,17 @@ ServiceWorkerManager::DispatchFetchEvent
+     }
+ 
+     // This should only happen if IsAvailable() returned true.
+     MOZ_ASSERT(registration->mActiveWorker);
+ 
+     nsRefPtr<ServiceWorker> sw;
+     aRv = CreateServiceWorker(registration->mPrincipal,
+                               registration->mActiveWorker,
++                              failRunnable,
+                               getter_AddRefs(sw));
+     serviceWorker = sw.forget();
+   }
+ 
+   if (NS_WARN_IF(aRv.Failed())) {
+     return;
+   }
+ 
+@@ -3665,17 +3704,19 @@ ServiceWorkerManager::GetDocumentRegistr
+   return NS_OK;
+ }
+ 
+ /*
+  * The .controller is for the registration associated with the document when
+  * the document was loaded.
+  */
+ NS_IMETHODIMP
+-ServiceWorkerManager::GetDocumentController(nsIDOMWindow* aWindow, nsISupports** aServiceWorker)
++ServiceWorkerManager::GetDocumentController(nsIDOMWindow* aWindow,
++                                            nsIRunnable* aLoadFailedRunnable,
++                                            nsISupports** aServiceWorker)
+ {
+   nsCOMPtr<nsPIDOMWindow> window = do_QueryInterface(aWindow);
+   MOZ_ASSERT(window);
+   if (!window || !window->GetExtantDoc()) {
      return NS_ERROR_FAILURE;
+   }
+ 
+   nsCOMPtr<nsIDocument> doc = window->GetExtantDoc();
+@@ -3684,16 +3725,17 @@ ServiceWorkerManager::GetDocumentControl
+   nsresult rv = GetDocumentRegistration(doc, getter_AddRefs(registration));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return rv;
+   }
+ 
+   nsRefPtr<ServiceWorker> serviceWorker;
+   rv = CreateServiceWorkerForWindow(window,
+                                     registration->mActiveWorker,
++                                    aLoadFailedRunnable,
+                                     getter_AddRefs(serviceWorker));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return rv;
+   }
+ 
+   serviceWorker.forget(aServiceWorker);
+   return NS_OK;
+ }
+@@ -3726,16 +3768,17 @@ ServiceWorkerManager::GetActive(nsIDOMWi
+   return GetServiceWorkerForScope(aWindow, aScope,
+                                   WhichServiceWorker::ACTIVE_WORKER,
+                                   aServiceWorker);
+ }
+ 
+ NS_IMETHODIMP
+ ServiceWorkerManager::CreateServiceWorker(nsIPrincipal* aPrincipal,
+                                           ServiceWorkerInfo* aInfo,
++                                          nsIRunnable* aLoadFailedRunnable,
+                                           ServiceWorker** aServiceWorker)
+ {
+   AssertIsOnMainThread();
+   MOZ_ASSERT(aPrincipal);
+ 
+   WorkerLoadInfo info;
+   nsresult rv = NS_NewURI(getter_AddRefs(info.mBaseURI), aInfo->ScriptSpec(),
+                           nullptr, nullptr);
+@@ -3791,16 +3834,17 @@ ServiceWorkerManager::CreateServiceWorke
    }
  
    AutoJSAPI jsapi;
    jsapi.Init();
    nsRefPtr<SharedWorker> sharedWorker;
-+  // TODO
    rv = rs->CreateSharedWorkerForServiceWorkerFromLoadInfo(jsapi.cx(), &info,
                                                            NS_ConvertUTF8toUTF16(aInfo->ScriptSpec()),
                                                            aInfo->Scope(),
-+                                                          nullptr,
++                                                          aLoadFailedRunnable,
                                                            getter_AddRefs(sharedWorker));
  
    if (NS_WARN_IF(NS_FAILED(rv))) {
@@ -166,6 +596,46 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
  
    nsRefPtr<ServiceWorker> serviceWorker =
      new ServiceWorker(nullptr, aInfo, sharedWorker);
+diff --git a/dom/workers/ServiceWorkerManager.h b/dom/workers/ServiceWorkerManager.h
+--- a/dom/workers/ServiceWorkerManager.h
++++ b/dom/workers/ServiceWorkerManager.h
+@@ -415,32 +415,35 @@ private:
+   Update(ServiceWorkerRegistrationInfo* aRegistration);
+ 
+   nsresult
+   GetDocumentRegistration(nsIDocument* aDoc, ServiceWorkerRegistrationInfo** aRegistrationInfo);
+ 
+   NS_IMETHOD
+   CreateServiceWorkerForWindow(nsPIDOMWindow* aWindow,
+                                ServiceWorkerInfo* aInfo,
++                               nsIRunnable* aLoadFailedRunnable,
+                                ServiceWorker** aServiceWorker);
+ 
+   NS_IMETHOD
+   CreateServiceWorker(nsIPrincipal* aPrincipal,
+                       ServiceWorkerInfo* aInfo,
++                      nsIRunnable* aLoadFailedRunnable,
+                       ServiceWorker** aServiceWorker);
+ 
+   NS_IMETHODIMP
+   GetServiceWorkerForScope(nsIDOMWindow* aWindow,
+                            const nsAString& aScope,
+                            WhichServiceWorker aWhichWorker,
+                            nsISupports** aServiceWorker);
+ 
+   already_AddRefed<ServiceWorker>
+   CreateServiceWorkerForScope(const OriginAttributes& aOriginAttributes,
+-                              const nsACString& aScope);
++                              const nsACString& aScope,
++                              nsIRunnable* aLoadFailedRunnable);
+ 
+   void
+   InvalidateServiceWorkerRegistrationWorker(ServiceWorkerRegistrationInfo* aRegistration,
+                                             WhichServiceWorker aWhichOnes);
+ 
+   void
+   StartControllingADocument(ServiceWorkerRegistrationInfo* aRegistration,
+                             nsIDocument* aDoc);
 diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
 --- a/dom/workers/WorkerPrivate.cpp
 +++ b/dom/workers/WorkerPrivate.cpp
