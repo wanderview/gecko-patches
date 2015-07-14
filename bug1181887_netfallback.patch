@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent b9b0220b679072ae8ec26940a1b7f1e5b6588a31
+# Parent c9926e4fd2552cf81baacd4c1b06d27b0ac2a154
 Bug 1181887 Fall back to network if ServiceWorker script fails to load. r=ehsan r=khuey
 
 diff --git a/dom/interfaces/base/nsIServiceWorkerManager.idl b/dom/interfaces/base/nsIServiceWorkerManager.idl
@@ -51,115 +51,10 @@ diff --git a/dom/interfaces/base/nsIServiceWorkerManager.idl b/dom/interfaces/ba
     * - Existing ServiceWorker instances handling fetches will keep running.
     * - All documents will immediately stop being controlled.
     * - Unregister jobs will be queued for all registrations.
-diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
---- a/dom/workers/RuntimeService.cpp
-+++ b/dom/workers/RuntimeService.cpp
-@@ -2407,25 +2407,27 @@ RuntimeService::CreateSharedWorkerIntern
-   WorkerLoadInfo loadInfo;
-   nsresult rv = WorkerPrivate::GetLoadInfo(cx, window, nullptr, aScriptURL,
-                                            false,
-                                            WorkerPrivate::OverrideLoadGroup,
-                                            aType, &loadInfo);
-   NS_ENSURE_SUCCESS(rv, rv);
- 
-   return CreateSharedWorkerFromLoadInfo(cx, &loadInfo, aScriptURL, aName, aType,
-+                                        nullptr, // load failed runnable
-                                         aSharedWorker);
- }
- 
- nsresult
- RuntimeService::CreateSharedWorkerFromLoadInfo(JSContext* aCx,
-                                                WorkerLoadInfo* aLoadInfo,
-                                                const nsAString& aScriptURL,
-                                                const nsACString& aName,
-                                                WorkerType aType,
-+                                               nsIRunnable* aLoadFailedRunnable,
-                                                SharedWorker** aSharedWorker)
- {
-   AssertIsOnMainThread();
-   MOZ_ASSERT(aLoadInfo);
-   MOZ_ASSERT(aLoadInfo->mResolvedScriptURI);
-   MOZ_ASSERT_IF(aType == WorkerTypeService, aLoadInfo->mServiceWorkerID > 0);
- 
-   nsRefPtr<WorkerPrivate> workerPrivate;
-@@ -2455,18 +2457,18 @@ RuntimeService::CreateSharedWorkerFromLo
-   // the SharedWorker object itself is created before then WorkerScriptLoaded()
-   // will reset the loadInfo's window.
-   nsCOMPtr<nsPIDOMWindow> window = aLoadInfo->mWindow;
- 
-   bool created = false;
-   if (!workerPrivate) {
-     ErrorResult rv;
-     workerPrivate =
--      WorkerPrivate::Constructor(aCx, aScriptURL, false,
--                                 aType, aName, aLoadInfo, rv);
-+      WorkerPrivate::Constructor(aCx, aScriptURL, false, aType, aName,
-+                                 aLoadInfo, aLoadFailedRunnable, rv);
-     NS_ENSURE_TRUE(workerPrivate, rv.StealNSResult());
- 
-     created = true;
-   } else {
-     // If we're attaching to an existing SharedWorker private, then we
-     // must update the overriden load group to account for our document's
-     // load group.
-     workerPrivate->UpdateOverridenLoadGroup(aLoadInfo->mLoadGroup);
-diff --git a/dom/workers/RuntimeService.h b/dom/workers/RuntimeService.h
---- a/dom/workers/RuntimeService.h
-+++ b/dom/workers/RuntimeService.h
-@@ -158,20 +158,22 @@ public:
-                                       WorkerTypeShared, aSharedWorker);
-   }
- 
-   nsresult
-   CreateSharedWorkerForServiceWorkerFromLoadInfo(JSContext* aCx,
-                                                  WorkerLoadInfo* aLoadInfo,
-                                                  const nsAString& aScriptURL,
-                                                  const nsACString& aScope,
-+                                                 nsIRunnable* aLoadFailedRunnable,
-                                                  SharedWorker** aSharedWorker)
-   {
-     return CreateSharedWorkerFromLoadInfo(aCx, aLoadInfo, aScriptURL, aScope,
--                                          WorkerTypeService, aSharedWorker);
-+                                          WorkerTypeService, aLoadFailedRunnable,
-+                                          aSharedWorker);
-   }
- 
-   void
-   ForgetSharedWorker(WorkerPrivate* aWorkerPrivate);
- 
-   const NavigatorProperties&
-   GetNavigatorProperties() const
-   {
-@@ -310,20 +312,25 @@ private:
- 
-   nsresult
-   CreateSharedWorkerInternal(const GlobalObject& aGlobal,
-                              const nsAString& aScriptURL,
-                              const nsACString& aName,
-                              WorkerType aType,
-                              SharedWorker** aSharedWorker);
- 
-+  // aLoadFailedRunnable will execute on main thread if script loading
-+  // later fails during script loading.  If we fail in this method
-+  // immediately and never start script loading, then the runnable is
-+  // never executed.
-   nsresult
-   CreateSharedWorkerFromLoadInfo(JSContext* aCx,
-                                  WorkerLoadInfo* aLoadInfo,
-                                  const nsAString& aScriptURL,
-                                  const nsACString& aName,
-                                  WorkerType aType,
-+                                 nsIRunnable* aLoadFailedRunnable,
-                                  SharedWorker** aSharedWorker);
- };
- 
- END_WORKERS_NAMESPACE
- 
- #endif /* mozilla_dom_workers_runtimeservice_h__ */
 diff --git a/dom/workers/ScriptLoader.cpp b/dom/workers/ScriptLoader.cpp
 --- a/dom/workers/ScriptLoader.cpp
 +++ b/dom/workers/ScriptLoader.cpp
-@@ -1694,16 +1694,17 @@ ScriptExecutorRunnable::WorkerRun(JSCont
+@@ -1702,16 +1702,17 @@ ScriptExecutorRunnable::WorkerRun(JSCont
  
      NS_ASSERTION(!loadInfo.mChannel, "Should no longer have a channel!");
      NS_ASSERTION(loadInfo.mExecutionScheduled, "Should be scheduled!");
@@ -302,7 +197,7 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
      }
  
      nsMainThreadPtrHandle<ContinueLifecycleTask> handle(
-@@ -1820,28 +1842,30 @@ ServiceWorkerRegistrationInfo::Activate(
+@@ -1828,28 +1850,30 @@ ServiceWorkerRegistrationInfo::Activate(
  
    // "Queue a task to fire a simple event named controllerchange..."
    nsCOMPtr<nsIRunnable> controllerChangeRunnable =
@@ -338,7 +233,7 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
  
    nsMainThreadPtrHandle<ServiceWorker> serviceWorkerHandle(
      new nsMainThreadPtrHolder<ServiceWorker>(serviceWorker));
-@@ -2213,17 +2237,17 @@ ServiceWorkerManager::SendPushEvent(cons
+@@ -2221,17 +2245,17 @@ ServiceWorkerManager::SendPushEvent(cons
    return NS_ERROR_NOT_AVAILABLE;
  #else
    OriginAttributes attrs;
@@ -357,7 +252,7 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
      new nsMainThreadPtrHolder<ServiceWorker>(serviceWorker));
  
    nsRefPtr<SendPushEventRunnable> r =
-@@ -2248,17 +2272,17 @@ ServiceWorkerManager::SendPushSubscripti
+@@ -2256,17 +2280,17 @@ ServiceWorkerManager::SendPushSubscripti
    return NS_ERROR_NOT_AVAILABLE;
  #else
    OriginAttributes attrs;
@@ -376,7 +271,7 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
  
    nsRefPtr<SendPushSubscriptionChangeEventRunnable> r =
      new SendPushSubscriptionChangeEventRunnable(
-@@ -2384,17 +2408,18 @@ ServiceWorkerManager::CheckReadyPromise(
+@@ -2392,17 +2416,18 @@ ServiceWorkerManager::CheckReadyPromise(
      return true;
    }
  
@@ -396,7 +291,7 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
    if (NS_FAILED(rv)) {
      return nullptr;
    }
-@@ -2406,16 +2431,17 @@ ServiceWorkerManager::CreateServiceWorke
+@@ -2414,16 +2439,17 @@ ServiceWorkerManager::CreateServiceWorke
  
    if (!registration->mActiveWorker) {
      return nullptr;
@@ -414,7 +309,7 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
  
    return sw.forget();
  }
-@@ -2686,16 +2712,17 @@ ServiceWorkerRegistrationInfo::FinishAct
+@@ -2694,16 +2720,17 @@ ServiceWorkerRegistrationInfo::FinishAct
      mActiveWorker->UpdateState(ServiceWorkerState::Redundant);
      mActiveWorker = nullptr;
    }
@@ -432,25 +327,25 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
  
    AutoJSAPI jsapi;
    jsapi.Init(aWindow);
-@@ -2720,16 +2747,17 @@ ServiceWorkerManager::CreateServiceWorke
+@@ -2718,16 +2745,17 @@ ServiceWorkerManager::CreateServiceWorke
+                                            &loadInfo);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return rv;
+   }
+ 
+   MOZ_ASSERT(!aInfo->CacheName().IsEmpty());
+   loadInfo.mServiceWorkerCacheName = aInfo->CacheName();
+   loadInfo.mServiceWorkerID = aInfo->ID();
++  loadInfo.mLoadFailedAsyncRunnable = aLoadFailedRunnable;
+ 
+   RuntimeService* rs = RuntimeService::GetOrCreateService();
    if (!rs) {
      return NS_ERROR_FAILURE;
    }
  
    nsRefPtr<SharedWorker> sharedWorker;
    rv = rs->CreateSharedWorkerForServiceWorkerFromLoadInfo(cx, &loadInfo,
-                                                           NS_ConvertUTF8toUTF16(aInfo->ScriptSpec()),
-                                                           aInfo->Scope(),
-+                                                          aLoadFailedRunnable,
-                                                           getter_AddRefs(sharedWorker));
-   if (NS_WARN_IF(NS_FAILED(rv))) {
-     return rv;
-   }
- 
-   nsRefPtr<ServiceWorker> serviceWorker =
-     new ServiceWorker(aWindow, aInfo, sharedWorker);
- 
-@@ -3277,19 +3305,23 @@ ServiceWorkerManager::GetServiceWorkerFo
+@@ -3285,19 +3313,23 @@ ServiceWorkerManager::GetServiceWorkerFo
    } else {
      MOZ_CRASH("Invalid worker type");
    }
@@ -474,7 +369,7 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
    serviceWorker->SetState(info->State());
    serviceWorker.forget(aServiceWorker);
    return NS_OK;
-@@ -3549,21 +3581,27 @@ ServiceWorkerManager::DispatchFetchEvent
+@@ -3557,21 +3589,27 @@ ServiceWorkerManager::DispatchFetchEvent
    nsCOMPtr<nsISupports> serviceWorker;
  
    bool isNavigation = false;
@@ -503,7 +398,7 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
        return;
      }
  
-@@ -3582,16 +3620,17 @@ ServiceWorkerManager::DispatchFetchEvent
+@@ -3590,16 +3628,17 @@ ServiceWorkerManager::DispatchFetchEvent
      }
  
      // This should only happen if IsAvailable() returned true.
@@ -521,7 +416,7 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
      return;
    }
  
-@@ -3665,17 +3704,19 @@ ServiceWorkerManager::GetDocumentRegistr
+@@ -3673,17 +3712,19 @@ ServiceWorkerManager::GetDocumentRegistr
    return NS_OK;
  }
  
@@ -542,7 +437,7 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
    }
  
    nsCOMPtr<nsIDocument> doc = window->GetExtantDoc();
-@@ -3684,16 +3725,17 @@ ServiceWorkerManager::GetDocumentControl
+@@ -3692,16 +3733,17 @@ ServiceWorkerManager::GetDocumentControl
    nsresult rv = GetDocumentRegistration(doc, getter_AddRefs(registration));
    if (NS_WARN_IF(NS_FAILED(rv))) {
      return rv;
@@ -560,7 +455,7 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
    serviceWorker.forget(aServiceWorker);
    return NS_OK;
  }
-@@ -3726,16 +3768,17 @@ ServiceWorkerManager::GetActive(nsIDOMWi
+@@ -3734,16 +3776,17 @@ ServiceWorkerManager::GetActive(nsIDOMWi
    return GetServiceWorkerForScope(aWindow, aScope,
                                    WhichServiceWorker::ACTIVE_WORKER,
                                    aServiceWorker);
@@ -578,24 +473,25 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
    WorkerLoadInfo info;
    nsresult rv = NS_NewURI(getter_AddRefs(info.mBaseURI), aInfo->ScriptSpec(),
                            nullptr, nullptr);
-@@ -3791,16 +3834,17 @@ ServiceWorkerManager::CreateServiceWorke
+@@ -3788,16 +3831,18 @@ ServiceWorkerManager::CreateServiceWorke
+   // NOTE: this defaults the SW load context to:
+   //  - private browsing = false
+   //  - content = true
+   //  - use remote tabs = false
+   // Alternatively we could persist the original load group values and use
+   // them here.
+   WorkerPrivate::OverrideLoadInfoLoadGroup(info);
+ 
++  info.mLoadFailedAsyncRunnable = aLoadFailedRunnable;
++
+   RuntimeService* rs = RuntimeService::GetOrCreateService();
+   if (!rs) {
+     return NS_ERROR_FAILURE;
    }
  
    AutoJSAPI jsapi;
    jsapi.Init();
    nsRefPtr<SharedWorker> sharedWorker;
-   rv = rs->CreateSharedWorkerForServiceWorkerFromLoadInfo(jsapi.cx(), &info,
-                                                           NS_ConvertUTF8toUTF16(aInfo->ScriptSpec()),
-                                                           aInfo->Scope(),
-+                                                          aLoadFailedRunnable,
-                                                           getter_AddRefs(sharedWorker));
- 
-   if (NS_WARN_IF(NS_FAILED(rv))) {
-     return rv;
-   }
- 
-   nsRefPtr<ServiceWorker> serviceWorker =
-     new ServiceWorker(nullptr, aInfo, sharedWorker);
 diff --git a/dom/workers/ServiceWorkerManager.h b/dom/workers/ServiceWorkerManager.h
 --- a/dom/workers/ServiceWorkerManager.h
 +++ b/dom/workers/ServiceWorkerManager.h
@@ -639,100 +535,58 @@ diff --git a/dom/workers/ServiceWorkerManager.h b/dom/workers/ServiceWorkerManag
 diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
 --- a/dom/workers/WorkerPrivate.cpp
 +++ b/dom/workers/WorkerPrivate.cpp
-@@ -4737,37 +4737,40 @@ WorkerDebugger::ReportErrorToDebuggerOnM
-   LogErrorToConsole(aMessage, aFilename, nsString(), aLineno, 0, 0, 0);
+@@ -2379,16 +2379,19 @@ WorkerLoadInfo::StealFrom(WorkerLoadInfo
+   aOther.mCSP.swap(mCSP);
+ 
+   MOZ_ASSERT(!mChannel);
+   aOther.mChannel.swap(mChannel);
+ 
+   MOZ_ASSERT(!mLoadGroup);
+   aOther.mLoadGroup.swap(mLoadGroup);
+ 
++  MOZ_ASSERT(!mLoadFailedAsyncRunnable);
++  aOther.mLoadFailedAsyncRunnable.swap(mLoadFailedAsyncRunnable);
++
+   MOZ_ASSERT(!mInterfaceRequestor);
+   aOther.mInterfaceRequestor.swap(mInterfaceRequestor);
+ 
+   MOZ_ASSERT(!mPrincipalInfo);
+   mPrincipalInfo = aOther.mPrincipalInfo.forget();
+ 
+   mDomain = aOther.mDomain;
+   mServiceWorkerCacheName = aOther.mServiceWorkerCacheName;
+@@ -3413,28 +3416,29 @@ WorkerPrivateParent<Derived>::ForgetOver
+ template <class Derived>
+ void
+ WorkerPrivateParent<Derived>::ForgetMainThreadObjects(
+                                       nsTArray<nsCOMPtr<nsISupports> >& aDoomed)
+ {
+   AssertIsOnParentThread();
+   MOZ_ASSERT(!mMainThreadObjectsForgotten);
+ 
+-  static const uint32_t kDoomedCount = 9;
++  static const uint32_t kDoomedCount = 10;
+ 
+   aDoomed.SetCapacity(kDoomedCount);
+ 
+   SwapToISupportsArray(mLoadInfo.mWindow, aDoomed);
+   SwapToISupportsArray(mLoadInfo.mScriptContext, aDoomed);
+   SwapToISupportsArray(mLoadInfo.mBaseURI, aDoomed);
+   SwapToISupportsArray(mLoadInfo.mResolvedScriptURI, aDoomed);
+   SwapToISupportsArray(mLoadInfo.mPrincipal, aDoomed);
+   SwapToISupportsArray(mLoadInfo.mChannel, aDoomed);
+   SwapToISupportsArray(mLoadInfo.mCSP, aDoomed);
+   SwapToISupportsArray(mLoadInfo.mLoadGroup, aDoomed);
++  SwapToISupportsArray(mLoadInfo.mLoadFailedAsyncRunnable, aDoomed);
+   SwapToISupportsArray(mLoadInfo.mInterfaceRequestor, aDoomed);
+   // Before adding anything here update kDoomedCount above!
+ 
+   MOZ_ASSERT(aDoomed.Length() == kDoomedCount);
+ 
+   mMainThreadObjectsForgotten = true;
  }
  
- WorkerPrivate::WorkerPrivate(JSContext* aCx,
-                              WorkerPrivate* aParent,
-                              const nsAString& aScriptURL,
-                              bool aIsChromeWorker, WorkerType aWorkerType,
-                              const nsACString& aSharedWorkerName,
--                             WorkerLoadInfo& aLoadInfo)
-+                             WorkerLoadInfo& aLoadInfo,
-+                             nsIRunnable* aLoadFailedRunnable)
-   : WorkerPrivateParent<WorkerPrivate>(aCx, aParent, aScriptURL,
-                                        aIsChromeWorker, aWorkerType,
-                                        aSharedWorkerName, aLoadInfo)
-   , mJSContext(nullptr)
-   , mPRThread(nullptr)
-   , mDebuggerEventLoopLevel(0)
-+  , mLoadFailedRunnable(aLoadFailedRunnable)
-   , mErrorHandlerRecursionCount(0)
-   , mNextTimeoutId(1)
-   , mStatus(Pending)
-   , mFrozen(false)
-   , mTimerRunning(false)
-   , mRunningExpiredTimeouts(false)
-   , mCloseHandlerStarted(false)
-   , mCloseHandlerFinished(false)
-   , mMemoryReporterRunning(false)
-   , mBlockedForMemoryReporter(false)
-   , mCancelAllPendingRunnables(false)
-   , mPeriodicGCTimerRunning(false)
-   , mIdleGCTimerRunning(false)
-   , mWorkerScriptExecutedSuccessfully(false)
-+  // TODO
- {
-   MOZ_ASSERT_IF(!IsDedicatedWorker(), !aSharedWorkerName.IsVoid());
-   MOZ_ASSERT_IF(IsDedicatedWorker(), aSharedWorkerName.IsEmpty());
- 
-   if (aParent) {
-     aParent->AssertIsOnWorkerThread();
-     aParent->GetAllPreferences(mPreferences);
-     mOnLine = aParent->OnLine();
-@@ -4844,26 +4847,28 @@ already_AddRefed<WorkerPrivate>
- WorkerPrivate::Constructor(const GlobalObject& aGlobal,
-                            const nsAString& aScriptURL,
-                            bool aIsChromeWorker, WorkerType aWorkerType,
-                            const nsACString& aSharedWorkerName,
-                            WorkerLoadInfo* aLoadInfo, ErrorResult& aRv)
- {
-   JSContext* cx = aGlobal.Context();
-   return Constructor(cx, aScriptURL, aIsChromeWorker, aWorkerType,
--                     aSharedWorkerName, aLoadInfo, aRv);
-+                     aSharedWorkerName, aLoadInfo, nullptr, aRv);
- }
- 
- // static
- already_AddRefed<WorkerPrivate>
- WorkerPrivate::Constructor(JSContext* aCx,
-                            const nsAString& aScriptURL,
-                            bool aIsChromeWorker, WorkerType aWorkerType,
-                            const nsACString& aSharedWorkerName,
--                           WorkerLoadInfo* aLoadInfo, ErrorResult& aRv)
-+                           WorkerLoadInfo* aLoadInfo,
-+                           nsIRunnable* aLoadFailedRunnable,
-+                           ErrorResult& aRv)
- {
-   WorkerPrivate* parent = NS_IsMainThread() ?
-                           nullptr :
-                           GetCurrentThreadWorkerPrivate();
-   if (parent) {
-     parent->AssertIsOnWorkerThread();
-   } else {
-     AssertIsOnMainThread();
-@@ -4906,17 +4911,18 @@ WorkerPrivate::Constructor(JSContext* aC
-   else {
-     runtimeService = RuntimeService::GetService();
-   }
- 
-   MOZ_ASSERT(runtimeService);
- 
-   nsRefPtr<WorkerPrivate> worker =
-     new WorkerPrivate(aCx, parent, aScriptURL, aIsChromeWorker,
--                      aWorkerType, aSharedWorkerName, *aLoadInfo);
-+                      aWorkerType, aSharedWorkerName, *aLoadInfo,
-+                      aLoadFailedRunnable);
- 
-   if (!runtimeService->RegisterWorker(aCx, worker)) {
-     aRv.Throw(NS_ERROR_UNEXPECTED);
-     return nullptr;
-   }
- 
-   worker->EnableDebugger();
- 
-@@ -5454,16 +5460,27 @@ WorkerPrivate::RunBeforeNextEvent(nsIRun
+@@ -5462,16 +5466,29 @@ WorkerPrivate::RunBeforeNextEvent(nsIRun
        return false;
      }
    }
@@ -743,12 +597,14 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
  void
 +WorkerPrivate::MaybeDispatchLoadFailedRunnable()
 +{
-+  nsCOMPtr<nsIRunnable> runnable = mLoadFailedRunnable.forget();
++  AssertIsOnWorkerThread();
++
++  nsCOMPtr<nsIRunnable> runnable = StealLoadFailedAsyncRunnable();
 +  if (!runnable) {
 +    return;
 +  }
 +
-+  MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(runnable)));
++  MOZ_ALWAYS_TRUE(NS_SUCCEEDED(NS_DispatchToMainThread(runnable.forget())));
 +}
 +
 +void
@@ -763,7 +619,30 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
 diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
 --- a/dom/workers/WorkerPrivate.h
 +++ b/dom/workers/WorkerPrivate.h
-@@ -951,16 +951,19 @@ class WorkerPrivate : public WorkerPriva
+@@ -793,16 +793,22 @@ public:
+   GetAllSharedWorkers(nsTArray<nsRefPtr<SharedWorker>>& aSharedWorkers);
+ 
+   void
+   CloseSharedWorkersForWindow(nsPIDOMWindow* aWindow);
+ 
+   void
+   UpdateOverridenLoadGroup(nsILoadGroup* aBaseLoadGroup);
+ 
++  already_AddRefed<nsIRunnable>
++  StealLoadFailedAsyncRunnable()
++  {
++    return mLoadInfo.mLoadFailedAsyncRunnable.forget();
++  }
++
+   IMPL_EVENT_HANDLER(message)
+   IMPL_EVENT_HANDLER(error)
+ 
+ #ifdef DEBUG
+   void
+   AssertIsOnParentThread() const;
+ 
+   void
+@@ -951,16 +957,19 @@ class WorkerPrivate : public WorkerPriva
    nsCOMPtr<nsITimer> mGCTimer;
    nsCOMPtr<nsIEventTarget> mPeriodicGCTimerTarget;
    nsCOMPtr<nsIEventTarget> mIdleGCTimerTarget;
@@ -783,27 +662,7 @@ diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
    bool mTimerRunning;
    bool mRunningExpiredTimeouts;
    bool mCloseHandlerStarted;
-@@ -986,17 +989,18 @@ public:
-   Constructor(const GlobalObject& aGlobal, const nsAString& aScriptURL,
-               bool aIsChromeWorker, WorkerType aWorkerType,
-               const nsACString& aSharedWorkerName,
-               WorkerLoadInfo* aLoadInfo, ErrorResult& aRv);
- 
-   static already_AddRefed<WorkerPrivate>
-   Constructor(JSContext* aCx, const nsAString& aScriptURL, bool aIsChromeWorker,
-               WorkerType aWorkerType, const nsACString& aSharedWorkerName,
--              WorkerLoadInfo* aLoadInfo, ErrorResult& aRv);
-+              WorkerLoadInfo* aLoadInfo, nsIRunnable* aLoadFailedRunnable,
-+              ErrorResult& aRv);
- 
-   static bool
-   WorkerAvailable(JSContext* /* unused */, JSObject* /* unused */);
- 
-   enum LoadGroupBehavior
-   {
-     InheritLoadGroup,
-     OverrideLoadGroup
-@@ -1362,21 +1366,24 @@ public:
+@@ -1362,16 +1371,19 @@ public:
      return mWorkerScriptExecutedSuccessfully;
    }
  
@@ -819,13 +678,51 @@ diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
    WorkerPrivate(JSContext* aCx, WorkerPrivate* aParent,
                  const nsAString& aScriptURL, bool aIsChromeWorker,
                  WorkerType aWorkerType, const nsACString& aSharedWorkerName,
--                WorkerLoadInfo& aLoadInfo);
-+                WorkerLoadInfo& aLoadInfo, nsIRunnable* aLoadFailedRunnable);
+                 WorkerLoadInfo& aLoadInfo);
  
    bool
    MayContinueRunning()
-   {
-     AssertIsOnWorkerThread();
+diff --git a/dom/workers/Workers.h b/dom/workers/Workers.h
+--- a/dom/workers/Workers.h
++++ b/dom/workers/Workers.h
+@@ -34,16 +34,17 @@
+ class nsIContentSecurityPolicy;
+ class nsIScriptContext;
+ class nsIGlobalObject;
+ class nsPIDOMWindow;
+ class nsIPrincipal;
+ class nsILoadGroup;
+ class nsITabChild;
+ class nsIChannel;
++class nsIRunnable;
+ class nsIURI;
  
-     Status status;
-     {
+ namespace mozilla {
+ namespace ipc {
+ class PrincipalInfo;
+ }
+ 
+ namespace dom {
+@@ -215,16 +216,22 @@ struct WorkerLoadInfo
+   nsCOMPtr<nsIURI> mResolvedScriptURI;
+   nsCOMPtr<nsIPrincipal> mPrincipal;
+   nsCOMPtr<nsIScriptContext> mScriptContext;
+   nsCOMPtr<nsPIDOMWindow> mWindow;
+   nsCOMPtr<nsIContentSecurityPolicy> mCSP;
+   nsCOMPtr<nsIChannel> mChannel;
+   nsCOMPtr<nsILoadGroup> mLoadGroup;
+ 
++  // mLoadFailedAsyncRunnable will execute on main thread if script loading
++  // fails during script loading.  If script loading is never started due to
++  // a synchronous error, then the runnable is never executed.  The runnable
++  // is guaranteed to be released on the main thread.
++  nsCOMPtr<nsIRunnable> mLoadFailedAsyncRunnable;
++
+   class InterfaceRequestor final : public nsIInterfaceRequestor
+   {
+     NS_DECL_ISUPPORTS
+ 
+   public:
+     InterfaceRequestor(nsIPrincipal* aPrincipal, nsILoadGroup* aLoadGroup);
+     void MaybeAddTabChild(nsILoadGroup* aLoadGroup);
+     NS_IMETHOD GetInterface(const nsIID& aIID, void** aSink) override;
