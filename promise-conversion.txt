@@ -1,0 +1,327 @@
+# HG changeset patch
+# User Boris Zbarsky <bzbarsky@mit.edu>
+# Date 1437768690 14400
+#      Fri Jul 24 16:11:30 2015 -0400
+# Node ID 787dab6f060ad82560d2b64f67b358688987fe6c
+# Parent  8b18128f2a4f253fad235cf1129a1f42ab5e8a67
+Bug 983301.  Handle JS-to-native conversion for Promise values via calling Promise::Resolve on whatever value was passed in (except if the type is nullable and the passed-in value is null or undefined).  r=peterv
+
+diff --git a/dom/bindings/Codegen.py b/dom/bindings/Codegen.py
+--- a/dom/bindings/Codegen.py
++++ b/dom/bindings/Codegen.py
+@@ -4924,36 +4924,42 @@ def getJSToNativeConversionInfo(type, de
+             conversion = indent(CGCallbackTempRoot(name).define())
+ 
+             template = wrapObjectTemplate(conversion, type,
+                                           "${declName} = nullptr;\n",
+                                           failureCode)
+             return JSToNativeConversionInfo(template, declType=declType,
+                                             dealWithOptional=isOptional)
+ 
++        if descriptor.interface.identifier.name == "AbortablePromise":
++            raise TypeError("Need to figure out what argument conversion "
++                            "should look like for AbortablePromise: %s" %
++                            sourceDescription)
++
+         # This is an interface that we implement as a concrete class
+         # or an XPCOM interface.
+ 
+         # Allow null pointers for nullable types and old-binding classes, and
+         # use an nsRefPtr or raw pointer for callback return values to make
+         # them easier to return.
+         argIsPointer = (type.nullable() or type.unroll().inner.isExternal() or
+                         isCallbackReturnValue)
+ 
+-        # Sequences and non-worker callbacks have to hold a strong ref to the
+-        # thing being passed down.  Union return values must hold a strong ref
+-        # because they may be returning an addrefed pointer.
+-        # Also, callback return values always end up
+-        # addrefing anyway, so there is no point trying to avoid it here and it
+-        # makes other things simpler since we can assume the return value is a
+-        # strong ref.
+-        forceOwningType = ((descriptor.interface.isCallback() and
+-                            not descriptor.workers) or
+-                           isMember or
+-                           isCallbackReturnValue)
++        # Sequence and dictionary members have to hold a strong ref to the thing
++        # being passed down.
++        #
++        # Also, callback return values always end up addrefing anyway, so there
++        # is no point trying to avoid it here and it makes other things simpler
++        # since we can assume the return value is a strong ref.
++        #
++        # Finally, promises need to hold a strong ref because that's what
++        # Promise.resolve returns.
++        assert not descriptor.interface.isCallback()
++        isPromise = descriptor.interface.identifier.name == "Promise"
++        forceOwningType = isMember or isCallbackReturnValue or isPromise
+ 
+         typeName = descriptor.nativeType
+         typePtr = typeName + "*"
+ 
+         # Compute a few things:
+         #  - declType is the type we want to return as the first element of our
+         #    tuple.
+         #  - holderType is the type we want to return as the third element
+@@ -4970,17 +4976,39 @@ def getJSToNativeConversionInfo(type, de
+             if forceOwningType:
+                 declType = "OwningNonNull<" + typeName + ">"
+             else:
+                 declType = "NonNull<" + typeName + ">"
+ 
+         templateBody = ""
+         if forceOwningType:
+             templateBody += 'static_assert(IsRefcounted<%s>::value, "We can only store refcounted classes.");' % typeName
+-        if not descriptor.skipGen and not descriptor.interface.isConsequential() and not descriptor.interface.isExternal():
++
++        if isPromise:
++            templateBody = fill(
++                """
++                { // Scope for our GlobalObject and ErrorResult
++
++                  // Might as well use CurrentGlobalOrNull here; that will at
++                  // least give us the same behavior as if the caller just called
++                  // Promise.resolve() themselves.
++                  GlobalObject promiseGlobal(cx, JS::CurrentGlobalOrNull(cx));
++                  if (promiseGlobal.Failed()) {
++                    $*{exceptionCode}
++                  }
++                  ErrorResult promiseRv;
++                  $${declName} = Promise::Resolve(promiseGlobal, $${val}, promiseRv);
++                  if (promiseRv.Failed()) {
++                    ThrowMethodFailed(cx, promiseRv);
++                    $*{exceptionCode}
++                  }
++                }
++                """,
++                exceptionCode=exceptionCode)
++        elif not descriptor.skipGen and not descriptor.interface.isConsequential() and not descriptor.interface.isExternal():
+             if failureCode is not None:
+                 templateBody += str(CastableObjectUnwrapper(
+                     descriptor,
+                     "&${val}.toObject()",
+                     "${declName}",
+                     failureCode))
+             else:
+                 templateBody += str(FailureFatalCastableObjectUnwrapper(
+@@ -5011,21 +5039,34 @@ def getJSToNativeConversionInfo(type, de
+             templateBody += CGIndenter(onFailureBadType(failureCode,
+                                                         descriptor.interface.identifier.name)).define()
+             templateBody += ("}\n"
+                              "MOZ_ASSERT(${holderName});\n")
+ 
+             # And store our value in ${declName}
+             templateBody += "${declName} = ${holderName};\n"
+ 
+-        # Just pass failureCode, not onFailureBadType, here, so we'll report the
+-        # thing as not an object as opposed to not implementing whatever our
+-        # interface is.
+-        templateBody = wrapObjectTemplate(templateBody, type,
+-                                          "${declName} = nullptr;\n", failureCode)
++        if isPromise:
++            if type.nullable():
++                codeToSetNull = "${declName} = nullptr;\n"
++                templateBody = CGIfElseWrapper(
++                    "${val}.isNullOrUndefined()",
++                    CGGeneric(codeToSetNull),
++                    CGGeneric(templateBody)).define()
++                if isinstance(defaultValue, IDLNullValue):
++                    templateBody = handleDefault(templateBody, codeToSetNull)
++            else:
++                assert defaultValue is None
++        else:
++            # Just pass failureCode, not onFailureBadType, here, so we'll report
++            # the thing as not an object as opposed to not implementing whatever
++            # our interface is.
++            templateBody = wrapObjectTemplate(templateBody, type,
++                                              "${declName} = nullptr;\n",
++                                              failureCode)
+ 
+         declType = CGGeneric(declType)
+         if holderType is not None:
+             holderType = CGGeneric(holderType)
+         return JSToNativeConversionInfo(templateBody,
+                                         declType=declType,
+                                         holderType=holderType,
+                                         dealWithOptional=isOptional)
+@@ -13181,17 +13222,18 @@ class CGNativeMember(ClassMethod):
+         if type.isUnion():
+             # unionTypeDecl will handle nullable types, so return False for
+             # auto-wrapping in Nullable
+             return CGUnionStruct.unionTypeDecl(type, isMember), True, False
+ 
+         if type.isGeckoInterface() and not type.isCallbackInterface():
+             iface = type.unroll().inner
+             argIsPointer = type.nullable() or iface.isExternal()
+-            forceOwningType = iface.isCallback() or isMember
++            forceOwningType = (iface.isCallback() or isMember or
++                               iface.identifier.name == "Promise")
+             if argIsPointer:
+                 if (optional or isMember) and forceOwningType:
+                     typeDecl = "nsRefPtr<%s>"
+                 else:
+                     typeDecl = "%s*"
+             else:
+                 if optional or isMember:
+                     if forceOwningType:
+diff --git a/dom/bindings/OwningNonNull.h b/dom/bindings/OwningNonNull.h
+--- a/dom/bindings/OwningNonNull.h
++++ b/dom/bindings/OwningNonNull.h
+@@ -68,17 +68,17 @@ public:
+   OwningNonNull<T>&
+   operator=(T& aValue)
+   {
+     init(&aValue);
+     return *this;
+   }
+ 
+   OwningNonNull<T>&
+-  operator=(const already_AddRefed<T>& aValue)
++  operator=(already_AddRefed<T>&& aValue)
+   {
+     init(aValue);
+     return *this;
+   }
+ 
+   // Don't allow assigning nullptr, it makes no sense
+   void operator=(decltype(nullptr)) = delete;
+ 
+diff --git a/dom/bindings/test/TestBindingHeader.h b/dom/bindings/test/TestBindingHeader.h
+--- a/dom/bindings/test/TestBindingHeader.h
++++ b/dom/bindings/test/TestBindingHeader.h
+@@ -17,16 +17,17 @@
+ #include "nsGenericHTMLElement.h"
+ #include "nsWrapperCache.h"
+ 
+ // Forward declare this before we include TestCodeGenBinding.h, because that header relies on including
+ // this one for it, for ParentDict. Hopefully it won't begin to rely on it in more fundamental ways.
+ namespace mozilla {
+ namespace dom {
+ class TestExternalInterface;
++class Promise;
+ } // namespace dom
+ } // namespace mozilla
+ 
+ // We don't export TestCodeGenBinding.h, but it's right in our parent dir.
+ #include "../TestCodeGenBinding.h"
+ 
+ extern bool TestFuncControlledMember(JSContext*, JSObject*);
+ 
+@@ -702,16 +703,27 @@ public:
+   void PassOptionalNullableDate(const Optional<Nullable<Date> >&);
+   void PassOptionalNullableDateWithDefaultValue(const Nullable<Date>&);
+   void PassDateSequence(const Sequence<Date>&);
+   void PassDateMozMap(const MozMap<Date>&);
+   void PassNullableDateSequence(const Sequence<Nullable<Date> >&);
+   Date ReceiveDate();
+   Nullable<Date> ReceiveNullableDate();
+ 
++  // Promise types
++  void PassPromise(Promise&);
++  void PassNullablePromise(Promise*);
++  void PassOptionalPromise(const Optional<OwningNonNull<Promise>>&);
++  void PassOptionalNullablePromise(const Optional<nsRefPtr<Promise>>&);
++  void PassOptionalNullablePromiseWithDefaultValue(Promise*);
++  void PassPromiseSequence(const Sequence<OwningNonNull<Promise>>&);
++  void PassPromiseMozMap(const MozMap<nsRefPtr<Promise>>&);
++  void PassNullablePromiseSequence(const Sequence<nsRefPtr<Promise>> &);
++  Promise* ReceivePromise();
++
+   // binaryNames tests
+   void MethodRenamedTo();
+   void OtherMethodRenamedTo();
+   void MethodRenamedTo(int8_t);
+   int8_t AttributeGetterRenamedTo();
+   int8_t AttributeRenamedTo();
+   void SetAttributeRenamedTo(int8_t);
+   int8_t OtherAttributeRenamedTo();
+diff --git a/dom/bindings/test/TestCodeGen.webidl b/dom/bindings/test/TestCodeGen.webidl
+--- a/dom/bindings/test/TestCodeGen.webidl
++++ b/dom/bindings/test/TestCodeGen.webidl
+@@ -672,16 +672,26 @@ interface TestInterface {
+   void passOptionalNullableDate(optional Date? arg);
+   void passOptionalNullableDateWithDefaultValue(optional Date? arg = null);
+   void passDateSequence(sequence<Date> arg);
+   void passNullableDateSequence(sequence<Date?> arg);
+   void passDateMozMap(MozMap<Date> arg);
+   Date receiveDate();
+   Date? receiveNullableDate();
+ 
++  // Promise types
++  void passPromise(Promise<any> arg);
++  void passNullablePromise(Promise<any>? arg);
++  void passOptionalPromise(optional Promise<any> arg);
++  void passOptionalNullablePromise(optional Promise<any>? arg);
++  void passOptionalNullablePromiseWithDefaultValue(optional Promise<any>? arg = null);
++  void passPromiseSequence(sequence<Promise<any>> arg);
++  void passNullablePromiseSequence(sequence<Promise<any>?> arg);
++  Promise<any> receivePromise();
++
+   // binaryNames tests
+   void methodRenamedFrom();
+   [BinaryName="otherMethodRenamedTo"]
+   void otherMethodRenamedFrom();
+   void methodRenamedFrom(byte argument);
+   readonly attribute byte attributeGetterRenamedFrom;
+   attribute byte attributeRenamedFrom;
+   [BinaryName="otherAttributeRenamedTo"]
+diff --git a/dom/bindings/test/TestExampleGen.webidl b/dom/bindings/test/TestExampleGen.webidl
+--- a/dom/bindings/test/TestExampleGen.webidl
++++ b/dom/bindings/test/TestExampleGen.webidl
+@@ -536,16 +536,26 @@ interface TestExampleInterface {
+   void passOptionalNullableDate(optional Date? arg);
+   void passOptionalNullableDateWithDefaultValue(optional Date? arg = null);
+   void passDateSequence(sequence<Date> arg);
+   void passNullableDateSequence(sequence<Date?> arg);
+   void passDateMozMap(MozMap<Date> arg);
+   Date receiveDate();
+   Date? receiveNullableDate();
+ 
++  // Promise types
++  void passPromise(Promise<any> arg);
++  void passNullablePromise(Promise<any>? arg);
++  void passOptionalPromise(optional Promise<any> arg);
++  void passOptionalNullablePromise(optional Promise<any>? arg);
++  void passOptionalNullablePromiseWithDefaultValue(optional Promise<any>? arg = null);
++  void passPromiseSequence(sequence<Promise<any>> arg);
++  void passNullablePromiseSequence(sequence<Promise<any>?> arg);
++  Promise<any> receivePromise();
++
+   // binaryNames tests
+   void methodRenamedFrom();
+   [BinaryName="otherMethodRenamedTo"]
+   void otherMethodRenamedFrom();
+   void methodRenamedFrom(byte argument);
+   readonly attribute byte attributeGetterRenamedFrom;
+   attribute byte attributeRenamedFrom;
+   [BinaryName="otherAttributeRenamedTo"]
+diff --git a/dom/bindings/test/TestJSImplGen.webidl b/dom/bindings/test/TestJSImplGen.webidl
+--- a/dom/bindings/test/TestJSImplGen.webidl
++++ b/dom/bindings/test/TestJSImplGen.webidl
+@@ -548,16 +548,26 @@ interface TestJSImplInterface {
+   void passOptionalNullableDate(optional Date? arg);
+   void passOptionalNullableDateWithDefaultValue(optional Date? arg = null);
+   void passDateSequence(sequence<Date> arg);
+   void passNullableDateSequence(sequence<Date?> arg);
+   void passDateMozMap(MozMap<Date> arg);
+   Date receiveDate();
+   Date? receiveNullableDate();
+ 
++  // Promise types
++  void passPromise(Promise<any> arg);
++  void passNullablePromise(Promise<any>? arg);
++  void passOptionalPromise(optional Promise<any> arg);
++  void passOptionalNullablePromise(optional Promise<any>? arg);
++  void passOptionalNullablePromiseWithDefaultValue(optional Promise<any>? arg = null);
++  void passPromiseSequence(sequence<Promise<any>> arg);
++  void passNullablePromiseSequence(sequence<Promise<any>?> arg);
++  Promise<any> receivePromise();
++
+   // binaryNames tests
+   void methodRenamedFrom();
+   [BinaryName="otherMethodRenamedTo"]
+   void otherMethodRenamedFrom();
+   void methodRenamedFrom(byte argument);
+   readonly attribute byte attributeGetterRenamedFrom;
+   attribute byte attributeRenamedFrom;
+   [BinaryName="otherAttributeRenamedTo"]

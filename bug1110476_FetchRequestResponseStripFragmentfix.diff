@@ -1,0 +1,291 @@
+# HG changeset patch
+# User Antonio de Luna Lopez <tonydelun@gmail.com>
+# Parent  8d262d1d0ae51740523db8089b4562e93e0c0e41
+Bug 1110476 - Stripped url fragment from Request::GetUrl() by calling either nsIURI::SetRef() or workers::URL::SetHash() in Request's url getter utility methods. Stripped url fragment from Response::GetUrl() by adding the method InternalRequest::StripFragmentAndSetUrl() which calls nsIURI::SetRef(). Added a test in dom/tests/mochitest/fetch/test_request.js for Request::GetUrl(). Removed manual url stripping from dom/cache/TypeUtils.cpp.
+
+diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
+--- a/dom/cache/TypeUtils.cpp
++++ b/dom/cache/TypeUtils.cpp
+@@ -409,35 +409,25 @@ TypeUtils::ProcessURL(nsACString& aUrl, 
+     nsAutoCString scheme(Substring(flatURL, schemePos, schemeLen));
+     *aSchemeValidOut = scheme.LowerCaseEqualsLiteral("http") ||
+                        scheme.LowerCaseEqualsLiteral("https") ||
+                        scheme.LowerCaseEqualsLiteral("app");
+   }
+ 
+   uint32_t queryPos;
+   int32_t queryLen;
+-  uint32_t refPos;
+-  int32_t refLen;
+ 
+   aRv = urlParser->ParsePath(url + pathPos, flatURL.Length() - pathPos,
+                              nullptr, nullptr,               // ignore filepath
+                              &queryPos, &queryLen,
+-                             &refPos, &refLen);
++                             nullptr, nullptr);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return;
+   }
+ 
+-  // TODO: Remove this once Request/Response properly strip the fragment (bug 1110476)
+-  if (refLen >= 0) {
+-    // ParsePath gives us ref position relative to the start of the path
+-    refPos += pathPos;
+-
+-    aUrl = Substring(aUrl, 0, refPos - 1);
+-  }
+-
+   if (!aUrlWithoutQueryOut) {
+     return;
+   }
+ 
+   MOZ_ASSERT(aUrlQueryOut);
+ 
+   if (queryLen < 0) {
+     *aUrlWithoutQueryOut = aUrl;
+diff --git a/dom/fetch/FetchDriver.cpp b/dom/fetch/FetchDriver.cpp
+--- a/dom/fetch/FetchDriver.cpp
++++ b/dom/fetch/FetchDriver.cpp
+@@ -575,17 +575,18 @@ FetchDriver::BeginAndGetFilteredResponse
+ {
+   MOZ_ASSERT(aResponse);
+   nsAutoCString reqURL;
+   if (aFinalURI) {
+     aFinalURI->GetSpec(reqURL);
+   } else {
+     mRequest->GetURL(reqURL);
+   }
+-  aResponse->SetUrl(reqURL);
++  nsresult rv = aResponse->StripFragmentAndSetUrl(reqURL);
++  MOZ_ASSERT(NS_SUCCEEDED(rv));
+ 
+   // FIXME(nsm): Handle mixed content check, step 7 of fetch.
+ 
+   nsRefPtr<InternalResponse> filteredResponse;
+   switch (mRequest->GetResponseTainting()) {
+     case InternalRequest::RESPONSETAINT_BASIC:
+       filteredResponse = aResponse->BasicResponse();
+       break;
+diff --git a/dom/fetch/InternalRequest.h b/dom/fetch/InternalRequest.h
+--- a/dom/fetch/InternalRequest.h
++++ b/dom/fetch/InternalRequest.h
+@@ -371,16 +371,17 @@ private:
+   explicit InternalRequest(const InternalRequest& aOther);
+ 
+   ~InternalRequest();
+ 
+   static RequestContext
+   MapContentPolicyTypeToRequestContext(nsContentPolicyType aContentPolicyType);
+ 
+   nsCString mMethod;
++  // mURL always stores the url with the ref stripped
+   nsCString mURL;
+   nsRefPtr<InternalHeaders> mHeaders;
+   nsCOMPtr<nsIInputStream> mBodyStream;
+ 
+   nsContentPolicyType mContentPolicyType;
+ 
+   // Empty string: no-referrer
+   // "about:client": client (default)
+diff --git a/dom/fetch/InternalResponse.cpp b/dom/fetch/InternalResponse.cpp
+--- a/dom/fetch/InternalResponse.cpp
++++ b/dom/fetch/InternalResponse.cpp
+@@ -1,19 +1,21 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "InternalResponse.h"
+ 
++#include "mozilla/Assertions.h"
+ #include "mozilla/dom/InternalHeaders.h"
+ #include "mozilla/dom/cache/CacheTypes.h"
+ #include "mozilla/ipc/PBackgroundSharedTypes.h"
++#include "nsIURI.h"
+ #include "nsStreamUtils.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ InternalResponse::InternalResponse(uint16_t aStatus, const nsACString& aStatusText)
+   : mType(ResponseType::Default)
+   , mStatus(aStatus)
+@@ -80,16 +82,44 @@ InternalResponse::CORSResponse()
+ }
+ 
+ void
+ InternalResponse::SetPrincipalInfo(UniquePtr<mozilla::ipc::PrincipalInfo> aPrincipalInfo)
+ {
+   mPrincipalInfo = Move(aPrincipalInfo);
+ }
+ 
++nsresult
++InternalResponse::StripFragmentAndSetUrl(const nsACString& aUrl)
++{
++  MOZ_ASSERT(NS_IsMainThread());
++
++  nsCOMPtr<nsIURI> iuri;
++  nsresult rv;
++
++  rv = NS_NewURI(getter_AddRefs(iuri), aUrl);
++  if(NS_WARN_IF(NS_FAILED(rv))){
++    return rv;
++  }
++
++  rv = iuri->SetRef(EmptyCString());
++  if(NS_WARN_IF(NS_FAILED(rv))){
++    return rv;
++  }
++
++  nsCString spec;
++  rv = iuri->GetSpec(spec);
++  if(NS_WARN_IF(NS_FAILED(rv))){
++    return rv;
++  }
++
++  SetUrl(spec);
++  return NS_OK;
++}
++
+ already_AddRefed<InternalResponse>
+ InternalResponse::OpaqueResponse()
+ {
+   MOZ_ASSERT(!mWrappedResponse, "Can't OpaqueResponse a already wrapped response");
+   nsRefPtr<InternalResponse> response = new InternalResponse(0, EmptyCString());
+   response->mType = ResponseType::Opaque;
+   response->mTerminationReason = mTerminationReason;
+   response->mURL = mURL;
+diff --git a/dom/fetch/InternalResponse.h b/dom/fetch/InternalResponse.h
+--- a/dom/fetch/InternalResponse.h
++++ b/dom/fetch/InternalResponse.h
+@@ -73,16 +73,17 @@ public:
+ 
+   // FIXME(nsm): Return with exclude fragment.
+   void
+   GetUrl(nsCString& aURL) const
+   {
+     aURL.Assign(mURL);
+   }
+ 
++  // SetUrl should only be called when the fragment has alredy been stripped
+   void
+   SetUrl(const nsACString& aURL)
+   {
+     mURL.Assign(aURL);
+   }
+ 
+   uint16_t
+   GetStatus() const
+@@ -174,16 +175,19 @@ public:
+   {
+     return mPrincipalInfo;
+   }
+ 
+   // Takes ownership of the principal info.
+   void
+   SetPrincipalInfo(UniquePtr<mozilla::ipc::PrincipalInfo> aPrincipalInfo);
+ 
++  nsresult
++  StripFragmentAndSetUrl(const nsACString& aUrl);
++
+ private:
+   ~InternalResponse();
+ 
+   explicit InternalResponse(const InternalResponse& aOther) = delete;
+   InternalResponse& operator=(const InternalResponse&) = delete;
+ 
+   // Returns an instance of InternalResponse which is a copy of this
+   // InternalResponse, except headers, body and wrapped response (if any) which
+diff --git a/dom/fetch/Request.cpp b/dom/fetch/Request.cpp
+--- a/dom/fetch/Request.cpp
++++ b/dom/fetch/Request.cpp
+@@ -59,16 +59,21 @@ GetRequestURLFromDocument(nsIDocument* a
+ 
+   nsCOMPtr<nsIURI> baseURI = aDocument->GetBaseURI();
+   nsCOMPtr<nsIURI> resolvedURI;
+   aRv = NS_NewURI(getter_AddRefs(resolvedURI), aInput, nullptr, baseURI);
+   if (NS_WARN_IF(aRv.Failed())) {
+       return;
+   }
+ 
++  aRv = resolvedURI->SetRef(EmptyCString());
++  if (NS_WARN_IF(aRv.Failed())) {
++    return;
++  }
++
+   nsAutoCString spec;
+   aRv = resolvedURI->GetSpec(spec);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return;
+   }
+ 
+   CopyUTF8toUTF16(spec, aRequestURL);
+ }
+@@ -81,16 +86,21 @@ GetRequestURLFromChrome(const nsAString&
+ 
+ #ifdef DEBUG
+   nsCOMPtr<nsIURI> uri;
+   aRv = NS_NewURI(getter_AddRefs(uri), aInput, nullptr, nullptr);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return;
+   }
+ 
++  aRv = uri->SetRef(EmptyCString());
++  if (NS_WARN_IF(aRv.Failed())) {
++    return;
++  }
++
+   nsAutoCString spec;
+   aRv = uri->GetSpec(spec);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return;
+   }
+ 
+   CopyUTF8toUTF16(spec, aRequestURL);
+ #else
+@@ -108,16 +118,21 @@ GetRequestURLFromWorker(const GlobalObje
+ 
+   NS_ConvertUTF8toUTF16 baseURL(worker->GetLocationInfo().mHref);
+   nsRefPtr<workers::URL> url =
+     workers::URL::Constructor(aGlobal, aInput, baseURL, aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return;
+   }
+ 
++  url->SetHash(EmptyString(), aRv);
++  if (NS_WARN_IF(aRv.Failed())) {
++    return;
++  }
++
+   url->Stringify(aRequestURL, aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return;
+   }
+ }
+ 
+ } // namespace
+ 
+diff --git a/dom/tests/mochitest/fetch/test_request.js b/dom/tests/mochitest/fetch/test_request.js
+--- a/dom/tests/mochitest/fetch/test_request.js
++++ b/dom/tests/mochitest/fetch/test_request.js
+@@ -211,17 +211,17 @@ function testMethod() {
+   }
+ 
+   // Non HEAD/GET should not throw.
+   var r = new Request("", { method: "patch", body: "hello" });
+ }
+ 
+ function testUrlFragment() {
+   var req = new Request("./request#withfragment");
+-  ok(req.url, (new URL("./request", self.location.href)).href, "request.url should be serialized with exclude fragment flag set");
++  is(req.url, (new URL("./request", self.location.href)).href, "request.url should be serialized with exclude fragment flag set");
+ }
+ 
+ function testBodyUsed() {
+   var req = new Request("./bodyused", { method: 'post', body: "Sample body" });
+   is(req.bodyUsed, false, "bodyUsed is initially false.");
+   return req.text().then((v) => {
+     is(v, "Sample body", "Body should match");
+     is(req.bodyUsed, true, "After reading body, bodyUsed should be true.");
