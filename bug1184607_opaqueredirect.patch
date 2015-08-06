@@ -362,10 +362,133 @@ diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
    MOZ_ASSERT(!result.Failed());
    internalRequest->Headers()->Fill(*internalHeaders, result);
    MOZ_ASSERT(!result.Failed());
+diff --git a/dom/fetch/Fetch.cpp b/dom/fetch/Fetch.cpp
+--- a/dom/fetch/Fetch.cpp
++++ b/dom/fetch/Fetch.cpp
+@@ -212,16 +212,18 @@ FetchRequest(nsIGlobalObject* aGlobal, c
+ 
+   nsRefPtr<Request> request = Request::Constructor(global, aInput, aInit, aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return nullptr;
+   }
+ 
+   nsRefPtr<InternalRequest> r = request->GetInternalRequest();
+ 
++  printf_stderr("### ### FetchRequest() redirect flag %u\n", r->GetRedirectMode());
++
+   if (NS_IsMainThread()) {
+     nsCOMPtr<nsPIDOMWindow> window = do_QueryInterface(aGlobal);
+     nsCOMPtr<nsIDocument> doc;
+     nsCOMPtr<nsILoadGroup> loadGroup;
+     nsIPrincipal* principal;
+     if (window) {
+       doc = window->GetExtantDoc();
+       if (!doc) {
 diff --git a/dom/fetch/FetchDriver.cpp b/dom/fetch/FetchDriver.cpp
 --- a/dom/fetch/FetchDriver.cpp
 +++ b/dom/fetch/FetchDriver.cpp
-@@ -837,16 +837,18 @@ FetchDriver::AsyncOnChannelRedirect(nsIC
+@@ -45,16 +45,17 @@ NS_IMPL_ISUPPORTS(FetchDriver,
+ FetchDriver::FetchDriver(InternalRequest* aRequest, nsIPrincipal* aPrincipal,
+                          nsILoadGroup* aLoadGroup)
+   : mPrincipal(aPrincipal)
+   , mLoadGroup(aLoadGroup)
+   , mRequest(aRequest)
+   , mFetchRecursionCount(0)
+   , mResponseAvailableCalled(false)
+ {
++  printf_stderr("### ### FetchDriver() with redirect mode %u\n", mRequest->GetRedirectMode());
+ }
+ 
+ FetchDriver::~FetchDriver()
+ {
+   // We assert this since even on failures, we should call
+   // FailWithNetworkError().
+   MOZ_ASSERT(mResponseAvailableCalled);
+ }
+@@ -590,16 +591,19 @@ FetchDriver::BeginAndGetFilteredResponse
+       filteredResponse = aResponse->BasicResponse();
+       break;
+     case InternalRequest::RESPONSETAINT_CORS:
+       filteredResponse = aResponse->CORSResponse();
+       break;
+     case InternalRequest::RESPONSETAINT_OPAQUE:
+       filteredResponse = aResponse->OpaqueResponse();
+       break;
++    case InternalRequest::RESPONSETAINT_OPAQUEREDIRECT:
++      filteredResponse = aResponse->OpaqueRedirectResponse();
++      break;
+     default:
+       MOZ_CRASH("Unexpected case");
+   }
+ 
+   MOZ_ASSERT(filteredResponse);
+   MOZ_ASSERT(mObserver);
+   mObserver->OnResponseAvailable(filteredResponse);
+   mResponseAvailableCalled = true;
+@@ -744,16 +748,21 @@ FetchDriver::OnStartRequest(nsIRequest* 
+   nsCOMPtr<nsIURI> channelURI;
+   rv = channel->GetURI(getter_AddRefs(channelURI));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     FailWithNetworkError();
+     // Cancel request.
+     return rv;
+   }
+ 
++  nsAutoCString spec;
++  channelURI->GetSpec(spec);
++  printf_stderr("### ### FetchDriver::OnStartRequest() status:%u url:%s\n",
++                response->GetStatus(), spec.get());
++
+   // Resolves fetch() promise which may trigger code running in a worker.  Make
+   // sure the Response is fully initialized before calling this.
+   mResponse = BeginAndGetFilteredResponse(response, channelURI);
+ 
+   nsCOMPtr<nsIEventTarget> sts = do_GetService(NS_STREAMTRANSPORTSERVICE_CONTRACTID, &rv);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     FailWithNetworkError();
+     // Cancel request.
+@@ -810,24 +819,40 @@ FetchDriver::AsyncOnChannelRedirect(nsIC
+                                     nsIChannel* aNewChannel,
+                                     uint32_t aFlags,
+                                     nsIAsyncVerifyRedirectCallback *aCallback)
+ {
+   NS_PRECONDITION(aNewChannel, "Redirect without a channel?");
+ 
+   nsresult rv;
+ 
++  printf_stderr("### ### redirect with flag %u\n", mRequest->GetRedirectMode());
++
++  if (NS_WARN_IF(mRequest->GetRedirectMode() == RequestRedirect::Error)) {
++    aOldChannel->Cancel(NS_BINDING_FAILED);
++    return NS_BINDING_FAILED;
++  }
++
+   // Section 4.2, Step 4.6-4.7, enforcing a redirect count is done by Necko.
+   // The pref used is "network.http.redirection-limit" which is set to 20 by
+   // default.
+   //
+   // Step 4.8. We only unset this for spec compatibility. Any actions we take
+   // on mRequest here do not affect what the channel does.
+   mRequest->UnsetSameOriginDataURL();
+ 
++  if (mRequest->GetRedirectMode() == RequestRedirect::Manual) {
++    // TODO: is this right?
++    printf_stderr("### ### abort redirect due to manual flag\n");
++    mRequest->SetResponseTainting(InternalRequest::RESPONSETAINT_OPAQUEREDIRECT);
++    return NS_BINDING_FAILED;
++  }
++
++  MOZ_ASSERT(mRequest->GetRedirectMode() == RequestRedirect::Follow);
++
+   //
+   // Requests that require preflight are not permitted to redirect.
+   // Fetch spec section 4.2 "HTTP Fetch", step 4.9 just uses the manual
+   // redirect flag to decide whether to execute step 4.10 or not. We do not
+   // represent it in our implementation.
+   // The only thing we do is to check if the request requires a preflight (part
+   // of step 4.9), in which case we abort. This part cannot be done by
+   // nsCORSListenerProxy since it does not have access to mRequest.
+@@ -837,16 +862,18 @@ FetchDriver::AsyncOnChannelRedirect(nsIC
      rv = DoesNotRequirePreflight(aNewChannel);
      if (NS_FAILED(rv)) {
        NS_WARNING("FetchDriver::OnChannelRedirect: "
@@ -387,7 +510,25 @@ diff --git a/dom/fetch/FetchDriver.cpp b/dom/fetch/FetchDriver.cpp
 diff --git a/dom/fetch/InternalRequest.cpp b/dom/fetch/InternalRequest.cpp
 --- a/dom/fetch/InternalRequest.cpp
 +++ b/dom/fetch/InternalRequest.cpp
-@@ -75,16 +75,17 @@ InternalRequest::InternalRequest(const I
+@@ -37,16 +37,17 @@ InternalRequest::GetRequestConstructorCo
+   copy->mSameOriginDataURL = true;
+   copy->mPreserveContentCodings = true;
+   // The default referrer is already about:client.
+ 
+   copy->mContentPolicyType = nsIContentPolicy::TYPE_FETCH;
+   copy->mMode = mMode;
+   copy->mCredentialsMode = mCredentialsMode;
+   copy->mCacheMode = mCacheMode;
++  copy->mRedirectMode = mRedirectMode;
+   copy->mCreatedByFetchEvent = mCreatedByFetchEvent;
+   return copy.forget();
+ }
+ 
+ already_AddRefed<InternalRequest>
+ InternalRequest::Clone()
+ {
+   nsRefPtr<InternalRequest> clone = new InternalRequest(*this);
+@@ -75,16 +76,17 @@ InternalRequest::InternalRequest(const I
    , mURL(aOther.mURL)
    , mHeaders(new InternalHeaders(*aOther.mHeaders))
    , mContentPolicyType(aOther.mContentPolicyType)
@@ -408,7 +549,18 @@ diff --git a/dom/fetch/InternalRequest.cpp b/dom/fetch/InternalRequest.cpp
 diff --git a/dom/fetch/InternalRequest.h b/dom/fetch/InternalRequest.h
 --- a/dom/fetch/InternalRequest.h
 +++ b/dom/fetch/InternalRequest.h
-@@ -97,16 +97,17 @@ public:
+@@ -87,26 +87,28 @@ class InternalRequest final
+ public:
+   NS_INLINE_DECL_THREADSAFE_REFCOUNTING(InternalRequest)
+ 
+   enum ResponseTainting
+   {
+     RESPONSETAINT_BASIC,
+     RESPONSETAINT_CORS,
+     RESPONSETAINT_OPAQUE,
++    RESPONSETAINT_OPAQUEREDIRECT,
+   };
+ 
    explicit InternalRequest()
      : mMethod("GET")
      , mHeaders(new InternalHeaders(HeadersGuardEnum::None))
@@ -426,7 +578,7 @@ diff --git a/dom/fetch/InternalRequest.h b/dom/fetch/InternalRequest.h
        // how certain contexts will override it to set it to true. Fetch
        // specification does not handle this yet.
      , mSameOriginDataURL(true)
-@@ -259,16 +260,28 @@ public:
+@@ -259,16 +261,28 @@ public:
    }
  
    void
@@ -455,7 +607,7 @@ diff --git a/dom/fetch/InternalRequest.h b/dom/fetch/InternalRequest.h
  
    void
    SetContentPolicyType(nsContentPolicyType aContentPolicyType);
-@@ -384,16 +397,17 @@ private:
+@@ -384,16 +398,17 @@ private:
    // "about:client": client (default)
    // URL: an URL
    nsString mReferrer;
@@ -633,6 +785,71 @@ diff --git a/dom/fetch/InternalResponse.h b/dom/fetch/InternalResponse.h
      if (mWrappedResponse) {
        return mWrappedResponse->SetBody(aBody);
      }
+diff --git a/dom/fetch/Request.cpp b/dom/fetch/Request.cpp
+--- a/dom/fetch/Request.cpp
++++ b/dom/fetch/Request.cpp
+@@ -165,16 +165,18 @@ Request::Constructor(const GlobalObject&
+       }
+     }
+ 
+     request = inputReq->GetInternalRequest();
+   } else {
+     request = new InternalRequest();
+   }
+ 
++  printf_stderr("### ### Request::Constructor() redirect flag %u\n", request->GetRedirectMode());
++
+   request = request->GetRequestConstructorCopy(global, aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return nullptr;
+   }
+ 
+   RequestMode fallbackMode = RequestMode::EndGuard_;
+   RequestCredentials fallbackCredentials = RequestCredentials::EndGuard_;
+   RequestCache fallbackCache = RequestCache::EndGuard_;
+@@ -232,16 +234,21 @@ Request::Constructor(const GlobalObject&
+ 
+   RequestCache cache = aInit.mCache.WasPassed() ?
+                        aInit.mCache.Value() : fallbackCache;
+   if (cache != RequestCache::EndGuard_) {
+     request->ClearCreatedByFetchEvent();
+     request->SetCacheMode(cache);
+   }
+ 
++  if (aInit.mRedirect.WasPassed()) {
++    printf_stderr("### ### set redirect mode from init %u\n", aInit.mRedirect.Value());
++    request->SetRedirectMode(aInit.mRedirect.Value());
++  }
++
+   // Request constructor step 14.
+   if (aInit.mMethod.WasPassed()) {
+     nsAutoCString method(aInit.mMethod.Value());
+     nsAutoCString upperCaseMethod = method;
+     ToUpperCase(upperCaseMethod);
+ 
+     // Step 14.1. Disallow forbidden methods, and anything that is not a HTTP
+     // token, since HTTP states that Method may be any of the defined values or
+@@ -339,18 +346,20 @@ Request::Constructor(const GlobalObject&
+                              contentType, aRv);
+     }
+ 
+     if (aRv.Failed()) {
+       return nullptr;
+     }
+   }
+ 
++
+   nsRefPtr<Request> domRequest = new Request(global, request);
+   domRequest->SetMimeType();
++  printf_stderr("### ### Request::Constructor() end with redirect flag %u\n", domRequest->Redirect());
+   return domRequest.forget();
+ }
+ 
+ already_AddRefed<Request>
+ Request::Clone(ErrorResult& aRv) const
+ {
+   if (BodyUsed()) {
+     aRv.ThrowTypeError(MSG_FETCH_BODY_CONSUMED_ERROR);
 diff --git a/dom/fetch/Request.h b/dom/fetch/Request.h
 --- a/dom/fetch/Request.h
 +++ b/dom/fetch/Request.h
@@ -725,7 +942,7 @@ diff --git a/dom/webidl/Response.webidl b/dom/webidl/Response.webidl
 diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEvents.cpp
 --- a/dom/workers/ServiceWorkerEvents.cpp
 +++ b/dom/workers/ServiceWorkerEvents.cpp
-@@ -125,17 +125,18 @@ public:
+@@ -125,17 +125,19 @@ public:
        // channel info for the worker script.
        channelInfo = mWorkerChannelInfo;
      }
@@ -735,6 +952,7 @@ diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEven
      }
  
 -    mChannel->SynthesizeStatus(mInternalResponse->GetStatus(), mInternalResponse->GetStatusText());
++    printf_stderr("### ### FinishResponse() status:%u\n", mInternalResponse->GetUnfilteredStatus());
 +    mChannel->SynthesizeStatus(mInternalResponse->GetUnfilteredStatus(),
 +                               mInternalResponse->GetUnfilteredStatusText());
  
@@ -745,7 +963,7 @@ diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEven
      }
  
      rv = mChannel->FinishSynthesizedResponse();
-@@ -143,28 +144,31 @@ public:
+@@ -143,28 +145,31 @@ public:
      return rv;
    }
  };
@@ -780,7 +998,40 @@ diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEven
    void RejectedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue) override;
  
    void CancelRequest(nsresult aStatus);
-@@ -265,16 +269,18 @@ RespondWithHandler::ResolvedCallback(JSC
+@@ -236,27 +241,32 @@ public:
+ 
+ NS_IMPL_ISUPPORTS0(RespondWithHandler)
+ 
+ void
+ RespondWithHandler::ResolvedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue)
+ {
+   AutoCancel autoCancel(this);
+ 
++  printf_stderr("### ### RespondWithHandler::ResolvedCallback()\n");
++
+   if (!aValue.isObject()) {
+     NS_WARNING("FetchEvent::RespondWith was passed a promise resolved to a non-Object value");
+     return;
+   }
+ 
+   nsRefPtr<Response> response;
+   nsresult rv = UNWRAP_OBJECT(Response, &aValue.toObject(), response);
+   if (NS_FAILED(rv)) {
+     return;
+   }
+ 
++  printf_stderr("### ### RespondWithHandler::ResolvedCallback() response type %u\n",
++                response->Type());
++
+   WorkerPrivate* worker = GetCurrentThreadWorkerPrivate();
+   MOZ_ASSERT(worker);
+   worker->AssertIsOnWorkerThread();
+ 
+   // Allow opaque response interception to be disabled until we can ensure the
+   // security implications are not a complete disaster.
+   if (response->Type() == ResponseType::Opaque &&
+       !worker->OpaqueInterceptionEnabled()) {
+@@ -265,47 +275,60 @@ RespondWithHandler::ResolvedCallback(JSC
    }
  
    // Section 4.2, step 2.2:
@@ -799,16 +1050,20 @@ diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEven
  
    if (response->Type() == ResponseType::Opaque && mRequestMode != RequestMode::No_cors) {
      autoCancel.SetCancelStatus(NS_ERROR_BAD_OPAQUE_INTERCEPTION_REQUEST_MODE);
-@@ -282,30 +288,35 @@ RespondWithHandler::ResolvedCallback(JSC
+     return;
    }
  
++  // TODO: remove this case as its no longer in the spec (bug 1184967)
    if (mIsClientRequest && response->Type() != ResponseType::Basic &&
-       response->Type() != ResponseType::Default) {
+-      response->Type() != ResponseType::Default) {
++      response->Type() != ResponseType::Default &&
++      response->Type() != ResponseType::Opaqueredirect) {
      autoCancel.SetCancelStatus(NS_ERROR_CLIENT_REQUEST_OPAQUE_INTERCEPTION);
      return;
    }
  
 +  if (!mIsNavigationRequest && response->Type() == ResponseType::Opaqueredirect) {
++    printf_stderr("### ### opaqueredirect failed because not a navigation\n");
 +    autoCancel.SetCancelStatus(NS_ERROR_BAD_OPAQUE_REDIRECT_INTERCEPTION);
 +    return;
 +  }
@@ -823,6 +1078,9 @@ diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEven
      return;
    }
  
++  printf_stderr("### ### RespondWith() type:%u status:%u\n",
++                response->Type(), ir->GetUnfilteredStatus());
++
    nsAutoPtr<RespondWithClosure> closure(
        new RespondWithClosure(mInterceptedChannel, ir, worker->GetChannelInfo()));
    nsCOMPtr<nsIInputStream> body;
@@ -836,7 +1094,7 @@ diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEven
      rv = mInterceptedChannel->GetResponseBody(getter_AddRefs(responseBody));
      if (NS_WARN_IF(NS_FAILED(rv))) {
        return;
-@@ -354,17 +365,17 @@ FetchEvent::RespondWith(Promise& aArg, E
+@@ -354,17 +377,17 @@ FetchEvent::RespondWith(Promise& aArg, E
      aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
      return;
    }
@@ -858,7 +1116,7 @@ diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEven
 diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
 --- a/dom/workers/ServiceWorkerManager.cpp
 +++ b/dom/workers/ServiceWorkerManager.cpp
-@@ -3675,16 +3675,20 @@ private:
+@@ -3675,16 +3675,23 @@ private:
      MOZ_ASSERT(internalReq);
      internalReq->SetCreatedByFetchEvent();
  
@@ -867,7 +1125,10 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
  
      request->SetContentPolicyType(mContentPolicyType);
  
++    printf_stderr("### ### content policy type %u\n", mContentPolicyType);
++
 +    if (internalReq->IsNavigationRequest()) {
++      printf_stderr("### ### set redirect mode to manual\n");
 +      internalReq->SetRedirectMode(RequestRedirect::Manual);
 +    }
 +
@@ -879,6 +1140,21 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
      init.mIsReload.Construct(mIsReload);
      nsRefPtr<FetchEvent> event =
        FetchEvent::Constructor(globalObj, NS_LITERAL_STRING("fetch"), init, result);
+diff --git a/dom/workers/test/serviceworkers/fetch/requesturl/requesturl_test.js b/dom/workers/test/serviceworkers/fetch/requesturl/requesturl_test.js
+--- a/dom/workers/test/serviceworkers/fetch/requesturl/requesturl_test.js
++++ b/dom/workers/test/serviceworkers/fetch/requesturl/requesturl_test.js
+@@ -1,10 +1,11 @@
+ addEventListener("fetch", event => {
+   var url = event.request.url;
++  dump("### ### fetch event redirect:" + event.request.redirect + " url:" + url + "\n");
+   var badURL = url.indexOf("secret.html") > -1;
+   event.respondWith(
+     new Promise(resolve => {
+       clients.matchAll().then(clients => {
+         for (var client of clients) {
+           if (client.url.indexOf("index.html") > -1) {
+             client.postMessage({status: "ok", result: !badURL, message: "Should not find a bad URL (" + url + ")"});
+             break;
 diff --git a/xpcom/base/ErrorList.h b/xpcom/base/ErrorList.h
 --- a/xpcom/base/ErrorList.h
 +++ b/xpcom/base/ErrorList.h
