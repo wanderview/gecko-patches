@@ -1,0 +1,903 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  b12a261ee32e04d96e2e2594b3ba06979770495b
+Bug 1184607 Implement fetch opaqueredirect and associated logic. r=ehsan
+
+diff --git a/dom/cache/CacheTypes.ipdlh b/dom/cache/CacheTypes.ipdlh
+--- a/dom/cache/CacheTypes.ipdlh
++++ b/dom/cache/CacheTypes.ipdlh
+@@ -8,16 +8,17 @@ include protocol PCacheStreamControl;
+ include InputStreamParams;
+ include ChannelInfo;
+ include PBackgroundSharedTypes;
+ 
+ using HeadersGuardEnum from "mozilla/dom/cache/IPCUtils.h";
+ using RequestCredentials from "mozilla/dom/cache/IPCUtils.h";
+ using RequestMode from "mozilla/dom/cache/IPCUtils.h";
+ using RequestCache from "mozilla/dom/cache/IPCUtils.h";
++using RequestRedirect from "mozilla/dom/cache/IPCUtils.h";
+ using ResponseType from "mozilla/dom/cache/IPCUtils.h";
+ using mozilla::void_t from "ipc/IPCMessageUtils.h";
+ using struct nsID from "nsID.h";
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+@@ -59,16 +60,17 @@ struct CacheRequest
+   HeadersEntry[] headers;
+   HeadersGuardEnum headersGuard;
+   nsString referrer;
+   RequestMode mode;
+   RequestCredentials credentials;
+   CacheReadStreamOrVoid body;
+   uint32_t contentPolicyType;
+   RequestCache requestCache;
++  RequestRedirect requestRedirect;
+ };
+ 
+ union CacheRequestOrVoid
+ {
+   void_t;
+   CacheRequest;
+ };
+ 
+diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
+--- a/dom/cache/DBSchema.cpp
++++ b/dom/cache/DBSchema.cpp
+@@ -26,21 +26,22 @@
+ #include "mozilla/dom/ResponseBinding.h"
+ #include "nsIContentPolicy.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ namespace db {
+ 
++// This should not be changed any more.  Write a migration instead.
+ const int32_t kMaxWipeSchemaVersion = 15;
+ 
+ namespace {
+ 
+-const int32_t kLatestSchemaVersion = 15;
++const int32_t kLatestSchemaVersion = 16;
+ const int32_t kMaxEntriesPerStatement = 255;
+ 
+ const uint32_t kPageSize = 4 * 1024;
+ 
+ // Grow the database in chunks to reduce fragmentation
+ const uint32_t kGrowthSize = 32 * 1024;
+ const uint32_t kGrowthPages = kGrowthSize / kPageSize;
+ static_assert(kGrowthSize % kPageSize == 0,
+@@ -82,22 +83,28 @@ static_assert(int(RequestCredentials::Om
+ static_assert(int(RequestCache::Default) == 0 &&
+               int(RequestCache::No_store) == 1 &&
+               int(RequestCache::Reload) == 2 &&
+               int(RequestCache::No_cache) == 3 &&
+               int(RequestCache::Force_cache) == 4 &&
+               int(RequestCache::Only_if_cached) == 5 &&
+               int(RequestCache::EndGuard_) == 6,
+               "RequestCache values are as expected");
++static_assert(int(RequestRedirect::Follow) == 0 &&
++              int(RequestRedirect::Error) == 1 &&
++              int(RequestRedirect::Manual) == 2 &&
++              int(RequestRedirect::EndGuard_) == 3,
++              "RequestRedirect values are as expected");
+ static_assert(int(ResponseType::Basic) == 0 &&
+               int(ResponseType::Cors) == 1 &&
+               int(ResponseType::Default) == 2 &&
+               int(ResponseType::Error) == 3 &&
+               int(ResponseType::Opaque) == 4 &&
+-              int(ResponseType::EndGuard_) == 5,
++              int(ResponseType::Opaqueredirect) == 5 &&
++              int(ResponseType::EndGuard_) == 6,
+               "ResponseType values are as expected");
+ 
+ // If the static_asserts below fails, it means that you have changed the
+ // Namespace enum in a way that may be incompatible with the existing data
+ // stored in the DOM Cache.  You would need to update the Cache database schema
+ // accordingly and adjust the failing static_assert.
+ static_assert(DEFAULT_NAMESPACE == 0 &&
+               CHROME_ONLY_NAMESPACE == 1 &&
+@@ -271,16 +278,17 @@ CreateSchema(mozIStorageConnection* aCon
+         "request_url_query TEXT NOT NULL, "
+         "request_url_query_hash BLOB NOT NULL, "    // first 8-bytes of sha1 hash
+         "request_referrer TEXT NOT NULL, "
+         "request_headers_guard INTEGER NOT NULL, "
+         "request_mode INTEGER NOT NULL, "
+         "request_credentials INTEGER NOT NULL, "
+         "request_contentpolicytype INTEGER NOT NULL, "
+         "request_cache INTEGER NOT NULL, "
++        "request_redirect INTEGER NOT NULL, "
+         "request_body_id TEXT NULL, "
+         "response_type INTEGER NOT NULL, "
+         "response_url TEXT NOT NULL, "
+         "response_status INTEGER NOT NULL, "
+         "response_status_text TEXT NOT NULL, "
+         "response_headers_guard INTEGER NOT NULL, "
+         "response_body_id TEXT NULL, "
+         "response_security_info_id INTEGER NULL REFERENCES security_info(id), "
+@@ -1523,16 +1531,17 @@ InsertEntry(mozIStorageConnection* aConn
+       "request_url_query, "
+       "request_url_query_hash, "
+       "request_referrer, "
+       "request_headers_guard, "
+       "request_mode, "
+       "request_credentials, "
+       "request_contentpolicytype, "
+       "request_cache, "
++      "request_redirect, "
+       "request_body_id, "
+       "response_type, "
+       "response_url, "
+       "response_status, "
+       "response_status_text, "
+       "response_headers_guard, "
+       "response_body_id, "
+       "response_security_info_id, "
+@@ -1547,16 +1556,17 @@ InsertEntry(mozIStorageConnection* aConn
+       ":request_url_query, "
+       ":request_url_query_hash, "
+       ":request_referrer, "
+       ":request_headers_guard, "
+       ":request_mode, "
+       ":request_credentials, "
+       ":request_contentpolicytype, "
+       ":request_cache, "
++      ":request_redirect, "
+       ":request_body_id, "
+       ":response_type, "
+       ":response_url, "
+       ":response_status, "
+       ":response_status_text, "
+       ":response_headers_guard, "
+       ":response_body_id, "
+       ":response_security_info_id, "
+@@ -1615,16 +1625,19 @@ InsertEntry(mozIStorageConnection* aConn
+   rv = state->BindInt32ByName(NS_LITERAL_CSTRING("request_contentpolicytype"),
+     static_cast<int32_t>(aRequest.contentPolicyType()));
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   rv = state->BindInt32ByName(NS_LITERAL_CSTRING("request_cache"),
+     static_cast<int32_t>(aRequest.requestCache()));
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
++  rv = state->BindInt32ByName(NS_LITERAL_CSTRING("request_redirect"),
++    static_cast<int32_t>(aRequest.requestRedirect()));
++
+   rv = BindId(state, NS_LITERAL_CSTRING("request_body_id"), aRequestBodyId);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   rv = state->BindInt32ByName(NS_LITERAL_CSTRING("response_type"),
+                               static_cast<int32_t>(aResponse.type()));
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   rv = state->BindUTF8StringByName(NS_LITERAL_CSTRING("response_url"),
+@@ -1894,16 +1907,17 @@ ReadRequest(mozIStorageConnection* aConn
+       "request_url_no_query, "
+       "request_url_query, "
+       "request_referrer, "
+       "request_headers_guard, "
+       "request_mode, "
+       "request_credentials, "
+       "request_contentpolicytype, "
+       "request_cache, "
++      "request_redirect, "
+       "request_body_id "
+     "FROM entries "
+     "WHERE id=:id;"
+   ), getter_AddRefs(state));
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+   rv = state->BindInt32ByName(NS_LITERAL_CSTRING("id"), aEntryId);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+@@ -1948,23 +1962,29 @@ ReadRequest(mozIStorageConnection* aConn
+     static_cast<nsContentPolicyType>(requestContentPolicyType);
+ 
+   int32_t requestCache;
+   rv = state->GetInt32(8, &requestCache);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+   aSavedRequestOut->mValue.requestCache() =
+     static_cast<RequestCache>(requestCache);
+ 
++  int32_t requestRedirect;
++  rv = state->GetInt32(9, &requestRedirect);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++  aSavedRequestOut->mValue.requestRedirect() =
++    static_cast<RequestRedirect>(requestRedirect);
++
+   bool nullBody = false;
+-  rv = state->GetIsNull(9, &nullBody);
++  rv = state->GetIsNull(10, &nullBody);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+   aSavedRequestOut->mHasBodyId = !nullBody;
+ 
+   if (aSavedRequestOut->mHasBodyId) {
+-    rv = ExtractId(state, 9, &aSavedRequestOut->mBodyId);
++    rv = ExtractId(state, 10, &aSavedRequestOut->mBodyId);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+   }
+ 
+   rv = aConn->CreateStatement(NS_LITERAL_CSTRING(
+     "SELECT "
+       "name, "
+       "value "
+     "FROM request_headers "
+diff --git a/dom/cache/IPCUtils.h b/dom/cache/IPCUtils.h
+--- a/dom/cache/IPCUtils.h
++++ b/dom/cache/IPCUtils.h
+@@ -34,16 +34,21 @@ namespace IPC {
+                                     mozilla::dom::RequestCredentials::Omit,
+                                     mozilla::dom::RequestCredentials::EndGuard_> {};
+   template<>
+   struct ParamTraits<mozilla::dom::RequestCache> :
+     public ContiguousEnumSerializer<mozilla::dom::RequestCache,
+                                     mozilla::dom::RequestCache::Default,
+                                     mozilla::dom::RequestCache::EndGuard_> {};
+   template<>
++  struct ParamTraits<mozilla::dom::RequestRedirect> :
++    public ContiguousEnumSerializer<mozilla::dom::RequestRedirect,
++                                    mozilla::dom::RequestRedirect::Follow,
++                                    mozilla::dom::RequestRedirect::EndGuard_> {};
++  template<>
+   struct ParamTraits<mozilla::dom::ResponseType> :
+     public ContiguousEnumSerializer<mozilla::dom::ResponseType,
+                                     mozilla::dom::ResponseType::Basic,
+                                     mozilla::dom::ResponseType::EndGuard_> {};
+   template<>
+   struct ParamTraits<mozilla::dom::cache::Namespace> :
+     public ContiguousEnumSerializer<mozilla::dom::cache::Namespace,
+                                     mozilla::dom::cache::DEFAULT_NAMESPACE,
+diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
+--- a/dom/cache/TypeUtils.cpp
++++ b/dom/cache/TypeUtils.cpp
+@@ -174,16 +174,17 @@ TypeUtils::ToCacheRequest(CacheRequest& 
+   nsRefPtr<InternalHeaders> headers = aIn->Headers();
+   MOZ_ASSERT(headers);
+   ToHeadersEntryList(aOut.headers(), headers);
+   aOut.headersGuard() = headers->Guard();
+   aOut.mode() = aIn->Mode();
+   aOut.credentials() = aIn->GetCredentialsMode();
+   aOut.contentPolicyType() = aIn->ContentPolicyType();
+   aOut.requestCache() = aIn->GetCacheMode();
++  aOut.requestRedirect() = aIn->GetRedirectMode();
+ 
+   if (aBodyAction == IgnoreBody) {
+     aOut.body() = void_t();
+     return;
+   }
+ 
+   // BodyUsed flag is checked and set previously in ToInternalRequest()
+ 
+@@ -207,18 +208,18 @@ TypeUtils::ToCacheResponseWithoutBody(Ca
+     // Pass all Response URL schemes through... The spec only requires we take
+     // action on invalid schemes for Request objects.
+     ProcessURL(aOut.url(), nullptr, nullptr, nullptr, aRv);
+     if (aRv.Failed()) {
+       return;
+     }
+   }
+ 
+-  aOut.status() = aIn.GetStatus();
+-  aOut.statusText() = aIn.GetStatusText();
++  aOut.status() = aIn.GetUnfilteredStatus();
++  aOut.statusText() = aIn.GetUnfilteredStatusText();
+   nsRefPtr<InternalHeaders> headers = aIn.UnfilteredHeaders();
+   MOZ_ASSERT(headers);
+   if (HasVaryStar(headers)) {
+     aRv.ThrowTypeError(MSG_RESPONSE_HAS_VARY_STAR);
+     return;
+   }
+   ToHeadersEntryList(aOut.headers(), headers);
+   aOut.headersGuard() = headers->Guard();
+@@ -240,17 +241,17 @@ TypeUtils::ToCacheResponse(CacheResponse
+ 
+   nsRefPtr<InternalResponse> ir = aIn.GetInternalResponse();
+   ToCacheResponseWithoutBody(aOut, *ir, aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return;
+   }
+ 
+   nsCOMPtr<nsIInputStream> stream;
+-  ir->GetInternalBody(getter_AddRefs(stream));
++  ir->GetUnfilteredBody(getter_AddRefs(stream));
+   if (stream) {
+     aIn.SetBodyUsed();
+   }
+ 
+   SerializeCacheStream(stream, &aOut.body(), aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return;
+   }
+@@ -299,27 +300,29 @@ TypeUtils::ToResponse(const CacheRespons
+     ir->SetPrincipalInfo(Move(info));
+   }
+ 
+   nsCOMPtr<nsIInputStream> stream = ReadStream::Create(aIn.body());
+   ir->SetBody(stream);
+ 
+   switch (aIn.type())
+   {
+-    case ResponseType::Default:
+-      break;
+-    case ResponseType::Opaque:
+-      ir = ir->OpaqueResponse();
+-      break;
+     case ResponseType::Basic:
+       ir = ir->BasicResponse();
+       break;
+     case ResponseType::Cors:
+       ir = ir->CORSResponse();
+       break;
++    case ResponseType::Default:
++      break;
++    case ResponseType::Opaque:
++      ir = ir->OpaqueResponse();
++      break;
++    case ResponseType::Opaqueredirect:
++      ir = ir->OpaqueRedirectResponse();
+     default:
+       MOZ_CRASH("Unexpected ResponseType!");
+   }
+   MOZ_ASSERT(ir);
+ 
+   nsRefPtr<Response> ref = new Response(GetGlobalObject(), ir);
+   return ref.forget();
+ }
+@@ -335,16 +338,17 @@ TypeUtils::ToInternalRequest(const Cache
+   url.Append(aIn.urlQuery());
+   internalRequest->SetURL(url);
+ 
+   internalRequest->SetReferrer(aIn.referrer());
+   internalRequest->SetMode(aIn.mode());
+   internalRequest->SetCredentialsMode(aIn.credentials());
+   internalRequest->SetContentPolicyType(aIn.contentPolicyType());
+   internalRequest->SetCacheMode(aIn.requestCache());
++  internalRequest->SetRedirectMode(aIn.requestRedirect());
+ 
+   nsRefPtr<InternalHeaders> internalHeaders =
+     ToInternalHeaders(aIn.headers(), aIn.headersGuard());
+   ErrorResult result;
+   internalRequest->Headers()->SetGuard(aIn.headersGuard(), result);
+   MOZ_ASSERT(!result.Failed());
+   internalRequest->Headers()->Fill(*internalHeaders, result);
+   MOZ_ASSERT(!result.Failed());
+diff --git a/dom/fetch/FetchDriver.cpp b/dom/fetch/FetchDriver.cpp
+--- a/dom/fetch/FetchDriver.cpp
++++ b/dom/fetch/FetchDriver.cpp
+@@ -837,16 +837,18 @@ FetchDriver::AsyncOnChannelRedirect(nsIC
+     rv = DoesNotRequirePreflight(aNewChannel);
+     if (NS_FAILED(rv)) {
+       NS_WARNING("FetchDriver::OnChannelRedirect: "
+                  "DoesNotRequirePreflight returned failure");
+       return rv;
+     }
+   }
+ 
++  // TODO: handle manual redirect flag
++
+   mRedirectCallback = aCallback;
+   mOldRedirectChannel = aOldChannel;
+   mNewRedirectChannel = aNewChannel;
+ 
+   nsCOMPtr<nsIChannelEventSink> outer =
+     do_GetInterface(mNotificationCallbacks);
+   if (outer) {
+     // The callee is supposed to call OnRedirectVerifyCallback() on success,
+diff --git a/dom/fetch/InternalRequest.cpp b/dom/fetch/InternalRequest.cpp
+--- a/dom/fetch/InternalRequest.cpp
++++ b/dom/fetch/InternalRequest.cpp
+@@ -75,16 +75,17 @@ InternalRequest::InternalRequest(const I
+   , mURL(aOther.mURL)
+   , mHeaders(new InternalHeaders(*aOther.mHeaders))
+   , mContentPolicyType(aOther.mContentPolicyType)
+   , mReferrer(aOther.mReferrer)
+   , mMode(aOther.mMode)
+   , mCredentialsMode(aOther.mCredentialsMode)
+   , mResponseTainting(aOther.mResponseTainting)
+   , mCacheMode(aOther.mCacheMode)
++  , mRedirectMode(aOther.mRedirectMode)
+   , mAuthenticationFlag(aOther.mAuthenticationFlag)
+   , mForceOriginHeader(aOther.mForceOriginHeader)
+   , mPreserveContentCodings(aOther.mPreserveContentCodings)
+   , mSameOriginDataURL(aOther.mSameOriginDataURL)
+   , mSandboxedStorageAreaURLs(aOther.mSandboxedStorageAreaURLs)
+   , mSkipServiceWorker(aOther.mSkipServiceWorker)
+   , mSynchronous(aOther.mSynchronous)
+   , mUnsafeRequest(aOther.mUnsafeRequest)
+diff --git a/dom/fetch/InternalRequest.h b/dom/fetch/InternalRequest.h
+--- a/dom/fetch/InternalRequest.h
++++ b/dom/fetch/InternalRequest.h
+@@ -97,16 +97,17 @@ public:
+   explicit InternalRequest()
+     : mMethod("GET")
+     , mHeaders(new InternalHeaders(HeadersGuardEnum::None))
+     , mReferrer(NS_LITERAL_STRING(kFETCH_CLIENT_REFERRER_STR))
+     , mMode(RequestMode::No_cors)
+     , mCredentialsMode(RequestCredentials::Omit)
+     , mResponseTainting(RESPONSETAINT_BASIC)
+     , mCacheMode(RequestCache::Default)
++    , mRedirectMode(RequestRedirect::Follow)
+     , mAuthenticationFlag(false)
+     , mForceOriginHeader(false)
+     , mPreserveContentCodings(false)
+       // FIXME(nsm): This should be false by default, but will lead to the
+       // algorithm never loading data: URLs right now. See Bug 1018872 about
+       // how certain contexts will override it to set it to true. Fetch
+       // specification does not handle this yet.
+     , mSameOriginDataURL(true)
+@@ -259,16 +260,28 @@ public:
+   }
+ 
+   void
+   SetCacheMode(RequestCache aCacheMode)
+   {
+     mCacheMode = aCacheMode;
+   }
+ 
++  RequestRedirect
++  GetRedirectMode() const
++  {
++    return mRedirectMode;
++  }
++
++  void
++  SetRedirectMode(RequestRedirect aRedirectMode)
++  {
++    mRedirectMode = aRedirectMode;
++  }
++
+   nsContentPolicyType
+   ContentPolicyType() const
+   {
+     return mContentPolicyType;
+   }
+ 
+   void
+   SetContentPolicyType(nsContentPolicyType aContentPolicyType);
+@@ -384,16 +397,17 @@ private:
+   // "about:client": client (default)
+   // URL: an URL
+   nsString mReferrer;
+ 
+   RequestMode mMode;
+   RequestCredentials mCredentialsMode;
+   ResponseTainting mResponseTainting;
+   RequestCache mCacheMode;
++  RequestRedirect mRedirectMode;
+ 
+   bool mAuthenticationFlag;
+   bool mForceOriginHeader;
+   bool mPreserveContentCodings;
+   bool mSameOriginDataURL;
+   bool mSandboxedStorageAreaURLs;
+   bool mSkipServiceWorker;
+   bool mSynchronous;
+diff --git a/dom/fetch/InternalResponse.cpp b/dom/fetch/InternalResponse.cpp
+--- a/dom/fetch/InternalResponse.cpp
++++ b/dom/fetch/InternalResponse.cpp
+@@ -87,26 +87,35 @@ InternalResponse::SetPrincipalInfo(Uniqu
+ 
+ already_AddRefed<InternalResponse>
+ InternalResponse::OpaqueResponse()
+ {
+   MOZ_ASSERT(!mWrappedResponse, "Can't OpaqueResponse a already wrapped response");
+   nsRefPtr<InternalResponse> response = new InternalResponse(0, EmptyCString());
+   response->mType = ResponseType::Opaque;
+   response->mTerminationReason = mTerminationReason;
+-  response->mURL = mURL;
+   response->mChannelInfo = mChannelInfo;
+   if (mPrincipalInfo) {
+     response->mPrincipalInfo = MakeUnique<mozilla::ipc::PrincipalInfo>(*mPrincipalInfo);
+   }
+   response->mWrappedResponse = this;
+   return response.forget();
+ }
+ 
+ already_AddRefed<InternalResponse>
++InternalResponse::OpaqueRedirectResponse()
++{
++  MOZ_ASSERT(!mWrappedResponse, "Can't OpaqueRedirectResponse a already wrapped response");
++  nsRefPtr<InternalResponse> response = OpaqueResponse();
++  response->mType = ResponseType::Opaqueredirect;
++  response->mURL = mURL;
++  return response.forget();
++}
++
++already_AddRefed<InternalResponse>
+ InternalResponse::CreateIncompleteCopy()
+ {
+   nsRefPtr<InternalResponse> copy = new InternalResponse(mStatus, mStatusText);
+   copy->mType = mType;
+   copy->mTerminationReason = mTerminationReason;
+   copy->mURL = mURL;
+   copy->mChannelInfo = mChannelInfo;
+   if (mPrincipalInfo) {
+diff --git a/dom/fetch/InternalResponse.h b/dom/fetch/InternalResponse.h
+--- a/dom/fetch/InternalResponse.h
++++ b/dom/fetch/InternalResponse.h
+@@ -44,29 +44,33 @@ public:
+     response->mType = ResponseType::Error;
+     return response.forget();
+   }
+ 
+   already_AddRefed<InternalResponse>
+   OpaqueResponse();
+ 
+   already_AddRefed<InternalResponse>
++  OpaqueRedirectResponse();
++
++  already_AddRefed<InternalResponse>
+   BasicResponse();
+ 
+   already_AddRefed<InternalResponse>
+   CORSResponse();
+ 
+   ResponseType
+   Type() const
+   {
+     MOZ_ASSERT_IF(mType == ResponseType::Error, !mWrappedResponse);
+     MOZ_ASSERT_IF(mType == ResponseType::Default, !mWrappedResponse);
+     MOZ_ASSERT_IF(mType == ResponseType::Basic, mWrappedResponse);
+     MOZ_ASSERT_IF(mType == ResponseType::Cors, mWrappedResponse);
+     MOZ_ASSERT_IF(mType == ResponseType::Opaque, mWrappedResponse);
++    MOZ_ASSERT_IF(mType == ResponseType::Opaqueredirect, mWrappedResponse);
+     return mType;
+   }
+ 
+   bool
+   IsError() const
+   {
+     return Type() == ResponseType::Error;
+   }
+@@ -85,22 +89,42 @@ public:
+   }
+ 
+   uint16_t
+   GetStatus() const
+   {
+     return mStatus;
+   }
+ 
++  uint16_t
++  GetUnfilteredStatus() const
++  {
++    if (mWrappedResponse) {
++      return mWrappedResponse->GetStatus();
++    }
++
++    return GetStatus();
++  }
++
+   const nsCString&
+   GetStatusText() const
+   {
+     return mStatusText;
+   }
+ 
++  const nsCString&
++  GetUnfilteredStatusText() const
++  {
++    if (mWrappedResponse) {
++      return mWrappedResponse->GetStatusText();
++    }
++
++    return GetStatusText();
++  }
++
+   InternalHeaders*
+   Headers()
+   {
+     return mHeaders;
+   }
+ 
+   InternalHeaders*
+   UnfilteredHeaders()
+@@ -108,35 +132,36 @@ public:
+     if (mWrappedResponse) {
+       return mWrappedResponse->Headers();
+     };
+ 
+     return Headers();
+   }
+ 
+   void
+-  GetInternalBody(nsIInputStream** aStream)
++  GetUnfilteredBody(nsIInputStream** aStream)
+   {
+     if (mWrappedResponse) {
+       MOZ_ASSERT(!mBody);
+       return mWrappedResponse->GetBody(aStream);
+     }
+     nsCOMPtr<nsIInputStream> stream = mBody;
+     stream.forget(aStream);
+   }
+ 
+   void
+   GetBody(nsIInputStream** aStream)
+   {
+-    if (Type() == ResponseType::Opaque) {
++    if (Type() == ResponseType::Opaque ||
++        Type() == ResponseType::Opaqueredirect) {
+       *aStream = nullptr;
+       return;
+     }
+ 
+-    return GetInternalBody(aStream);
++    return GetUnfilteredBody(aStream);
+   }
+ 
+   void
+   SetBody(nsIInputStream* aBody)
+   {
+     if (mWrappedResponse) {
+       return mWrappedResponse->SetBody(aBody);
+     }
+diff --git a/dom/fetch/Request.h b/dom/fetch/Request.h
+--- a/dom/fetch/Request.h
++++ b/dom/fetch/Request.h
+@@ -71,16 +71,22 @@ public:
+   }
+ 
+   RequestCache
+   Cache() const
+   {
+     return mRequest->GetCacheMode();
+   }
+ 
++  RequestRedirect
++  Redirect() const
++  {
++    return mRequest->GetRedirectMode();
++  }
++
+   RequestContext
+   Context() const
+   {
+     return mRequest->Context();
+   }
+ 
+   void
+   SetContentPolicyType(nsContentPolicyType aContentPolicyType)
+diff --git a/dom/webidl/Request.webidl b/dom/webidl/Request.webidl
+--- a/dom/webidl/Request.webidl
++++ b/dom/webidl/Request.webidl
+@@ -18,16 +18,17 @@ interface Request {
+   [SameObject] readonly attribute Headers headers;
+ 
+   [Func="mozilla::dom::Request::RequestContextEnabled"]
+   readonly attribute RequestContext context;
+   readonly attribute DOMString referrer;
+   readonly attribute RequestMode mode;
+   readonly attribute RequestCredentials credentials;
+   readonly attribute RequestCache cache;
++  readonly attribute RequestRedirect redirect;
+ 
+   [Throws,
+    NewObject] Request clone();
+ 
+   // Bug 1124638 - Allow chrome callers to set the context.
+   [ChromeOnly]
+   void setContentPolicyType(nsContentPolicyType context);
+ };
+@@ -35,16 +36,17 @@ Request implements Body;
+ 
+ dictionary RequestInit {
+   ByteString method;
+   HeadersInit headers;
+   BodyInit body;
+   RequestMode mode;
+   RequestCredentials credentials;
+   RequestCache cache;
++  RequestRedirect redirect;
+ };
+ 
+ // Gecko currently does not ship RequestContext, so please don't use it in IDL
+ // that is exposed to script.
+ enum RequestContext {
+   "audio", "beacon", "cspreport", "download", "embed", "eventsource", "favicon", "fetch",
+   "font", "form", "frame", "hyperlink", "iframe", "image", "imageset", "import",
+   "internal", "location", "manifest", "object", "ping", "plugin", "prefetch", "script",
+@@ -56,8 +58,9 @@ enum RequestContext {
+ // allows us to use the various conversion conveniences offered by the WebIDL
+ // codegen. The Request constructor has explicit checks to prevent it being
+ // passed as a valid value, while Request.mode never returns it. Since enums
+ // are only exposed as strings to client JS, this has the same effect as not
+ // exposing it at all.
+ enum RequestMode { "same-origin", "no-cors", "cors", "cors-with-forced-preflight" };
+ enum RequestCredentials { "omit", "same-origin", "include" };
+ enum RequestCache { "default", "no-store", "reload", "no-cache", "force-cache", "only-if-cached" };
++enum RequestRedirect { "follow", "error", "manual" };
+diff --git a/dom/webidl/Response.webidl b/dom/webidl/Response.webidl
+--- a/dom/webidl/Response.webidl
++++ b/dom/webidl/Response.webidl
+@@ -29,9 +29,9 @@ Response implements Body;
+ 
+ dictionary ResponseInit {
+   unsigned short status = 200;
+   // WebIDL spec doesn't allow default values for ByteString.
+   ByteString statusText;
+   HeadersInit headers;
+ };
+ 
+-enum ResponseType { "basic", "cors", "default", "error", "opaque" };
++enum ResponseType { "basic", "cors", "default", "error", "opaque", "opaqueredirect" };
+diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEvents.cpp
+--- a/dom/workers/ServiceWorkerEvents.cpp
++++ b/dom/workers/ServiceWorkerEvents.cpp
+@@ -125,17 +125,18 @@ public:
+       // channel info for the worker script.
+       channelInfo = mWorkerChannelInfo;
+     }
+     nsresult rv = mChannel->SetChannelInfo(&channelInfo);
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       return rv;
+     }
+ 
+-    mChannel->SynthesizeStatus(mInternalResponse->GetStatus(), mInternalResponse->GetStatusText());
++    mChannel->SynthesizeStatus(mInternalResponse->GetUnfilteredStatus(),
++                               mInternalResponse->GetUnfilteredStatusText());
+ 
+     nsAutoTArray<InternalHeaders::Entry, 5> entries;
+     mInternalResponse->UnfilteredHeaders()->GetEntries(entries);
+     for (uint32_t i = 0; i < entries.Length(); ++i) {
+        mChannel->SynthesizeHeader(entries[i].mName, entries[i].mValue);
+     }
+ 
+     rv = mChannel->FinishSynthesizedResponse();
+@@ -143,28 +144,31 @@ public:
+     return rv;
+   }
+ };
+ 
+ class RespondWithHandler final : public PromiseNativeHandler
+ {
+   nsMainThreadPtrHandle<nsIInterceptedChannel> mInterceptedChannel;
+   nsMainThreadPtrHandle<ServiceWorker> mServiceWorker;
+-  RequestMode mRequestMode;
+-  bool mIsClientRequest;
++  const RequestMode mRequestMode;
++  const bool mIsClientRequest;
++  const bool mIsNavigationRequest;
+ public:
+   NS_DECL_ISUPPORTS
+ 
+   RespondWithHandler(nsMainThreadPtrHandle<nsIInterceptedChannel>& aChannel,
+                      nsMainThreadPtrHandle<ServiceWorker>& aServiceWorker,
+-                     RequestMode aRequestMode, bool aIsClientRequest)
++                     RequestMode aRequestMode, bool aIsClientRequest,
++                     bool aIsNavigationRequest)
+     : mInterceptedChannel(aChannel)
+     , mServiceWorker(aServiceWorker)
+     , mRequestMode(aRequestMode)
+     , mIsClientRequest(aIsClientRequest)
++    , mIsNavigationRequest(aIsNavigationRequest)
+   {
+   }
+ 
+   void ResolvedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue) override;
+ 
+   void RejectedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue) override;
+ 
+   void CancelRequest(nsresult aStatus);
+@@ -265,16 +269,18 @@ RespondWithHandler::ResolvedCallback(JSC
+   }
+ 
+   // Section 4.2, step 2.2:
+   //  If one of the following conditions is true, return a network error:
+   //    * response's type is "error".
+   //    * request's mode is not "no-cors" and response's type is "opaque".
+   //    * request is a client request and response's type is neither "basic"
+   //      nor "default".
++  //    * request is not a navigation request and response's type is
++  //      "opaqueredirect".
+ 
+   if (response->Type() == ResponseType::Error) {
+     autoCancel.SetCancelStatus(NS_ERROR_INTERCEPTED_ERROR_RESPONSE);
+     return;
+   }
+ 
+   if (response->Type() == ResponseType::Opaque && mRequestMode != RequestMode::No_cors) {
+     autoCancel.SetCancelStatus(NS_ERROR_BAD_OPAQUE_INTERCEPTION_REQUEST_MODE);
+@@ -282,30 +288,35 @@ RespondWithHandler::ResolvedCallback(JSC
+   }
+ 
+   if (mIsClientRequest && response->Type() != ResponseType::Basic &&
+       response->Type() != ResponseType::Default) {
+     autoCancel.SetCancelStatus(NS_ERROR_CLIENT_REQUEST_OPAQUE_INTERCEPTION);
+     return;
+   }
+ 
++  if (!mIsNavigationRequest && response->Type() == ResponseType::Opaqueredirect) {
++    autoCancel.SetCancelStatus(NS_ERROR_BAD_OPAQUE_REDIRECT_INTERCEPTION);
++    return;
++  }
++
+   if (NS_WARN_IF(response->BodyUsed())) {
+     autoCancel.SetCancelStatus(NS_ERROR_INTERCEPTED_USED_RESPONSE);
+     return;
+   }
+ 
+   nsRefPtr<InternalResponse> ir = response->GetInternalResponse();
+   if (NS_WARN_IF(!ir)) {
+     return;
+   }
+ 
+   nsAutoPtr<RespondWithClosure> closure(
+       new RespondWithClosure(mInterceptedChannel, ir, worker->GetChannelInfo()));
+   nsCOMPtr<nsIInputStream> body;
+-  ir->GetInternalBody(getter_AddRefs(body));
++  ir->GetUnfilteredBody(getter_AddRefs(body));
+   // Errors and redirects may not have a body.
+   if (body) {
+     response->SetBodyUsed();
+ 
+     nsCOMPtr<nsIOutputStream> responseBody;
+     rv = mInterceptedChannel->GetResponseBody(getter_AddRefs(responseBody));
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       return;
+@@ -354,17 +365,17 @@ FetchEvent::RespondWith(Promise& aArg, E
+     aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+     return;
+   }
+ 
+   nsRefPtr<InternalRequest> ir = mRequest->GetInternalRequest();
+   mWaitToRespond = true;
+   nsRefPtr<RespondWithHandler> handler =
+     new RespondWithHandler(mChannel, mServiceWorker, mRequest->Mode(),
+-                           ir->IsClientRequest());
++                           ir->IsClientRequest(), ir->IsNavigationRequest());
+   aArg.AppendNativeHandler(handler);
+ }
+ 
+ already_AddRefed<ServiceWorkerClient>
+ FetchEvent::GetClient()
+ {
+   if (!mClient) {
+     if (!mClientInfo) {
+diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
+--- a/dom/workers/ServiceWorkerManager.cpp
++++ b/dom/workers/ServiceWorkerManager.cpp
+@@ -3675,16 +3675,20 @@ private:
+     MOZ_ASSERT(internalReq);
+     internalReq->SetCreatedByFetchEvent();
+ 
+     internalReq->SetBody(mUploadStream);
+     internalReq->SetReferrer(NS_ConvertUTF8toUTF16(mReferrer));
+ 
+     request->SetContentPolicyType(mContentPolicyType);
+ 
++    if (internalReq->IsNavigationRequest()) {
++      internalReq->SetRedirectMode(RequestRedirect::Manual);
++    }
++
+     RootedDictionary<FetchEventInit> init(aCx);
+     init.mRequest.Construct();
+     init.mRequest.Value() = request;
+     init.mBubbles = false;
+     init.mCancelable = true;
+     init.mIsReload.Construct(mIsReload);
+     nsRefPtr<FetchEvent> event =
+       FetchEvent::Constructor(globalObj, NS_LITERAL_STRING("fetch"), init, result);
+diff --git a/xpcom/base/ErrorList.h b/xpcom/base/ErrorList.h
+--- a/xpcom/base/ErrorList.h
++++ b/xpcom/base/ErrorList.h
+@@ -328,16 +328,18 @@
+   /* Attempt to return opaque response for anything but "non-cors" request */
+   ERROR(NS_ERROR_BAD_OPAQUE_INTERCEPTION_REQUEST_MODE, FAILURE(102)),
+   /* Service worker intercepted with an error response */
+   ERROR(NS_ERROR_INTERCEPTED_ERROR_RESPONSE,           FAILURE(103)),
+   /* Service worker intercepted with a response with bodyUsed set to true */
+   ERROR(NS_ERROR_INTERCEPTED_USED_RESPONSE,            FAILURE(104)),
+   /* Service worker intercepted a client request with an opaque response */
+   ERROR(NS_ERROR_CLIENT_REQUEST_OPAQUE_INTERCEPTION,   FAILURE(105)),
++  /* Service worker intercepted a non-navigation with an opaque redirect */
++  ERROR(NS_ERROR_BAD_OPAQUE_REDIRECT_INTERCEPTION,     FAILURE(106)),
+ #undef MODULE
+ 
+ 
+   /* ======================================================================= */
+   /* 7: NS_ERROR_MODULE_PLUGINS */
+   /* ======================================================================= */
+ #define MODULE NS_ERROR_MODULE_PLUGINS
+   ERROR(NS_ERROR_PLUGINS_PLUGINSNOTCHANGED,        FAILURE(1000)),
