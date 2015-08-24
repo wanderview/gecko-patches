@@ -1,0 +1,219 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  8ac1384cdf937f7c39834136f51f6fa28fb12af6
+
+diff --git a/dom/cache/DBMigration.cpp b/dom/cache/DBMigration.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/DBMigration.cpp
+@@ -0,0 +1,94 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "mozilla/dom/cache/DBMigration.h"
++
++#include "mozilla/DebugOnly.h"
++#include "mozilla/dom/cache/DBSchema.h"
++
++namespace mozilla {
++namespace dom {
++namespace cache {
++namespace db {
++
++namespace {
++
++typedef nsresult (*MigrationFunc)(mozIStorageConnection*);
++struct Migration
++{
++  Migration(int32_t aFromVersion, MigrationFunc aFunc)
++    : mFromVersion(aFromVersion)
++    , mFunc(aFunc)
++  { }
++  int32_t mFromVersion;
++  MigrationFunc mFunc;
++};
++
++nsresult MigrateFromVersion15(mozIStorageConnection* aConn);
++
++Migration sMigrationList[] = {
++  Migration(15, MigrateFromVersion15),
++};
++
++uint32_t sMigrationListLength = sizeof(sMigrationList) / sizeof(Migration);
++
++} // anonymous namespace
++
++nsresult
++Migrate(mozIStorageConnection* aConn)
++{
++  MOZ_ASSERT(!NS_IsMainThread());
++  MOZ_ASSERT(aConn);
++
++  int32_t currentVersion = 0;
++  nsresult rv = aConn->GetSchemaVersion(&currentVersion);
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  while (currentVersion < kLatestSchemaVersion) {
++    // Wiping old databases is handled in DBAction.  Make sure we don't
++    // accidentally get here for one of those old databases.
++    MOZ_ASSERT(currentVersion >= kMaxWipeSchemaVersion);
++
++    for (uint32_t i = 0; i < sMigrationListLength; ++i) {
++      if (sMigrationList[i].mFromVersion == currentVersion) {
++        rv = sMigrationList[i].mFunc(aConn);
++        if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++        break;
++      }
++    }
++
++    DebugOnly<int32_t> lastVersion = currentVersion;
++    rv = aConn->GetSchemaVersion(&currentVersion);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++    MOZ_ASSERT(currentVersion > lastVersion);
++  }
++
++  MOZ_ASSERT(currentVersion == kLatestSchemaVersion);
++
++  return rv;
++}
++
++namespace {
++
++nsresult MigrateFromVersion15(mozIStorageConnection* aConn)
++{
++  MOZ_ASSERT(!NS_IsMainThread());
++  MOZ_ASSERT(aConn);
++
++  nsresult rv = aConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING(
++    "PRAGMA foreign_keys=OFF;"
++  ));
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  return rv;
++}
++
++} // anonymous namespace
++
++} // namespace db
++} // namespace cache
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/cache/DBMigration.h b/dom/cache/DBMigration.h
+new file mode 100644
+--- /dev/null
++++ b/dom/cache/DBMigration.h
+@@ -0,0 +1,25 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_cache_DBMigration_h
++#define mozilla_dom_cache_DBMigration_h
++
++class mozIStorageConnection;
++
++namespace mozilla {
++namespace dom {
++namespace cache {
++namespace db {
++
++nsresult
++Migrate(mozIStorageConnection* aConn);
++
++} // namespace db
++} // namespace cache
++} // namespace dom
++} // namespace mozilla
++
++#endif // mozilla_dom_cache_DBMigration_h
+diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
+--- a/dom/cache/DBSchema.cpp
++++ b/dom/cache/DBSchema.cpp
+@@ -29,19 +29,21 @@
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ namespace db {
+ 
+ // This should not be changed any more.  Write a migration instead.
+ const int32_t kMaxWipeSchemaVersion = 15;
+ 
++// Update this whenever the schema is changed.
++const int32_t kLatestSchemaVersion = 16;
++
+ namespace {
+ 
+-const int32_t kLatestSchemaVersion = 16;
+ const int32_t kMaxEntriesPerStatement = 255;
+ 
+ const uint32_t kPageSize = 4 * 1024;
+ 
+ // Grow the database in chunks to reduce fragmentation
+ const uint32_t kGrowthSize = 32 * 1024;
+ const uint32_t kGrowthPages = kGrowthSize / kPageSize;
+ static_assert(kGrowthSize % kPageSize == 0,
+diff --git a/dom/cache/DBSchema.h b/dom/cache/DBSchema.h
+--- a/dom/cache/DBSchema.h
++++ b/dom/cache/DBSchema.h
+@@ -114,14 +114,17 @@ StorageGetKeys(mozIStorageConnection* aC
+ 
+ // Note, this works best when its NOT executed within a transaction.
+ nsresult
+ IncrementalVacuum(mozIStorageConnection* aConn);
+ 
+ // We will wipe out databases with a schema versions less than this.
+ extern const int32_t kMaxWipeSchemaVersion;
+ 
++// The latest DB schema version.
++extern const int32_t kLatestSchemaVersion;
++
+ } // namespace db
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_cache_DBSchema_h
+diff --git a/dom/cache/moz.build b/dom/cache/moz.build
+--- a/dom/cache/moz.build
++++ b/dom/cache/moz.build
+@@ -19,16 +19,17 @@ EXPORTS.mozilla.dom.cache += [
+     'CacheStorage.h',
+     'CacheStorageChild.h',
+     'CacheStorageParent.h',
+     'CacheStreamControlChild.h',
+     'CacheStreamControlParent.h',
+     'Connection.h',
+     'Context.h',
+     'DBAction.h',
++    'DBMigration.h',
+     'DBSchema.h',
+     'Feature.h',
+     'FileUtils.h',
+     'IPCUtils.h',
+     'Manager.h',
+     'ManagerId.h',
+     'PrincipalVerifier.h',
+     'QuotaClient.h',
+@@ -54,16 +55,17 @@ UNIFIED_SOURCES += [
+     'CacheStorage.cpp',
+     'CacheStorageChild.cpp',
+     'CacheStorageParent.cpp',
+     'CacheStreamControlChild.cpp',
+     'CacheStreamControlParent.cpp',
+     'Connection.cpp',
+     'Context.cpp',
+     'DBAction.cpp',
++    'DBMigration.cpp',
+     'DBSchema.cpp',
+     'Feature.cpp',
+     'FileUtils.cpp',
+     'Manager.cpp',
+     'ManagerId.cpp',
+     'PrincipalVerifier.cpp',
+     'QuotaClient.cpp',
+     'ReadStream.cpp',
