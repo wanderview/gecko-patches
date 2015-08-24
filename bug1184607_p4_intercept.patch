@@ -1,0 +1,361 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  34b34351fcc54fc3635cfef6681f9f4614fdbd1b
+Bug 1184607 P4 Handle the RequestRedirect mode during service worker interception. r=nsm
+
+diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
+--- a/docshell/base/nsDocShell.cpp
++++ b/docshell/base/nsDocShell.cpp
+@@ -5066,16 +5066,17 @@ nsDocShell::DisplayLoadError(nsresult aE
+         error.AssignLiteral("corruptedContentError");
+         break;
+       case NS_ERROR_INTERCEPTION_FAILED:
+       case NS_ERROR_OPAQUE_INTERCEPTION_DISABLED:
+       case NS_ERROR_BAD_OPAQUE_INTERCEPTION_REQUEST_MODE:
+       case NS_ERROR_INTERCEPTED_ERROR_RESPONSE:
+       case NS_ERROR_INTERCEPTED_USED_RESPONSE:
+       case NS_ERROR_CLIENT_REQUEST_OPAQUE_INTERCEPTION:
++      case NS_ERROR_BAD_OPAQUE_REDIRECT_INTERCEPTION:
+         // ServiceWorker intercepted request, but something went wrong.
+         nsContentUtils::MaybeReportInterceptionErrorToConsole(GetDocument(),
+                                                               aError);
+         error.AssignLiteral("corruptedContentError");
+         break;
+       default:
+         break;
+     }
+diff --git a/dom/base/nsContentUtils.cpp b/dom/base/nsContentUtils.cpp
+--- a/dom/base/nsContentUtils.cpp
++++ b/dom/base/nsContentUtils.cpp
+@@ -3432,16 +3432,18 @@ nsContentUtils::MaybeReportInterceptionE
+   } else if (aError == NS_ERROR_BAD_OPAQUE_INTERCEPTION_REQUEST_MODE) {
+     messageName = "BadOpaqueInterceptionRequestMode";
+   } else if (aError == NS_ERROR_INTERCEPTED_ERROR_RESPONSE) {
+     messageName = "InterceptedErrorResponse";
+   } else if (aError == NS_ERROR_INTERCEPTED_USED_RESPONSE) {
+     messageName = "InterceptedUsedResponse";
+   } else if (aError == NS_ERROR_CLIENT_REQUEST_OPAQUE_INTERCEPTION) {
+     messageName = "ClientRequestOpaqueInterception";
++  } else if (aError == NS_ERROR_BAD_OPAQUE_REDIRECT_INTERCEPTION) {
++    messageName = "BadOpaqueRedirectInterception";
+   }
+ 
+   if (messageName) {
+     return ReportToConsole(nsIScriptError::warningFlag,
+                            NS_LITERAL_CSTRING("Service Worker Interception"),
+                            aDocument,
+                            nsContentUtils::eDOM_PROPERTIES,
+                            messageName);
+diff --git a/dom/locales/en-US/chrome/dom/dom.properties b/dom/locales/en-US/chrome/dom/dom.properties
+--- a/dom/locales/en-US/chrome/dom/dom.properties
++++ b/dom/locales/en-US/chrome/dom/dom.properties
+@@ -168,10 +168,12 @@ InterceptionFailed=ServiceWorker network
+ # LOCALIZATION NOTE: Do not translate "ServiceWorker", "FetchEvent.respondWith()", "opaque", or "Response".
+ OpaqueInterceptionDisabled=A ServiceWorker passed an opaque Response to FetchEvent.respondWith() while opaque interception is disabled.
+ # LOCALIZATION NOTE: Do not translate "ServiceWorker", "FetchEvent.respondWith()", "FetchEvent.request.type", "same-origin", "cors", "no-cors", "opaque", "Response", or "RequestMode".
+ BadOpaqueInterceptionRequestMode=A ServiceWorker passed an opaque Response to FetchEvent.respondWith() while the FetchEvent.request.type was either "same-origin" or "cors". Opaque Response objects are only valid when the RequestMode is "no-cors".
+ # LOCALIZATION NOTE: Do not translate "ServiceWorker", "Error", "Response", "FetchEvent.respondWith()", or "fetch()".
+ InterceptedErrorResponse=A ServiceWorker passed an Error Response to FetchEvent.respondWith(). This typically means the ServiceWorker performed an invalid fetch() call.
+ # LOCALIZATION NOTE: Do not translate "ServiceWorker", "Response", "FetchEvent.respondWith()", or "Response.clone()".
+ InterceptedUsedResponse=A ServiceWorker passed a used Response to FetchEvent.respondWith(). The body of a Response may only be read once. Use Response.clone() to access the body multiple times.
+-# LOCALIZATION NOTE: Do not translate "ServiceWorker", "Response", "FetchEvent.respondWith()", "FetchEvent.request", or "Worker".
++# LOCALIZATION NOTE: Do not translate "ServiceWorker", "opaque", "Response", "FetchEvent.respondWith()", "FetchEvent.request", or "Worker".
+ ClientRequestOpaqueInterception=A ServiceWorker passed an opaque Response to FetchEvent.respondWith() while FetchEvent.request was a client request. A client request is generally a browser navigation or top-level Worker script.
++# LOCALIZATION NOTE: Do not translate "ServiceWorker", "opaqueredirect", "Response", "FetchEvent.respondWith()", or "FetchEvent.request".
++BadOpaqueRedirectInterception=A ServiceWorker passed an opaqueredirect Response to FetchEvent.respondWith() while FetchEvent.request was not a navigation request.
+diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEvents.cpp
+--- a/dom/workers/ServiceWorkerEvents.cpp
++++ b/dom/workers/ServiceWorkerEvents.cpp
+@@ -125,17 +125,18 @@ public:
+       // channel info for the worker script.
+       channelInfo = mWorkerChannelInfo;
+     }
+     nsresult rv = mChannel->SetChannelInfo(&channelInfo);
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       return rv;
+     }
+ 
+-    mChannel->SynthesizeStatus(mInternalResponse->GetStatus(), mInternalResponse->GetStatusText());
++    mChannel->SynthesizeStatus(mInternalResponse->GetUnfilteredStatus(),
++                               mInternalResponse->GetUnfilteredStatusText());
+ 
+     nsAutoTArray<InternalHeaders::Entry, 5> entries;
+     mInternalResponse->UnfilteredHeaders()->GetEntries(entries);
+     for (uint32_t i = 0; i < entries.Length(); ++i) {
+        mChannel->SynthesizeHeader(entries[i].mName, entries[i].mValue);
+     }
+ 
+     rv = mChannel->FinishSynthesizedResponse();
+@@ -143,28 +144,31 @@ public:
+     return rv;
+   }
+ };
+ 
+ class RespondWithHandler final : public PromiseNativeHandler
+ {
+   nsMainThreadPtrHandle<nsIInterceptedChannel> mInterceptedChannel;
+   nsMainThreadPtrHandle<ServiceWorker> mServiceWorker;
+-  RequestMode mRequestMode;
+-  bool mIsClientRequest;
++  const RequestMode mRequestMode;
++  const bool mIsClientRequest;
++  const bool mIsNavigationRequest;
+ public:
+   NS_DECL_ISUPPORTS
+ 
+   RespondWithHandler(nsMainThreadPtrHandle<nsIInterceptedChannel>& aChannel,
+                      nsMainThreadPtrHandle<ServiceWorker>& aServiceWorker,
+-                     RequestMode aRequestMode, bool aIsClientRequest)
++                     RequestMode aRequestMode, bool aIsClientRequest,
++                     bool aIsNavigationRequest)
+     : mInterceptedChannel(aChannel)
+     , mServiceWorker(aServiceWorker)
+     , mRequestMode(aRequestMode)
+     , mIsClientRequest(aIsClientRequest)
++    , mIsNavigationRequest(aIsNavigationRequest)
+   {
+   }
+ 
+   void ResolvedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue) override;
+ 
+   void RejectedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue) override;
+ 
+   void CancelRequest(nsresult aStatus);
+@@ -265,47 +269,56 @@ RespondWithHandler::ResolvedCallback(JSC
+   }
+ 
+   // Section 4.2, step 2.2:
+   //  If one of the following conditions is true, return a network error:
+   //    * response's type is "error".
+   //    * request's mode is not "no-cors" and response's type is "opaque".
+   //    * request is a client request and response's type is neither "basic"
+   //      nor "default".
++  //    * request is not a navigation request and response's type is
++  //      "opaqueredirect".
+ 
+   if (response->Type() == ResponseType::Error) {
+     autoCancel.SetCancelStatus(NS_ERROR_INTERCEPTED_ERROR_RESPONSE);
+     return;
+   }
+ 
+   if (response->Type() == ResponseType::Opaque && mRequestMode != RequestMode::No_cors) {
+     autoCancel.SetCancelStatus(NS_ERROR_BAD_OPAQUE_INTERCEPTION_REQUEST_MODE);
+     return;
+   }
+ 
++  // TODO: remove this case as its no longer in the spec (bug 1184967)
+   if (mIsClientRequest && response->Type() != ResponseType::Basic &&
+-      response->Type() != ResponseType::Default) {
++      response->Type() != ResponseType::Default &&
++      response->Type() != ResponseType::Opaqueredirect) {
+     autoCancel.SetCancelStatus(NS_ERROR_CLIENT_REQUEST_OPAQUE_INTERCEPTION);
+     return;
+   }
+ 
++  if (!mIsNavigationRequest && response->Type() == ResponseType::Opaqueredirect) {
++    autoCancel.SetCancelStatus(NS_ERROR_BAD_OPAQUE_REDIRECT_INTERCEPTION);
++    return;
++  }
++
+   if (NS_WARN_IF(response->BodyUsed())) {
+     autoCancel.SetCancelStatus(NS_ERROR_INTERCEPTED_USED_RESPONSE);
+     return;
+   }
+ 
+   nsRefPtr<InternalResponse> ir = response->GetInternalResponse();
+   if (NS_WARN_IF(!ir)) {
+     return;
+   }
+ 
+   nsAutoPtr<RespondWithClosure> closure(
+       new RespondWithClosure(mInterceptedChannel, ir, worker->GetChannelInfo()));
+   nsCOMPtr<nsIInputStream> body;
+-  ir->GetInternalBody(getter_AddRefs(body));
++  ir->GetUnfilteredBody(getter_AddRefs(body));
+   // Errors and redirects may not have a body.
+   if (body) {
+     response->SetBodyUsed();
+ 
+     nsCOMPtr<nsIOutputStream> responseBody;
+     rv = mInterceptedChannel->GetResponseBody(getter_AddRefs(responseBody));
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       return;
+@@ -354,17 +367,17 @@ FetchEvent::RespondWith(Promise& aArg, E
+     aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+     return;
+   }
+ 
+   nsRefPtr<InternalRequest> ir = mRequest->GetInternalRequest();
+   mWaitToRespond = true;
+   nsRefPtr<RespondWithHandler> handler =
+     new RespondWithHandler(mChannel, mServiceWorker, mRequest->Mode(),
+-                           ir->IsClientRequest());
++                           ir->IsClientRequest(), ir->IsNavigationRequest());
+   aArg.AppendNativeHandler(handler);
+ }
+ 
+ already_AddRefed<ServiceWorkerClient>
+ FetchEvent::GetClient()
+ {
+   if (!mClient) {
+     if (!mClientInfo) {
+diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
+--- a/dom/workers/ServiceWorkerManager.cpp
++++ b/dom/workers/ServiceWorkerManager.cpp
+@@ -3631,32 +3631,34 @@ class FetchEventRunnable : public Worker
+   nsMainThreadPtrHandle<ServiceWorker> mServiceWorker;
+   nsTArray<nsCString> mHeaderNames;
+   nsTArray<nsCString> mHeaderValues;
+   nsAutoPtr<ServiceWorkerClientInfo> mClientInfo;
+   nsCString mSpec;
+   nsCString mMethod;
+   bool mIsReload;
+   RequestMode mRequestMode;
++  RequestRedirect mRequestRedirect;
+   RequestCredentials mRequestCredentials;
+   nsContentPolicyType mContentPolicyType;
+   nsCOMPtr<nsIInputStream> mUploadStream;
+   nsCString mReferrer;
+ public:
+   FetchEventRunnable(WorkerPrivate* aWorkerPrivate,
+                      nsMainThreadPtrHandle<nsIInterceptedChannel>& aChannel,
+                      nsMainThreadPtrHandle<ServiceWorker>& aServiceWorker,
+                      nsAutoPtr<ServiceWorkerClientInfo>& aClientInfo,
+                      bool aIsReload)
+     : WorkerRunnable(aWorkerPrivate, WorkerThreadModifyBusyCount)
+     , mInterceptedChannel(aChannel)
+     , mServiceWorker(aServiceWorker)
+     , mClientInfo(aClientInfo)
+     , mIsReload(aIsReload)
+     , mRequestMode(RequestMode::No_cors)
++    , mRequestRedirect(RequestRedirect::Follow)
+     // By default we set it to same-origin since normal HTTP fetches always
+     // send credentials to same-origin websites unless explicitly forbidden.
+     , mRequestCredentials(RequestCredentials::Same_origin)
+     , mContentPolicyType(nsIContentPolicy::TYPE_INVALID)
+     , mReferrer(kFETCH_CLIENT_REFERRER_STR)
+   {
+     MOZ_ASSERT(aWorkerPrivate);
+   }
+@@ -3708,33 +3710,49 @@ public:
+     nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(channel);
+     if (httpChannel) {
+       rv = httpChannel->GetRequestMethod(mMethod);
+       NS_ENSURE_SUCCESS(rv, rv);
+ 
+       nsCOMPtr<nsIHttpChannelInternal> internalChannel = do_QueryInterface(httpChannel);
+       NS_ENSURE_TRUE(internalChannel, NS_ERROR_NOT_AVAILABLE);
+ 
+-      uint32_t mode;
+-      internalChannel->GetCorsMode(&mode);
+-      switch (mode) {
++      uint32_t corsMode;
++      internalChannel->GetCorsMode(&corsMode);
++      switch (corsMode) {
+         case nsIHttpChannelInternal::CORS_MODE_SAME_ORIGIN:
+           mRequestMode = RequestMode::Same_origin;
+           break;
+         case nsIHttpChannelInternal::CORS_MODE_NO_CORS:
+           mRequestMode = RequestMode::No_cors;
+           break;
+         case nsIHttpChannelInternal::CORS_MODE_CORS:
+         case nsIHttpChannelInternal::CORS_MODE_CORS_WITH_FORCED_PREFLIGHT:
+           mRequestMode = RequestMode::Cors;
+           break;
+         default:
+           MOZ_CRASH("Unexpected CORS mode");
+       }
+ 
++      uint32_t redirectMode;
++      internalChannel->GetRedirectMode(&redirectMode);
++      switch (redirectMode) {
++        case nsIHttpChannelInternal::REDIRECT_MODE_FOLLOW:
++          mRequestRedirect = RequestRedirect::Follow;
++          break;
++        case nsIHttpChannelInternal::REDIRECT_MODE_ERROR:
++          mRequestRedirect = RequestRedirect::Error;
++          break;
++        case nsIHttpChannelInternal::REDIRECT_MODE_MANUAL:
++          mRequestRedirect = RequestRedirect::Manual;
++          break;
++        default:
++          MOZ_CRASH("Unexpected redirect mode");
++      }
++
+       if (loadFlags & nsIRequest::LOAD_ANONYMOUS) {
+         mRequestCredentials = RequestCredentials::Omit;
+       } else {
+         bool includeCrossOrigin;
+         internalChannel->GetCorsIncludeCredentials(&includeCrossOrigin);
+         if (includeCrossOrigin) {
+           mRequestCredentials = RequestCredentials::Include;
+         }
+@@ -3817,16 +3835,17 @@ private:
+       }
+     }
+ 
+     nsRefPtr<Headers> headers = new Headers(globalObj.GetAsSupports(), internalHeaders);
+     reqInit.mHeaders.Construct();
+     reqInit.mHeaders.Value().SetAsHeaders() = headers;
+ 
+     reqInit.mMode.Construct(mRequestMode);
++    reqInit.mRedirect.Construct(mRequestRedirect);
+     reqInit.mCredentials.Construct(mRequestCredentials);
+ 
+     ErrorResult result;
+     nsRefPtr<Request> request = Request::Constructor(globalObj, requestInfo, reqInit, result);
+     if (NS_WARN_IF(result.Failed())) {
+       result.SuppressException();
+       return false;
+     }
+@@ -3835,16 +3854,28 @@ private:
+     MOZ_ASSERT(internalReq);
+     internalReq->SetCreatedByFetchEvent();
+ 
+     internalReq->SetBody(mUploadStream);
+     internalReq->SetReferrer(NS_ConvertUTF8toUTF16(mReferrer));
+ 
+     request->SetContentPolicyType(mContentPolicyType);
+ 
++#if DEBUG
++    nsCOMPtr<nsIChannel> channel;
++    MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
++      mInterceptedChannel->GetChannel(getter_AddRefs(channel))));
++    nsCOMPtr<nsIHttpChannel> http = do_QueryInterface(channel);
++
++    // TODO: remove conditional on http here once app protocol support is
++    //       removed service worker interception
++    MOZ_ASSERT_IF(http && internalReq->IsNavigationRequest(),
++                  request->Redirect() == RequestRedirect::Manual);
++#endif // DEBUG
++
+     RootedDictionary<FetchEventInit> init(aCx);
+     init.mRequest.Construct();
+     init.mRequest.Value() = request;
+     init.mBubbles = false;
+     init.mCancelable = true;
+     init.mIsReload.Construct(mIsReload);
+     nsRefPtr<FetchEvent> event =
+       FetchEvent::Constructor(globalObj, NS_LITERAL_STRING("fetch"), init, result);
+diff --git a/xpcom/base/ErrorList.h b/xpcom/base/ErrorList.h
+--- a/xpcom/base/ErrorList.h
++++ b/xpcom/base/ErrorList.h
+@@ -328,16 +328,18 @@
+   /* Attempt to return opaque response for anything but "non-cors" request */
+   ERROR(NS_ERROR_BAD_OPAQUE_INTERCEPTION_REQUEST_MODE, FAILURE(102)),
+   /* Service worker intercepted with an error response */
+   ERROR(NS_ERROR_INTERCEPTED_ERROR_RESPONSE,           FAILURE(103)),
+   /* Service worker intercepted with a response with bodyUsed set to true */
+   ERROR(NS_ERROR_INTERCEPTED_USED_RESPONSE,            FAILURE(104)),
+   /* Service worker intercepted a client request with an opaque response */
+   ERROR(NS_ERROR_CLIENT_REQUEST_OPAQUE_INTERCEPTION,   FAILURE(105)),
++  /* Service worker intercepted a non-navigation with an opaque redirect */
++  ERROR(NS_ERROR_BAD_OPAQUE_REDIRECT_INTERCEPTION,     FAILURE(106)),
+ #undef MODULE
+ 
+ 
+   /* ======================================================================= */
+   /* 7: NS_ERROR_MODULE_PLUGINS */
+   /* ======================================================================= */
+ #define MODULE NS_ERROR_MODULE_PLUGINS
+   ERROR(NS_ERROR_PLUGINS_PLUGINSNOTCHANGED,        FAILURE(1000)),
