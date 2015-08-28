@@ -1,0 +1,165 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  7bb9a10b71a37709a23d3fee4a1d867a5d72bdf1
+Bug 1184607 P7.6 Expose CacheStorage .caches property on xpcshell global. r=smaug
+
+diff --git a/dom/cache/CacheStorage.cpp b/dom/cache/CacheStorage.cpp
+--- a/dom/cache/CacheStorage.cpp
++++ b/dom/cache/CacheStorage.cpp
+@@ -228,16 +228,52 @@ CacheStorage::CreateOnWorker(Namespace a
+     return ref.forget();
+   }
+ 
+   nsRefPtr<CacheStorage> ref = new CacheStorage(aNamespace, aGlobal,
+                                                 principalInfo, feature);
+   return ref.forget();
+ }
+ 
++// static
++bool
++CacheStorage::DefineCaches(JSContext* aCx, JS::Handle<JSObject*> aGlobal)
++{
++  MOZ_ASSERT(NS_IsMainThread());
++  MOZ_ASSERT(js::GetObjectClass(aGlobal)->flags & JSCLASS_DOM_GLOBAL,
++             "Passed object is not a global object!");
++
++  if (NS_WARN_IF(!CacheStorageBinding::GetConstructorObject(aCx, aGlobal) ||
++                 !CacheBinding::GetConstructorObject(aCx, aGlobal))) {
++    return false;
++  }
++
++  nsIPrincipal* principal = nsContentUtils::ObjectPrincipal(aGlobal);
++  MOZ_ASSERT(principal);
++
++  ErrorResult rv;
++  nsRefPtr<CacheStorage> storage =
++    CreateOnMainThread(DEFAULT_NAMESPACE, xpc::NativeGlobal(aGlobal), principal,
++                       false, /* private browsing */
++                       true,  /* force trusted */
++                       rv);
++  if (NS_WARN_IF(rv.Failed())) {
++    rv.SuppressException();
++    return false;
++  }
++
++  JS::Rooted<JS::Value> caches(aCx);
++  js::AssertSameCompartment(aCx, aGlobal);
++  if (NS_WARN_IF(!GetOrCreateDOMReflector(aCx, storage, &caches))) {
++    return false;
++  }
++
++  return JS_DefineProperty(aCx, aGlobal, "caches", caches, JSPROP_ENUMERATE);
++}
++
+ CacheStorage::CacheStorage(Namespace aNamespace, nsIGlobalObject* aGlobal,
+                            const PrincipalInfo& aPrincipalInfo, Feature* aFeature)
+   : mNamespace(aNamespace)
+   , mGlobal(aGlobal)
+   , mPrincipalInfo(MakeUnique<PrincipalInfo>(aPrincipalInfo))
+   , mFeature(aFeature)
+   , mActor(nullptr)
+   , mStatus(NS_OK)
+diff --git a/dom/cache/CacheStorage.h b/dom/cache/CacheStorage.h
+--- a/dom/cache/CacheStorage.h
++++ b/dom/cache/CacheStorage.h
+@@ -51,16 +51,19 @@ public:
+   CreateOnMainThread(Namespace aNamespace, nsIGlobalObject* aGlobal,
+                      nsIPrincipal* aPrincipal, bool aPrivateBrowsing,
+                      bool aForceTrustedOrigin, ErrorResult& aRv);
+ 
+   static already_AddRefed<CacheStorage>
+   CreateOnWorker(Namespace aNamespace, nsIGlobalObject* aGlobal,
+                  workers::WorkerPrivate* aWorkerPrivate, ErrorResult& aRv);
+ 
++  static bool
++  DefineCaches(JSContext* aCx, JS::Handle<JSObject*> aGlobal);
++
+   // webidl interface methods
+   already_AddRefed<Promise> Match(const RequestOrUSVString& aRequest,
+                                   const CacheQueryOptions& aOptions,
+                                   ErrorResult& aRv);
+   already_AddRefed<Promise> Has(const nsAString& aKey, ErrorResult& aRv);
+   already_AddRefed<Promise> Open(const nsAString& aKey, ErrorResult& aRv);
+   already_AddRefed<Promise> Delete(const nsAString& aKey, ErrorResult& aRv);
+   already_AddRefed<Promise> Keys(ErrorResult& aRv);
+diff --git a/js/xpconnect/src/Sandbox.cpp b/js/xpconnect/src/Sandbox.cpp
+--- a/js/xpconnect/src/Sandbox.cpp
++++ b/js/xpconnect/src/Sandbox.cpp
+@@ -25,16 +25,17 @@
+ #include "nsXMLHttpRequest.h"
+ #include "WrapperFactory.h"
+ #include "xpcprivate.h"
+ #include "XPCWrapper.h"
+ #include "XrayWrapper.h"
+ #include "Crypto.h"
+ #include "mozilla/dom/BindingUtils.h"
+ #include "mozilla/dom/BlobBinding.h"
++#include "mozilla/dom/cache/CacheStorage.h"
+ #include "mozilla/dom/CSSBinding.h"
+ #include "mozilla/dom/indexedDB/IndexedDatabaseManager.h"
+ #include "mozilla/dom/Fetch.h"
+ #include "mozilla/dom/FileBinding.h"
+ #include "mozilla/dom/PromiseBinding.h"
+ #include "mozilla/dom/RequestBinding.h"
+ #include "mozilla/dom/ResponseBinding.h"
+ #ifdef MOZ_WEBRTC
+@@ -903,16 +904,18 @@ xpc::GlobalProperties::Parse(JSContext* 
+         } else if (!strcmp(name.ptr(), "crypto")) {
+             crypto = true;
+ #ifdef MOZ_WEBRTC
+         } else if (!strcmp(name.ptr(), "rtcIdentityProvider")) {
+             rtcIdentityProvider = true;
+ #endif
+         } else if (!strcmp(name.ptr(), "fetch")) {
+             fetch = true;
++        } else if (!strcmp(name.ptr(), "caches")) {
++            caches = true;
+         } else {
+             JS_ReportError(cx, "Unknown property name: %s", name.ptr());
+             return false;
+         }
+     }
+     return true;
+ }
+ 
+@@ -968,16 +971,19 @@ xpc::GlobalProperties::Define(JSContext*
+ #ifdef MOZ_WEBRTC
+     if (rtcIdentityProvider && !SandboxCreateRTCIdentityProvider(cx, obj))
+         return false;
+ #endif
+ 
+     if (fetch && !SandboxCreateFetch(cx, obj))
+         return false;
+ 
++    if (caches && !dom::cache::CacheStorage::DefineCaches(cx, obj))
++        return false;
++
+     return true;
+ }
+ 
+ nsresult
+ xpc::CreateSandboxObject(JSContext* cx, MutableHandleValue vp, nsISupports* prinOrSop,
+                          SandboxOptions& options)
+ {
+     // Create the sandbox global object
+diff --git a/js/xpconnect/src/xpcprivate.h b/js/xpconnect/src/xpcprivate.h
+--- a/js/xpconnect/src/xpcprivate.h
++++ b/js/xpconnect/src/xpcprivate.h
+@@ -3413,16 +3413,17 @@ struct GlobalProperties {
+     bool URLSearchParams : 1;
+     bool atob : 1;
+     bool btoa : 1;
+     bool Blob : 1;
+     bool File : 1;
+     bool crypto : 1;
+     bool rtcIdentityProvider : 1;
+     bool fetch : 1;
++    bool caches : 1;
+ };
+ 
+ // Infallible.
+ already_AddRefed<nsIXPCComponents_utils_Sandbox>
+ NewSandboxConstructor();
+ 
+ // Returns true if class of 'obj' is SandboxClass.
+ bool
