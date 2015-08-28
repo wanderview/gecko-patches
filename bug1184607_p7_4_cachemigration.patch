@@ -1,12 +1,51 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  41f3c5989bba3cc41e4ad8410487b39b1c27b3f1
+# Parent  84c73dea0aae427667ee977eed74bc6122cfb3de
 Bug 1184607 P7.4 Infrastructure for running Cache schema migrations. r=ehsan
 
 diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
 --- a/dom/cache/DBSchema.cpp
 +++ b/dom/cache/DBSchema.cpp
-@@ -321,16 +321,17 @@ static nsresult ExtractId(mozIStorageSta
+@@ -9,16 +9,17 @@
+ #include "ipc/IPCMessageUtils.h"
+ #include "mozilla/dom/InternalHeaders.h"
+ #include "mozilla/dom/cache/CacheTypes.h"
+ #include "mozilla/dom/cache/SavedTypes.h"
+ #include "mozilla/dom/cache/Types.h"
+ #include "mozilla/dom/cache/TypeUtils.h"
+ #include "mozIStorageConnection.h"
+ #include "mozIStorageStatement.h"
++#include "mozStorageHelper.h"
+ #include "nsCOMPtr.h"
+ #include "nsTArray.h"
+ #include "nsCRT.h"
+ #include "nsHttp.h"
+ #include "nsICryptoHash.h"
+ #include "nsNetCID.h"
+ #include "mozilla/BasePrincipal.h"
+ #include "mozilla/dom/HeadersBinding.h"
+@@ -34,18 +35,18 @@ namespace db {
+ const int32_t kFirstShippedSchemaVersion = 15;
+ 
+ namespace {
+ 
+ const int32_t kLatestSchemaVersion = 15;
+ 
+ // ---------
+ // The following constants define the SQL schema.  These are defined in the
+-// same order the SQL should be executed in CreateSchema().  They are broken
+-// out as constants for convenient use in validation and migration.
++// same order the SQL should be executed in CreateOrMigrateSchema().  They are
++// broken out as constants for convenient use in validation and migration.
+ // ---------
+ 
+ // The caches table is the single source of truth about what Cache
+ // objects exist for the origin.  The contents of the Cache are stored
+ // in the entries table that references back to caches.
+ //
+ // The caches table is also referenced from storage.  Rows in storage
+ // represent named Cache objects.  There are cases, however, where
+@@ -321,20 +322,21 @@ static nsresult ExtractId(mozIStorageSta
                            nsID* aIdOut);
  static nsresult CreateAndBindKeyStatement(mozIStorageConnection* aConn,
                                            const char* aQueryFormat,
@@ -19,12 +58,17 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
  } // namespace
  
  nsresult
- CreateSchema(mozIStorageConnection* aConn)
+-CreateSchema(mozIStorageConnection* aConn)
++CreateOrMigrateSchema(mozIStorageConnection* aConn)
  {
    MOZ_ASSERT(!NS_IsMainThread());
    MOZ_ASSERT(aConn);
  
-@@ -342,17 +343,24 @@ CreateSchema(mozIStorageConnection* aCon
+   int32_t schemaVersion;
+   nsresult rv = aConn->GetSchemaVersion(&schemaVersion);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+@@ -342,17 +344,32 @@ CreateSchema(mozIStorageConnection* aCon
      // We already have the correct schema version.  Validate it matches
      // our expected schema and then proceed.
      rv = Validate(aConn);
@@ -34,11 +78,19 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
    }
  
 -  if (!schemaVersion) {
++  mozStorageTransaction trans(aConn, false,
++                              mozIStorageConnection::TRANSACTION_IMMEDIATE);
++  bool needVacuum = false;
++
 +  if (schemaVersion) {
 +    // A schema exists, but its not the current version.  Attempt to
 +    // migrate it to our new schema.
 +    rv = Migrate(aConn);
 +    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++    // Migrations happen infrequently and reflect a chance in DB structure.
++    // This is a good time to rebuild the database.
++    needVacuum = true;
 +
 +  } else {
 +    // There is no schema installed.  Create the database from scratch.
@@ -50,7 +102,33 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
  
      rv = aConn->ExecuteSimpleSQL(nsDependentCString(kIndexSecurityInfoHash));
      if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
-@@ -2312,14 +2320,73 @@ Validate(mozIStorageConnection* aConn)
+@@ -380,16 +397,25 @@ CreateSchema(mozIStorageConnection* aCon
+ 
+     rv = aConn->GetSchemaVersion(&schemaVersion);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+   }
+ 
+   rv = Validate(aConn);
+   if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
++  rv = trans.Commit();
++  if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++
++  if (needVacuum) {
++    // Unfortunately, this must be performed outside of the transaction.
++    aConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING("VACUUM"));
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++  }
++
+   return rv;
+ }
+ 
+ nsresult
+ InitializeConnection(mozIStorageConnection* aConn)
+ {
+   MOZ_ASSERT(!NS_IsMainThread());
+   MOZ_ASSERT(aConn);
+@@ -2312,14 +2338,73 @@ Validate(mozIStorageConnection* aConn)
        return NS_ERROR_FAILURE;
      }
    }
@@ -124,3 +202,60 @@ diff --git a/dom/cache/DBSchema.cpp b/dom/cache/DBSchema.cpp
  } // namespace cache
  } // namespace dom
  } // namespace mozilla
+diff --git a/dom/cache/DBSchema.h b/dom/cache/DBSchema.h
+--- a/dom/cache/DBSchema.h
++++ b/dom/cache/DBSchema.h
+@@ -24,18 +24,19 @@ class CacheQueryParams;
+ class CacheRequest;
+ class CacheRequestOrVoid;
+ class CacheResponse;
+ struct SavedRequest;
+ struct SavedResponse;
+ 
+ namespace db {
+ 
++// Note, this cannot be executed within a transaction.
+ nsresult
+-CreateSchema(mozIStorageConnection* aConn);
++CreateOrMigrateSchema(mozIStorageConnection* aConn);
+ 
+ // Note, this cannot be executed within a transaction.
+ nsresult
+ InitializeConnection(mozIStorageConnection* aConn);
+ 
+ nsresult
+ CreateCacheId(mozIStorageConnection* aConn, CacheId* aCacheIdOut);
+ 
+diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
+--- a/dom/cache/Manager.cpp
++++ b/dom/cache/Manager.cpp
+@@ -49,26 +49,19 @@ public:
+ 
+   virtual nsresult
+   RunSyncWithDBOnTarget(const QuotaInfo& aQuotaInfo, nsIFile* aDBDir,
+                         mozIStorageConnection* aConn) override
+   {
+     nsresult rv = BodyCreateDir(aDBDir);
+     if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+-    {
+-      mozStorageTransaction trans(aConn, false,
+-                                  mozIStorageConnection::TRANSACTION_IMMEDIATE);
+-
+-      rv = db::CreateSchema(aConn);
+-      if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+-
+-      rv = trans.Commit();
+-      if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+-    }
++    // executes in its own transaction
++    rv = db::CreateOrMigrateSchema(aConn);
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
+ 
+     // If the Context marker file exists, then the last session was
+     // not cleanly shutdown.  In these cases sqlite will ensure that
+     // the database is valid, but we might still orphan data.  Both
+     // Cache objects and body files can be referenced by DOM objects
+     // after they are "removed" from their parent.  So we need to
+     // look and see if any of these late access objects have been
+     // orphaned.
