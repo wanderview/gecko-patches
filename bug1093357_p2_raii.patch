@@ -1,0 +1,380 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  428e404ec0ecebee9a31f9870b473a83f38b0a5d
+Bug 1093357 P2 Add an RAII type to safely handle serialized stream actors. r=khuey
+
+diff --git a/ipc/glue/InputStreamParamsOrSendStream.ipdlh b/ipc/glue/InputStreamParamsOrSendStream.ipdlh
+new file mode 100644
+--- /dev/null
++++ b/ipc/glue/InputStreamParamsOrSendStream.ipdlh
+@@ -0,0 +1,25 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
++ * You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++include protocol PSendStream;
++include InputStreamParams;
++
++namespace mozilla {
++namespace ipc {
++
++struct InputStreamParamsOrSendStream
++{
++  OptionalInputStreamParams optionalStream;
++  OptionalFileDescriptorSet optionalFds;
++  nullable PSendStream optionalSendStream;
++};
++
++union OptionalInputStreamParamsOrSendStream
++{
++  InputStreamParamsOrSendStream;
++  void_t;
++};
++
++} // namespace ipc
++} // namespace mozilla
+diff --git a/ipc/glue/InputStreamUtils.cpp b/ipc/glue/InputStreamUtils.cpp
+--- a/ipc/glue/InputStreamUtils.cpp
++++ b/ipc/glue/InputStreamUtils.cpp
+@@ -2,19 +2,24 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "InputStreamUtils.h"
+ 
+ #include "nsIIPCSerializableInputStream.h"
+ 
+ #include "mozilla/Assertions.h"
++#include "mozilla/dom/PContentChild.h"
+ #include "mozilla/dom/File.h"
+ #include "mozilla/dom/ipc/BlobChild.h"
+ #include "mozilla/dom/ipc/BlobParent.h"
++#include "mozilla/ipc/FileDescriptorSetChild.h"
++#include "mozilla/ipc/FileDescriptorSetParent.h"
++#include "mozilla/ipc/PBackgroundChild.h"
++#include "mozilla/ipc/SendStream.h"
+ #include "nsComponentManagerUtils.h"
+ #include "nsDebug.h"
+ #include "nsID.h"
+ #include "nsIXULRuntime.h"
+ #include "nsMIMEInputStream.h"
+ #include "nsMultiplexInputStream.h"
+ #include "nsNetCID.h"
+ #include "nsStringStream.h"
+@@ -177,10 +182,209 @@ DeserializeInputStream(const OptionalInp
+ 
+     default:
+       MOZ_ASSERT(false, "Unknown params!");
+   }
+ 
+   return stream.forget();
+ }
+ 
++namespace {
++
++void
++DeserializeFds(const InputStreamParamsOrSendStream& aValue,
++               nsTArray<FileDescriptor>& aFdsOut)
++{
++  if (aValue.optionalFds().type() !=
++      OptionalFileDescriptorSet::TPFileDescriptorSetParent) {
++    return;
++  }
++
++  FileDescriptorSetParent* fdSetActor =
++    static_cast<FileDescriptorSetParent*>(aValue.optionalFds().get_PFileDescriptorSetParent());
++  MOZ_ASSERT(fdSetActor);
++
++  fdSetActor->ForgetFileDescriptors(aFdsOut);
++  MOZ_ASSERT(!aFdsOut.IsEmpty());
++
++  if (!fdSetActor->Send__delete__(fdSetActor)) {
++    // child process is gone, warn and allow actor to clean up normally
++    NS_WARNING("Failed to delete fd set actor.");
++  }
++}
++
++} // anonymous namespace
++
++already_AddRefed<nsIInputStream>
++DeserializeInputStream(const InputStreamParamsOrSendStream& aValue)
++{
++  auto sendStream =
++    static_cast<SendStreamParent*>(aValue.optionalSendStreamParent());
++  if (sendStream) {
++    nsCOMPtr<nsIInputStream> stream = sendStream->TakeReader();
++    return stream.forget();
++  }
++
++  nsAutoTArray<FileDescriptor, 4> fds;
++  DeserializeFds(aValue, fds);
++
++  return DeserializeInputStream(aValue.optionalStream(), fds);
++}
++
++namespace {
++
++void
++CleanupChildFds(InputStreamParamsOrSendStream& aValue, bool aTaken)
++{
++  if (aValue.optionalFds().type() !=
++      OptionalFileDescriptorSet::TPFileDescriptorSetChild) {
++    return;
++  }
++
++  nsAutoTArray<FileDescriptor, 4> fds;
++
++  FileDescriptorSetChild* fdSetActor =
++    static_cast<FileDescriptorSetChild*>(aValue.optionalFds().get_PFileDescriptorSetChild());
++  MOZ_ASSERT(fdSetActor);
++
++  if (!aTaken) {
++    unused << fdSetActor->Send__delete__(fdSetActor);
++  }
++
++  // FileDescriptorSet doesn't clear its fds in its ActorDestroy, so we
++  // unconditionally forget them here.  The fds themselves are auto-closed in
++  // ~FileDescriptor since they originated in this process.
++  fdSetActor->ForgetFileDescriptors(fds);
++}
++
++void
++CleanupChildSendStream(InputStreamParamsOrSendStream& aValue, bool aTaken)
++{
++  if (!aValue.optionalSendStreamChild()) {
++    return;
++  }
++
++  auto sendStream =
++    static_cast<SendStreamChild*>(aValue.optionalSendStreamChild());
++
++  if (!aTaken) {
++    sendStream->StartDestroy();
++    return;
++  }
++
++  // If we the SendStream was taken to be sent to the parent, then we need to
++  // start it before forgetting about it.
++  sendStream->Start();
++}
++
++} // anonymous namespace
++
++AutoIPCStreamChild::AutoIPCStreamChild()
++  : mValue(void_t(), void_t(), nullptr, nullptr)
++  , mTaken(false)
++{
++}
++
++AutoIPCStreamChild::~AutoIPCStreamChild()
++{
++  CleanupChildFds(mValue, mTaken);
++  CleanupChildSendStream(mValue, mTaken);
++}
++
++template <typename M>
++AutoIPCStreamChild::AutoIPCStreamChild(nsIInputStream* aStream, M* aManager)
++  : mValue(void_t(), void_t(), nullptr, nullptr)
++  , mTaken(false)
++{
++  SerializeOrSend(aStream, aManager);
++}
++
++template <typename M>
++void
++AutoIPCStreamChild::SerializeOrSend(nsIInputStream* aStream, M* aManager)
++{
++  MOZ_ASSERT(aStream);
++  MOZ_ASSERT(aManager);
++  MOZ_ASSERT(!mTaken);
++  MOZ_ASSERT(!IsSet());
++
++  // First attempt simple stream serialization
++  nsCOMPtr<nsIIPCSerializableInputStream> serializable =
++    do_QueryInterface(aStream);
++  if (serializable) {
++    InputStreamParams params;
++    nsAutoTArray<FileDescriptor, 4> fds;
++
++    serializable->Serialize(params, fds);
++
++    if (params.type() == InputStreamParams::T__None) {
++      MOZ_CRASH("Serialize failed!");
++    }
++
++    mValue.optionalStream() = params;
++
++    if (!fds.IsEmpty()) {
++      PFileDescriptorSetChild* fdSet =
++        aManager->SendPFileDescriptorSetConstructor(fds[0]);
++      for (uint32_t i = 1; i < fds.Length(); ++i) {
++        unused << fdSet->SendAddFileDescriptor(fds[i]);
++      }
++
++      mValue.optionalFds() = fdSet;
++    }
++
++    return;
++  }
++
++  // As a fallback, attempt to stream the data across using a SendStream
++  // actor.  This will fail for blocking streams.
++  nsCOMPtr<nsIAsyncInputStream> asyncStream = do_QueryInterface(aStream);
++  mValue.optionalSendStreamChild() =
++    SendStreamChild::Create(asyncStream, aManager);
++
++  if (!mValue.optionalSendStreamChild()) {
++    MOZ_CRASH("SendStream creation failed!");
++  }
++}
++
++bool
++AutoIPCStreamChild::IsSet() const
++{
++  // We should never have the parent SendStream actor set on the child side.
++  MOZ_ASSERT(mValue.optionalSendStreamParent() == nullptr);
++
++  // If the file descriptors are set, then we must have a serialized stream.
++  MOZ_ASSERT_IF(mValue.optionalFds().type() != OptionalFileDescriptorSet::Tvoid_t,
++                mValue.optionalStream().type() != OptionalInputStreamParams::Tvoid_t);
++
++  return mValue.optionalSendStreamChild() != nullptr ||
++         mValue.optionalStream().type() != OptionalInputStreamParams::Tvoid_t;
++}
++
++InputStreamParamsOrSendStream&
++AutoIPCStreamChild::Take()
++{
++  MOZ_ASSERT(!mTaken);
++  MOZ_ASSERT(IsSet());
++  mTaken = true;
++  return mValue;
++}
++
++// Support PContentChild as manager
++template <>
++AutoIPCStreamChild::AutoIPCStreamChild<PContentChild>(nsIInputStream*,
++                                                      PContentChild*);
++template<>
++void
++AutoIPCStreamChild::SerializeOrSend<PContentChild>(nsIInputStream*,
++                                                   PContentChild*);
++
++// Support PBackgroundChild as manager
++template <>
++AutoIPCStreamChild::AutoIPCStreamChild<PBackgroundChild>(nsIInputStream*,
++                                                         PBackgroundChild*);
++template<>
++void
++AutoIPCStreamChild::SerializeOrSend<PBackgroundChild>(nsIInputStream*,
++                                                      PBackgroundChild*);
++
+ } // namespace ipc
+ } // namespace mozilla
+diff --git a/ipc/glue/InputStreamUtils.h b/ipc/glue/InputStreamUtils.h
+--- a/ipc/glue/InputStreamUtils.h
++++ b/ipc/glue/InputStreamUtils.h
+@@ -1,24 +1,26 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_ipc_InputStreamUtils_h
+ #define mozilla_ipc_InputStreamUtils_h
+ 
+ #include "mozilla/ipc/InputStreamParams.h"
++#include "mozilla/ipc/InputStreamParamsOrSendStream.h"
+ #include "nsCOMPtr.h"
+ #include "nsIInputStream.h"
+ #include "nsTArray.h"
+ 
+ namespace mozilla {
+ namespace ipc {
+ 
+ class FileDescriptor;
++class PBackgroundChild;
+ 
+ void
+ SerializeInputStream(nsIInputStream* aInputStream,
+                      InputStreamParams& aParams,
+                      nsTArray<FileDescriptor>& aFileDescriptors);
+ 
+ void
+ SerializeInputStream(nsIInputStream* aInputStream,
+@@ -28,12 +30,55 @@ SerializeInputStream(nsIInputStream* aIn
+ already_AddRefed<nsIInputStream>
+ DeserializeInputStream(const InputStreamParams& aParams,
+                        const nsTArray<FileDescriptor>& aFileDescriptors);
+ 
+ already_AddRefed<nsIInputStream>
+ DeserializeInputStream(const OptionalInputStreamParams& aParams,
+                        const nsTArray<FileDescriptor>& aFileDescriptors);
+ 
++already_AddRefed<nsIInputStream>
++DeserializeInputStream(const InputStreamParamsOrSendStream& aValue);
++
++// RAII helper class that serializes an nsIInputStream into an
++// InputStreamParamsOrSendStream IPC struct.  Use the Take() method when
++// passing the value to the IPC Send*() method.  If Take() is never
++// called then any actors will be cleaned up when the RAII object
++// goes out of scope.  If the stream data is being passed as a SendStream
++// actor then the copying will be started when the RAII object goes
++// out of scope.
++//
++// Like SerializeInputStream(), the AutoIPCStreamChild will crash if
++// serialization cannot be completed.  Currently, this should only
++// occur if the nsIInputStream cannot be serialized and is also blocking.
++//
++// Example:
++//
++//  AutoIPCStreamChild streamChild(inputStream, actor->Manager());
++//  actor->SendData(streamChild.Take());
++//
++class MOZ_STACK_CLASS AutoIPCStreamChild final
++{
++  InputStreamParamsOrSendStream mValue;
++  bool mTaken;
++
++public:
++  AutoIPCStreamChild();
++  ~AutoIPCStreamChild();
++
++  template <typename M>
++  AutoIPCStreamChild(nsIInputStream* aStream, M* aManager);
++
++  template <typename M>
++  void
++  SerializeOrSend(nsIInputStream* aStream, M* aManager);
++
++  bool
++  IsSet() const;
++
++  InputStreamParamsOrSendStream&
++  Take();
++};
++
+ } // namespace ipc
+ } // namespace mozilla
+ 
+ #endif // mozilla_ipc_InputStreamUtils_h
+diff --git a/ipc/glue/moz.build b/ipc/glue/moz.build
+--- a/ipc/glue/moz.build
++++ b/ipc/glue/moz.build
+@@ -144,16 +144,17 @@ LOCAL_INCLUDES += [
+     '/dom/broadcastchannel',
+     '/dom/indexedDB',
+     '/dom/workers',
+     '/xpcom/build',
+ ]
+ 
+ IPDL_SOURCES = [
+     'InputStreamParams.ipdlh',
++    'InputStreamParamsOrSendStream.ipdlh',
+     'PBackground.ipdl',
+     'PBackgroundSharedTypes.ipdlh',
+     'PBackgroundTest.ipdl',
+     'PFileDescriptorSet.ipdl',
+     'PProcLoader.ipdl',
+     'ProtocolTypes.ipdlh',
+     'PSendStream.ipdl',
+     'URIParams.ipdlh',
