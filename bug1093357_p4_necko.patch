@@ -1,0 +1,309 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  433d41de74cb9fbf7bf9f075b34956979a95d1e2
+Bug 1093357 P4 Update necko HTTP upload stream to use send stream actor. r=jduell
+
+diff --git a/netwerk/ipc/NeckoChannelParams.ipdlh b/netwerk/ipc/NeckoChannelParams.ipdlh
+--- a/netwerk/ipc/NeckoChannelParams.ipdlh
++++ b/netwerk/ipc/NeckoChannelParams.ipdlh
+@@ -5,16 +5,17 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ include protocol PHttpChannel;
+ include protocol PFTPChannel;
+ include protocol PRtspChannel;
+ include URIParams;
+ include InputStreamParams;
++include InputStreamParamsOrSendStream;
+ include PBackgroundSharedTypes;
+ 
+ using struct mozilla::void_t from "ipc/IPCMessageUtils.h";
+ using RequestHeaderTuples from "mozilla/net/PHttpChannelParams.h";
+ using struct nsHttpAtom from "nsHttp.h";
+ using class nsHttpResponseHead from "nsHttpResponseHead.h";
+ 
+ namespace mozilla {
+@@ -68,32 +69,31 @@ struct HttpChannelOpenArgs
+   OptionalURIParams           doc;
+   OptionalURIParams           referrer;
+   uint32_t                    referrerPolicy;
+   OptionalURIParams           apiRedirectTo;
+   OptionalURIParams           topWindowURI;
+   uint32_t                    loadFlags;
+   RequestHeaderTuples         requestHeaders;
+   nsCString                   requestMethod;
+-  OptionalInputStreamParams   uploadStream;
++  OptionalInputStreamParamsOrSendStream uploadStream;
+   bool                        uploadStreamHasHeaders;
+   uint16_t                    priority;
+   uint32_t                    classOfService;
+   uint8_t                     redirectionLimit;
+   bool                        allowPipelining;
+   bool                        allowSTS;
+   uint32_t                    thirdPartyFlags;
+   bool                        resumeAt;
+   uint64_t                    startPos;
+   nsCString                   entityID;
+   bool                        chooseApplicationCache;
+   nsCString                   appCacheClientID;
+   bool                        allowSpdy;
+   bool                        allowAltSvc;
+-  OptionalFileDescriptorSet   fds;
+   OptionalLoadInfoArgs        loadInfo;
+   OptionalHttpResponseHead    synthesizedResponseHead;
+   nsCString                   synthesizedSecurityInfoSerialization;
+   uint32_t                    cacheKey;
+   nsCString                   schedulingContextID;
+ };
+ 
+ struct HttpChannelConnectArgs
+diff --git a/netwerk/ipc/PNecko.ipdl b/netwerk/ipc/PNecko.ipdl
+--- a/netwerk/ipc/PNecko.ipdl
++++ b/netwerk/ipc/PNecko.ipdl
+@@ -16,16 +16,17 @@ include protocol PTCPSocket;
+ include protocol PTCPServerSocket;
+ include protocol PUDPSocket;
+ include protocol PRemoteOpenFile;
+ include protocol PDNSRequest;
+ include protocol PChannelDiverter;
+ include protocol PBlob; //FIXME: bug #792908
+ include protocol PFileDescriptorSet;
+ include protocol PDataChannel;
++include protocol PSendStream;
+ 
+ include protocol PRtspController;
+ include protocol PRtspChannel;
+ include URIParams;
+ include InputStreamParams;
+ include NeckoChannelParams;
+ include PBrowserOrId;
+ 
+diff --git a/netwerk/protocol/http/HttpChannelChild.cpp b/netwerk/protocol/http/HttpChannelChild.cpp
+--- a/netwerk/protocol/http/HttpChannelChild.cpp
++++ b/netwerk/protocol/http/HttpChannelChild.cpp
+@@ -1617,49 +1617,30 @@ HttpChannelChild::ContinueAsyncOpen()
+   SerializeURI(mDocumentURI, openArgs.doc());
+   SerializeURI(mReferrer, openArgs.referrer());
+   openArgs.referrerPolicy() = mReferrerPolicy;
+   SerializeURI(mAPIRedirectToURI, openArgs.apiRedirectTo());
+   openArgs.loadFlags() = mLoadFlags;
+   openArgs.requestHeaders() = mClientSetRequestHeaders;
+   openArgs.requestMethod() = mRequestHead.Method();
+ 
+-  nsTArray<mozilla::ipc::FileDescriptor> fds;
+-  SerializeInputStream(mUploadStream, openArgs.uploadStream(), fds);
++  AutoIPCStreamChild uploadStreamChild(openArgs.uploadStream());
++  uploadStreamChild.SerializeOrSend(mUploadStream, Manager()->Manager());
+ 
+   if (mResponseHead) {
+     openArgs.synthesizedResponseHead() = *mResponseHead;
+   } else {
+     openArgs.synthesizedResponseHead() = mozilla::void_t();
+   }
+ 
+   nsCOMPtr<nsISerializable> secInfoSer = do_QueryInterface(mSecurityInfo);
+   if (secInfoSer) {
+     NS_SerializeToString(secInfoSer, openArgs.synthesizedSecurityInfoSerialization());
+   }
+ 
+-  OptionalFileDescriptorSet optionalFDs;
+-
+-  if (fds.IsEmpty()) {
+-    optionalFDs = mozilla::void_t();
+-  } else if (fds.Length() <= kMaxFileDescriptorsPerMessage) {
+-    optionalFDs = nsTArray<mozilla::ipc::FileDescriptor>();
+-    optionalFDs.get_ArrayOfFileDescriptor().SwapElements(fds);
+-  } else {
+-    MOZ_ASSERT(gNeckoChild->Manager());
+-
+-    PFileDescriptorSetChild* fdSet =
+-      gNeckoChild->Manager()->SendPFileDescriptorSetConstructor(fds[0]);
+-    for (uint32_t i = 1; i < fds.Length(); ++i) {
+-      unused << fdSet->SendAddFileDescriptor(fds[i]);
+-    }
+-
+-    optionalFDs = fdSet;
+-  }
+-
+   nsCOMPtr<mozIThirdPartyUtil> util(do_GetService(THIRDPARTYUTIL_CONTRACTID));
+   if (util) {
+     bool thirdParty;
+     nsresult rv = util->IsThirdPartyChannel(this, nullptr, &thirdParty);
+     if (NS_FAILED(rv)) {
+       // If we couldn't compute whether this is a third-party load, assume that
+       // it is.
+       thirdParty = true;
+@@ -1669,18 +1650,16 @@ HttpChannelChild::ContinueAsyncOpen()
+       nsIHttpChannelInternal::THIRD_PARTY_PARENT_IS_THIRD_PARTY :
+       nsIHttpChannelInternal::THIRD_PARTY_PARENT_IS_SAME_PARTY;
+     nsCOMPtr<nsIURI> uri;
+     GetTopWindowURI(getter_AddRefs(uri));
+   }
+ 
+   SerializeURI(mTopWindowURI, openArgs.topWindowURI());
+ 
+-  openArgs.fds() = optionalFDs;
+-
+   openArgs.uploadStreamHasHeaders() = mUploadStreamHasHeaders;
+   openArgs.priority() = mPriority;
+   openArgs.classOfService() = mClassOfService;
+   openArgs.redirectionLimit() = mRedirectionLimit;
+   openArgs.allowPipelining() = mAllowPipelining;
+   openArgs.allowSTS() = mAllowSTS;
+   openArgs.thirdPartyFlags() = mThirdPartyFlags;
+   openArgs.resumeAt() = mSendResumeAt;
+@@ -1717,25 +1696,17 @@ HttpChannelChild::ContinueAsyncOpen()
+   // until OnStopRequest, or we do a redirect, or we hit an IPDL error.
+   AddIPDLReference();
+ 
+   PBrowserOrId browser = static_cast<ContentChild*>(gNeckoChild->Manager())
+                          ->GetBrowserOrId(tabChild);
+   gNeckoChild->SendPHttpChannelConstructor(this, browser,
+                                            IPC::SerializedLoadContext(this),
+                                            openArgs);
+-
+-  if (optionalFDs.type() ==
+-        OptionalFileDescriptorSet::TPFileDescriptorSetChild) {
+-    FileDescriptorSetChild* fdSetActor =
+-      static_cast<FileDescriptorSetChild*>(
+-        optionalFDs.get_PFileDescriptorSetChild());
+-
+-    fdSetActor->ForgetFileDescriptors(fds);
+-  }
++  uploadStreamChild.TakeOptionalValue();
+ 
+   return NS_OK;
+ }
+ 
+ //-----------------------------------------------------------------------------
+ // HttpChannelChild::nsIHttpChannel
+ //-----------------------------------------------------------------------------
+ 
+diff --git a/netwerk/protocol/http/HttpChannelParent.cpp b/netwerk/protocol/http/HttpChannelParent.cpp
+--- a/netwerk/protocol/http/HttpChannelParent.cpp
++++ b/netwerk/protocol/http/HttpChannelParent.cpp
+@@ -116,17 +116,17 @@ HttpChannelParent::Init(const HttpChanne
+     return DoAsyncOpen(a.uri(), a.original(), a.doc(), a.referrer(),
+                        a.referrerPolicy(), a.apiRedirectTo(), a.topWindowURI(),
+                        a.loadFlags(), a.requestHeaders(),
+                        a.requestMethod(), a.uploadStream(),
+                        a.uploadStreamHasHeaders(), a.priority(), a.classOfService(),
+                        a.redirectionLimit(), a.allowPipelining(), a.allowSTS(),
+                        a.thirdPartyFlags(), a.resumeAt(), a.startPos(),
+                        a.entityID(), a.chooseApplicationCache(),
+-                       a.appCacheClientID(), a.allowSpdy(), a.allowAltSvc(), a.fds(),
++                       a.appCacheClientID(), a.allowSpdy(), a.allowAltSvc(),
+                        a.loadInfo(), a.synthesizedResponseHead(),
+                        a.synthesizedSecurityInfoSerialization(),
+                        a.cacheKey(), a.schedulingContextID());
+   }
+   case HttpChannelCreationArgs::THttpChannelConnectArgs:
+   {
+     const HttpChannelConnectArgs& cArgs = aArgs.get_HttpChannelConnectArgs();
+     return ConnectChannel(cArgs.channelId(), cArgs.shouldIntercept());
+@@ -257,32 +257,31 @@ HttpChannelParent::DoAsyncOpen(  const U
+                                  const OptionalURIParams&   aDocURI,
+                                  const OptionalURIParams&   aReferrerURI,
+                                  const uint32_t&            aReferrerPolicy,
+                                  const OptionalURIParams&   aAPIRedirectToURI,
+                                  const OptionalURIParams&   aTopWindowURI,
+                                  const uint32_t&            aLoadFlags,
+                                  const RequestHeaderTuples& requestHeaders,
+                                  const nsCString&           requestMethod,
+-                                 const OptionalInputStreamParams& uploadStream,
++                                 const OptionalInputStreamParamsOrSendStream& uploadStream,
+                                  const bool&                uploadStreamHasHeaders,
+                                  const uint16_t&            priority,
+                                  const uint32_t&            classOfService,
+                                  const uint8_t&             redirectionLimit,
+                                  const bool&                allowPipelining,
+                                  const bool&                allowSTS,
+                                  const uint32_t&            thirdPartyFlags,
+                                  const bool&                doResumeAt,
+                                  const uint64_t&            startPos,
+                                  const nsCString&           entityID,
+                                  const bool&                chooseApplicationCache,
+                                  const nsCString&           appCacheClientID,
+                                  const bool&                allowSpdy,
+                                  const bool&                allowAltSvc,
+-                                 const OptionalFileDescriptorSet& aFds,
+                                  const OptionalLoadInfoArgs& aLoadInfoArgs,
+                                  const OptionalHttpResponseHead& aSynthesizedResponseHead,
+                                  const nsCString&           aSecurityInfoSerialization,
+                                  const uint32_t&            aCacheKey,
+                                  const nsCString&           aSchedulingContextID)
+ {
+   nsCOMPtr<nsIURI> uri = DeserializeURI(aURI);
+   if (!uri) {
+@@ -365,32 +364,17 @@ HttpChannelParent::DoAsyncOpen(  const U
+   }
+ 
+   mParentListener = new HttpChannelParentListener(this);
+ 
+   mChannel->SetNotificationCallbacks(mParentListener);
+ 
+   mChannel->SetRequestMethod(nsDependentCString(requestMethod.get()));
+ 
+-  nsTArray<mozilla::ipc::FileDescriptor> fds;
+-  if (aFds.type() == OptionalFileDescriptorSet::TPFileDescriptorSetParent) {
+-    FileDescriptorSetParent* fdSetActor =
+-      static_cast<FileDescriptorSetParent*>(aFds.get_PFileDescriptorSetParent());
+-    MOZ_ASSERT(fdSetActor);
+-
+-    fdSetActor->ForgetFileDescriptors(fds);
+-    MOZ_ASSERT(!fds.IsEmpty());
+-
+-    unused << fdSetActor->Send__delete__(fdSetActor);
+-  } else if (aFds.type() == OptionalFileDescriptorSet::TArrayOfFileDescriptor) {
+-    const_cast<OptionalFileDescriptorSet&>(aFds).
+-      get_ArrayOfFileDescriptor().SwapElements(fds);
+-  }
+-
+-  nsCOMPtr<nsIInputStream> stream = DeserializeInputStream(uploadStream, fds);
++  nsCOMPtr<nsIInputStream> stream = DeserializeInputStream(uploadStream);
+   if (stream) {
+     mChannel->InternalSetUploadStream(stream);
+     mChannel->SetUploadStreamHasHeaders(uploadStreamHasHeaders);
+   }
+ 
+   if (aSynthesizedResponseHead.type() == OptionalHttpResponseHead::TnsHttpResponseHead) {
+     mSynthesizedResponseHead = new nsHttpResponseHead(aSynthesizedResponseHead.get_nsHttpResponseHead());
+     mShouldIntercept = true;
+diff --git a/netwerk/protocol/http/HttpChannelParent.h b/netwerk/protocol/http/HttpChannelParent.h
+--- a/netwerk/protocol/http/HttpChannelParent.h
++++ b/netwerk/protocol/http/HttpChannelParent.h
+@@ -95,32 +95,31 @@ protected:
+                    const OptionalURIParams&   docUri,
+                    const OptionalURIParams&   referrerUri,
+                    const uint32_t&            referrerPolicy,
+                    const OptionalURIParams&   internalRedirectUri,
+                    const OptionalURIParams&   topWindowUri,
+                    const uint32_t&            loadFlags,
+                    const RequestHeaderTuples& requestHeaders,
+                    const nsCString&           requestMethod,
+-                   const OptionalInputStreamParams& uploadStream,
++                   const ipc::OptionalInputStreamParamsOrSendStream& uploadStream,
+                    const bool&                uploadStreamHasHeaders,
+                    const uint16_t&            priority,
+                    const uint32_t&            classOfService,
+                    const uint8_t&             redirectionLimit,
+                    const bool&                allowPipelining,
+                    const bool&                allowSTS,
+                    const uint32_t&            thirdPartyFlags,
+                    const bool&                doResumeAt,
+                    const uint64_t&            startPos,
+                    const nsCString&           entityID,
+                    const bool&                chooseApplicationCache,
+                    const nsCString&           appCacheClientID,
+                    const bool&                allowSpdy,
+                    const bool&                allowAltSvc,
+-                   const OptionalFileDescriptorSet& aFds,
+                    const OptionalLoadInfoArgs& aLoadInfoArgs,
+                    const OptionalHttpResponseHead& aSynthesizedResponseHead,
+                    const nsCString&           aSecurityInfoSerialization,
+                    const uint32_t&            aCacheKey,
+                    const nsCString&           aSchedulingContextID);
+ 
+   virtual bool RecvSetPriority(const uint16_t& priority) override;
+   virtual bool RecvSetClassOfService(const uint32_t& cos) override;
