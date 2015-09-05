@@ -61,7 +61,7 @@ diff --git a/ipc/glue/InputStreamUtils.cpp b/ipc/glue/InputStreamUtils.cpp
  #include "nsMultiplexInputStream.h"
  #include "nsNetCID.h"
  #include "nsStringStream.h"
-@@ -177,10 +182,281 @@ DeserializeInputStream(const OptionalInp
+@@ -177,10 +182,284 @@ DeserializeInputStream(const OptionalInp
  
      default:
        MOZ_ASSERT(false, "Unknown params!");
@@ -70,6 +70,12 @@ diff --git a/ipc/glue/InputStreamUtils.cpp b/ipc/glue/InputStreamUtils.cpp
    return stream.forget();
  }
  
++namespace {
++
++// The SerializeOrSendInputStream() and CleanupSendInputStreamParamsOrSendStream
++// functions could be externally exposed.  For now, though, keep them private
++// to encourage use of the safer RAII AutoIPCStreamChild class.
++
 +template<typename M>
 +void
 +SerializeOrSendInputStream(nsIInputStream* aStream,
@@ -133,36 +139,6 @@ diff --git a/ipc/glue/InputStreamUtils.cpp b/ipc/glue/InputStreamUtils.cpp
 +  SerializeOrSendInputStream(aStream, aValue, aManager);
 +}
 +
-+already_AddRefed<nsIInputStream>
-+DeserializeInputStream(const InputStreamParamsOrSendStream& aValue)
-+{
-+  auto sendStream =
-+    static_cast<SendStreamParent*>(aValue.optionalSendStreamParent());
-+  if (sendStream) {
-+    nsCOMPtr<nsIInputStream> stream = sendStream->TakeReader();
-+    return stream.forget();
-+  }
-+
-+  nsAutoTArray<FileDescriptor, 4> fds;
-+  if (aValue.optionalFds().type() ==
-+      OptionalFileDescriptorSet::TPFileDescriptorSetParent) {
-+
-+    FileDescriptorSetParent* fdSetActor = static_cast<FileDescriptorSetParent*>(
-+      aValue.optionalFds().get_PFileDescriptorSetParent());
-+    MOZ_ASSERT(fdSetActor);
-+
-+    fdSetActor->ForgetFileDescriptors(fds);
-+    MOZ_ASSERT(!fds.IsEmpty());
-+
-+    if (!fdSetActor->Send__delete__(fdSetActor)) {
-+      // child process is gone, warn and allow actor to clean up normally
-+      NS_WARNING("Failed to delete fd set actor.");
-+    }
-+  }
-+
-+  return DeserializeInputStream(aValue.optionalStream(), fds);
-+}
-+
 +void
 +CleanupInputStreamParamsOrSendStream(InputStreamParamsOrSendStream& aValue,
 +                                     bool aConsumedByIPC)
@@ -213,6 +189,38 @@ diff --git a/ipc/glue/InputStreamUtils.cpp b/ipc/glue/InputStreamUtils.cpp
 +  CleanupInputStreamParamsOrSendStream(aValue, aConsumedByIPC);
 +}
 +
++} // anonymous namespace
++
++already_AddRefed<nsIInputStream>
++DeserializeInputStream(const InputStreamParamsOrSendStream& aValue)
++{
++  auto sendStream =
++    static_cast<SendStreamParent*>(aValue.optionalSendStreamParent());
++  if (sendStream) {
++    nsCOMPtr<nsIInputStream> stream = sendStream->TakeReader();
++    return stream.forget();
++  }
++
++  nsAutoTArray<FileDescriptor, 4> fds;
++  if (aValue.optionalFds().type() ==
++      OptionalFileDescriptorSet::TPFileDescriptorSetParent) {
++
++    FileDescriptorSetParent* fdSetActor = static_cast<FileDescriptorSetParent*>(
++      aValue.optionalFds().get_PFileDescriptorSetParent());
++    MOZ_ASSERT(fdSetActor);
++
++    fdSetActor->ForgetFileDescriptors(fds);
++    MOZ_ASSERT(!fds.IsEmpty());
++
++    if (!fdSetActor->Send__delete__(fdSetActor)) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("Failed to delete fd set actor.");
++    }
++  }
++
++  return DeserializeInputStream(aValue.optionalStream(), fds);
++}
++
 +AutoIPCStreamChild::AutoIPCStreamChild()
 +  : mInlineValue(void_t())
 +  , mValue(nullptr)
@@ -249,9 +257,26 @@ diff --git a/ipc/glue/InputStreamUtils.cpp b/ipc/glue/InputStreamUtils.cpp
 +  }
 +}
 +
-+template <typename M>
 +void
-+AutoIPCStreamChild::SerializeOrSend(nsIInputStream* aStream, M* aManager)
++AutoIPCStreamChild::SerializeOrSend(nsIInputStream* aStream,
++                                    PContentChild* aManager)
++{
++  MOZ_ASSERT(aStream);
++  MOZ_ASSERT(aManager);
++  MOZ_ASSERT(mValue || mOptionalValue);
++  MOZ_ASSERT(!mTaken);
++  MOZ_ASSERT(!IsSet());
++
++  if (mValue) {
++    SerializeOrSendInputStream(aStream, *mValue, aManager);
++  } else {
++    SerializeOrSendInputStream(aStream, *mOptionalValue, aManager);
++  }
++}
++
++void
++AutoIPCStreamChild::SerializeOrSend(nsIInputStream* aStream,
++                                    PBackgroundChild* aManager)
 +{
 +  MOZ_ASSERT(aStream);
 +  MOZ_ASSERT(aManager);
@@ -319,34 +344,12 @@ diff --git a/ipc/glue/InputStreamUtils.cpp b/ipc/glue/InputStreamUtils.cpp
 +  return *mOptionalValue;
 +}
 +
-+// Support PContentChild as manager
-+template<>
-+void
-+SerializeOrSendInputStream<PContentChild>(nsIInputStream* aStream,
-+                                          InputStreamParamsOrSendStream& aValue,
-+                                          PContentChild* aManager);
-+template<>
-+void
-+AutoIPCStreamChild::SerializeOrSend<PContentChild>(nsIInputStream*,
-+                                                   PContentChild*);
-+
-+// Support PBackgroundChild as manager
-+template<>
-+void
-+SerializeOrSendInputStream<PBackgroundChild>(nsIInputStream* aStream,
-+                                             InputStreamParamsOrSendStream& aValue,
-+                                             PBackgroundChild* aManager);
-+template<>
-+void
-+AutoIPCStreamChild::SerializeOrSend<PBackgroundChild>(nsIInputStream*,
-+                                                      PBackgroundChild*);
-+
  } // namespace ipc
  } // namespace mozilla
 diff --git a/ipc/glue/InputStreamUtils.h b/ipc/glue/InputStreamUtils.h
 --- a/ipc/glue/InputStreamUtils.h
 +++ b/ipc/glue/InputStreamUtils.h
-@@ -1,24 +1,26 @@
+@@ -1,24 +1,31 @@
  /* This Source Code Form is subject to the terms of the Mozilla Public
   * License, v. 2.0. If a copy of the MPL was not distributed with this
   * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -361,6 +364,11 @@ diff --git a/ipc/glue/InputStreamUtils.h b/ipc/glue/InputStreamUtils.h
  #include "nsTArray.h"
  
  namespace mozilla {
++
++namespace dom {
++class PContentChild;
++}
++
  namespace ipc {
  
  class FileDescriptor;
@@ -373,7 +381,7 @@ diff --git a/ipc/glue/InputStreamUtils.h b/ipc/glue/InputStreamUtils.h
  
  void
  SerializeInputStream(nsIInputStream* aInputStream,
-@@ -28,12 +30,79 @@ SerializeInputStream(nsIInputStream* aIn
+@@ -28,12 +35,61 @@ SerializeInputStream(nsIInputStream* aIn
  already_AddRefed<nsIInputStream>
  DeserializeInputStream(const InputStreamParams& aParams,
                         const nsTArray<FileDescriptor>& aFileDescriptors);
@@ -382,26 +390,6 @@ diff --git a/ipc/glue/InputStreamUtils.h b/ipc/glue/InputStreamUtils.h
  DeserializeInputStream(const OptionalInputStreamParams& aParams,
                         const nsTArray<FileDescriptor>& aFileDescriptors);
  
-+template<typename M>
-+void
-+SerializeOrSendInputStream(nsIInputStream* aStream,
-+                           InputStreamParamsOrSendStream& aValue,
-+                           M* aManager);
-+
-+template<typename M>
-+void
-+SerializeOrSendInputStream(nsIInputStream* aStream,
-+                           OptionalInputStreamParamsOrSendStream& aValue,
-+                           M* aManager);
-+
-+void
-+CleanupInputStreamParamsOrSendStream(InputStreamParamsOrSendStream& aValue,
-+                                     bool aConsumedByIPC);
-+
-+void
-+CleanupInputStreamParamsOrSendStream(OptionalInputStreamParamsOrSendStream& aValue,
-+                                     bool aConsumedByIPC);
-+
 +already_AddRefed<nsIInputStream>
 +DeserializeInputStream(const InputStreamParamsOrSendStream& aValue);
 +
@@ -435,9 +423,11 @@ diff --git a/ipc/glue/InputStreamUtils.h b/ipc/glue/InputStreamUtils.h
 +  explicit AutoIPCStreamChild(OptionalInputStreamParamsOrSendStream& aTarget);
 +  ~AutoIPCStreamChild();
 +
-+  template <typename M>
 +  void
-+  SerializeOrSend(nsIInputStream* aStream, M* aManager);
++  SerializeOrSend(nsIInputStream* aStream, dom::PContentChild* aManager);
++
++  void
++  SerializeOrSend(nsIInputStream* aStream, PBackgroundChild* aManager);
 +
 +  bool
 +  IsSet() const;
