@@ -1,0 +1,245 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  6ce94480aecbcf57e9c36f9930c88e55b6637d03
+Bug 1203680 P3 Add a method to ensure an http upload stream is directly cloneable. r=mcmanus
+
+diff --git a/netwerk/base/nsIUploadChannel2.idl b/netwerk/base/nsIUploadChannel2.idl
+--- a/netwerk/base/nsIUploadChannel2.idl
++++ b/netwerk/base/nsIUploadChannel2.idl
+@@ -1,18 +1,19 @@
+ /* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "nsISupports.idl"
+ 
+ interface nsIInputStream;
++interface nsIRunnable;
+ 
+-[scriptable, uuid(62e6529a-5cf6-491a-82ef-b3a8273cdd19)]
++[scriptable, uuid(2f712b52-19c5-4e0c-9e8f-b5c7c3b67049)]
+ interface nsIUploadChannel2 : nsISupports
+ {
+     /**
+      * Sets a stream to be uploaded by this channel with the specified
+      * Content-Type and Content-Length header values.
+      *
+      * Most implementations of this interface require that the stream:
+      *   (1) implement threadsafe addRef and release
+@@ -42,13 +43,25 @@ interface nsIUploadChannel2 : nsISupport
+     /**
+      * Value of aStreamHasHeaders from the last successful call to
+      * explicitSetUploadStream.  TRUE indicates the attached upload stream
+      * contians request headers.
+      */
+     readonly attribute boolean uploadStreamHasHeaders;
+ 
+     /**
+-     * Clones the upload stream and returns an equivalent stream.
++     * Ensure the upload stream, if any, is cloneable.  This may involve
++     * async copying, so a callback runnable must be provided.  It will
++     * invoked on the current thread when the upload stream is ready
++     * for cloning.  If the stream is already cloneable, then the callback
++     * will be invoked synchronously.
++     */
++    [noscript]
++    void ensureUploadStreamIsCloneable(in nsIRunnable aCallback);
++
++    /**
++     * Clones the upload stream.  May return failure if the upload stream
++     * is not cloneable.  If this is not acceptable, use the
++     * ensureUploadStreamIsCloneable() method first.
+      */
+     [noscript]
+     nsIInputStream cloneUploadStream();
+ };
+diff --git a/netwerk/protocol/http/HttpBaseChannel.cpp b/netwerk/protocol/http/HttpBaseChannel.cpp
+--- a/netwerk/protocol/http/HttpBaseChannel.cpp
++++ b/netwerk/protocol/http/HttpBaseChannel.cpp
+@@ -14,16 +14,17 @@
+ #include "nsMimeTypes.h"
+ #include "nsNetCID.h"
+ #include "nsNetUtil.h"
+ 
+ #include "nsICachingChannel.h"
+ #include "nsIPrincipal.h"
+ #include "nsIScriptError.h"
+ #include "nsISeekableStream.h"
++#include "nsIStorageStream.h"
+ #include "nsITimedChannel.h"
+ #include "nsIEncodedChannel.h"
+ #include "nsIApplicationCacheChannel.h"
+ #include "nsIMutableArray.h"
+ #include "nsEscape.h"
+ #include "nsStreamListenerWrapper.h"
+ #include "nsISecurityConsoleMessage.h"
+ #include "nsURLHelper.h"
+@@ -580,39 +581,115 @@ EnsureStreamBuffered(nsCOMPtr<nsIInputSt
+     nsresult rv = NS_NewBufferedInputStream(getter_AddRefs(bufferedStream),
+                                             aStream,
+                                             4096);
+     NS_ENSURE_SUCCESS_VOID(rv);
+     aStream.swap(bufferedStream);
+   }
+ }
+ 
++namespace {
++
++void
++CopyComplete(void* aClosure, nsresult aStatus) {
++  // Called on the STS thread by NS_AsyncCopy
++  auto channel = static_cast<HttpBaseChannel*>(aClosure);
++  nsCOMPtr<nsIRunnable> runnable = NS_NewRunnableMethodWithArg<nsresult>(
++    channel, &HttpBaseChannel::EnsureUploadStreamIsCloneableComplete, aStatus);
++  NS_DispatchToMainThread(runnable.forget());
++}
++
++} // anonymous namespace
++
++NS_IMETHODIMP
++HttpBaseChannel::EnsureUploadStreamIsCloneable(nsIRunnable* aCallback)
++{
++  MOZ_ASSERT(NS_IsMainThread(), "Should only be called on the main thread.");
++  NS_ENSURE_ARG_POINTER(aCallback);
++
++  // We could in theory allow multiple callers to use this method,
++  // but the complexity does not seem worth it yet.  Just fail if
++  // this is called more than once simultaneously.
++  NS_ENSURE_FALSE(mUploadCloneableCallback, NS_ERROR_UNEXPECTED);
++
++  // If the CloneUploadStream() will succeed, then synchronously invoke
++  // the callback to indicate we're already cloneable.
++  if (!mUploadStream || NS_InputStreamIsCloneable(mUploadStream)) {
++    aCallback->Run();
++    return NS_OK;
++  }
++
++  nsCOMPtr<nsIStorageStream> storageStream;
++  nsresult rv = NS_NewStorageStream(4096, UINT32_MAX,
++                                    getter_AddRefs(storageStream));
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  nsCOMPtr<nsIInputStream> newUploadStream;
++  rv = storageStream->NewInputStream(0, getter_AddRefs(newUploadStream));
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  nsCOMPtr<nsIOutputStream> sink = do_QueryInterface(storageStream);
++  nsCOMPtr<nsIEventTarget> target =
++    do_GetService(NS_STREAMTRANSPORTSERVICE_CONTRACTID);
++
++  mUploadCloneableCallback = aCallback;
++
++  rv = NS_AsyncCopy(mUploadStream, sink, target,
++                    NS_ASYNCCOPY_VIA_READSEGMENTS,
++                    4096, // copy segment size
++                    CopyComplete, this);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    mUploadCloneableCallback = nullptr;
++    return rv;
++  }
++
++  // Since we're consuming the old stream, replace it with the new
++  // stream immediately.
++  mUploadStream = newUploadStream;
++
++  // Explicity hold the stream alive until copying is complete.  This will
++  // be released in EnsureUploadStreamIsCloneableComplete().
++  AddRef();
++
++  return NS_OK;
++}
++
++void
++HttpBaseChannel::EnsureUploadStreamIsCloneableComplete(nsresult aStatus)
++{
++  MOZ_ASSERT(NS_IsMainThread(), "Should only be called on the main thread.");
++  MOZ_ASSERT(mUploadCloneableCallback);
++
++  if (NS_SUCCEEDED(mStatus)) {
++    mStatus = aStatus;
++  }
++
++  mUploadCloneableCallback->Run();
++  mUploadCloneableCallback = nullptr;
++
++  // Release the reference we grabbed in EnsureUploadStreamIsCloneable() now
++  // that the copying is complete.
++  Release();
++}
++
+ NS_IMETHODIMP
+ HttpBaseChannel::CloneUploadStream(nsIInputStream** aClonedStream)
+ {
+   NS_ENSURE_ARG_POINTER(aClonedStream);
+   *aClonedStream = nullptr;
+ 
+   if (!mUploadStream) {
+     return NS_OK;
+   }
+ 
+   nsCOMPtr<nsIInputStream> clonedStream;
+-  nsCOMPtr<nsIInputStream> replacementStream;
+-  nsresult rv = NS_CloneInputStream(mUploadStream, getter_AddRefs(clonedStream),
+-                                    getter_AddRefs(replacementStream));
++  nsresult rv = NS_CloneInputStream(mUploadStream, getter_AddRefs(clonedStream));
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+-  if (replacementStream) {
+-    mUploadStream.swap(replacementStream);
+-
+-    // Ensure that the replacement stream is buffered.
+-    EnsureStreamBuffered(mUploadStream);
+-  }
+-
++  // TODO: is this needed?
+   // Ensure that the cloned stream is buffered.
+   EnsureStreamBuffered(clonedStream);
+ 
+   clonedStream.forget(aClonedStream);
+ 
+   return NS_OK;
+ }
+ 
+diff --git a/netwerk/protocol/http/HttpBaseChannel.h b/netwerk/protocol/http/HttpBaseChannel.h
+--- a/netwerk/protocol/http/HttpBaseChannel.h
++++ b/netwerk/protocol/http/HttpBaseChannel.h
+@@ -259,16 +259,20 @@ public: /* Necko internal use only... */
+     static bool ShouldRewriteRedirectToGET(uint32_t httpStatus,
+                                            nsHttpRequestHead::ParsedMethodType method);
+ 
+     // Like nsIEncodedChannel::DoApplyConversions except context is set to
+     // mListenerContext.
+     nsresult DoApplyContentConversions(nsIStreamListener *aNextListener,
+                                        nsIStreamListener **aNewNextListener);
+ 
++    // Callback on main thread when NS_AsyncCopy() is finished populating
++    // the new mUploadStream.
++    void EnsureUploadStreamIsCloneableComplete(nsresult aStatus);
++
+ protected:
+   nsCOMArray<nsISecurityConsoleMessage> mSecurityConsoleMessages;
+ 
+   // Handle notifying listener, removing from loadgroup if request failed.
+   void     DoNotifyListener();
+   virtual void DoNotifyListenerCleanup() = 0;
+ 
+   // drop reference to listener, its callbacks, and the progress sink
+@@ -319,16 +323,17 @@ protected:
+   nsCOMPtr<nsILoadInfo>             mLoadInfo;
+   nsCOMPtr<nsIInterfaceRequestor>   mCallbacks;
+   nsCOMPtr<nsIProgressEventSink>    mProgressSink;
+   nsCOMPtr<nsIURI>                  mReferrer;
+   nsCOMPtr<nsIApplicationCache>     mApplicationCache;
+ 
+   nsHttpRequestHead                 mRequestHead;
+   nsCOMPtr<nsIInputStream>          mUploadStream;
++  nsCOMPtr<nsIRunnable>             mUploadCloneableCallback;
+   nsAutoPtr<nsHttpResponseHead>     mResponseHead;
+   nsRefPtr<nsHttpConnectionInfo>    mConnectionInfo;
+   nsCOMPtr<nsIProxyInfo>            mProxyInfo;
+   nsCOMPtr<nsISupports>             mSecurityInfo;
+ 
+   nsCString                         mSpec; // ASCII encoded URL spec
+   nsCString                         mContentTypeHint;
+   nsCString                         mContentCharsetHint;
