@@ -1,0 +1,153 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  53aa9fd3b6ffd5528400c1ae13f7f4e953dc93ce
+Bug 1210941 P11 Use LOAD_BYPASS_SERVICE_WORKER in worker ScriptLoader. r=ehsan
+
+diff --git a/dom/workers/ScriptLoader.cpp b/dom/workers/ScriptLoader.cpp
+--- a/dom/workers/ScriptLoader.cpp
++++ b/dom/workers/ScriptLoader.cpp
+@@ -102,16 +102,17 @@ ChannelFromScriptURL(nsIPrincipal* princ
+                      nsIDocument* parentDoc,
+                      nsILoadGroup* loadGroup,
+                      nsIIOService* ios,
+                      nsIScriptSecurityManager* secMan,
+                      const nsAString& aScriptURL,
+                      bool aIsMainScript,
+                      WorkerScriptType aWorkerScriptType,
+                      nsContentPolicyType aContentPolicyType,
++                     nsLoadFlags aLoadFlags,
+                      nsIChannel** aChannel)
+ {
+   AssertIsOnMainThread();
+ 
+   nsresult rv;
+   nsCOMPtr<nsIURI> uri;
+   rv = nsContentUtils::NewURIWithDocumentCharset(getter_AddRefs(uri),
+                                                  aScriptURL, parentDoc,
+@@ -154,44 +155,44 @@ ChannelFromScriptURL(nsIPrincipal* princ
+     rv = principal->CheckMayLoad(uri, false, true);
+     NS_ENSURE_SUCCESS(rv, NS_ERROR_DOM_SECURITY_ERR);
+   }
+   else {
+     rv = secMan->CheckLoadURIWithPrincipal(principal, uri, 0);
+     NS_ENSURE_SUCCESS(rv, NS_ERROR_DOM_SECURITY_ERR);
+   }
+ 
+-  uint32_t flags = nsIRequest::LOAD_NORMAL | nsIChannel::LOAD_CLASSIFY_URI;
++  aLoadFlags |= nsIChannel::LOAD_CLASSIFY_URI;
+ 
+   nsCOMPtr<nsIChannel> channel;
+   // If we have the document, use it
+   if (parentDoc) {
+     rv = NS_NewChannel(getter_AddRefs(channel),
+                        uri,
+                        parentDoc,
+                        nsILoadInfo::SEC_NORMAL,
+                        aContentPolicyType,
+                        loadGroup,
+                        nullptr, // aCallbacks
+-                       flags,
++                       aLoadFlags,
+                        ios);
+   } else {
+     // We must have a loadGroup with a load context for the principal to
+     // traverse the channel correctly.
+     MOZ_ASSERT(loadGroup);
+     MOZ_ASSERT(NS_LoadGroupMatchesPrincipal(loadGroup, principal));
+ 
+     rv = NS_NewChannel(getter_AddRefs(channel),
+                        uri,
+                        principal,
+                        nsILoadInfo::SEC_NORMAL,
+                        aContentPolicyType,
+                        loadGroup,
+                        nullptr, // aCallbacks
+-                       flags,
++                       aLoadFlags,
+                        ios);
+   }
+ 
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   if (nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(channel)) {
+     rv = nsContentUtils::SetFetchReferrerURIWithPolicy(principal, parentDoc,
+                                                        httpChannel);
+@@ -844,21 +845,30 @@ private:
+     nsCOMPtr<nsIIOService> ios(do_GetIOService());
+ 
+     nsIScriptSecurityManager* secMan = nsContentUtils::GetSecurityManager();
+     NS_ASSERTION(secMan, "This should never be null!");
+ 
+     ScriptLoadInfo& loadInfo = mLoadInfos[aIndex];
+     nsresult& rv = loadInfo.mLoadResult;
+ 
++    nsLoadFlags loadFlags = nsIRequest::LOAD_NORMAL;
++
++    // If we are loading a script for a ServiceWorker then we must not
++    // try to intercept it.  If the interception matches the current
++    // ServiceWorker's scope then we could deadlock the load.
++    if (mWorkerPrivate->IsServiceWorker()) {
++      loadFlags |= nsIChannel::LOAD_BYPASS_SERVICE_WORKER;
++    }
++
+     if (!channel) {
+       rv = ChannelFromScriptURL(principal, baseURI, parentDoc, loadGroup, ios,
+                                 secMan, loadInfo.mURL, IsMainWorkerScript(),
+                                 mWorkerScriptType,
+-                                mWorkerPrivate->ContentPolicyType(),
++                                mWorkerPrivate->ContentPolicyType(), loadFlags,
+                                 getter_AddRefs(channel));
+       if (NS_WARN_IF(NS_FAILED(rv))) {
+         return rv;
+       }
+     }
+ 
+     // We need to know which index we're on in OnStreamComplete so we know
+     // where to put the result.
+@@ -876,26 +886,16 @@ private:
+     // We don't care about progress so just use the simple stream loader for
+     // OnStreamComplete notification only.
+     nsCOMPtr<nsIStreamLoader> loader;
+     rv = NS_NewStreamLoader(getter_AddRefs(loader), this);
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       return rv;
+     }
+ 
+-    // If we are loading a script for a ServiceWorker then we must not
+-    // try to intercept it.  If the interception matches the current
+-    // ServiceWorker's scope then we could deadlock the load.
+-    if (mWorkerPrivate->IsServiceWorker()) {
+-      nsCOMPtr<nsIHttpChannelInternal> internal = do_QueryInterface(channel);
+-      if (internal) {
+-        internal->ForceNoIntercept();
+-      }
+-    }
+-
+     if (loadInfo.mCacheStatus != ScriptLoadInfo::ToBeCached) {
+       rv = channel->AsyncOpen(loader, indexSupports);
+       if (NS_WARN_IF(NS_FAILED(rv))) {
+         return rv;
+       }
+     } else {
+       nsCOMPtr<nsIOutputStream> writer;
+ 
+@@ -1853,17 +1853,18 @@ ChannelFromScriptURLMainThread(nsIPrinci
+ 
+   nsCOMPtr<nsIIOService> ios(do_GetIOService());
+ 
+   nsIScriptSecurityManager* secMan = nsContentUtils::GetSecurityManager();
+   NS_ASSERTION(secMan, "This should never be null!");
+ 
+   return ChannelFromScriptURL(aPrincipal, aBaseURI, aParentDoc, aLoadGroup,
+                               ios, secMan, aScriptURL, true, WorkerScript,
+-                              aContentPolicyType, aChannel);
++                              aContentPolicyType, nsIRequest::LOAD_NORMAL,
++                              aChannel);
+ }
+ 
+ nsresult
+ ChannelFromScriptURLWorkerThread(JSContext* aCx,
+                                  WorkerPrivate* aParent,
+                                  const nsAString& aScriptURL,
+                                  nsIChannel** aChannel)
+ {
