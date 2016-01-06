@@ -1,0 +1,243 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  8fdcca5e95d88abe3009bb540692c03be721db39
+Bug 1232558 P2 Abort the ServiceWorkerScriptCache CompareManager at xpcom-shutdown. r=ehsan
+
+diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
+--- a/dom/workers/ServiceWorkerManager.cpp
++++ b/dom/workers/ServiceWorkerManager.cpp
+@@ -958,17 +958,17 @@ public:
+     , mCallback(aCallback)
+     , mUpdateAndInstallInfo(aServiceWorkerInfo)
+     , mCanceled(false)
+   {
+     AssertIsOnMainThread();
+     MOZ_ASSERT(aPrincipal);
+   }
+ 
+-  void
++  virtual void
+   Cancel()
+   {
+     mQueue = nullptr;
+     mCanceled = true;
+   }
+ 
+ protected:
+   nsCOMPtr<nsIPrincipal> mPrincipal;
+@@ -1261,16 +1261,17 @@ private:
+ };
+ 
+ class ServiceWorkerRegisterJob final : public ServiceWorkerJobBase,
+                                        public serviceWorkerScriptCache::CompareCallback
+ {
+   friend class ContinueUpdateRunnable;
+ 
+   nsCOMPtr<nsILoadGroup> mLoadGroup;
++  RefPtr<serviceWorkerScriptCache::CompareHandle> mCompareHandle;
+ 
+   ~ServiceWorkerRegisterJob()
+   { }
+ 
+ public:
+   NS_DECL_ISUPPORTS_INHERITED
+ 
+   // [[Register]]
+@@ -1297,16 +1298,27 @@ public:
+                            ServiceWorkerUpdateFinishCallback* aCallback)
+     : ServiceWorkerJobBase(aQueue, Type::UpdateJob, aPrincipal, aScope,
+                            aScriptSpec, aCallback, nullptr)
+   {
+     AssertIsOnMainThread();
+   }
+ 
+   void
++  Cancel() override
++  {
++    AssertIsOnMainThread();
++    if (mCompareHandle) {
++      mCompareHandle->Abort();
++      mCompareHandle = nullptr;
++    }
++    ServiceWorkerJobBase::Cancel();
++  }
++
++  void
+   Start() override
+   {
+     AssertIsOnMainThread();
+     MOZ_ASSERT(!mCanceled);
+ 
+     RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+     if (!swm->HasBackgroundActor()) {
+       nsCOMPtr<nsIRunnable> runnable =
+@@ -1562,29 +1574,34 @@ private:
+ 
+     // 9.2.20 If newestWorker is not null, and newestWorker's script url is
+     // equal to registration's registering script url and response is a
+     // byte-for-byte match with the script resource of newestWorker...
+     if (workerInfo && workerInfo->ScriptSpec().Equals(mScriptSpec)) {
+       cacheName = workerInfo->CacheName();
+     }
+ 
+-    rv = serviceWorkerScriptCache::Compare(mRegistration, mPrincipal, cacheName,
+-                                           NS_ConvertUTF8toUTF16(mScriptSpec),
+-                                           this, mLoadGroup);
++    // Note, this creates a reference cycle between the CompareManager and
++    // the job.  This cycle is explicitly broken in Done().
++    mCompareHandle =
++      serviceWorkerScriptCache::Compare(mRegistration, mPrincipal, cacheName,
++                                        NS_ConvertUTF8toUTF16(mScriptSpec),
++                                        this, mLoadGroup);
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       return Fail(rv);
+     }
+   }
+ 
+   void
+   Done(nsresult aStatus)
+   {
+     AssertIsOnMainThread();
+ 
++    mCompareHandle = nullptr;
++
+     if (mRegistration) {
+       mRegistration->mUpdating = false;
+     }
+ 
+     ServiceWorkerJob::Done(aStatus);
+   }
+ };
+ 
+diff --git a/dom/workers/ServiceWorkerScriptCache.cpp b/dom/workers/ServiceWorkerScriptCache.cpp
+--- a/dom/workers/ServiceWorkerScriptCache.cpp
++++ b/dom/workers/ServiceWorkerScriptCache.cpp
+@@ -222,17 +222,18 @@ private:
+     WaitingForValue
+   } mState;
+ 
+   bool mAborted;
+ };
+ 
+ NS_IMPL_ISUPPORTS(CompareCache, nsIStreamLoaderObserver)
+ 
+-class CompareManager final : public PromiseNativeHandler
++class CompareManager final : public PromiseNativeHandler,
++                             public CompareHandle
+ {
+ public:
+   NS_DECL_ISUPPORTS
+ 
+   explicit CompareManager(ServiceWorkerRegistrationInfo* aRegistration,
+                           CompareCallback* aCallback)
+     : mRegistration(aRegistration)
+     , mCallback(aCallback)
+@@ -447,16 +448,39 @@ public:
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       return rv;
+     }
+ 
+     mPrincipalInfo = Move(principalInfo);
+     return NS_OK;
+   }
+ 
++  void
++  Abort()
++  {
++    AssertIsOnMainThread();
++
++    // Do nothing if the manager has already been cleaned up.
++    if (!mCallback) {
++      return;
++    }
++
++    // otherwise abort all current operations
++    if (mCN) {
++      mCN->Abort();
++    }
++    if (mCC) {
++      mCC->Abort();
++    }
++
++    // The aborted network and cache objects should callback with a failure.
++    // Wait for this graceful cleanup to complete instead of cleaning up
++    // explicitly here.
++  }
++
+ private:
+   ~CompareManager()
+   {
+     AssertIsOnMainThread();
+     MOZ_ASSERT(!mCC);
+     MOZ_ASSERT(!mCN);
+   }
+ 
+@@ -1039,33 +1063,33 @@ GenerateCacheName(nsAString& aName)
+ 
+   char chars[NSID_LENGTH];
+   id.ToProvidedString(chars);
+   aName.AssignASCII(chars, NSID_LENGTH);
+ 
+   return NS_OK;
+ }
+ 
+-nsresult
++already_AddRefed<CompareHandle>
+ Compare(ServiceWorkerRegistrationInfo* aRegistration,
+         nsIPrincipal* aPrincipal, const nsAString& aCacheName,
+         const nsAString& aURL, CompareCallback* aCallback,
+         nsILoadGroup* aLoadGroup)
+ {
+   AssertIsOnMainThread();
+   MOZ_ASSERT(aRegistration);
+   MOZ_ASSERT(aPrincipal);
+   MOZ_ASSERT(!aURL.IsEmpty());
+   MOZ_ASSERT(aCallback);
+ 
+   RefPtr<CompareManager> cm = new CompareManager(aRegistration, aCallback);
+ 
+   nsresult rv = cm->Initialize(aPrincipal, aURL, aCacheName, aLoadGroup);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    return rv;
++    return nullptr;
+   }
+ 
+-  return NS_OK;
++  return cm.forget();
+ }
+ 
+ } // namespace serviceWorkerScriptCache
+ 
+ END_WORKERS_NAMESPACE
+diff --git a/dom/workers/ServiceWorkerScriptCache.h b/dom/workers/ServiceWorkerScriptCache.h
+--- a/dom/workers/ServiceWorkerScriptCache.h
++++ b/dom/workers/ServiceWorkerScriptCache.h
+@@ -38,17 +38,27 @@ public:
+                    bool aInCacheAndEqual,
+                    const nsAString& aNewCacheName,
+                    const nsACString& aMaxScope) = 0;
+ 
+   NS_IMETHOD_(MozExternalRefCountType) AddRef() = 0;
+   NS_IMETHOD_(MozExternalRefCountType) Release() = 0;
+ };
+ 
+-nsresult
++class CompareHandle
++{
++public:
++  virtual void
++  Abort() = 0;
++
++  NS_IMETHOD_(MozExternalRefCountType) AddRef() = 0;
++  NS_IMETHOD_(MozExternalRefCountType) Release() = 0;
++};
++
++already_AddRefed<CompareHandle>
+ Compare(ServiceWorkerRegistrationInfo* aRegistration,
+         nsIPrincipal* aPrincipal, const nsAString& aCacheName,
+         const nsAString& aURL, CompareCallback* aCallback, nsILoadGroup* aLoadGroup);
+ 
+ } // namespace serviceWorkerScriptCache
+ 
+ } // namespace workers
+ } // namespace dom
