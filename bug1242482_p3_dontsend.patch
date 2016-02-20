@@ -1,0 +1,164 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  924a2500bcf7196ce26326fa1345b22e4d073ccb
+Bug 1242482 P3 Don't send unregister messages when triggered from a PropagateUnregister(). r=baku
+
+diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
+--- a/dom/workers/ServiceWorkerManager.cpp
++++ b/dom/workers/ServiceWorkerManager.cpp
+@@ -2422,29 +2422,32 @@ ServiceWorkerManager::GetActiveWorkerInf
+ }
+ 
+ class ServiceWorkerUnregisterJob final : public ServiceWorkerJob
+ {
+   RefPtr<ServiceWorkerRegistrationInfo> mRegistration;
+   const nsCString mScope;
+   nsCOMPtr<nsIServiceWorkerUnregisterCallback> mCallback;
+   nsCOMPtr<nsIPrincipal> mPrincipal;
++  const bool mSendToParent;
+ 
+   ~ServiceWorkerUnregisterJob()
+   {}
+ 
+ public:
+   ServiceWorkerUnregisterJob(ServiceWorkerJobQueue* aQueue,
+                              const nsACString& aScope,
+                              nsIServiceWorkerUnregisterCallback* aCallback,
+-                             nsIPrincipal* aPrincipal)
++                             nsIPrincipal* aPrincipal,
++                             bool aSendToParent = true)
+     : ServiceWorkerJob(aQueue, Type::UnregisterJob)
+     , mScope(aScope)
+     , mCallback(aCallback)
+     , mPrincipal(aPrincipal)
++    , mSendToParent(aSendToParent)
+   {
+     AssertIsOnMainThread();
+   }
+ 
+   void
+   Start() override
+   {
+     AssertIsOnMainThread();
+@@ -2495,17 +2498,17 @@ private:
+     MOZ_ASSERT(registration);
+ 
+     // Note, we send the message to remove the registration from disk now even
+     // though we may only set the mPendingUninstall flag below.  This is
+     // necessary to ensure the registration is removed if the controlled
+     // clients are closed by shutting down the browser.  If the registration
+     // is resurrected by clearing mPendingUninstall then it should be saved
+     // to disk again.
+-    if (!registration->mPendingUninstall && swm->mActor) {
++    if (mSendToParent && !registration->mPendingUninstall && swm->mActor) {
+       swm->mActor->SendUnregister(principalInfo, NS_ConvertUTF8toUTF16(mScope));
+     }
+ 
+     // "Set registration's uninstalling flag."
+     registration->mPendingUninstall = true;
+     // "Resolve promise with true"
+     rv = mCallback ? mCallback->UnregisterSucceeded(true) : NS_OK;
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+@@ -2577,16 +2580,57 @@ ServiceWorkerManager::Unregister(nsIPrin
+     queue->Append(job);
+     return NS_OK;
+   }
+ 
+   AppendPendingOperation(queue, job);
+   return NS_OK;
+ }
+ 
++nsresult
++ServiceWorkerManager::NotifyUnregister(nsIPrincipal* aPrincipal,
++                                       const nsAString& aScope)
++{
++  AssertIsOnMainThread();
++  MOZ_ASSERT(aPrincipal);
++
++  nsresult rv;
++
++// This is not accessible by content, and callers should always ensure scope is
++// a correct URI, so this is wrapped in DEBUG
++#ifdef DEBUG
++  nsCOMPtr<nsIURI> scopeURI;
++  rv = NS_NewURI(getter_AddRefs(scopeURI), aScope, nullptr, nullptr);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return rv;
++  }
++#endif
++
++  nsAutoCString originSuffix;
++  rv = PrincipalToScopeKey(aPrincipal, originSuffix);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return rv;
++  }
++
++  NS_ConvertUTF16toUTF8 scope(aScope);
++  ServiceWorkerJobQueue* queue = GetOrCreateJobQueue(originSuffix, scope);
++  MOZ_ASSERT(queue);
++
++  RefPtr<ServiceWorkerUnregisterJob> job =
++    new ServiceWorkerUnregisterJob(queue, scope, nullptr, aPrincipal, false);
++
++  if (mActor) {
++    queue->Append(job);
++    return NS_OK;
++  }
++
++  AppendPendingOperation(queue, job);
++  return NS_OK;
++}
++
+ ServiceWorkerJobQueue*
+ ServiceWorkerManager::GetOrCreateJobQueue(const nsACString& aKey,
+                                           const nsACString& aScope)
+ {
+   ServiceWorkerManager::RegistrationDataPerPrincipal* data;
+   if (!mRegistrationInfos.Get(aKey, &data)) {
+     data = new RegistrationDataPerPrincipal();
+     mRegistrationInfos.Put(aKey, data);
+diff --git a/dom/workers/ServiceWorkerManager.h b/dom/workers/ServiceWorkerManager.h
+--- a/dom/workers/ServiceWorkerManager.h
++++ b/dom/workers/ServiceWorkerManager.h
+@@ -494,16 +494,19 @@ public:
+   void
+   MaybeCheckNavigationUpdate(nsIDocument* aDoc);
+ 
+   nsresult
+   SendPushEvent(const nsACString& aOriginAttributes,
+                 const nsACString& aScope,
+                 Maybe<nsTArray<uint8_t>> aData);
+ 
++  nsresult
++  NotifyUnregister(nsIPrincipal* aPrincipal, const nsAString& aScope);
++
+ private:
+   ServiceWorkerManager();
+   ~ServiceWorkerManager();
+ 
+   void
+   Init();
+ 
+   ServiceWorkerJobQueue*
+diff --git a/dom/workers/ServiceWorkerManagerChild.cpp b/dom/workers/ServiceWorkerManagerChild.cpp
+--- a/dom/workers/ServiceWorkerManagerChild.cpp
++++ b/dom/workers/ServiceWorkerManagerChild.cpp
+@@ -57,17 +57,17 @@ ServiceWorkerManagerChild::RecvNotifyUnr
+   RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+   MOZ_ASSERT(swm);
+ 
+   nsCOMPtr<nsIPrincipal> principal = PrincipalInfoToPrincipal(aPrincipalInfo);
+   if (NS_WARN_IF(!principal)) {
+     return true;
+   }
+ 
+-  nsresult rv = swm->Unregister(principal, nullptr, aScope);
++  nsresult rv = swm->NotifyUnregister(principal, aScope);
+   Unused << NS_WARN_IF(NS_FAILED(rv));
+   return true;
+ }
+ 
+ bool
+ ServiceWorkerManagerChild::RecvNotifyRemove(const nsCString& aHost)
+ {
+   if (mShuttingDown) {

@@ -1,0 +1,210 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  f2f8fc172f4c62334e9a92bcf10e00fe877387d5
+Bug 1243453 P1 Make nsCORSListenerProxy call UpdateChannel() for internal redirects. r=sicking
+
+diff --git a/netwerk/protocol/http/nsCORSListenerProxy.cpp b/netwerk/protocol/http/nsCORSListenerProxy.cpp
+--- a/netwerk/protocol/http/nsCORSListenerProxy.cpp
++++ b/netwerk/protocol/http/nsCORSListenerProxy.cpp
+@@ -438,17 +438,17 @@ nsCORSListenerProxy::~nsCORSListenerProx
+ }
+ 
+ nsresult
+ nsCORSListenerProxy::Init(nsIChannel* aChannel, DataURIHandling aAllowDataURI)
+ {
+   aChannel->GetNotificationCallbacks(getter_AddRefs(mOuterNotificationCallbacks));
+   aChannel->SetNotificationCallbacks(this);
+ 
+-  nsresult rv = UpdateChannel(aChannel, aAllowDataURI);
++  nsresult rv = UpdateChannel(aChannel, aAllowDataURI, UpdateType::Default);
+   if (NS_FAILED(rv)) {
+     mOuterListener = nullptr;
+     mRequestingPrincipal = nullptr;
+     mOriginHeaderPrincipal = nullptr;
+     mOuterNotificationCallbacks = nullptr;
+   }
+ #ifdef DEBUG
+   mInited = true;
+@@ -631,18 +631,32 @@ nsCORSListenerProxy::GetInterface(const 
+ 
+ NS_IMETHODIMP
+ nsCORSListenerProxy::AsyncOnChannelRedirect(nsIChannel *aOldChannel,
+                                             nsIChannel *aNewChannel,
+                                             uint32_t aFlags,
+                                             nsIAsyncVerifyRedirectCallback *aCb)
+ {
+   nsresult rv;
+-  if (!NS_IsInternalSameURIRedirect(aOldChannel, aNewChannel, aFlags) &&
+-      !NS_IsHSTSUpgradeRedirect(aOldChannel, aNewChannel, aFlags)) {
++  if (NS_IsInternalSameURIRedirect(aOldChannel, aNewChannel, aFlags) ||
++      NS_IsHSTSUpgradeRedirect(aOldChannel, aNewChannel, aFlags)) {
++    // Internal redirects still need to be updated in order to maintain
++    // the correct headers.  We use DataURIHandling::Allow, since unallowed
++    // data URIs should have been blocked before we got to the internal
++    // redirect.
++    rv = UpdateChannel(aNewChannel, DataURIHandling::Allow,
++                       UpdateType::InternalOrHSTSRedirect);
++    if (NS_FAILED(rv)) {
++        NS_WARNING("nsCORSListenerProxy::AsyncOnChannelRedirect: "
++                   "internal redirect UpdateChannel() returned failure");
++      aOldChannel->Cancel(rv);
++      return rv;
++    }
++  } else {
++    // A real, external redirect.  Perform CORS checking on new URL.
+     rv = CheckRequestApproved(aOldChannel);
+     if (NS_FAILED(rv)) {
+       nsCOMPtr<nsIURI> oldURI;
+       NS_GetFinalChannelURI(aOldChannel, getter_AddRefs(oldURI));
+       if (oldURI) {
+         if (sPreflightCache) {
+           // OK to use mRequestingPrincipal since preflights never get
+           // redirected.
+@@ -693,17 +707,18 @@ nsCORSListenerProxy::AsyncOnChannelRedir
+       }
+ 
+       if (NS_FAILED(rv)) {
+         aOldChannel->Cancel(rv);
+         return rv;
+       }
+     }
+ 
+-    rv = UpdateChannel(aNewChannel, DataURIHandling::Disallow);
++    rv = UpdateChannel(aNewChannel, DataURIHandling::Disallow,
++                       UpdateType::Default);
+     if (NS_FAILED(rv)) {
+         NS_WARNING("nsCORSListenerProxy::AsyncOnChannelRedirect: "
+                    "UpdateChannel() returned failure");
+       aOldChannel->Cancel(rv);
+       return rv;
+     }
+   }
+ 
+@@ -795,17 +810,18 @@ CheckUpgradeInsecureRequestsPreventsCORS
+   // lets see if the loadInfo indicates that the request will
+   // be upgraded before fetching any data from the netwerk.
+   return loadInfo->GetUpgradeInsecureRequests();
+ }
+ 
+ 
+ nsresult
+ nsCORSListenerProxy::UpdateChannel(nsIChannel* aChannel,
+-                                   DataURIHandling aAllowDataURI)
++                                   DataURIHandling aAllowDataURI,
++                                   UpdateType aUpdateType)
+ {
+   nsCOMPtr<nsIURI> uri, originalURI;
+   nsresult rv = NS_GetFinalChannelURI(aChannel, getter_AddRefs(uri));
+   NS_ENSURE_SUCCESS(rv, rv);
+   rv = aChannel->GetOriginalURI(getter_AddRefs(originalURI));
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   nsCOMPtr<nsILoadInfo> loadInfo = aChannel->GetLoadInfo();
+@@ -865,17 +881,17 @@ nsCORSListenerProxy::UpdateChannel(nsICh
+   // then the xhr request will be upgraded to https before it fetches any data
+   // from the netwerk, hence we shouldn't require CORS in that specific case.
+   if (CheckUpgradeInsecureRequestsPreventsCORS(mRequestingPrincipal, aChannel)) {
+     return NS_OK;
+   }
+ 
+   // Check if we need to do a preflight, and if so set one up. This must be
+   // called once we know that the request is going, or has gone, cross-origin.
+-  rv = CheckPreflightNeeded(aChannel);
++  rv = CheckPreflightNeeded(aChannel, aUpdateType);
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   // It's a cross site load
+   mHasBeenCrossSite = true;
+ 
+   nsCString userpass;
+   uri->GetUserPass(userpass);
+   NS_ENSURE_TRUE(userpass.IsEmpty(), NS_ERROR_DOM_BAD_URI);
+@@ -904,17 +920,17 @@ nsCORSListenerProxy::UpdateChannel(nsICh
+     rv = http->SetLoadFlags(flags);
+     NS_ENSURE_SUCCESS(rv, rv);
+   }
+ 
+   return NS_OK;
+ }
+ 
+ nsresult
+-nsCORSListenerProxy::CheckPreflightNeeded(nsIChannel* aChannel)
++nsCORSListenerProxy::CheckPreflightNeeded(nsIChannel* aChannel, UpdateType aUpdateType)
+ {
+   // If this caller isn't using AsyncOpen2, or if this *is* a preflight channel,
+   // then we shouldn't initiate preflight for this channel.
+   nsCOMPtr<nsILoadInfo> loadInfo = aChannel->GetLoadInfo();
+   if (!loadInfo ||
+       loadInfo->GetSecurityMode() !=
+         nsILoadInfo::SEC_REQUIRE_CORS_DATA_INHERITS ||
+       loadInfo->GetIsPreflight()) {
+@@ -957,17 +973,19 @@ nsCORSListenerProxy::CheckPreflightNeede
+ 
+   if (!doPreflight) {
+     return NS_OK;
+   }
+ 
+   // A preflight is needed. But if we've already been cross-site, then
+   // we already did a preflight when that happened, and so we're not allowed
+   // to do another preflight again.
+-  NS_ENSURE_FALSE(mHasBeenCrossSite, NS_ERROR_DOM_BAD_URI);
++  if (aUpdateType != UpdateType::InternalOrHSTSRedirect) {
++    NS_ENSURE_FALSE(mHasBeenCrossSite, NS_ERROR_DOM_BAD_URI);
++  }
+ 
+   nsCOMPtr<nsIHttpChannelInternal> internal = do_QueryInterface(http);
+   NS_ENSURE_TRUE(internal, NS_ERROR_DOM_BAD_URI);
+ 
+   internal->SetCorsPreflightParameters(
+     headers.IsEmpty() ? loadInfoHeaders : headers);
+ 
+   return NS_OK;
+diff --git a/netwerk/protocol/http/nsCORSListenerProxy.h b/netwerk/protocol/http/nsCORSListenerProxy.h
+--- a/netwerk/protocol/http/nsCORSListenerProxy.h
++++ b/netwerk/protocol/http/nsCORSListenerProxy.h
+@@ -32,16 +32,22 @@ class nsHttpChannel;
+ }
+ 
+ enum class DataURIHandling
+ {
+   Allow,
+   Disallow
+ };
+ 
++enum class UpdateType
++{
++  Default,
++  InternalOrHSTSRedirect
++};
++
+ class nsCORSListenerProxy final : public nsIStreamListener,
+                                   public nsIInterfaceRequestor,
+                                   public nsIChannelEventSink,
+                                   public nsIThreadRetargetableStreamListener
+ {
+ public:
+   nsCORSListenerProxy(nsIStreamListener* aOuter,
+                       nsIPrincipal* aRequestingPrincipal,
+@@ -73,19 +79,20 @@ private:
+                                            nsIPrincipal* aRequestingPrincipal);
+   static nsresult StartCORSPreflight(nsIChannel* aRequestChannel,
+                                      nsICorsPreflightCallback* aCallback,
+                                      nsTArray<nsCString>& aACUnsafeHeaders,
+                                      nsIChannel** aPreflightChannel);
+ 
+   ~nsCORSListenerProxy();
+ 
+-  nsresult UpdateChannel(nsIChannel* aChannel, DataURIHandling aAllowDataURI);
++  nsresult UpdateChannel(nsIChannel* aChannel, DataURIHandling aAllowDataURI,
++                         UpdateType aUpdateType);
+   nsresult CheckRequestApproved(nsIRequest* aRequest);
+-  nsresult CheckPreflightNeeded(nsIChannel* aChannel);
++  nsresult CheckPreflightNeeded(nsIChannel* aChannel, UpdateType aUpdateType);
+ 
+   nsCOMPtr<nsIStreamListener> mOuterListener;
+   // The principal that originally kicked off the request
+   nsCOMPtr<nsIPrincipal> mRequestingPrincipal;
+   // The principal to use for our Origin header ("source origin" in spec terms).
+   // This can get changed during redirects, unlike mRequestingPrincipal.
+   nsCOMPtr<nsIPrincipal> mOriginHeaderPrincipal;
+   nsCOMPtr<nsIInterfaceRequestor> mOuterNotificationCallbacks;

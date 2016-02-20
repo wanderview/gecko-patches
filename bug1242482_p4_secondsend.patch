@@ -1,0 +1,150 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  6b4221246444d1bcb8efb357fa0fff0cb19a2712
+Bug 1242482 P4 Don't call SendUnregister() a second time when SW registration is finally removed. r=baku
+
+diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
+--- a/dom/workers/ServiceWorkerManager.cpp
++++ b/dom/workers/ServiceWorkerManager.cpp
+@@ -2520,17 +2520,16 @@ private:
+     // "If no service worker client is using registration..."
+     if (!registration->IsControllingDocuments()) {
+       // "If registration's uninstalling flag is set.."
+       if (!registration->mPendingUninstall) {
+         return NS_OK;
+       }
+ 
+       // "Invoke [[Clear Registration]]..."
+-      registration->Clear();
+       swm->RemoveRegistration(registration);
+     }
+ 
+     return NS_OK;
+   }
+ 
+   // The unregister job is done irrespective of success or failure of any sort.
+   void
+@@ -3401,17 +3400,16 @@ ServiceWorkerManager::StartControllingAD
+ }
+ 
+ void
+ ServiceWorkerManager::StopControllingADocument(ServiceWorkerRegistrationInfo* aRegistration)
+ {
+   aRegistration->StopControllingADocument();
+   if (!aRegistration->IsControllingDocuments()) {
+     if (aRegistration->mPendingUninstall) {
+-      aRegistration->Clear();
+       RemoveRegistration(aRegistration);
+     } else {
+       // If the registration has an active worker that is running
+       // this might be a good time to stop it.
+       if (aRegistration->mActiveWorker) {
+         ServiceWorkerPrivate* serviceWorkerPrivate =
+           aRegistration->mActiveWorker->WorkerPrivate();
+         serviceWorkerPrivate->NoteStoppedControllingDocuments();
+@@ -4302,56 +4300,45 @@ ServiceWorkerManager::CreateNewRegistrat
+ }
+ 
+ void
+ ServiceWorkerManager::MaybeRemoveRegistration(ServiceWorkerRegistrationInfo* aRegistration)
+ {
+   MOZ_ASSERT(aRegistration);
+   RefPtr<ServiceWorkerInfo> newest = aRegistration->Newest();
+   if (!newest && HasScope(aRegistration->mPrincipal, aRegistration->mScope)) {
+-    aRegistration->Clear();
+     RemoveRegistration(aRegistration);
+   }
+ }
+ 
+ void
+-ServiceWorkerManager::RemoveRegistrationInternal(ServiceWorkerRegistrationInfo* aRegistration)
+-{
+-  MOZ_ASSERT(aRegistration);
+-  MOZ_ASSERT(!aRegistration->IsControllingDocuments());
+-
+-  if (mShuttingDown) {
+-    return;
+-  }
+-
+-  // All callers should be either from a job in which case the actor is
+-  // available, or from MaybeStopControlling(), in which case, this will only be
+-  // called if a valid registration is found. If a valid registration exists,
+-  // it means the actor is available since the original map of registrations is
+-  // populated by it, and any new registrations wait until the actor is
+-  // available before proceeding (See ServiceWorkerRegisterJob::Start).
+-  MOZ_ASSERT(mActor);
+-
+-  PrincipalInfo principalInfo;
+-  if (NS_WARN_IF(NS_FAILED(PrincipalToPrincipalInfo(aRegistration->mPrincipal,
+-                                                    &principalInfo)))) {
+-    //XXXnsm I can't think of any other reason a stored principal would fail to
+-    //convert.
+-    NS_WARNING("Unable to unregister serviceworker due to possible OOM");
+-    return;
+-  }
+-
+-  mActor->SendUnregister(principalInfo, NS_ConvertUTF8toUTF16(aRegistration->mScope));
+-}
+-
+-void
+ ServiceWorkerManager::RemoveRegistration(ServiceWorkerRegistrationInfo* aRegistration)
+ {
+-  RemoveRegistrationInternal(aRegistration);
++  // Note, we do not need to call mActor->SendUnregister() here.  There are a few
++  // ways we can get here:
++  // 1) Through a normal unregister which calls SendUnregister() in the unregister
++  //    job Start() method.
++  // 2) Through origin storage being purged.  These result in ForceUnregister()
++  //    starting unregister jobs which in turn call SendUnregister().
++  // 3) Through the failure to install a new service worker.  Since we don't store
++  //    the registration until install succeeds, we do not need to call
++  //    SendUnregister here.
++  // Assert these conditions by testing for pending uninstall (cases 1 and 2) or
++  // null workers (case 3).
++#ifdef DEBUG
++  RefPtr<ServiceWorkerInfo> newest = aRegistration->Newest();
++  MOZ_ASSERT(aRegistration->mPendingUninstall || !newest);
++#endif
++
+   MOZ_ASSERT(HasScope(aRegistration->mPrincipal, aRegistration->mScope));
++
++  // When a registration is removed, we must clear its contents since the DOM
++  // object may be held by content script.
++  aRegistration->Clear();
++
+   RemoveScopeAndRegistration(aRegistration);
+ }
+ 
+ namespace {
+ /**
+  * See browser/components/sessionstore/Utils.jsm function hasRootDomain().
+  *
+  * Returns true if the |url| passed in is part of the given root |domain|.
+diff --git a/dom/workers/ServiceWorkerManager.h b/dom/workers/ServiceWorkerManager.h
+--- a/dom/workers/ServiceWorkerManager.h
++++ b/dom/workers/ServiceWorkerManager.h
+@@ -636,24 +636,16 @@ private:
+     return !!mActor;
+   }
+ 
+   nsClassHashtable<nsISupportsHashKey, PendingReadyPromise> mPendingReadyPromises;
+ 
+   void
+   MaybeRemoveRegistration(ServiceWorkerRegistrationInfo* aRegistration);
+ 
+-  // Does all cleanup except removing the registration from
+-  // mServiceWorkerRegistrationInfos. This is useful when we clear
+-  // registrations via remove()/removeAll() since we are iterating over the
+-  // hashtable and can cleanly remove within the hashtable enumeration
+-  // function.
+-  void
+-  RemoveRegistrationInternal(ServiceWorkerRegistrationInfo* aRegistration);
+-
+   // Removes all service worker registrations that matches the given pattern.
+   void
+   RemoveAllRegistrations(OriginAttributesPattern* aPattern);
+ 
+   RefPtr<ServiceWorkerManagerChild> mActor;
+ 
+   struct PendingOperation;
+   nsTArray<PendingOperation> mPendingOperations;

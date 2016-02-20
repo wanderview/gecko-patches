@@ -1,0 +1,173 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  ea39d4a6232c278dd8d805608a07cf9f4cc4c76b
+Bug 1246319 P1 Dedupe service worker registrar entries. r=baku
+
+diff --git a/dom/workers/ServiceWorkerRegistrar.cpp b/dom/workers/ServiceWorkerRegistrar.cpp
+--- a/dom/workers/ServiceWorkerRegistrar.cpp
++++ b/dom/workers/ServiceWorkerRegistrar.cpp
+@@ -136,51 +136,59 @@ ServiceWorkerRegistrar::GetRegistrations
+   if (firstTime) {
+     firstTime = false;
+     Telemetry::AccumulateTimeDelta(
+       Telemetry::SERVICE_WORKER_REGISTRATION_LOADING,
+       startTime);
+   }
+ }
+ 
++namespace {
++
++bool Equivalent(const ServiceWorkerRegistrationData& aLeft,
++                const ServiceWorkerRegistrationData& aRight)
++{
++  MOZ_ASSERT(aLeft.principal().type() ==
++             mozilla::ipc::PrincipalInfo::TContentPrincipalInfo);
++  MOZ_ASSERT(aRight.principal().type() ==
++             mozilla::ipc::PrincipalInfo::TContentPrincipalInfo);
++
++  const auto& leftPrincipal = aLeft.principal().get_ContentPrincipalInfo();
++  const auto& rightPrincipal = aRight.principal().get_ContentPrincipalInfo();
++
++  // Only compare the attributes, not the spec part of the principal.
++  // The scope comparison above already covers the origin and codebase
++  // principals include the full path in their spec which is not what
++  // we want here.
++  return aLeft.scope() == aRight.scope() &&
++         leftPrincipal.attrs() == rightPrincipal.attrs();
++}
++
++} // anonymous namespace
++
+ void
+ ServiceWorkerRegistrar::RegisterServiceWorker(
+                                      const ServiceWorkerRegistrationData& aData)
+ {
+   AssertIsOnBackgroundThread();
+ 
+   if (mShuttingDown) {
+     NS_WARNING("Failed to register a serviceWorker during shutting down.");
+     return;
+   }
+ 
+   {
+     MonitorAutoLock lock(mMonitor);
+     MOZ_ASSERT(mDataLoaded);
+ 
+-    const mozilla::ipc::PrincipalInfo& newPrincipalInfo = aData.principal();
+-    MOZ_ASSERT(newPrincipalInfo.type() ==
+-               mozilla::ipc::PrincipalInfo::TContentPrincipalInfo);
+-
+-    const mozilla::ipc::ContentPrincipalInfo& newContentPrincipalInfo =
+-      newPrincipalInfo.get_ContentPrincipalInfo();
+-
+     bool found = false;
+     for (uint32_t i = 0, len = mData.Length(); i < len; ++i) {
+-      if (mData[i].scope() == aData.scope()) {
+-        const mozilla::ipc::PrincipalInfo& existingPrincipalInfo =
+-          mData[i].principal();
+-        const mozilla::ipc::ContentPrincipalInfo& existingContentPrincipalInfo =
+-          existingPrincipalInfo.get_ContentPrincipalInfo();
+-
+-        if (newContentPrincipalInfo == existingContentPrincipalInfo) {
+-          mData[i] = aData;
+-          found = true;
+-          break;
+-        }
++      if (Equivalent(aData, mData[i])) {
++        found = true;
++        break;
+       }
+     }
+ 
+     if (!found) {
+       mData.AppendElement(aData);
+     }
+   }
+ 
+@@ -200,19 +208,22 @@ ServiceWorkerRegistrar::UnregisterServic
+   }
+ 
+   bool deleted = false;
+ 
+   {
+     MonitorAutoLock lock(mMonitor);
+     MOZ_ASSERT(mDataLoaded);
+ 
++    ServiceWorkerRegistrationData tmp;
++    tmp.principal() = aPrincipalInfo;
++    tmp.scope() = aScope;
++
+     for (uint32_t i = 0; i < mData.Length(); ++i) {
+-      if (mData[i].principal() == aPrincipalInfo &&
+-          mData[i].scope() == aScope) {
++      if (Equivalent(tmp, mData[i])) {
+         mData.RemoveElementAt(i);
+         deleted = true;
+         break;
+       }
+     }
+   }
+ 
+   if (deleted) {
+@@ -310,19 +321,21 @@ ServiceWorkerRegistrar::ReadData()
+   }
+ 
+   if (!IsSupportedVersion(version)) {
+     nsContentUtils::LogMessageToConsole(nsPrintfCString(
+       "Unsupported service worker registrar version: %s", version.get()).get());
+     return NS_ERROR_FAILURE;
+   }
+ 
++  nsTArray<ServiceWorkerRegistrationData> tmpData;
++
+   bool overwrite = false;
+   while (hasMoreLines) {
+-    ServiceWorkerRegistrationData* entry = mData.AppendElement();
++    ServiceWorkerRegistrationData* entry = tmpData.AppendElement();
+ 
+ #define GET_LINE(x)                                   \
+     rv = lineInputStream->ReadLine(x, &hasMoreLines); \
+     if (NS_WARN_IF(NS_FAILED(rv))) {                  \
+       return rv;                                      \
+     }                                                 \
+     if (NS_WARN_IF(!hasMoreLines)) {                  \
+       return NS_ERROR_FAILURE;                        \
+@@ -390,16 +403,38 @@ ServiceWorkerRegistrar::ReadData()
+ 
+     if (!line.EqualsLiteral(SERVICEWORKERREGISTRAR_TERMINATOR)) {
+       return NS_ERROR_FAILURE;
+     }
+   }
+ 
+   stream->Close();
+ 
++  // Dedupe data in file.  Old profiles had many duplicates.  In theory
++  // we can remove this in the future. (Bug 1248449)
++  for (uint32_t i = 0; i < tmpData.Length(); ++i) {
++    bool match = false;
++    for (uint32_t j = 0; j < mData.Length(); ++j) {
++      // Use same comparison as RegisterServiceWorker. Scope contains
++      // basic origin information.  Combine with any principal attributes.
++      if (Equivalent(tmpData[i], mData[j])) {
++        // Last match wins, just like legacy loading used to do in
++        // the ServiceWorkerManager.
++        mData[j] = tmpData[i];
++        // Dupe found, so overwrite file with reduced list.
++        overwrite = true;
++        match = true;
++        break;
++      }
++    }
++    if (!match) {
++      mData.AppendElement(tmpData[i]);
++    }
++  }
++
+   // Overwrite previous version.
+   // Cannot call SaveData directly because gtest uses main-thread.
+   if (overwrite && NS_FAILED(WriteData())) {
+     NS_WARNING("Failed to write data for the ServiceWorker Registations.");
+     DeleteData();
+   }
+ 
+   return NS_OK;
