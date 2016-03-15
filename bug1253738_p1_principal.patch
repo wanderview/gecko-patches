@@ -1,0 +1,176 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  be593a64d7c6a826260514fe758ef32a6ee580f7
+Bug 1253738 P1 Require an explicit principal when looking up a service worker registration. r=baku
+
+diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
+--- a/docshell/base/nsDocShell.cpp
++++ b/docshell/base/nsDocShell.cpp
+@@ -14186,17 +14186,19 @@ nsDocShell::ShouldPrepareForIntercept(ns
+         return NS_OK;
+       }
+     }
+   }
+ 
+   if (aIsNonSubresourceRequest) {
+     PrincipalOriginAttributes attrs;
+     attrs.InheritFromDocShellToDoc(mOriginAttributes, aURI);
+-    *aShouldIntercept = swm->IsAvailable(attrs, aURI);
++    nsCOMPtr<nsIPrincipal> principal =
++      BasePrincipal::CreateCodebasePrincipal(aURI, attrs);
++    *aShouldIntercept = swm->IsAvailable(principal, aURI);
+     return NS_OK;
+   }
+ 
+   nsCOMPtr<nsIDocument> doc = GetDocument();
+   if (!doc) {
+     return NS_ERROR_NOT_AVAILABLE;
+   }
+ 
+diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
+--- a/dom/workers/ServiceWorkerManager.cpp
++++ b/dom/workers/ServiceWorkerManager.cpp
+@@ -2406,18 +2406,20 @@ ServiceWorkerManager::GetActiveWorkerInf
+ {
+   AssertIsOnMainThread();
+ 
+   nsCOMPtr<nsIURI> scopeURI;
+   nsresult rv = NS_NewURI(getter_AddRefs(scopeURI), aScope, nullptr, nullptr);
+   if (NS_FAILED(rv)) {
+     return nullptr;
+   }
++  nsCOMPtr<nsIPrincipal> principal =
++    BasePrincipal::CreateCodebasePrincipal(scopeURI, aOriginAttributes);
+   RefPtr<ServiceWorkerRegistrationInfo> registration =
+-    GetServiceWorkerRegistrationInfo(aOriginAttributes, scopeURI);
++    GetServiceWorkerRegistrationInfo(principal, scopeURI);
+   if (!registration) {
+     return nullptr;
+   }
+ 
+   return registration->mActiveWorker;
+ }
+ 
+ ServiceWorkerInfo*
+@@ -3111,27 +3113,16 @@ ServiceWorkerManager::GetServiceWorkerRe
+   if (NS_FAILED(rv)) {
+     return nullptr;
+   }
+ 
+   return GetServiceWorkerRegistrationInfo(originAttributesSuffix, aURI);
+ }
+ 
+ already_AddRefed<ServiceWorkerRegistrationInfo>
+-ServiceWorkerManager::GetServiceWorkerRegistrationInfo(const PrincipalOriginAttributes& aOriginAttributes,
+-                                                       nsIURI* aURI)
+-{
+-  MOZ_ASSERT(aURI);
+-
+-  nsAutoCString originAttributesSuffix;
+-  aOriginAttributes.CreateSuffix(originAttributesSuffix);
+-  return GetServiceWorkerRegistrationInfo(originAttributesSuffix, aURI);
+-}
+-
+-already_AddRefed<ServiceWorkerRegistrationInfo>
+ ServiceWorkerManager::GetServiceWorkerRegistrationInfo(const nsACString& aScopeKey,
+                                                        nsIURI* aURI)
+ {
+   MOZ_ASSERT(aURI);
+ 
+   nsAutoCString spec;
+   nsresult rv = aURI->GetSpec(spec);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+@@ -3678,18 +3669,22 @@ ServiceWorkerManager::DispatchFetchEvent
+     // the spec change.
+ 
+     nsCOMPtr<nsIURI> uri;
+     aRv = aChannel->GetSecureUpgradedChannelURI(getter_AddRefs(uri));
+     if (NS_WARN_IF(aRv.Failed())) {
+       return;
+     }
+ 
++    // non-subresource request means the URI contains the principal
++    nsCOMPtr<nsIPrincipal> principal =
++      BasePrincipal::CreateCodebasePrincipal(uri, aOriginAttributes);
++
+     RefPtr<ServiceWorkerRegistrationInfo> registration =
+-      GetServiceWorkerRegistrationInfo(aOriginAttributes, uri);
++      GetServiceWorkerRegistrationInfo(principal, uri);
+     if (!registration) {
+       NS_WARNING("No registration found when dispatching the fetch event");
+       aRv.Throw(NS_ERROR_FAILURE);
+       return;
+     }
+ 
+     // This should only happen if IsAvailable() returned true.
+     MOZ_ASSERT(registration->mActiveWorker);
+@@ -3721,23 +3716,24 @@ ServiceWorkerManager::DispatchFetchEvent
+     return;
+   }
+   // Otherwise, ensure the upload stream can be cloned directly.  This may
+   // require some async copying, so provide a callback.
+   aRv = uploadChannel->EnsureUploadStreamIsCloneable(continueRunnable);
+ }
+ 
+ bool
+-ServiceWorkerManager::IsAvailable(const PrincipalOriginAttributes& aOriginAttributes,
++ServiceWorkerManager::IsAvailable(nsIPrincipal* aPrincipal,
+                                   nsIURI* aURI)
+ {
++  MOZ_ASSERT(aPrincipal);
+   MOZ_ASSERT(aURI);
+ 
+   RefPtr<ServiceWorkerRegistrationInfo> registration =
+-    GetServiceWorkerRegistrationInfo(aOriginAttributes, aURI);
++    GetServiceWorkerRegistrationInfo(aPrincipal, aURI);
+   return registration && registration->mActiveWorker;
+ }
+ 
+ bool
+ ServiceWorkerManager::IsControlled(nsIDocument* aDoc, ErrorResult& aRv)
+ {
+   MOZ_ASSERT(aDoc);
+ 
+diff --git a/dom/workers/ServiceWorkerManager.h b/dom/workers/ServiceWorkerManager.h
+--- a/dom/workers/ServiceWorkerManager.h
++++ b/dom/workers/ServiceWorkerManager.h
+@@ -369,17 +369,17 @@ public:
+   // Note: Its safe to use weak references here because a RAII-style callback
+   //       is registered with the channel before its added to this list.  We
+   //       are guaranteed the callback will fire before and remove the ref
+   //       from this list before the channel is destroyed.
+   typedef nsTArray<nsIInterceptedChannel*> InterceptionList;
+   nsClassHashtable<nsCStringHashKey, InterceptionList> mNavigationInterceptions;
+ 
+   bool
+-  IsAvailable(const PrincipalOriginAttributes& aOriginAttributes, nsIURI* aURI);
++  IsAvailable(nsIPrincipal* aPrincipal, nsIURI* aURI);
+ 
+   bool
+   IsControlled(nsIDocument* aDocument, ErrorResult& aRv);
+ 
+   void
+   DispatchFetchEvent(const PrincipalOriginAttributes& aOriginAttributes,
+                      nsIDocument* aDoc,
+                      const nsAString& aDocumentIdForTopLevelNavigation,
+@@ -569,20 +569,16 @@ private:
+ 
+   already_AddRefed<ServiceWorkerRegistrationInfo>
+   GetServiceWorkerRegistrationInfo(nsIDocument* aDoc);
+ 
+   already_AddRefed<ServiceWorkerRegistrationInfo>
+   GetServiceWorkerRegistrationInfo(nsIPrincipal* aPrincipal, nsIURI* aURI);
+ 
+   already_AddRefed<ServiceWorkerRegistrationInfo>
+-  GetServiceWorkerRegistrationInfo(const PrincipalOriginAttributes& aOriginAttributes,
+-                                   nsIURI* aURI);
+-
+-  already_AddRefed<ServiceWorkerRegistrationInfo>
+   GetServiceWorkerRegistrationInfo(const nsACString& aScopeKey,
+                                    nsIURI* aURI);
+ 
+   // This method generates a key using appId and isInElementBrowser from the
+   // principal. We don't use the origin because it can change during the
+   // loading.
+   static nsresult
+   PrincipalToScopeKey(nsIPrincipal* aPrincipal, nsACString& aKey);
