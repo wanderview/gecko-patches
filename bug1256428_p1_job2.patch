@@ -1,0 +1,285 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  341344bdec8f10bf50646cd6ef2355361435cbf6
+Bug 1256428 P1 Add ServiceWorkerJob2 base class. r=ehsan
+
+diff --git a/dom/workers/ServiceWorkerJob.cpp b/dom/workers/ServiceWorkerJob.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/workers/ServiceWorkerJob.cpp
+@@ -0,0 +1,120 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "ServiceWorkerJob.h"
++
++#include "nsThreadUtils.h"
++#include "Workers.h"
++
++namespace mozilla {
++namespace dom {
++namespace workers {
++
++ServiceWorkerJob2::Type
++ServiceWorkerJob2::GetType() const
++{
++  return mType;
++}
++
++ServiceWorkerJob2::State
++ServiceWorkerJob2::GetState() const
++{
++  return mState;
++}
++
++bool
++ServiceWorkerJob2::IsEquivalentTo(ServiceWorkerJob2* aJob) const
++{
++  AssertIsOnMainThread();
++  MOZ_ASSERT(aJob);
++  return mType == aJob->mType &&
++         mScope.Equals(aJob->mScope) &&
++         mScriptSpec.Equals(aJob->mScriptSpec) &&
++         mPrincipal->Equals(aJob->mPrincipal);
++}
++
++void
++ServiceWorkerJob2::AppendNormalCallback(Callback* aCallback)
++{
++  AssertIsOnMainThread();
++  MOZ_ASSERT(aCallback);
++  MOZ_ASSERT(mFinalCallback != aCallback);
++  MOZ_ASSERT(!mCallbackList.Contains(aCallback));
++  mCallbackList.AppendElement(aCallback);
++}
++
++void
++ServiceWorkerJob2::SetFinalCallback(Callback* aCallback)
++{
++  AssertIsOnMainThread();
++  MOZ_ASSERT(aCallback);
++  MOZ_ASSERT(!mFinalCallback);
++  MOZ_ASSERT(!mCallbackList.Contains(aCallback));
++  mFinalCallback = aCallback;
++}
++
++void
++ServiceWorkerJob2::Start()
++{
++  AssertIsOnMainThread();
++  MOZ_ASSERT(mFinalCallback);
++
++  MOZ_ASSERT(mState == State::Initial);
++  mState = State::Started;
++
++  nsCOMPtr<nsIRunnable> runnable =
++    NS_NewRunnableMethod(this, &ServiceWorkerJob2::AsyncExecute);
++  MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
++    NS_DispatchToMainThread(runnable.forget())));
++}
++
++ServiceWorkerJob2::ServiceWorkerJob2(Type aType,
++                                     nsIPrincipal* aPrincipal,
++                                     const nsACString& aScope,
++                                     const nsACString& aScriptSpec)
++  : mType(aType)
++  , mPrincipal(aPrincipal)
++  , mScope(aScope)
++  , mScriptSpec(aScriptSpec)
++{
++  AssertIsOnMainThread();
++  MOZ_ASSERT(mPrincipal);
++  MOZ_ASSERT(!mScope.IsEmpty());
++  // Some job types may have an empty script spec
++}
++
++ServiceWorkerJob2::~ServiceWorkerJob2()
++{
++  AssertIsOnMainThread();
++  // Jobs must finish or never be started.  Destroying an actively running
++  // job is an error.
++  MOZ_ASSERT(mState != State::Started);
++}
++
++void
++ServiceWorkerJob2::Finish(ErrorResult& aRv)
++{
++  AssertIsOnMainThread();
++
++  // Our final callback may drop the last ref, so ensure we survive to the end
++  // of this method.
++  RefPtr<ServiceWorkerJob2> kungFuDeathGrip = this;
++
++  MOZ_ASSERT(mState == State::Started);
++  mState = State::Finished;
++
++  for (uint32_t i = 0; i < mCallbackList.Length(); ++i) {
++    mCallbackList[i]->JobFinished(this, aRv);
++  }
++  mCallbackList.Clear();
++
++  mFinalCallback->JobFinished(this, aRv);
++  mFinalCallback = nullptr;
++}
++
++} // namespace workers
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/workers/ServiceWorkerJob.h b/dom/workers/ServiceWorkerJob.h
+new file mode 100644
+--- /dev/null
++++ b/dom/workers/ServiceWorkerJob.h
+@@ -0,0 +1,129 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_workers_serviceworkerjob_h
++#define mozilla_dom_workers_serviceworkerjob_h
++
++#include "nsCOMPtr.h"
++#include "nsString.h"
++#include "nsTArray.h"
++
++class nsIPrincipal;
++
++namespace mozilla {
++
++class ErrorResult;
++
++namespace dom {
++namespace workers {
++
++class ServiceWorkerJob2
++{
++public:
++  // Implement this interface to receive notification when a job completes.
++  class Callback
++  {
++  public:
++    // Called once when the job completes.  If the job is started, then this
++    // will be called.  If a job is never executed due to browser shutdown,
++    // then this method will never be called.  This method is always called
++    // asynchronous from Start() on the main thread.
++    virtual void JobFinished(ServiceWorkerJob2* aJob, ErrorResult& aStatus) = 0;
++
++    NS_IMETHOD_(MozExternalRefCountType)
++    AddRef(void) = 0;
++
++    NS_IMETHOD_(MozExternalRefCountType)
++    Release(void) = 0;
++  };
++
++  enum class Type
++  {
++    Register,
++    Update,
++    Unregister
++  };
++
++  enum class State
++  {
++    Initial,
++    Started,
++    Finished
++  };
++
++  Type
++  GetType() const;
++
++  State
++  GetState() const;
++
++  bool
++  IsEquivalentTo(ServiceWorkerJob2* aJob) const;
++
++  // Add a callback that is invoked when the job completes.  These
++  // callbacks are called before the final callback in the order
++  // in which they are added.
++  void
++  AppendNormalCallback(Callback* aCallback);
++
++  // Define a final callback that is invoked last when the job
++  // completes.  This must be called exactly once before Start().
++  void
++  SetFinalCallback(Callback* aCallback);
++
++  // Start the job.  All work will be performed asynchronously on
++  // the main thread.  Once called the Finish() method must be called
++  // exactly once.
++  void
++  Start();
++
++  // All job types must provide a way to cancel their work.  This should
++  // result in a started job calling Finish() as soon as possible.  If
++  // the job has not been started, then it should not call Finish().
++  virtual void
++  Cancel() = 0;
++
++  NS_IMETHOD_(MozExternalRefCountType)
++  AddRef(void) = 0;
++
++  NS_IMETHOD_(MozExternalRefCountType)
++  Release(void) = 0;
++
++protected:
++  ServiceWorkerJob2(Type aType,
++                    nsIPrincipal* aPrincipal,
++                    const nsACString& aScope,
++                    const nsACString& aScriptSpec);
++
++  ~ServiceWorkerJob2();
++
++  // Indicate that the job has completed.  The must be called exactly
++  // once after Start() has initiated job execution.  It must be called
++  // asynchronously from Start().
++  void
++  Finish(ErrorResult& aRv);
++
++  // Specific job types should define AsyncExecute to begin their work.
++  // All errors and successes must result in Finish() being called.
++  virtual void
++  AsyncExecute() = 0;
++
++  const Type mType;
++  nsCOMPtr<nsIPrincipal> mPrincipal;
++  const nsCString mScope;
++  const nsCString mScriptSpec;
++
++private:
++  RefPtr<Callback> mFinalCallback;
++  nsTArray<RefPtr<Callback>> mCallbackList;
++  State mState;
++};
++
++} // namespace workers
++} // namespace dom
++} // namespace mozilla
++
++#endif // mozilla_dom_workers_serviceworkerjob_h
+diff --git a/dom/workers/moz.build b/dom/workers/moz.build
+--- a/dom/workers/moz.build
++++ b/dom/workers/moz.build
+@@ -62,16 +62,17 @@ UNIFIED_SOURCES += [
+     'RegisterBindings.cpp',
+     'RuntimeService.cpp',
+     'ScriptLoader.cpp',
+     'ServiceWorker.cpp',
+     'ServiceWorkerClient.cpp',
+     'ServiceWorkerClients.cpp',
+     'ServiceWorkerContainer.cpp',
+     'ServiceWorkerEvents.cpp',
++    'ServiceWorkerJob.cpp',
+     'ServiceWorkerManager.cpp',
+     'ServiceWorkerManagerChild.cpp',
+     'ServiceWorkerManagerParent.cpp',
+     'ServiceWorkerManagerService.cpp',
+     'ServiceWorkerMessageEvent.cpp',
+     'ServiceWorkerPrivate.cpp',
+     'ServiceWorkerRegistrar.cpp',
+     'ServiceWorkerRegistration.cpp',
