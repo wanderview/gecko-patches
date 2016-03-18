@@ -1,13 +1,13 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  341344bdec8f10bf50646cd6ef2355361435cbf6
+# Parent  9c5d494d05485aebf3fedf649abc0e7ae9d2dcf2
 Bug 1256428 P1 Add ServiceWorkerJob2 base class. r=ehsan
 
 diff --git a/dom/workers/ServiceWorkerJob.cpp b/dom/workers/ServiceWorkerJob.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/workers/ServiceWorkerJob.cpp
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,187 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -16,6 +16,7 @@ new file mode 100644
 +
 +#include "ServiceWorkerJob.h"
 +
++#include "nsProxyRelease.h"
 +#include "nsThreadUtils.h"
 +#include "Workers.h"
 +
@@ -36,6 +37,12 @@ new file mode 100644
 +}
 +
 +bool
++ServiceWorkerJob2::Canceled() const
++{
++  return mCanceled;
++}
++
++bool
 +ServiceWorkerJob2::IsEquivalentTo(ServiceWorkerJob2* aJob) const
 +{
 +  AssertIsOnMainThread();
@@ -47,30 +54,45 @@ new file mode 100644
 +}
 +
 +void
-+ServiceWorkerJob2::AppendNormalCallback(Callback* aCallback)
++ServiceWorkerJob2::AppendResultCallback(Callback* aCallback)
 +{
 +  AssertIsOnMainThread();
++  MOZ_ASSERT(mState == State::Initial);
 +  MOZ_ASSERT(aCallback);
 +  MOZ_ASSERT(mFinalCallback != aCallback);
-+  MOZ_ASSERT(!mCallbackList.Contains(aCallback));
-+  mCallbackList.AppendElement(aCallback);
++  MOZ_ASSERT(!mResultCallbackList.Contains(aCallback));
++  mResultCallbackList.AppendElement(aCallback);
 +}
 +
 +void
-+ServiceWorkerJob2::SetFinalCallback(Callback* aCallback)
++ServiceWorkerJob2::StealResultCallbacksFrom(ServiceWorkerJob2* aJob)
 +{
 +  AssertIsOnMainThread();
-+  MOZ_ASSERT(aCallback);
++  MOZ_ASSERT(aJob);
++  MOZ_ASSERT(aJob->mState == State::Initial);
++
++  // Take the callbacks from the other job immediately to avoid the
++  // any possibility of them existing on both jobs at once.
++  nsTArray<RefPtr<Callback>> callbackList;
++  callbackList.SwapElements(aJob->mResultCallbackList);
++
++  for (RefPtr<Callback>& callback : callbackList) {
++    // Use AppendResultCallback() so that assertion checking is performed on
++    // each callback.
++    AppendResultCallback(callback);
++  }
++}
++
++void
++ServiceWorkerJob2::Start(Callback* aFinalCallback)
++{
++  AssertIsOnMainThread();
++  MOZ_ASSERT(!mCanceled);
++
++  MOZ_ASSERT(aFinalCallback);
 +  MOZ_ASSERT(!mFinalCallback);
-+  MOZ_ASSERT(!mCallbackList.Contains(aCallback));
-+  mFinalCallback = aCallback;
-+}
-+
-+void
-+ServiceWorkerJob2::Start()
-+{
-+  AssertIsOnMainThread();
-+  MOZ_ASSERT(mFinalCallback);
++  MOZ_ASSERT(!mResultCallbackList.Contains(aFinalCallback));
++  mFinalCallback = aFinalCallback;
 +
 +  MOZ_ASSERT(mState == State::Initial);
 +  mState = State::Started;
@@ -79,6 +101,14 @@ new file mode 100644
 +    NS_NewRunnableMethod(this, &ServiceWorkerJob2::AsyncExecute);
 +  MOZ_ALWAYS_TRUE(NS_SUCCEEDED(
 +    NS_DispatchToMainThread(runnable.forget())));
++}
++
++void
++ServiceWorkerJob2::Cancel()
++{
++  AssertIsOnMainThread();
++  MOZ_ASSERT(!mCanceled);
++  mCanceled = true;
 +}
 +
 +ServiceWorkerJob2::ServiceWorkerJob2(Type aType,
@@ -105,24 +135,61 @@ new file mode 100644
 +}
 +
 +void
++ServiceWorkerJob2::InvokeResultCallbacks(ErrorResult& aRv)
++{
++  AssertIsOnMainThread();
++  MOZ_ASSERT(mState != State::Started);
++
++  for (RefPtr<Callback>& callback : mResultCallbackList) {
++    // The callback might consume an exception on the ErrorResult, so we need
++    // to clone in order to maintain the error for the next callback.
++    ErrorResult rv;
++    aRv.CloneTo(rv);
++
++    callback->JobFinished(this, rv);
++
++    // The callback may not consume the error.
++    rv.SuppressException();
++  }
++  mResultCallbackList.Clear();
++}
++
++void
++ServiceWorkerJob2::InvokeResultCallbacks(nsresult aRv)
++{
++  ErrorResult converted(aRv);
++  InvokeResultCallbacks(converted);
++}
++
++void
 +ServiceWorkerJob2::Finish(ErrorResult& aRv)
 +{
 +  AssertIsOnMainThread();
 +
-+  // Our final callback may drop the last ref, so ensure we survive to the end
-+  // of this method.
++  // The final callback may drop the last ref to this object.
 +  RefPtr<ServiceWorkerJob2> kungFuDeathGrip = this;
++
++  InvokeResultCallbacks(aRv);
 +
 +  MOZ_ASSERT(mState == State::Started);
 +  mState = State::Finished;
 +
-+  for (uint32_t i = 0; i < mCallbackList.Length(); ++i) {
-+    mCallbackList[i]->JobFinished(this, aRv);
-+  }
-+  mCallbackList.Clear();
-+
 +  mFinalCallback->JobFinished(this, aRv);
 +  mFinalCallback = nullptr;
++
++  // The callback may not consume the error.
++  aRv.SuppressException();
++
++  // Async release this object to ensure that our caller methods complete
++  // as well.
++  NS_ReleaseOnMainThread(kungFuDeathGrip.forget(), true /* always proxy */);
++}
++
++void
++ServiceWorkerJob2::Finish(nsresult aRv)
++{
++  ErrorResult converted(aRv);
++  Finish(converted);
 +}
 +
 +} // namespace workers
@@ -132,7 +199,7 @@ diff --git a/dom/workers/ServiceWorkerJob.h b/dom/workers/ServiceWorkerJob.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/workers/ServiceWorkerJob.h
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,152 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -195,31 +262,39 @@ new file mode 100644
 +  State
 +  GetState() const;
 +
++  // Determine if the job has been canceled.  This does not change the
++  // current State, but indicates that the job should progress to Finished
++  // as soon as possible.
++  bool
++  Canceled() const;
++
 +  bool
 +  IsEquivalentTo(ServiceWorkerJob2* aJob) const;
 +
-+  // Add a callback that is invoked when the job completes.  These
-+  // callbacks are called before the final callback in the order
-+  // in which they are added.
++  // Add a callback that will be invoked when the job's result is available.
++  // Some job types will invoke this before the job is actually finished.
++  // If an early callback does not occur, then it will be called automatically
++  // when Finish() is called.  These callbacks will be invoked while the job
++  // state is Started.
 +  void
-+  AppendNormalCallback(Callback* aCallback);
++  AppendResultCallback(Callback* aCallback);
 +
-+  // Define a final callback that is invoked last when the job
-+  // completes.  This must be called exactly once before Start().
++  // This takes ownership of any result callbacks associated with the given job
++  // and then appends them to this job's callback list.
 +  void
-+  SetFinalCallback(Callback* aCallback);
++  StealResultCallbacksFrom(ServiceWorkerJob2* aJob);
 +
 +  // Start the job.  All work will be performed asynchronously on
 +  // the main thread.  Once called the Finish() method must be called
-+  // exactly once.
++  // exactly once.  A final callback must be provided.  It will be
++  // invoked after all other callbacks have been processed.
 +  void
-+  Start();
++  Start(Callback* aFinalCallback);
 +
-+  // All job types must provide a way to cancel their work.  This should
-+  // result in a started job calling Finish() as soon as possible.  If
-+  // the job has not been started, then it should not call Finish().
-+  virtual void
-+  Cancel() = 0;
++  // Set an internal flag indicating that a started job should finish as
++  // soon as possible.
++  void
++  Cancel();
 +
 +  NS_IMETHOD_(MozExternalRefCountType)
 +  AddRef(void) = 0;
@@ -235,11 +310,25 @@ new file mode 100644
 +
 +  ~ServiceWorkerJob2();
 +
++  // Invoke the result callbacks immediately.  The job must be in the
++  // Started state.  The callbacks are cleared after being invoked,
++  // so subsequent method calls have no effect.
++  void
++  InvokeResultCallbacks(ErrorResult& aRv);
++
++  // Convenience method that converts to ErrorResult and calls real method.
++  void
++  InvokeResultCallbacks(nsresult aRv);
++
 +  // Indicate that the job has completed.  The must be called exactly
 +  // once after Start() has initiated job execution.  It must be called
 +  // asynchronously from Start().
 +  void
 +  Finish(ErrorResult& aRv);
++
++  // Convenience method that converts to ErrorResult and calls real method.
++  void
++  Finish(nsresult aRv);
 +
 +  // Specific job types should define AsyncExecute to begin their work.
 +  // All errors and successes must result in Finish() being called.
@@ -253,8 +342,9 @@ new file mode 100644
 +
 +private:
 +  RefPtr<Callback> mFinalCallback;
-+  nsTArray<RefPtr<Callback>> mCallbackList;
++  nsTArray<RefPtr<Callback>> mResultCallbackList;
 +  State mState;
++  bool mCanceled;
 +};
 +
 +} // namespace workers
@@ -265,7 +355,7 @@ new file mode 100644
 diff --git a/dom/workers/moz.build b/dom/workers/moz.build
 --- a/dom/workers/moz.build
 +++ b/dom/workers/moz.build
-@@ -62,16 +62,17 @@ UNIFIED_SOURCES += [
+@@ -61,16 +61,17 @@ UNIFIED_SOURCES += [
      'RegisterBindings.cpp',
      'RuntimeService.cpp',
      'ScriptLoader.cpp',
