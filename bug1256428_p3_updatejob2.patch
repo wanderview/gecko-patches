@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  3c45bad2ee59e3137dd1c4053dd1d995716512d1
+# Parent  c0e19c7620652d7b9b24ae09eca840acfd5ea29a
 Bug 1256428 P3 Add ServiceWorkerUpdateJob2. r=ehsan
 
 diff --git a/dom/bindings/Errors.msg b/dom/bindings/Errors.msg
@@ -44,7 +44,7 @@ diff --git a/dom/workers/ServiceWorkerUpdateJob.cpp b/dom/workers/ServiceWorkerU
 new file mode 100644
 --- /dev/null
 +++ b/dom/workers/ServiceWorkerUpdateJob.cpp
-@@ -0,0 +1,482 @@
+@@ -0,0 +1,492 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -84,7 +84,7 @@ new file mode 100644
 +    mJob->ComparisonResult(aStatus, aInCacheAndEqual, aNewCacheName, aMaxScope);
 +  }
 +
-+  NS_INLINE_DECL_REFCOUNTING(ServiceWorkerUpdateJob2::CompareCallback)
++  NS_INLINE_DECL_REFCOUNTING(ServiceWorkerUpdateJob2::CompareCallback, override)
 +};
 +
 +class ServiceWorkerUpdateJob2::ContinueUpdateRunnable final : public LifeCycleEventCallback
@@ -144,6 +144,170 @@ new file mode 100644
 +    return NS_OK;
 +  }
 +};
++
++ServiceWorkerUpdateJob2::ServiceWorkerUpdateJob2(nsIPrincipal* aPrincipal,
++                        const nsACString& aScope,
++                        const nsACString& aScriptSpec,
++                        nsILoadGroup* aLoadGroup)
++  : ServiceWorkerJob2(Type::Update, aPrincipal, aScope, aScriptSpec)
++  , mLoadGroup(aLoadGroup)
++{
++  AssertIsOnMainThread();
++}
++
++already_AddRefed<ServiceWorkerRegistrationInfo>
++ServiceWorkerUpdateJob2::GetRegistration() const
++{
++  AssertIsOnMainThread();
++  RefPtr<ServiceWorkerRegistrationInfo> ref = mRegistration;
++  return ref.forget();
++}
++
++ServiceWorkerUpdateJob2::ServiceWorkerUpdateJob2(Type aType,
++                                                 nsIPrincipal* aPrincipal,
++                                                 const nsACString& aScope,
++                                                 const nsACString& aScriptSpec,
++                                                 nsILoadGroup* aLoadGroup)
++  : ServiceWorkerJob2(aType, aPrincipal, aScope, aScriptSpec)
++  , mLoadGroup(aLoadGroup)
++{
++  AssertIsOnMainThread();
++}
++
++ServiceWorkerUpdateJob2::~ServiceWorkerUpdateJob2()
++{
++}
++
++void
++ServiceWorkerUpdateJob2::FailUpdateJob(ErrorResult& aRv)
++{
++  AssertIsOnMainThread();
++  MOZ_ASSERT(aRv.Failed());
++
++  if (mRegistration) {
++    if (mServiceWorker) {
++      mServiceWorker->UpdateState(ServiceWorkerState::Redundant);
++      serviceWorkerScriptCache::PurgeCache(mRegistration->mPrincipal,
++                                           mServiceWorker->CacheName());
++    }
++
++    RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
++
++    if (mRegistration->mInstallingWorker) {
++      mRegistration->mInstallingWorker->UpdateState(ServiceWorkerState::Redundant);
++      mRegistration->mInstallingWorker = nullptr;
++      if (swm) {
++        swm->InvalidateServiceWorkerRegistrationWorker(mRegistration,
++                                                       WhichServiceWorker::INSTALLING_WORKER);
++      }
++      serviceWorkerScriptCache::PurgeCache(mRegistration->mPrincipal,
++                                           mRegistration->mInstallingWorker->CacheName());
++    }
++
++    if (swm) {
++      swm->MaybeRemoveRegistration(mRegistration);
++    }
++  }
++
++  mServiceWorker = nullptr;
++  mRegistration = nullptr;
++
++  Finish(aRv);
++}
++
++void
++ServiceWorkerUpdateJob2::FailUpdateJob(nsresult aRv)
++{
++  ErrorResult rv(aRv);
++  FailUpdateJob(rv);
++}
++
++void
++ServiceWorkerUpdateJob2::AsyncExecute()
++{
++  AssertIsOnMainThread();
++  MOZ_ASSERT(GetType() == Type::Update);
++
++  if (Canceled()) {
++    FailUpdateJob(NS_ERROR_DOM_ABORT_ERR);
++    return;
++  }
++
++  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
++  RefPtr<ServiceWorkerRegistrationInfo> registration =
++    swm->GetRegistration(mPrincipal, mScope);
++
++  if (!registration || registration->mPendingUninstall) {
++    ErrorResult rv;
++    rv.ThrowTypeError<MSG_SW_UPDATE_BAD_REGISTRATION>(NS_ConvertUTF8toUTF16(mScope),
++                                                      NS_LITERAL_STRING("uninstalled"));
++    FailUpdateJob(rv);
++    return;
++  }
++
++  // If a different script has been registered between when this update
++  // was scheduled and it running now, then simply abort.
++  RefPtr<ServiceWorkerInfo> newest = registration->Newest();
++  if (newest && !mScriptSpec.Equals(newest->ScriptSpec())) {
++    ErrorResult rv;
++    rv.ThrowTypeError<MSG_SW_UPDATE_BAD_REGISTRATION>(NS_ConvertUTF8toUTF16(mScope),
++                                                      NS_LITERAL_STRING("changed"));
++    FailUpdateJob(rv);
++    return;
++  }
++
++  SetRegistration(registration);
++  Update();
++}
++
++void
++ServiceWorkerUpdateJob2::SetRegistration(ServiceWorkerRegistrationInfo* aRegistration)
++{
++  AssertIsOnMainThread();
++
++  MOZ_ASSERT(!mRegistration);
++  MOZ_ASSERT(aRegistration);
++  mRegistration = aRegistration;
++}
++
++void
++ServiceWorkerUpdateJob2::Update()
++{
++  AssertIsOnMainThread();
++
++  // SetRegistration() must be called before Update().
++  MOZ_ASSERT(mRegistration);
++
++  // TODO: I think we can remove mUpdating from registration now
++  mRegistration->mUpdating = true;
++
++  if (Canceled()) {
++    FailUpdateJob(NS_ERROR_DOM_ABORT_ERR);
++    return;
++  }
++
++  MOZ_ASSERT(!mRegistration->mInstallingWorker);
++
++  RefPtr<ServiceWorkerInfo> workerInfo = mRegistration->Newest();
++  nsAutoString cacheName;
++
++  // If the script has not changed, we need to perform a byte-for-byte
++  // comparison.
++  if (workerInfo && workerInfo->ScriptSpec().Equals(mScriptSpec)) {
++    cacheName = workerInfo->CacheName();
++  }
++
++  RefPtr<CompareCallback> callback = new CompareCallback(this);
++
++  nsresult rv =
++    serviceWorkerScriptCache::Compare(mRegistration, mPrincipal, cacheName,
++                                      NS_ConvertUTF8toUTF16(mScriptSpec),
++                                      callback, mLoadGroup);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    FailUpdateJob(rv);
++    return;
++  }
++}
 +
 +void
 +ServiceWorkerUpdateJob2::ComparisonResult(nsresult aStatus,
@@ -370,160 +534,6 @@ new file mode 100644
 +  mRegistration->TryToActivateAsync();
 +}
 +
-+ServiceWorkerUpdateJob2::ServiceWorkerUpdateJob2(Type aType,
-+                                                 nsIPrincipal* aPrincipal,
-+                                                 const nsACString& aScope,
-+                                                 const nsACString& aScriptSpec,
-+                                                 nsILoadGroup* aLoadGroup)
-+  : ServiceWorkerJob2(aType, aPrincipal, aScope, aScriptSpec)
-+  , mLoadGroup(aLoadGroup)
-+{
-+  AssertIsOnMainThread();
-+}
-+
-+ServiceWorkerUpdateJob2::~ServiceWorkerUpdateJob2()
-+{
-+}
-+
-+void
-+ServiceWorkerUpdateJob2::FailUpdateJob(ErrorResult& aRv)
-+{
-+  AssertIsOnMainThread();
-+  MOZ_ASSERT(aRv.Failed());
-+
-+  if (mRegistration) {
-+    if (mServiceWorker) {
-+      mServiceWorker->UpdateState(ServiceWorkerState::Redundant);
-+      serviceWorkerScriptCache::PurgeCache(mRegistration->mPrincipal,
-+                                           mServiceWorker->CacheName());
-+    }
-+
-+    RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
-+
-+    if (mRegistration->mInstallingWorker) {
-+      mRegistration->mInstallingWorker->UpdateState(ServiceWorkerState::Redundant);
-+      mRegistration->mInstallingWorker = nullptr;
-+      if (swm) {
-+        swm->InvalidateServiceWorkerRegistrationWorker(mRegistration,
-+                                                       WhichServiceWorker::INSTALLING_WORKER);
-+      }
-+      serviceWorkerScriptCache::PurgeCache(mRegistration->mPrincipal,
-+                                           mRegistration->mInstallingWorker->CacheName());
-+    }
-+
-+    if (swm) {
-+      swm->MaybeRemoveRegistration(mRegistration);
-+    }
-+  }
-+
-+  mServiceWorker = nullptr;
-+  mRegistration = nullptr;
-+
-+  Finish(aRv);
-+}
-+
-+void
-+ServiceWorkerUpdateJob2::FailUpdateJob(nsresult aRv)
-+{
-+  ErrorResult rv(aRv);
-+  FailUpdateJob(rv);
-+}
-+
-+void
-+ServiceWorkerUpdateJob2::AsyncExecute()
-+{
-+  AssertIsOnMainThread();
-+  MOZ_ASSERT(GetType() == Type::Update);
-+
-+  if (Canceled()) {
-+    FailUpdateJob(NS_ERROR_DOM_ABORT_ERR);
-+    return;
-+  }
-+
-+  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
-+  RefPtr<ServiceWorkerRegistrationInfo> registration =
-+    swm->GetRegistration(mPrincipal, mScope);
-+
-+  if (!registration || registration->mPendingUninstall) {
-+    ErrorResult rv;
-+    rv.ThrowTypeError<MSG_SW_UPDATE_BAD_REGISTRATION>(NS_ConvertUTF8toUTF16(mScope),
-+                                                      NS_LITERAL_STRING("uninstalled"));
-+    FailUpdateJob(rv);
-+    return;
-+  }
-+
-+  // If a different script has been registered between when this update
-+  // was scheduled and it running now, then simply abort.
-+  RefPtr<ServiceWorkerInfo> newest = registration->Newest();
-+  if (newest && !mScriptSpec.Equals(newest->ScriptSpec())) {
-+    ErrorResult rv;
-+    rv.ThrowTypeError<MSG_SW_UPDATE_BAD_REGISTRATION>(NS_ConvertUTF8toUTF16(mScope),
-+                                                      NS_LITERAL_STRING("changed"));
-+    FailUpdateJob(rv);
-+    return;
-+  }
-+
-+  Update(registration);
-+}
-+
-+void
-+ServiceWorkerUpdateJob2::Update(ServiceWorkerRegistrationInfo* aRegistration)
-+{
-+  AssertIsOnMainThread();
-+
-+  MOZ_ASSERT(!mRegistration);
-+  MOZ_ASSERT(aRegistration);
-+  mRegistration = aRegistration;
-+
-+  // TODO: I think we can remove mUpdating from registration now
-+  mRegistration->mUpdating = true;
-+
-+  if (Canceled()) {
-+    FailUpdateJob(NS_ERROR_DOM_ABORT_ERR);
-+    return;
-+  }
-+
-+  MOZ_ASSERT(!mRegistration->mInstallingWorker);
-+
-+  RefPtr<ServiceWorkerInfo> workerInfo = mRegistration->Newest();
-+  nsAutoString cacheName;
-+
-+  // If the script has not changed, we need to perform a byte-for-byte
-+  // comparison.
-+  if (workerInfo && workerInfo->ScriptSpec().Equals(mScriptSpec)) {
-+    cacheName = workerInfo->CacheName();
-+  }
-+
-+  RefPtr<CompareCallback> callback = new CompareCallback(this);
-+
-+  nsresult rv =
-+    serviceWorkerScriptCache::Compare(mRegistration, mPrincipal, cacheName,
-+                                      NS_ConvertUTF8toUTF16(mScriptSpec),
-+                                      callback, mLoadGroup);
-+  if (NS_WARN_IF(NS_FAILED(rv))) {
-+    FailUpdateJob(rv);
-+    return;
-+  }
-+}
-+
-+ServiceWorkerUpdateJob2::ServiceWorkerUpdateJob2(nsIPrincipal* aPrincipal,
-+                        const nsACString& aScope,
-+                        const nsACString& aScriptSpec,
-+                        nsILoadGroup* aLoadGroup)
-+  : ServiceWorkerJob2(Type::Update, aPrincipal, aScope, aScriptSpec)
-+  , mLoadGroup(aLoadGroup)
-+{
-+  AssertIsOnMainThread();
-+}
-+
-+already_AddRefed<ServiceWorkerRegistrationInfo>
-+ServiceWorkerUpdateJob2::GetRegistration() const
-+{
-+  AssertIsOnMainThread();
-+  RefPtr<ServiceWorkerRegistrationInfo> ref = mRegistration;
-+  return ref.forget();
-+}
-+
 +} // namespace workers
 +} // namespace dom
 +} // namespace mozilla
@@ -531,7 +541,7 @@ diff --git a/dom/workers/ServiceWorkerUpdateJob.h b/dom/workers/ServiceWorkerUpd
 new file mode 100644
 --- /dev/null
 +++ b/dom/workers/ServiceWorkerUpdateJob.h
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,103 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -547,32 +557,25 @@ new file mode 100644
 +namespace dom {
 +namespace workers {
 +
++// A job class that performs the Update and Install algorithms from the
++// service worker spec.  This class is designed to be inherited and customized
++// as a different job type.  This is necessary because the register job
++// performs largely the same operations as the update job, but has a few
++// different starting steps.
 +class ServiceWorkerUpdateJob2 : public ServiceWorkerJob2
 +{
-+  class CompareCallback;
-+  class ContinueUpdateRunnable;
-+  class ContinueInstallRunnable;
++public:
++  // Construct an update job to be used only for updates.
++  ServiceWorkerUpdateJob2(nsIPrincipal* aPrincipal,
++                          const nsACString& aScope,
++                          const nsACString& aScriptSpec,
++                          nsILoadGroup* aLoadGroup);
 +
-+  nsCOMPtr<nsILoadGroup> mLoadGroup;
-+  RefPtr<ServiceWorkerRegistrationInfo> mRegistration;
-+  RefPtr<ServiceWorkerInfo> mServiceWorker;
-+
-+  void
-+  ComparisonResult(nsresult aStatus,
-+                   bool aInCacheAndEqual,
-+                   const nsAString& aNewCacheName,
-+                   const nsACString& aMaxScope);
-+
-+  void
-+  ContinueUpdateAfterScriptEval(bool aScriptEvaluationResult);
-+
-+  void
-+  Install();
-+
-+  void
-+  ContinueAfterInstallEvent(bool aInstallEventSuccess);
++  already_AddRefed<ServiceWorkerRegistrationInfo>
++  GetRegistration() const;
 +
 +protected:
++  // Construct an update job that is overriden as another job type.
 +  ServiceWorkerUpdateJob2(Type aType,
 +                          nsIPrincipal* aPrincipal,
 +                          const nsACString& aScope,
@@ -581,26 +584,60 @@ new file mode 100644
 +
 +  virtual ~ServiceWorkerUpdateJob2();
 +
++  // FailUpdateJob() must be called if an update job needs Finish() with
++  // an error.
 +  void
 +  FailUpdateJob(ErrorResult& aRv);
 +
 +  void
 +  FailUpdateJob(nsresult aRv);
 +
++  // The entry point when the update job is being used directly.  Job
++  // types overriding this class should override this method to
++  // customize behavior.
 +  virtual void
 +  AsyncExecute() override;
 +
++  // Set the registration to be operated on by Update() or to be immediately
++  // returned as a result of the job.  This must be called before Update().
 +  void
-+  Update(ServiceWorkerRegistrationInfo* aRegistration);
++  SetRegistration(ServiceWorkerRegistrationInfo* aRegistration);
 +
-+public:
-+  ServiceWorkerUpdateJob2(nsIPrincipal* aPrincipal,
-+                          const nsACString& aScope,
-+                          const nsACString& aScriptSpec,
-+                          nsILoadGroup* aLoadGroup);
++  // Execute the bulk of the update job logic using the registration defined
++  // by a previous SetRegistration() call.  This can be called by the overriden
++  // AsyncExecute() to complete the job.  The Update() method will always call
++  // Finish().  This method corresponds to the spec Update algorithm.
++  void
++  Update();
 +
-+  already_AddRefed<ServiceWorkerRegistrationInfo>
-+  GetRegistration() const;
++private:
++  class CompareCallback;
++  class ContinueUpdateRunnable;
++  class ContinueInstallRunnable;
++
++  // Utility method called after a script is loaded and compared to
++  // our current cached script.
++  void
++  ComparisonResult(nsresult aStatus,
++                   bool aInCacheAndEqual,
++                   const nsAString& aNewCacheName,
++                   const nsACString& aMaxScope);
++
++  // Utility method called after evaluating the worker script.
++  void
++  ContinueUpdateAfterScriptEval(bool aScriptEvaluationResult);
++
++  // Utility method corresponding to the spec Install algorithm.
++  void
++  Install();
++
++  // Utility method called after the install event is handled.
++  void
++  ContinueAfterInstallEvent(bool aInstallEventSuccess);
++
++  nsCOMPtr<nsILoadGroup> mLoadGroup;
++  RefPtr<ServiceWorkerRegistrationInfo> mRegistration;
++  RefPtr<ServiceWorkerInfo> mServiceWorker;
 +};
 +
 +} // namespace workers

@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  fcf36f1b0816f8e0535a9c17a603687992d8268e
+# Parent  7c30f769b24ffee83b502f67a815a0707f3d5da6
 Bug 1256428 P6 Use ServiceWorkerJobQueue2 and new job classes in ServiceWorkerManager. r=ehsan
 
 diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
@@ -52,7 +52,72 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
  struct ServiceWorkerManager::PendingOperation final
  {
    nsCOMPtr<nsIRunnable> mRunnable;
-@@ -1805,38 +1809,39 @@ ServiceWorkerManager::Register(mozIDOMWi
+@@ -699,46 +703,50 @@ public:
+   Run() override
+   {
+     AssertIsOnMainThread();
+     mTask->ContinueAfterWorkerEvent(mSuccess);
+     return NS_OK;
+   }
+ };
+ 
+-class ServiceWorkerResolveWindowPromiseOnUpdateCallback final : public ServiceWorkerUpdateFinishCallback
++class ServiceWorkerResolveWindowPromiseOnUpdateCallback final : public ServiceWorkerJob2::Callback
+ {
+   RefPtr<nsPIDOMWindowInner> mWindow;
+   // The promise "returned" by the call to Update up to
+   // navigator.serviceWorker.register().
+   RefPtr<Promise> mPromise;
+ 
+   ~ServiceWorkerResolveWindowPromiseOnUpdateCallback()
+   {}
+ 
++  virtual void
++  JobFinished(ServiceWorkerJob2* aJob, ErrorResult& aStatus) override
++  {
++    AssertIsOnMainThread();
++    MOZ_ASSERT(aJob);
++
++    if (aStatus.Failed()) {
++      mPromise->MaybeReject(aStatus);
++      return;
++    }
++
++    RefPtr<ServiceWorkerRegistrationMainThread> swr =
++      mWindow->GetServiceWorkerRegistration(NS_ConvertUTF8toUTF16(aJob->GetScope()));
++    mPromise->MaybeResolve(swr);
++  }
++
+ public:
+   ServiceWorkerResolveWindowPromiseOnUpdateCallback(nsPIDOMWindowInner* aWindow,
+                                                     Promise* aPromise)
+     : mWindow(aWindow)
+     , mPromise(aPromise)
+   {}
+ 
+-  void
+-  UpdateSucceeded(ServiceWorkerRegistrationInfo* aInfo) override
+-  {
+-    RefPtr<ServiceWorkerRegistrationMainThread> swr =
+-      mWindow->GetServiceWorkerRegistration(NS_ConvertUTF8toUTF16(aInfo->mScope));
+-    mPromise->MaybeResolve(swr);
+-  }
+-
+-  void
+-  UpdateFailed(ErrorResult& aStatus) override
+-  {
+-    mPromise->MaybeReject(aStatus);
+-  }
++  NS_INLINE_DECL_REFCOUNTING(ServiceWorkerResolveWindowPromiseOnUpdateCallback, override)
+ };
+ 
+ class ContinueUpdateRunnable final : public LifeCycleEventCallback
+ {
+   nsMainThreadPtrHandle<nsISupports> mJob;
+   bool mScriptEvaluationResult;
+ public:
+   explicit ContinueUpdateRunnable(const nsMainThreadPtrHandle<nsISupports> aJob)
+@@ -1805,38 +1813,39 @@ ServiceWorkerManager::Register(mozIDOMWi
    nsAutoCString scopeKey;
    rv = PrincipalToScopeKey(documentPrincipal, scopeKey);
    if (NS_WARN_IF(NS_FAILED(rv))) {
@@ -88,7 +153,7 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
 +  RefPtr<ServiceWorkerRegisterJob2> job =
 +    new ServiceWorkerRegisterJob2(documentPrincipal, cleanedScope, spec,
 +                                  loadGroup);
-+  // TODO: callback
++  job->AppendResultCallback(cb);
 +  queue->ScheduleJob(job);
  
    AssertIsOnMainThread();
@@ -98,7 +163,64 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
    return NS_OK;
  }
  
-@@ -2594,28 +2599,23 @@ ServiceWorkerManager::Unregister(nsIPrin
+@@ -2564,16 +2573,56 @@ private:
+   UnregisterAndDone()
+   {
+     nsresult rv = Unregister();
+     Unused << NS_WARN_IF(NS_FAILED(rv));
+     Done(rv);
+   }
+ };
+ 
++namespace {
++
++class UnregisterJobCallback final : public ServiceWorkerJob2::Callback
++{
++  nsCOMPtr<nsIServiceWorkerUnregisterCallback> mCallback;
++
++  ~UnregisterJobCallback()
++  {
++  }
++
++public:
++  explicit UnregisterJobCallback(nsIServiceWorkerUnregisterCallback* aCallback)
++    : mCallback(aCallback)
++  {
++    AssertIsOnMainThread();
++    MOZ_ASSERT(mCallback);
++  }
++
++  void
++  JobFinished(ServiceWorkerJob2* aJob, ErrorResult& aStatus)
++  {
++    AssertIsOnMainThread();
++    MOZ_ASSERT(aJob);
++
++    if (aStatus.Failed()) {
++      mCallback->UnregisterFailed();
++      return;
++    }
++
++    MOZ_ASSERT(aJob->GetType() == ServiceWorkerJob2::Type::Unregister);
++    RefPtr<ServiceWorkerUnregisterJob2> unregisterJob =
++      static_cast<ServiceWorkerUnregisterJob2*>(aJob);
++    mCallback->UnregisterSucceeded(unregisterJob->GetResult());
++  }
++
++  NS_INLINE_DECL_REFCOUNTING(UnregisterJobCallback)
++};
++
++} // anonymous namespace
++
+ NS_IMETHODIMP
+ ServiceWorkerManager::Unregister(nsIPrincipal* aPrincipal,
+                                  nsIServiceWorkerUnregisterCallback* aCallback,
+                                  const nsAString& aScope)
+ {
+   AssertIsOnMainThread();
+ 
+   if (!aPrincipal) {
+@@ -2594,28 +2643,27 @@ ServiceWorkerManager::Unregister(nsIPrin
  
    nsAutoCString scopeKey;
    rv = PrincipalToScopeKey(aPrincipal, scopeKey);
@@ -122,8 +244,12 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
 +  RefPtr<ServiceWorkerJobQueue2> queue = GetOrCreateJobQueue(scopeKey, scope);
 +
 +  RefPtr<ServiceWorkerUnregisterJob2> job =
-+    new ServiceWorkerUnregisterJob2(aPrincipal, scope, true /* sent to parent */);
-+  // TODO: callback
++    new ServiceWorkerUnregisterJob2(aPrincipal, scope, true /* send to parent */);
++
++  if (aCallback) {
++    RefPtr<UnregisterJobCallback> cb = new UnregisterJobCallback(aCallback);
++    job->AppendResultCallback(cb);
++  }
 +
 +  queue->ScheduleJob(job);
    return NS_OK;
@@ -134,7 +260,7 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
                                         const nsAString& aScope)
  {
    AssertIsOnMainThread();
-@@ -2635,49 +2635,45 @@ ServiceWorkerManager::NotifyUnregister(n
+@@ -2635,49 +2683,45 @@ ServiceWorkerManager::NotifyUnregister(n
  
    nsAutoCString scopeKey;
    rv = PrincipalToScopeKey(aPrincipal, scopeKey);
@@ -200,7 +326,7 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
  {
    // Note: We don't simply check gInstance for null-ness here, since otherwise
    // this can resurrect the ServiceWorkerManager pretty late during shutdown.
-@@ -3933,23 +3929,23 @@ ServiceWorkerManager::SoftUpdate(const P
+@@ -3933,26 +3977,66 @@ ServiceWorkerManager::SoftUpdate(const P
      return;
    }
  
@@ -226,12 +352,55 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
    }
  }
  
++namespace {
++
++class UpdateJobCallback final : public ServiceWorkerJob2::Callback
++{
++  RefPtr<ServiceWorkerUpdateFinishCallback> mCallback;
++
++  ~UpdateJobCallback()
++  {
++  }
++
++public:
++  explicit UpdateJobCallback(ServiceWorkerUpdateFinishCallback* aCallback)
++    : mCallback(aCallback)
++  {
++    AssertIsOnMainThread();
++    MOZ_ASSERT(mCallback);
++  }
++
++  void
++  JobFinished(ServiceWorkerJob2* aJob, ErrorResult& aStatus)
++  {
++    AssertIsOnMainThread();
++    MOZ_ASSERT(aJob);
++
++    if (aStatus.Failed()) {
++      mCallback->UpdateFailed(aStatus);
++      return;
++    }
++
++    MOZ_ASSERT(aJob->GetType() == ServiceWorkerJob2::Type::Update);
++    RefPtr<ServiceWorkerUpdateJob2> updateJob =
++      static_cast<ServiceWorkerUpdateJob2*>(aJob);
++    RefPtr<ServiceWorkerRegistrationInfo> reg = updateJob->GetRegistration();
++    mCallback->UpdateSucceeded(reg);
++  }
++
++  NS_INLINE_DECL_REFCOUNTING(UpdateJobCallback)
++};
++} // anonymous namespace
++
  void
  ServiceWorkerManager::Update(nsIPrincipal* aPrincipal,
                               const nsACString& aScope,
                               ServiceWorkerUpdateFinishCallback* aCallback)
  {
-@@ -3977,26 +3973,25 @@ ServiceWorkerManager::Update(nsIPrincipa
+   MOZ_ASSERT(aPrincipal);
+   MOZ_ASSERT(aCallback);
+ 
+@@ -3977,26 +4061,28 @@ ServiceWorkerManager::Update(nsIPrincipa
      aCallback->UpdateFailed(error);
  
      // In case the callback does not consume the exception
@@ -254,7 +423,10 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
 +  RefPtr<ServiceWorkerUpdateJob2> job =
 +    new ServiceWorkerUpdateJob2(aPrincipal, registration->mScope,
 +                                newest->ScriptSpec(), nullptr);
-+  // TODO: append callback
++
++  RefPtr<UpdateJobCallback> cb = new UpdateJobCallback(aCallback);
++  job->AppendResultCallback(cb);
++
 +  queue->ScheduleJob(job);
  }
  
@@ -264,7 +436,7 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
  FireControllerChangeOnDocument(nsIDocument* aDocument)
  {
    AssertIsOnMainThread();
-@@ -4436,20 +4431,20 @@ ServiceWorkerManager::GetAllRegistration
+@@ -4436,20 +4522,20 @@ ServiceWorkerManager::GetAllRegistration
  // MUST ONLY BE CALLED FROM Remove(), RemoveAll() and RemoveAllRegistrations()!
  void
  ServiceWorkerManager::ForceUnregister(RegistrationDataPerPrincipal* aRegistrationData,
@@ -288,7 +460,7 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
      timer->Cancel();
      aRegistrationData->mUpdateTimers.Remove(aRegistration->mScope);
    }
-@@ -4751,18 +4746,18 @@ ServiceWorkerManager::Observe(nsISupport
+@@ -4751,18 +4837,18 @@ ServiceWorkerManager::Observe(nsISupport
      for (auto it1 = mRegistrationInfos.Iter(); !it1.Done(); it1.Next()) {
        for (auto it2 = it1.UserData()->mUpdateTimers.Iter(); !it2.Done(); it2.Next()) {
          nsCOMPtr<nsITimer> timer = it2.UserData();
@@ -330,7 +502,7 @@ diff --git a/dom/workers/ServiceWorkerManager.h b/dom/workers/ServiceWorkerManag
  {
    uint32_t mControlledDocumentsCounter;
  
-@@ -508,17 +509,17 @@ public:
+@@ -509,17 +510,17 @@ public:
  
  private:
    ServiceWorkerManager();
@@ -349,7 +521,7 @@ diff --git a/dom/workers/ServiceWorkerManager.h b/dom/workers/ServiceWorkerManag
  
    already_AddRefed<ServiceWorkerRegistrationInfo>
    GetRegistration(const nsACString& aScopeKey,
-@@ -623,16 +624,17 @@ private:
+@@ -624,16 +625,17 @@ private:
        : mURI(aURI), mPromise(aPromise)
      {}
  
