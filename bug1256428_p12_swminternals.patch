@@ -1,0 +1,137 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  8331ca3ab9973eb1c5ff7c8d373fefa4ced10ec7
+Bug 1256428 P12 ServiceWorkerUnregisterJob2 should not use ServiceWorkerManager internals. r=ehsan
+
+diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
+--- a/dom/workers/ServiceWorkerManager.cpp
++++ b/dom/workers/ServiceWorkerManager.cpp
+@@ -4086,16 +4086,37 @@ ServiceWorkerManager::UpdateTimerFired(n
+   }
+ 
+   PrincipalOriginAttributes attrs =
+     BasePrincipal::Cast(aPrincipal)->OriginAttributesRef();
+ 
+   SoftUpdate(attrs, aScope);
+ }
+ 
++void
++ServiceWorkerManager::MaybeSendUnregister(nsIPrincipal* aPrincipal,
++                                          const nsACString& aScope)
++{
++  AssertIsOnMainThread();
++  MOZ_ASSERT(aPrincipal);
++  MOZ_ASSERT(!aScope.IsEmpty());
++
++  if (!mActor) {
++    return;
++  }
++
++  PrincipalInfo principalInfo;
++  nsresult rv = PrincipalToPrincipalInfo(aPrincipal, &principalInfo);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return;
++  }
++
++  Unused << mActor->SendUnregister(principalInfo, NS_ConvertUTF8toUTF16(aScope));
++}
++
+ NS_IMPL_ISUPPORTS(ServiceWorkerInfo, nsIServiceWorkerInfo)
+ 
+ NS_IMETHODIMP
+ ServiceWorkerInfo::GetScriptSpec(nsAString& aScriptSpec)
+ {
+   AssertIsOnMainThread();
+   CopyUTF8toUTF16(mScriptSpec, aScriptSpec);
+   return NS_OK;
+diff --git a/dom/workers/ServiceWorkerManager.h b/dom/workers/ServiceWorkerManager.h
+--- a/dom/workers/ServiceWorkerManager.h
++++ b/dom/workers/ServiceWorkerManager.h
+@@ -658,15 +658,18 @@ private:
+   RemoveNavigationInterception(const nsACString& aScope,
+                                nsIInterceptedChannel* aChannel);
+ 
+   void
+   ScheduleUpdateTimer(nsIPrincipal* aPrincipal, const nsACString& aScope);
+ 
+   void
+   UpdateTimerFired(nsIPrincipal* aPrincipal, const nsACString& aScope);
++
++  void
++  MaybeSendUnregister(nsIPrincipal* aPrincipal, const nsACString& aScope);
+ };
+ 
+ } // namespace workers
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_workers_serviceworkermanager_h
+diff --git a/dom/workers/ServiceWorkerUnregisterJob.cpp b/dom/workers/ServiceWorkerUnregisterJob.cpp
+--- a/dom/workers/ServiceWorkerUnregisterJob.cpp
++++ b/dom/workers/ServiceWorkerUnregisterJob.cpp
+@@ -35,60 +35,36 @@ ServiceWorkerUnregisterJob2::AsyncExecut
+ {
+   AssertIsOnMainThread();
+ 
+   if (Canceled()) {
+     Finish(NS_ERROR_DOM_ABORT_ERR);
+     return;
+   }
+ 
+-  PrincipalInfo principalInfo;
+-  nsresult rv = PrincipalToPrincipalInfo(mPrincipal, &principalInfo);
+-  if (NS_WARN_IF(NS_FAILED(rv))) {
+-    Finish(NS_OK);
+-    return;
+-  }
+-
+   RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+ 
+-  nsAutoCString scopeKey;
+-  rv = swm->PrincipalToScopeKey(mPrincipal, scopeKey);
+-  if (NS_WARN_IF(NS_FAILED(rv))) {
+-    Finish(NS_OK);
+-    return;
+-  }
+-
+   // "Let registration be the result of running [[Get Registration]]
+   // algorithm passing scope as the argument."
+-  ServiceWorkerManager::RegistrationDataPerPrincipal* data;
+-  // TODO: Don't reach into SWM internals here.  Expose a method instead.
+-  if (!swm->mRegistrationInfos.Get(scopeKey, &data)) {
++  RefPtr<ServiceWorkerRegistrationInfo> registration =
++    swm->GetRegistration(mPrincipal, mScope);
++  if (!registration) {
+     // "If registration is null, then, resolve promise with false."
+     Finish(NS_OK);
+     return;
+   }
+ 
+-  RefPtr<ServiceWorkerRegistrationInfo> registration;
+-  if (!data->mInfos.Get(mScope, getter_AddRefs(registration))) {
+-    // "If registration is null, then, resolve promise with false."
+-    Finish(NS_OK);
+-    return;
+-  }
+-
+-  MOZ_ASSERT(registration);
+-
+   // Note, we send the message to remove the registration from disk now even
+   // though we may only set the mPendingUninstall flag below.  This is
+   // necessary to ensure the registration is removed if the controlled
+   // clients are closed by shutting down the browser.  If the registration
+   // is resurrected by clearing mPendingUninstall then it should be saved
+   // to disk again.
+-  // TODO: Don't reach into SWM internals here.  Expose a method instead.
+-  if (mSendToParent && !registration->mPendingUninstall && swm->mActor) {
+-    swm->mActor->SendUnregister(principalInfo, NS_ConvertUTF8toUTF16(mScope));
++  if (mSendToParent && !registration->mPendingUninstall) {
++    swm->MaybeSendUnregister(mPrincipal, mScope);
+   }
+ 
+   // "Set registration's uninstalling flag."
+   registration->mPendingUninstall = true;
+ 
+   // "Resolve promise with true"
+   mResult = true;
+   InvokeResultCallbacks(NS_OK);
