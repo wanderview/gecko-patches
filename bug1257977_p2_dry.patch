@@ -1,0 +1,237 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  69dd69fa206f3650f4f420b44a7b6a1306bb7a35
+Bug 1257977 P2 Move ServiceWorker update logic into central place in ServiceWorkerRegistrationInfo methods. r=ehsan
+
+diff --git a/dom/workers/ServiceWorkerRegistrationInfo.cpp b/dom/workers/ServiceWorkerRegistrationInfo.cpp
+--- a/dom/workers/ServiceWorkerRegistrationInfo.cpp
++++ b/dom/workers/ServiceWorkerRegistrationInfo.cpp
+@@ -220,33 +220,25 @@ ServiceWorkerRegistrationInfo::PurgeActi
+   }
+   RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+   swm->InvalidateServiceWorkerRegistrationWorker(this, WhichServiceWorker::ACTIVE_WORKER);
+ }
+ 
+ void
+ ServiceWorkerRegistrationInfo::Activate()
+ {
+-  RefPtr<ServiceWorkerInfo> activatingWorker = mWaitingWorker;
+-  if (!activatingWorker) {
++  if (!mWaitingWorker) {
+     return;
+   }
+ 
+-  PurgeActiveWorker();
+-
+-  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+-  swm->InvalidateServiceWorkerRegistrationWorker(this, WhichServiceWorker::WAITING_WORKER);
+-
+-  mActiveWorker = activatingWorker.forget();
+-  mWaitingWorker = nullptr;
+-  mActiveWorker->UpdateState(ServiceWorkerState::Activating);
+-  NotifyListenersOnChange();
++  SetActive(mWaitingWorker);
+ 
+   // FIXME(nsm): Unlink appcache if there is one.
+ 
++  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+   swm->CheckPendingReadyPromises();
+ 
+   // "Queue a task to fire a simple event named controllerchange..."
+   nsCOMPtr<nsIRunnable> controllerChangeRunnable =
+     NS_NewRunnableMethodWithArg<RefPtr<ServiceWorkerRegistrationInfo>>(
+       swm, &ServiceWorkerManager::FireControllerChange, this);
+   NS_DispatchToMainThread(controllerChangeRunnable);
+ 
+@@ -387,26 +379,82 @@ ServiceWorkerRegistrationInfo::GetActive
+   AssertIsOnMainThread();
+   return mActiveWorker;
+ }
+ 
+ void
+ ServiceWorkerRegistrationInfo::SetInstalling(ServiceWorkerInfo* aServiceWorker)
+ {
+   AssertIsOnMainThread();
++  MOZ_ASSERT(mInstallingWorker != aServiceWorker);
++  MOZ_ASSERT(mWaitingWorker != aServiceWorker);
++  MOZ_ASSERT(mActiveWorker != aServiceWorker);
++
++  if (mInstallingWorker) {
++    mInstallingWorker->UpdateState(ServiceWorkerState::Redundant);
++    serviceWorkerScriptCache::PurgeCache(mPrincipal,
++                                         mInstallingWorker->CacheName());
++  }
++
+   mInstallingWorker = aServiceWorker;
++
++  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
++  swm->InvalidateServiceWorkerRegistrationWorker(this,
++                                                 WhichServiceWorker::INSTALLING_WORKER);
++
++  NotifyListenersOnChange();
+ }
+ 
+ void
+ ServiceWorkerRegistrationInfo::SetWaiting(ServiceWorkerInfo* aServiceWorker)
+ {
+   AssertIsOnMainThread();
+-  mWaitingWorker = aServiceWorker;
++  MOZ_ASSERT(aServiceWorker);
++  MOZ_ASSERT(mWaitingWorker != aServiceWorker);
++  MOZ_ASSERT(mActiveWorker != aServiceWorker);
++
++  if (mWaitingWorker) {
++    mWaitingWorker->UpdateState(ServiceWorkerState::Redundant);
++    serviceWorkerScriptCache::PurgeCache(mPrincipal,
++                                         mWaitingWorker->CacheName());
++  }
++
++  MOZ_RELEASE_ASSERT(mInstallingWorker == aServiceWorker);
++  mWaitingWorker = mInstallingWorker.forget();
++  mWaitingWorker->UpdateState(ServiceWorkerState::Installed);
++
++  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
++  swm->InvalidateServiceWorkerRegistrationWorker(this,
++                                                 WhichServiceWorker::INSTALLING_WORKER |
++                                                 WhichServiceWorker::WAITING_WORKER);
++
++  NotifyListenersOnChange();
++
++  swm->StoreRegistration(mPrincipal, this);
+ }
+ 
+ void
+ ServiceWorkerRegistrationInfo::SetActive(ServiceWorkerInfo* aServiceWorker)
+ {
+   AssertIsOnMainThread();
+-  mActiveWorker = aServiceWorker;
++  MOZ_ASSERT(aServiceWorker);
++  MOZ_ASSERT(mInstallingWorker != aServiceWorker);
++  MOZ_ASSERT(mActiveWorker != aServiceWorker);
++
++  if (mActiveWorker) {
++    mActiveWorker->UpdateState(ServiceWorkerState::Redundant);
++    serviceWorkerScriptCache::PurgeCache(mPrincipal,
++                                         mActiveWorker->CacheName());
++  }
++
++  MOZ_RELEASE_ASSERT(mWaitingWorker == aServiceWorker);
++  mActiveWorker = mWaitingWorker.forget();
++  mWaitingWorker->UpdateState(ServiceWorkerState::Activating);
++
++  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
++  swm->InvalidateServiceWorkerRegistrationWorker(this,
++                                                 WhichServiceWorker::WAITING_WORKER |
++                                                 WhichServiceWorker::ACTIVE_WORKER);
++
++  NotifyListenersOnChange();
+ }
+ 
+ END_WORKERS_NAMESPACE
+diff --git a/dom/workers/ServiceWorkerUpdateJob.cpp b/dom/workers/ServiceWorkerUpdateJob.cpp
+--- a/dom/workers/ServiceWorkerUpdateJob.cpp
++++ b/dom/workers/ServiceWorkerUpdateJob.cpp
+@@ -137,29 +137,19 @@ ServiceWorkerUpdateJob::FailUpdateJob(Er
+ 
+   if (mRegistration) {
+     if (mServiceWorker) {
+       mServiceWorker->UpdateState(ServiceWorkerState::Redundant);
+       serviceWorkerScriptCache::PurgeCache(mRegistration->mPrincipal,
+                                            mServiceWorker->CacheName());
+     }
+ 
++    mRegistration->SetInstalling(nullptr);
++
+     RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+-
+-    if (mRegistration->GetInstalling()) {
+-      mRegistration->GetInstalling()->UpdateState(ServiceWorkerState::Redundant);
+-      serviceWorkerScriptCache::PurgeCache(mRegistration->mPrincipal,
+-                                           mRegistration->GetInstalling()->CacheName());
+-      mRegistration->SetInstalling(nullptr);
+-      if (swm) {
+-        swm->InvalidateServiceWorkerRegistrationWorker(mRegistration,
+-                                                       WhichServiceWorker::INSTALLING_WORKER);
+-      }
+-    }
+-
+     if (swm) {
+       swm->MaybeRemoveRegistration(mRegistration);
+     }
+   }
+ 
+   mServiceWorker = nullptr;
+   mRegistration = nullptr;
+ 
+@@ -381,27 +371,23 @@ ServiceWorkerUpdateJob::Install()
+     return FailUpdateJob(NS_ERROR_DOM_ABORT_ERR);
+   }
+ 
+   MOZ_ASSERT(!mRegistration->GetInstalling());
+ 
+   MOZ_ASSERT(mServiceWorker);
+   mRegistration->SetInstalling(mServiceWorker);
+   mServiceWorker = nullptr;
+-  mRegistration->GetInstalling()->UpdateState(ServiceWorkerState::Installing);
+-  mRegistration->NotifyListenersOnChange();
+-
+-  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+-  swm->InvalidateServiceWorkerRegistrationWorker(mRegistration,
+-                                                 WhichServiceWorker::INSTALLING_WORKER);
+ 
+   InvokeResultCallbacks(NS_OK);
+ 
+   // The job should NOT fail from this point on.
+ 
++  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
++
+   // fire the updatefound event
+   nsCOMPtr<nsIRunnable> upr =
+     NS_NewRunnableMethodWithArg<RefPtr<ServiceWorkerRegistrationInfo>>(
+       swm,
+       &ServiceWorkerManager::FireUpdateFoundOnServiceWorkerRegistrations,
+       mRegistration);
+   NS_DispatchToMainThread(upr);
+ 
+@@ -428,41 +414,24 @@ void
+ ServiceWorkerUpdateJob::ContinueAfterInstallEvent(bool aInstallEventSuccess)
+ {
+   if (Canceled()) {
+     return FailUpdateJob(NS_ERROR_DOM_ABORT_ERR);
+   }
+ 
+   MOZ_ASSERT(mRegistration->GetInstalling());
+ 
+-  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+-
+   // "If installFailed is true"
+   if (NS_WARN_IF(!aInstallEventSuccess)) {
+     // The installing worker is cleaned up by FailUpdateJob().
+     FailUpdateJob(NS_ERROR_DOM_ABORT_ERR);
+     return;
+   }
+ 
+-  // "If registration's waiting worker is not null"
+-  if (mRegistration->GetWaiting()) {
+-    mRegistration->GetWaiting()->WorkerPrivate()->TerminateWorker();
+-    mRegistration->GetWaiting()->UpdateState(ServiceWorkerState::Redundant);
+-    serviceWorkerScriptCache::PurgeCache(mRegistration->mPrincipal,
+-                                         mRegistration->GetWaiting()->CacheName());
+-  }
+-
+   mRegistration->SetWaiting(mRegistration->GetInstalling());
+-  mRegistration->SetInstalling(nullptr);
+-  mRegistration->GetWaiting()->UpdateState(ServiceWorkerState::Installed);
+-  mRegistration->NotifyListenersOnChange();
+-  swm->StoreRegistration(mPrincipal, mRegistration);
+-  swm->InvalidateServiceWorkerRegistrationWorker(mRegistration,
+-                                                 WhichServiceWorker::INSTALLING_WORKER |
+-                                                 WhichServiceWorker::WAITING_WORKER);
+ 
+   Finish(NS_OK);
+ 
+   // Activate() is invoked out of band of atomic.
+   mRegistration->TryToActivateAsync();
+ }
+ 
+ } // namespace workers
