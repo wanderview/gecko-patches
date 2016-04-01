@@ -1,18 +1,130 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  69dd69fa206f3650f4f420b44a7b6a1306bb7a35
-Bug 1257977 P2 Move ServiceWorker update logic into central place in ServiceWorkerRegistrationInfo methods. r=ehsan
+# Parent  062a5ed27b8c1c535e95abdb352878b105681731
+Bug 1257977 P2 Move ServiceWorker update logic into central place in ServiceWorkerRegistrationInfo methods. r=jdm
 
+diff --git a/dom/workers/ServiceWorkerInfo.cpp b/dom/workers/ServiceWorkerInfo.cpp
+--- a/dom/workers/ServiceWorkerInfo.cpp
++++ b/dom/workers/ServiceWorkerInfo.cpp
+@@ -1,16 +1,18 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "ServiceWorkerInfo.h"
+ 
++#include "ServiceWorkerScriptCache.h"
++
+ BEGIN_WORKERS_NAMESPACE
+ 
+ NS_IMPL_ISUPPORTS(ServiceWorkerInfo, nsIServiceWorkerInfo)
+ 
+ NS_IMETHODIMP
+ ServiceWorkerInfo::GetScriptSpec(nsAString& aScriptSpec)
+ {
+   AssertIsOnMainThread();
+@@ -134,16 +136,19 @@ ServiceWorkerInfo::UpdateState(ServiceWo
+   // TODO: Do we care that these events will race with the propagation of the
+   //       state change?
+   if (aState == ServiceWorkerState::Activated && mState != aState) {
+     mServiceWorkerPrivate->Activated();
+   }
+   mState = aState;
+   nsCOMPtr<nsIRunnable> r = new ChangeStateUpdater(mInstances, mState);
+   MOZ_ALWAYS_SUCCEEDS(NS_DispatchToMainThread(r.forget()));
++  if (mState == ServiceWorkerState::Redundant) {
++    serviceWorkerScriptCache::PurgeCache(mPrincipal, mCacheName);
++  }
+ }
+ 
+ ServiceWorkerInfo::ServiceWorkerInfo(nsIPrincipal* aPrincipal,
+                                      const nsACString& aScope,
+                                      const nsACString& aScriptSpec,
+                                      const nsAString& aCacheName)
+   : mPrincipal(aPrincipal)
+   , mScope(aScope)
 diff --git a/dom/workers/ServiceWorkerRegistrationInfo.cpp b/dom/workers/ServiceWorkerRegistrationInfo.cpp
 --- a/dom/workers/ServiceWorkerRegistrationInfo.cpp
 +++ b/dom/workers/ServiceWorkerRegistrationInfo.cpp
-@@ -220,33 +220,25 @@ ServiceWorkerRegistrationInfo::PurgeActi
+@@ -15,46 +15,29 @@ ServiceWorkerRegistrationInfo::Clear()
+     mInstallingWorker->UpdateState(ServiceWorkerState::Redundant);
+     mInstallingWorker->WorkerPrivate()->NoteDeadServiceWorkerInfo();
+     mInstallingWorker = nullptr;
+     // FIXME(nsm): Abort any inflight requests from installing worker.
    }
-   RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
-   swm->InvalidateServiceWorkerRegistrationWorker(this, WhichServiceWorker::ACTIVE_WORKER);
+ 
+   if (mWaitingWorker) {
+     mWaitingWorker->UpdateState(ServiceWorkerState::Redundant);
+-
+-    nsresult rv = serviceWorkerScriptCache::PurgeCache(mPrincipal,
+-                                                       mWaitingWorker->CacheName());
+-    if (NS_FAILED(rv)) {
+-      NS_WARNING("Failed to purge the waiting cache.");
+-    }
+-
+     mWaitingWorker->WorkerPrivate()->NoteDeadServiceWorkerInfo();
+     mWaitingWorker = nullptr;
+   }
+ 
+   if (mActiveWorker) {
+     mActiveWorker->UpdateState(ServiceWorkerState::Redundant);
+-
+-    nsresult rv = serviceWorkerScriptCache::PurgeCache(mPrincipal,
+-                                                       mActiveWorker->CacheName());
+-    if (NS_FAILED(rv)) {
+-      NS_WARNING("Failed to purge the active cache.");
+-    }
+-
+     mActiveWorker->WorkerPrivate()->NoteDeadServiceWorkerInfo();
+     mActiveWorker = nullptr;
+   }
+ 
+-  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+-  MOZ_ASSERT(swm);
+-  swm->InvalidateServiceWorkerRegistrationWorker(this,
+-                                                 WhichServiceWorker::INSTALLING_WORKER |
+-                                                 WhichServiceWorker::WAITING_WORKER |
+-                                                 WhichServiceWorker::ACTIVE_WORKER);
++  NotifyListenersOnChange(WhichServiceWorker::INSTALLING_WORKER |
++                          WhichServiceWorker::WAITING_WORKER |
++                          WhichServiceWorker::ACTIVE_WORKER);
+ }
+ 
+ ServiceWorkerRegistrationInfo::ServiceWorkerRegistrationInfo(const nsACString& aScope,
+                                                              nsIPrincipal* aPrincipal)
+   : mControlledDocumentsCounter(0)
+   , mUpdateState(NoUpdate)
+   , mLastUpdateCheckTime(0)
+   , mScope(aScope)
+@@ -200,53 +183,27 @@ ServiceWorkerRegistrationInfo::TryToActi
+   if (!IsControllingDocuments() ||
+       // Waiting worker will be removed if the registration is removed
+       (mWaitingWorker && mWaitingWorker->SkipWaitingFlag())) {
+     Activate();
+   }
  }
  
  void
+-ServiceWorkerRegistrationInfo::PurgeActiveWorker()
+-{
+-  RefPtr<ServiceWorkerInfo> exitingWorker = mActiveWorker.forget();
+-  if (!exitingWorker)
+-    return;
+-
+-  // FIXME(jaoo): Bug 1170543 - Wait for exitingWorker to finish and terminate it.
+-  exitingWorker->UpdateState(ServiceWorkerState::Redundant);
+-  nsresult rv = serviceWorkerScriptCache::PurgeCache(mPrincipal,
+-                                                     exitingWorker->CacheName());
+-  if (NS_FAILED(rv)) {
+-    NS_WARNING("Failed to purge the activating cache.");
+-  }
+-  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+-  swm->InvalidateServiceWorkerRegistrationWorker(this, WhichServiceWorker::ACTIVE_WORKER);
+-}
+-
+-void
  ServiceWorkerRegistrationInfo::Activate()
  {
 -  RefPtr<ServiceWorkerInfo> activatingWorker = mWaitingWorker;
@@ -30,7 +142,7 @@ diff --git a/dom/workers/ServiceWorkerRegistrationInfo.cpp b/dom/workers/Service
 -  mWaitingWorker = nullptr;
 -  mActiveWorker->UpdateState(ServiceWorkerState::Activating);
 -  NotifyListenersOnChange();
-+  SetActive(mWaitingWorker);
++  TransitionWaitingToActive();
  
    // FIXME(nsm): Unlink appcache if there is one.
  
@@ -43,65 +155,89 @@ diff --git a/dom/workers/ServiceWorkerRegistrationInfo.cpp b/dom/workers/Service
        swm, &ServiceWorkerManager::FireControllerChange, this);
    NS_DispatchToMainThread(controllerChangeRunnable);
  
-@@ -387,26 +379,87 @@ ServiceWorkerRegistrationInfo::GetActive
+@@ -306,18 +263,26 @@ ServiceWorkerRegistrationInfo::IsLastUpd
+   if ((mLastUpdateCheckTime != 0) &&
+       (now - mLastUpdateCheckTime > kSecondsPerDay)) {
+     return true;
+   }
+   return false;
+ }
+ 
+ void
+-ServiceWorkerRegistrationInfo::NotifyListenersOnChange()
++ServiceWorkerRegistrationInfo::NotifyListenersOnChange(WhichServiceWorker aChangedWorkers)
+ {
++  AssertIsOnMainThread();
++  MOZ_ASSERT(aChangedWorkers & WhichServiceWorker::INSTALLING_WORKER |
++                               WhichServiceWorker::WAITING_WORKER |
++                               WhichServiceWorker::ACTIVE_WORKER);
++
++  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
++  swm->InvalidateServiceWorkerRegistrationWorker(this, aChangedWorkers);
++
+   nsTArray<nsCOMPtr<nsIServiceWorkerRegistrationInfoListener>> listeners(mListeners);
+   for (size_t index = 0; index < listeners.Length(); ++index) {
+     listeners[index]->OnChange();
+   }
+ }
+ 
+ void
+ ServiceWorkerRegistrationInfo::MaybeScheduleTimeCheckAndUpdate()
+@@ -384,29 +349,102 @@ ServiceWorkerRegistrationInfo::GetWaitin
+ ServiceWorkerInfo*
+ ServiceWorkerRegistrationInfo::GetActive() const
+ {
    AssertIsOnMainThread();
    return mActiveWorker;
  }
  
  void
++ServiceWorkerRegistrationInfo::ClearInstalling()
++{
++  AssertIsOnMainThread();
++
++  if (!mInstallingWorker) {
++    return;
++  }
++
++  mInstallingWorker->UpdateState(ServiceWorkerState::Redundant);
++  mInstallingWorker = nullptr;
++  NotifyListenersOnChange(WhichServiceWorker::INSTALLING_WORKER);
++}
++
++void
  ServiceWorkerRegistrationInfo::SetInstalling(ServiceWorkerInfo* aServiceWorker)
  {
    AssertIsOnMainThread();
-+  // aServiceWorker can be nullptr if the install event failed and we need
-+  // to clear the installing worker.
-+  MOZ_ASSERT_IF(aServiceWorker, mInstallingWorker != aServiceWorker);
-+  MOZ_ASSERT_IF(aServiceWorker, mWaitingWorker != aServiceWorker);
-+  MOZ_ASSERT_IF(aServiceWorker, mActiveWorker != aServiceWorker);
-+
-+  if (mInstallingWorker) {
-+    mInstallingWorker->UpdateState(ServiceWorkerState::Redundant);
-+    serviceWorkerScriptCache::PurgeCache(mPrincipal,
-+                                         mInstallingWorker->CacheName());
-+  }
-+
-   mInstallingWorker = aServiceWorker;
-+  if (mInstallingWorker) {
-+    mInstallingWorker->UpdateState(ServiceWorkerState::Installing);
-+  }
-+
-+  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
-+  swm->InvalidateServiceWorkerRegistrationWorker(this,
-+                                                 WhichServiceWorker::INSTALLING_WORKER);
-+
-+  NotifyListenersOnChange();
- }
- 
- void
- ServiceWorkerRegistrationInfo::SetWaiting(ServiceWorkerInfo* aServiceWorker)
- {
-   AssertIsOnMainThread();
--  mWaitingWorker = aServiceWorker;
 +  MOZ_ASSERT(aServiceWorker);
++  MOZ_ASSERT(!mInstallingWorker);
 +  MOZ_ASSERT(mWaitingWorker != aServiceWorker);
 +  MOZ_ASSERT(mActiveWorker != aServiceWorker);
 +
+   mInstallingWorker = aServiceWorker;
++  mInstallingWorker->UpdateState(ServiceWorkerState::Installing);
++  NotifyListenersOnChange(WhichServiceWorker::INSTALLING_WORKER);
+ }
+ 
+ void
+-ServiceWorkerRegistrationInfo::SetWaiting(ServiceWorkerInfo* aServiceWorker)
++ServiceWorkerRegistrationInfo::TransitionInstallingToWaiting()
+ {
+   AssertIsOnMainThread();
+-  mWaitingWorker = aServiceWorker;
++  MOZ_ASSERT(mInstallingWorker);
++
 +  if (mWaitingWorker) {
++    MOZ_ASSERT(mInstallingWorker->CacheName() != mWaitingWorker->CacheName());
 +    mWaitingWorker->UpdateState(ServiceWorkerState::Redundant);
-+    serviceWorkerScriptCache::PurgeCache(mPrincipal,
-+                                         mWaitingWorker->CacheName());
 +  }
 +
-+  MOZ_RELEASE_ASSERT(mInstallingWorker == aServiceWorker);
 +  mWaitingWorker = mInstallingWorker.forget();
 +  mWaitingWorker->UpdateState(ServiceWorkerState::Installed);
++  NotifyListenersOnChange(WhichServiceWorker::INSTALLING_WORKER |
++                          WhichServiceWorker::WAITING_WORKER);
 +
 +  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
-+  swm->InvalidateServiceWorkerRegistrationWorker(this,
-+                                                 WhichServiceWorker::INSTALLING_WORKER |
-+                                                 WhichServiceWorker::WAITING_WORKER);
-+
-+  NotifyListenersOnChange();
-+
 +  swm->StoreRegistration(mPrincipal, this);
  }
  
@@ -109,35 +245,141 @@ diff --git a/dom/workers/ServiceWorkerRegistrationInfo.cpp b/dom/workers/Service
  ServiceWorkerRegistrationInfo::SetActive(ServiceWorkerInfo* aServiceWorker)
  {
    AssertIsOnMainThread();
--  mActiveWorker = aServiceWorker;
 +  MOZ_ASSERT(aServiceWorker);
++
++  // TODO: Assert installing, waiting, and active are nullptr once the SWM
++  //       moves to the parent process.  After that happens this code will
++  //       only run for browser initialization and not for cross-process
++  //       overrides.
 +  MOZ_ASSERT(mInstallingWorker != aServiceWorker);
++  MOZ_ASSERT(mWaitingWorker != aServiceWorker);
 +  MOZ_ASSERT(mActiveWorker != aServiceWorker);
 +
 +  if (mActiveWorker) {
++    MOZ_ASSERT(aServiceWorker->CacheName() != mActiveWorker->CacheName());
 +    mActiveWorker->UpdateState(ServiceWorkerState::Redundant);
-+    serviceWorkerScriptCache::PurgeCache(mPrincipal,
-+                                         mActiveWorker->CacheName());
 +  }
 +
-+  MOZ_RELEASE_ASSERT(mWaitingWorker == aServiceWorker);
++  // The active worker is being overriden due to initial load or
++  // another process activating a worker.  Move straight to the
++  // Activated state.
+   mActiveWorker = aServiceWorker;
++  mActiveWorker->SetActivateStateUncheckedWithoutEvent(ServiceWorkerState::Activated);
++  NotifyListenersOnChange(WhichServiceWorker::ACTIVE_WORKER);
++}
++
++void
++ServiceWorkerRegistrationInfo::TransitionWaitingToActive()
++{
++  AssertIsOnMainThread();
++  MOZ_ASSERT(mWaitingWorker);
++
++  if (mActiveWorker) {
++    MOZ_ASSERT(mWaitingWorker->CacheName() != mActiveWorker->CacheName());
++    mActiveWorker->UpdateState(ServiceWorkerState::Redundant);
++  }
++
++  // We are transitioning from waiting to active normally, so go to
++  // the activating state.
 +  mActiveWorker = mWaitingWorker.forget();
 +  mActiveWorker->UpdateState(ServiceWorkerState::Activating);
-+
-+  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
-+  swm->InvalidateServiceWorkerRegistrationWorker(this,
-+                                                 WhichServiceWorker::WAITING_WORKER |
-+                                                 WhichServiceWorker::ACTIVE_WORKER);
-+
-+  NotifyListenersOnChange();
++  NotifyListenersOnChange(WhichServiceWorker::WAITING_WORKER |
++                          WhichServiceWorker::ACTIVE_WORKER);
  }
  
  END_WORKERS_NAMESPACE
+diff --git a/dom/workers/ServiceWorkerRegistrationInfo.h b/dom/workers/ServiceWorkerRegistrationInfo.h
+--- a/dom/workers/ServiceWorkerRegistrationInfo.h
++++ b/dom/workers/ServiceWorkerRegistrationInfo.h
+@@ -87,19 +87,16 @@ public:
+   {
+     return mActiveWorker && mControlledDocumentsCounter;
+   }
+ 
+   void
+   Clear();
+ 
+   void
+-  PurgeActiveWorker();
+-
+-  void
+   TryToActivateAsync();
+ 
+   void
+   TryToActivate();
+ 
+   void
+   Activate();
+ 
+@@ -108,17 +105,17 @@ public:
+ 
+   void
+   RefreshLastUpdateCheckTime();
+ 
+   bool
+   IsLastUpdateCheckTimeOverOneDay() const;
+ 
+   void
+-  NotifyListenersOnChange();
++  NotifyListenersOnChange(WhichServiceWorker aChangedWorkers);
+ 
+   void
+   MaybeScheduleTimeCheckAndUpdate();
+ 
+   void
+   MaybeScheduleUpdate();
+ 
+   bool
+@@ -128,23 +125,43 @@ public:
+   GetInstalling() const;
+ 
+   ServiceWorkerInfo*
+   GetWaiting() const;
+ 
+   ServiceWorkerInfo*
+   GetActive() const;
+ 
++  // Remove an existing installing worker, if present.  The worker will
++  // be transitioned to the Redundant state.
++  void
++  ClearInstalling();
++
++  // Set a new installing worker.  This may only be called if there is no
++  // existing installing worker.  The worker is transitioned to the Installing
++  // state.
+   void
+   SetInstalling(ServiceWorkerInfo* aServiceWorker);
+ 
++  // Transition the current installing worker to be the waiting worker.  The
++  // workers state is updated to Installed.
+   void
+-  SetWaiting(ServiceWorkerInfo* aServiceWorker);
++  TransitionInstallingToWaiting();
+ 
++  // Override the current active worker.  This is used during browser
++  // initialization to load persisted workers.  Its also used to propagate
++  // active workers across child processes in e10s.  This second use will
++  // go away once the ServiceWorkerManager moves to the parent process.
++  // The worker is transitioned to the Activated state.
+   void
+   SetActive(ServiceWorkerInfo* aServiceWorker);
++
++  // Transition the current waiting worker to be the new active worker.  The
++  // worker is updated to the Activating state.
++  void
++  TransitionWaitingToActive();
+ };
+ 
+ } // namespace workers
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_workers_serviceworkerregistrationinfo_h
 diff --git a/dom/workers/ServiceWorkerUpdateJob.cpp b/dom/workers/ServiceWorkerUpdateJob.cpp
 --- a/dom/workers/ServiceWorkerUpdateJob.cpp
 +++ b/dom/workers/ServiceWorkerUpdateJob.cpp
-@@ -137,29 +137,19 @@ ServiceWorkerUpdateJob::FailUpdateJob(Er
- 
+@@ -145,29 +145,19 @@ ServiceWorkerUpdateJob::FailUpdateJob(Er
+   // cleanup on every non-successful exit.
    if (mRegistration) {
      if (mServiceWorker) {
        mServiceWorker->UpdateState(ServiceWorkerState::Redundant);
@@ -145,7 +387,7 @@ diff --git a/dom/workers/ServiceWorkerUpdateJob.cpp b/dom/workers/ServiceWorkerU
                                             mServiceWorker->CacheName());
      }
  
-+    mRegistration->SetInstalling(nullptr);
++    mRegistration->ClearInstalling();
 +
      RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
 -
@@ -168,11 +410,11 @@ diff --git a/dom/workers/ServiceWorkerUpdateJob.cpp b/dom/workers/ServiceWorkerU
    mServiceWorker = nullptr;
    mRegistration = nullptr;
  
-@@ -381,27 +371,23 @@ ServiceWorkerUpdateJob::Install()
-     return FailUpdateJob(NS_ERROR_DOM_ABORT_ERR);
-   }
+@@ -403,29 +393,25 @@ ServiceWorkerUpdateJob::Install()
  
-   MOZ_ASSERT(!mRegistration->GetInstalling());
+   // Begin step 2 of the Install algorithm.
+   //
+   //  https://slightlyoff.github.io/ServiceWorker/spec/service_worker/index.html#installation-algorithm
  
    MOZ_ASSERT(mServiceWorker);
    mRegistration->SetInstalling(mServiceWorker);
@@ -184,9 +426,11 @@ diff --git a/dom/workers/ServiceWorkerUpdateJob.cpp b/dom/workers/ServiceWorkerU
 -  swm->InvalidateServiceWorkerRegistrationWorker(mRegistration,
 -                                                 WhichServiceWorker::INSTALLING_WORKER);
  
+   // Step 6 of the Install algorithm resolving the job promise.
    InvokeResultCallbacks(NS_OK);
  
-   // The job should NOT fail from this point on.
+   // The job promise cannot be rejected after this point, but the job can
+   // still fail; e.g. if the install event handler throws, etc.
  
 +  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
 +
@@ -198,7 +442,7 @@ diff --git a/dom/workers/ServiceWorkerUpdateJob.cpp b/dom/workers/ServiceWorkerU
        mRegistration);
    NS_DispatchToMainThread(upr);
  
-@@ -428,41 +414,24 @@ void
+@@ -452,43 +438,26 @@ void
  ServiceWorkerUpdateJob::ContinueAfterInstallEvent(bool aInstallEventSuccess)
  {
    if (Canceled()) {
@@ -209,6 +453,8 @@ diff --git a/dom/workers/ServiceWorkerUpdateJob.cpp b/dom/workers/ServiceWorkerU
  
 -  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
 -
+   // Continue executing the Install algorithm at step 12.
+ 
    // "If installFailed is true"
    if (NS_WARN_IF(!aInstallEventSuccess)) {
      // The installing worker is cleaned up by FailUpdateJob().
@@ -224,7 +470,7 @@ diff --git a/dom/workers/ServiceWorkerUpdateJob.cpp b/dom/workers/ServiceWorkerU
 -                                         mRegistration->GetWaiting()->CacheName());
 -  }
 -
-   mRegistration->SetWaiting(mRegistration->GetInstalling());
+-  mRegistration->SetWaiting(mRegistration->GetInstalling());
 -  mRegistration->SetInstalling(nullptr);
 -  mRegistration->GetWaiting()->UpdateState(ServiceWorkerState::Installed);
 -  mRegistration->NotifyListenersOnChange();
@@ -232,11 +478,12 @@ diff --git a/dom/workers/ServiceWorkerUpdateJob.cpp b/dom/workers/ServiceWorkerU
 -  swm->InvalidateServiceWorkerRegistrationWorker(mRegistration,
 -                                                 WhichServiceWorker::INSTALLING_WORKER |
 -                                                 WhichServiceWorker::WAITING_WORKER);
++  mRegistration->TransitionInstallingToWaiting();
  
    Finish(NS_OK);
  
-   // Activate() is invoked out of band of atomic.
-   mRegistration->TryToActivateAsync();
- }
+   // Step 20 calls for explicitly waiting for queued event tasks to fire.  Instead,
+   // we simply queue a runnable to execute Activate.  This ensures the events are
+   // flushed from the queue before proceeding.
  
- } // namespace workers
+   // Step 22 of the Install algorithm.  Activate is executed after the completion
