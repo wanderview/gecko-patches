@@ -1,0 +1,205 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  7f2a706395fa2ce8fc3b273819c80b887befacd5
+Bug 1093357 P1 interdiff 001 address review feedback
+
+diff --git a/ipc/glue/PSendStream.ipdl b/ipc/glue/PSendStream.ipdl
+--- a/ipc/glue/PSendStream.ipdl
++++ b/ipc/glue/PSendStream.ipdl
+@@ -12,16 +12,21 @@ protocol PSendStream
+ {
+   manager PBackground or PContent;
+ 
+ parent:
+   async Buffer(nsCString aBuffer);
+   async Close(nsresult aRv);
+ 
+ child:
++  // The parent side has hit an error condition and has requested the child
++  // actor issue a Close() message.  The close must be initiated by the child
++  // to avoid racing with an in-flight Buffer() message.
++  async RequestClose(nsresult aRv);
++
+   // Stream is always destroyed from the parent side.  This occurs if the
+   // parent encounters an error while writing to its pipe or if the child
+   // signals the stream should close by SendClose().
+   async __delete__();
+ };
+ 
+ } // namespace ipc
+ } // namespace mozilla
+diff --git a/ipc/glue/SendStreamChild.cpp b/ipc/glue/SendStreamChild.cpp
+--- a/ipc/glue/SendStreamChild.cpp
++++ b/ipc/glue/SendStreamChild.cpp
+@@ -43,16 +43,19 @@ public:
+ 
+ private:
+   class Callback;
+ 
+   // PSendStreamChild methods
+   virtual void
+   ActorDestroy(ActorDestroyReason aReason) override;
+ 
++  virtual bool
++  RecvRequestClose(const nsresult& aRv) override;
++
+   // WorkerFeature methods
+   virtual bool
+   Notify(Status aStatus) override;
+ 
+   void DoRead();
+ 
+   void Wait();
+ 
+@@ -170,19 +173,17 @@ SendStreamChildImpl::Start()
+   MOZ_ASSERT_IF(!NS_IsMainThread(), mWorkerPrivate);
+   DoRead();
+ }
+ 
+ void
+ SendStreamChildImpl::StartDestroy()
+ {
+   NS_ASSERT_OWNINGTHREAD(SendStreamChild);
+-
+-  // start actor destruction from the parent process
+-  Unused << SendClose(NS_ERROR_ABORT);
++  OnEnd(NS_ERROR_ABORT);
+ }
+ 
+ bool
+ SendStreamChildImpl::AddAsWorkerFeature(WorkerPrivate* aWorkerPrivate)
+ {
+   NS_ASSERT_OWNINGTHREAD(SendStreamChild);
+   MOZ_ASSERT(aWorkerPrivate);
+   bool result = aWorkerPrivate->AddFeature(this);
+@@ -192,36 +193,41 @@ SendStreamChildImpl::AddAsWorkerFeature(
+   return result;
+ }
+ 
+ void
+ SendStreamChildImpl::ActorDestroy(ActorDestroyReason aReason)
+ {
+   NS_ASSERT_OWNINGTHREAD(SendStreamChild);
+ 
+-  // If the parent side runs into a problem then the actor will be destroyed.
+-  // In this case we have not run OnEnd(), so still need to close the input
+-  // stream.
+-  if (!mClosed) {
+-    mStream->CloseWithStatus(NS_ERROR_ABORT);
+-    mClosed = true;
+-  }
++  // If the parent side runs into a problem it will ask the child to
++  // close the connection via RequestClose().  Therefore OnEnd() should
++  // always run before the actor is destroyed.
++  MOZ_ASSERT(mClosed);
+ 
+   if (mCallback) {
+     mCallback->ClearActor();
+     mCallback = nullptr;
+   }
+ 
+   if (mWorkerPrivate) {
+     mWorkerPrivate->RemoveFeature(this);
+     mWorkerPrivate = nullptr;
+   }
+ }
+ 
+ bool
++SendStreamChildImpl::RecvRequestClose(const nsresult& aRv)
++{
++  NS_ASSERT_OWNINGTHREAD(SendStreamChild);
++  OnEnd(aRv);
++  return true;
++}
++
++bool
+ SendStreamChildImpl::Notify(Status aStatus)
+ {
+   NS_ASSERT_OWNINGTHREAD(SendStreamChild);
+ 
+   // Keep the worker thread alive until the stream is finished.
+   return true;
+ }
+ 
+@@ -235,17 +241,21 @@ SendStreamChildImpl::DoRead()
+   // The input stream (likely a pipe) probably uses a segment size of
+   // 4kb.  If there is data already buffered it would be nice to aggregate
+   // multiple segments into a single IPC call.  Conversely, don't send too
+   // too large of a buffer in a single call to avoid spiking memory.
+   static const uint64_t kMaxBytesPerMessage = 32 * 1024;
+   static_assert(kMaxBytesPerMessage <= static_cast<uint64_t>(UINT32_MAX),
+                 "kMaxBytesPerMessage must cleanly cast to uint32_t");
+ 
+-  while (!mClosed) {
++  while (true) {
++    // It should not be possible to transition to closed state without
++    // this loop terminating via a return.
++    MOZ_ASSERT(!mClosed);
++
+     // Use non-auto here as we're unlikely to hit stack storage with the
+     // sizes we are sending.  Also, it would be nice to avoid another copy
+     // to the IPC layer which we avoid if we use COW strings.  Unfortunately
+     // IPC does not seem to support passing dependent storage types.
+     nsCString buffer;
+ 
+     uint64_t available = 0;
+     nsresult rv = mStream->Available(&available);
+@@ -261,16 +271,17 @@ SendStreamChildImpl::DoRead()
+ 
+     uint32_t expectedBytes =
+       static_cast<uint32_t>(std::min(available, kMaxBytesPerMessage));
+ 
+     buffer.SetLength(expectedBytes);
+ 
+     uint32_t bytesRead = 0;
+     rv = mStream->Read(buffer.BeginWriting(), buffer.Length(), &bytesRead);
++    MOZ_ASSERT_IF(NS_FAILED(rv), bytesRead == 0);
+     buffer.SetLength(bytesRead);
+ 
+     // If we read any data from the stream, send it across.
+     if (!buffer.IsEmpty()) {
+       Unused << SendBuffer(buffer);
+     }
+ 
+     if (rv == NS_BASE_STREAM_WOULD_BLOCK) {
+diff --git a/ipc/glue/SendStreamParent.cpp b/ipc/glue/SendStreamParent.cpp
+--- a/ipc/glue/SendStreamParent.cpp
++++ b/ipc/glue/SendStreamParent.cpp
+@@ -68,17 +68,17 @@ SendStreamParentImpl::ActorDestroy(Actor
+ bool
+ SendStreamParentImpl::RecvBuffer(const nsCString& aBuffer)
+ {
+   uint32_t numWritten = 0;
+ 
+   // This should only fail if we hit an OOM condition.
+   nsresult rv = mWriter->Write(aBuffer.get(), aBuffer.Length(), &numWritten);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    RecvClose(rv);
++    Unused << SendRequestClose(rv);
+   }
+ 
+   return true;
+ }
+ 
+ bool
+ SendStreamParentImpl::RecvClose(const nsresult& aRv)
+ {
+@@ -91,17 +91,17 @@ SendStreamParentImpl::SendStreamParentIm
+                                              nsIAsyncOutputStream* aWriter)
+   : mReader(aReader)
+   , mWriter(aWriter)
+ {
+   MOZ_ASSERT(mReader);
+   MOZ_ASSERT(mWriter);
+ }
+ 
+-} // anonymouns namespace
++} // anonymous namespace
+ 
+ SendStreamParent::~SendStreamParent()
+ {
+ }
+ 
+ PSendStreamParent*
+ AllocPSendStreamParent()
+ {
