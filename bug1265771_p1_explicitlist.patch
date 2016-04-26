@@ -1,0 +1,495 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  75baa31c20d73bbf08db184e9f7a514661d57be7
+Bug 1265771 P1 Make Clients.get() and Clients.matchAll() use explicit list of documents in SWM. r=bz
+
+diff --git a/dom/base/nsDocument.cpp b/dom/base/nsDocument.cpp
+--- a/dom/base/nsDocument.cpp
++++ b/dom/base/nsDocument.cpp
+@@ -1673,21 +1673,16 @@ nsDocument::~nsDocument()
+   mPendingTitleChangeEvent.Revoke();
+ 
+   // We don't want to leave residual locks on images. Make sure we're in an
+   // unlocked state, and then clear the table.
+   SetImageLockingState(false);
+   mImageTracker.Clear();
+ 
+   mPlugins.Clear();
+-
+-  nsCOMPtr<nsIObserverService> os = mozilla::services::GetObserverService();
+-  if (os) {
+-    os->RemoveObserver(this, "service-worker-get-client");
+-  }
+ }
+ 
+ NS_INTERFACE_TABLE_HEAD(nsDocument)
+   NS_WRAPPERCACHE_INTERFACE_TABLE_ENTRY
+   NS_INTERFACE_TABLE_BEGIN
+     NS_INTERFACE_TABLE_ENTRY_AMBIGUOUS(nsDocument, nsISupports, nsINode)
+     NS_INTERFACE_TABLE_ENTRY(nsDocument, nsINode)
+     NS_INTERFACE_TABLE_ENTRY(nsDocument, nsIDocument)
+@@ -2079,21 +2074,16 @@ nsDocument::Init()
+   NS_ENSURE_TRUE(global, NS_ERROR_FAILURE);
+   mScopeObject = do_GetWeakReference(global);
+   MOZ_ASSERT(mScopeObject);
+ 
+   mScriptLoader = new nsScriptLoader(this);
+ 
+   mozilla::HoldJSObjects(this);
+ 
+-  nsCOMPtr<nsIObserverService> os = mozilla::services::GetObserverService();
+-  if (os) {
+-    os->AddObserver(this, "service-worker-get-client", /* ownsWeak */ true);
+-  }
+-
+   return NS_OK;
+ }
+ 
+ void
+ nsIDocument::DeleteAllProperties()
+ {
+   for (uint32_t i = 0; i < GetPropertyTableCount(); ++i) {
+     PropertyTable(i)->DeleteAllProperties();
+@@ -4792,22 +4782,29 @@ nsDocument::SetScriptGlobalObject(nsIScr
+       return;
+     }
+ 
+     nsCOMPtr<nsIServiceWorkerManager> swm = mozilla::services::GetServiceWorkerManager();
+     if (swm) {
+       // If this document is being resurrected from the bfcache, then we may
+       // already have a document ID.  In that case reuse the same ID.  Otherwise
+       // get our document ID from the docshell.
+-      nsString documentId(GetId());
+-      if (documentId.IsEmpty()) {
++      nsString documentId;
++      if (GetId().IsEmpty()) {
+         static_cast<nsDocShell*>(docShell.get())->GetInterceptedDocumentId(documentId);
+-      }
+-
+-      swm->MaybeStartControlling(this, documentId);
++        SetId(documentId);
++      }
++
++      // Ensure we always have a document ID, even when the document is not
++      // intercepted.
++      if (NS_FAILED(GetOrCreateId(documentId))) {
++        NS_WARNING("Unable to generate window Client ID!");
++      }
++
++      swm->MaybeStartControlling(this);
+       mMaybeServiceWorkerControlled = true;
+     }
+   }
+ }
+ 
+ nsIScriptGlobalObject*
+ nsDocument::GetScriptHandlingObjectInternal() const
+ {
+@@ -12440,26 +12437,16 @@ nsDocument::Observe(nsISupports *aSubjec
+                     const char16_t *aData)
+ {
+   if (strcmp("app-theme-changed", aTopic) == 0) {
+     if (!nsContentUtils::IsSystemPrincipal(NodePrincipal()) &&
+         !IsUnstyledDocument()) {
+       // We don't want to style the chrome window, only app ones.
+       OnAppThemeChanged();
+     }
+-  } else if (strcmp("service-worker-get-client", aTopic) == 0) {
+-    nsAutoString clientId;
+-    GetOrCreateId(clientId);
+-    if (!clientId.IsEmpty() && clientId.Equals(aData)) {
+-      nsCOMPtr<nsISupportsInterfacePointer> ifptr = do_QueryInterface(aSubject);
+-      if (ifptr) {
+-        ifptr->SetData(static_cast<nsIDocument*>(this));
+-        ifptr->SetDataIID(&NS_GET_IID(nsIDocument));
+-      }
+-    }
+   }
+   return NS_OK;
+ }
+ 
+ void
+ nsDocument::OnAppThemeChanged()
+ {
+   // Bail out if there is no theme support set up properly.
+diff --git a/dom/base/nsIDocument.h b/dom/base/nsIDocument.h
+--- a/dom/base/nsIDocument.h
++++ b/dom/base/nsIDocument.h
+@@ -2724,16 +2724,21 @@ public:
+   }
+ 
+   void ReportHasScrollLinkedEffect();
+   bool HasScrollLinkedEffect() const
+   {
+     return mHasScrollLinkedEffect;
+   }
+ 
++  const nsString& GetId() const
++  {
++    return mId;
++  }
++
+ protected:
+   bool GetUseCounter(mozilla::UseCounter aUseCounter)
+   {
+     return mUseCounters[aUseCounter];
+   }
+ 
+   void SetChildDocumentUseCounter(mozilla::UseCounter aUseCounter)
+   {
+@@ -2788,21 +2793,16 @@ protected:
+ 
+   mozilla::dom::XPathEvaluator* XPathEvaluator();
+ 
+   void HandleRebuildUserFontSet() {
+     mPostedFlushUserFontSet = false;
+     FlushUserFontSet();
+   }
+ 
+-  const nsString& GetId() const
+-  {
+-    return mId;
+-  }
+-
+   nsCString mReferrer;
+   nsString mLastModified;
+ 
+   nsCOMPtr<nsIURI> mDocumentURI;
+   nsCOMPtr<nsIURI> mOriginalURI;
+   nsCOMPtr<nsIURI> mChromeXHRDocURI;
+   nsCOMPtr<nsIURI> mDocumentBaseURI;
+   nsCOMPtr<nsIURI> mChromeXHRDocBaseURI;
+diff --git a/dom/interfaces/base/nsIServiceWorkerManager.idl b/dom/interfaces/base/nsIServiceWorkerManager.idl
+--- a/dom/interfaces/base/nsIServiceWorkerManager.idl
++++ b/dom/interfaces/base/nsIServiceWorkerManager.idl
+@@ -112,23 +112,25 @@ interface nsIServiceWorkerManager : nsIS
+ 
+   nsIServiceWorkerRegistrationInfo getRegistrationByPrincipal(in nsIPrincipal aPrincipal,
+                                                               in DOMString aScope);
+ 
+   /**
+    * Call this to request that document `aDoc` be controlled by a ServiceWorker
+    * if a registration exists for it's scope.
+    *
+-   * This MUST only be called once per document!
++   * This MUST only be called when the document becomes active.  If a document
++   * becomes inactive and then active again, MaybeStopControlling() must be
++   * called at least once before calling MaybeStartControlling() again.
+    */
+-  [notxpcom,nostdcall] void MaybeStartControlling(in nsIDocument aDoc, in DOMString aDocumentId);
++  [notxpcom,nostdcall] void MaybeStartControlling(in nsIDocument aDoc);
+ 
+   /**
+    * Documents that have called MaybeStartControlling() should call this when
+-   * they are destroyed. This function may be called multiple times, and is
++   * they become inactive. This function may be called multiple times, and is
+    * idempotent.
+    */
+   [notxpcom,nostdcall] void MaybeStopControlling(in nsIDocument aDoc);
+ 
+   /*
+    * Returns a ServiceWorker.
+    * window is the window of the caller. scope is the registration's scope and must be
+    * a valid entry that window is allowed to load, otherwise this will return nullptr.
+diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
+--- a/dom/workers/ServiceWorkerManager.cpp
++++ b/dom/workers/ServiceWorkerManager.cpp
+@@ -1937,48 +1937,71 @@ ServiceWorkerManager::MaybeRemoveRegistr
+   }
+ 
+   if (data->mOrderedScopes.IsEmpty() && data->mJobQueues.Count() == 0) {
+     mRegistrationInfos.Remove(aScopeKey);
+   }
+ }
+ 
+ void
+-ServiceWorkerManager::MaybeStartControlling(nsIDocument* aDoc,
+-                                            const nsAString& aDocumentId)
++ServiceWorkerManager::MaybeStartControlling(nsIDocument* aDoc)
+ {
+   AssertIsOnMainThread();
++  MOZ_ASSERT(aDoc);
++  MOZ_ASSERT(!aDoc->GetId().IsEmpty());
+ 
+   // We keep a set of documents that service workers may choose to start
+-  // controlling using claim().
+-  MOZ_ASSERT(!mAllDocuments.Contains(aDoc));
+-  mAllDocuments.PutEntry(aDoc);
++  // controlling using claim(), return from matchAll(), etc.  Store
++  // the documents under their Client ID to make Clients.get() faster.
++#ifdef DEBUG
++  // In most cases we should only ever have a single document for each
++  // document ID, but in some cases two documents are produced.  For
++  // example, xslt will create a source document and then a second
++  // translated document.  When being intercepted both of these documents
++  // will get the same ID.  We detect this replacement by looking for
++  // the same nsIChannel on each document.  If they match then we can
++  // safely replace the document in our list.  Otherwise, something
++  // has gone wrong and we should assert.
++  if (mAllDocuments.Contains(aDoc->GetId())) {
++    nsCOMPtr<nsIChannel> oldChannel = mAllDocuments.GetWeak(aDoc->GetId())->GetChannel();
++    nsCOMPtr<nsIChannel> newChannel = aDoc->GetChannel();
++    MOZ_ASSERT(oldChannel == newChannel);
++  }
++#endif
++  mAllDocuments.Put(aDoc->GetId(), aDoc);
+ 
+   RefPtr<ServiceWorkerRegistrationInfo> registration =
+     GetServiceWorkerRegistrationInfo(aDoc);
+   if (registration) {
+     MOZ_ASSERT(!mControlledDocuments.Contains(aDoc));
+-    StartControllingADocument(registration, aDoc, aDocumentId);
++    StartControllingADocument(registration, aDoc);
+   }
+ }
+ 
+ void
+ ServiceWorkerManager::MaybeStopControlling(nsIDocument* aDoc)
+ {
++  AssertIsOnMainThread();
+   MOZ_ASSERT(aDoc);
+   RefPtr<ServiceWorkerRegistrationInfo> registration;
+   mControlledDocuments.Remove(aDoc, getter_AddRefs(registration));
+   // A document which was uncontrolled does not maintain that state itself, so
+   // it will always call MaybeStopControlling() even if there isn't an
+   // associated registration. So this check is required.
+   if (registration) {
+     StopControllingADocument(registration);
+   }
+ 
+-  mAllDocuments.RemoveEntry(aDoc);
++  // Certain features, like xslt, can create two documents with the same
++  // ID.  In those cases we don't want to remove our entry when the replaced
++  // document becomes inactive.  So we always have to verify we are removing
++  // the correct document.
++  if (mAllDocuments.GetWeak(aDoc->GetId()) == aDoc) {
++    mAllDocuments.Remove(aDoc->GetId());
++  }
+ }
+ 
+ void
+ ServiceWorkerManager::MaybeCheckNavigationUpdate(nsIDocument* aDoc)
+ {
+   AssertIsOnMainThread();
+   MOZ_ASSERT(aDoc);
+   // We perform these success path navigation update steps when the
+@@ -1994,27 +2017,23 @@ ServiceWorkerManager::MaybeCheckNavigati
+   mControlledDocuments.Get(aDoc, getter_AddRefs(registration));
+   if (registration) {
+     registration->MaybeScheduleUpdate();
+   }
+ }
+ 
+ void
+ ServiceWorkerManager::StartControllingADocument(ServiceWorkerRegistrationInfo* aRegistration,
+-                                                nsIDocument* aDoc,
+-                                                const nsAString& aDocumentId)
++                                                nsIDocument* aDoc)
+ {
+   MOZ_ASSERT(aRegistration);
+   MOZ_ASSERT(aDoc);
+ 
+   aRegistration->StartControllingADocument();
+   mControlledDocuments.Put(aDoc, aRegistration);
+-  if (!aDocumentId.IsEmpty()) {
+-    aDoc->SetId(aDocumentId);
+-  }
+   Telemetry::Accumulate(Telemetry::SERVICE_WORKER_CONTROLLED_DOCUMENTS, 1);
+ }
+ 
+ void
+ ServiceWorkerManager::StopControllingADocument(ServiceWorkerRegistrationInfo* aRegistration)
+ {
+   aRegistration->StopControllingADocument();
+   if (!aRegistration->IsControllingDocuments()) {
+@@ -2673,30 +2692,18 @@ ServiceWorkerManager::GetClient(nsIPrinc
+                                 ErrorResult& aRv)
+ {
+   UniquePtr<ServiceWorkerClientInfo> clientInfo;
+   nsCOMPtr<nsISupportsInterfacePointer> ifptr =
+     do_CreateInstance(NS_SUPPORTS_INTERFACE_POINTER_CONTRACTID);
+   if (NS_WARN_IF(!ifptr)) {
+     return clientInfo;
+   }
+-  nsCOMPtr<nsIObserverService> obs = mozilla::services::GetObserverService();
+-  if (NS_WARN_IF(!obs)) {
+-    return clientInfo;
+-  }
+-
+-  nsresult rv = obs->NotifyObservers(ifptr, "service-worker-get-client",
+-                                     PromiseFlatString(aClientId).get());
+-  if (NS_WARN_IF(NS_FAILED(rv))) {
+-    return clientInfo;
+-  }
+-
+-  nsCOMPtr<nsISupports> ptr;
+-  ifptr->GetData(getter_AddRefs(ptr));
+-  nsCOMPtr<nsIDocument> doc = do_QueryInterface(ptr);
++
++  nsCOMPtr<nsIDocument> doc = mAllDocuments.Get(aClientId);
+   if (NS_WARN_IF(!doc)) {
+     return clientInfo;
+   }
+ 
+   bool equals = false;
+   aPrincipal->Equals(doc->NodePrincipal(), &equals);
+   if (!equals) {
+     return clientInfo;
+@@ -2722,28 +2729,16 @@ ServiceWorkerManager::GetAllClients(nsIP
+   RefPtr<ServiceWorkerRegistrationInfo> registration =
+     GetRegistration(aPrincipal, aScope);
+ 
+   if (!registration) {
+     // The registration was removed, leave the array empty.
+     return;
+   }
+ 
+-  nsCOMPtr<nsIObserverService> obs = mozilla::services::GetObserverService();
+-  if (NS_WARN_IF(!obs)) {
+-    return;
+-  }
+-
+-  nsCOMPtr<nsISimpleEnumerator> enumerator;
+-  nsresult rv = obs->EnumerateObservers("service-worker-get-client",
+-                                        getter_AddRefs(enumerator));
+-  if (NS_WARN_IF(NS_FAILED(rv))) {
+-    return;
+-  }
+-
+   auto ProcessDocument = [&aDocuments](nsIPrincipal* aPrincipal, nsIDocument* aDoc) {
+     if (!aDoc || !aDoc->GetWindow()) {
+       return;
+     }
+ 
+     bool equals = false;
+     aPrincipal->Equals(aDoc->NodePrincipal(), &equals);
+     if (!equals) {
+@@ -2762,25 +2757,18 @@ ServiceWorkerManager::GetAllClients(nsIP
+     aDocuments.AppendElement(aDoc);
+   };
+ 
+   // Since it's not simple to check whether a document is in
+   // mControlledDocuments, we take different code paths depending on whether we
+   // need to look at all documents.  The common parts of the two loops are
+   // factored out into the ProcessDocument lambda.
+   if (aIncludeUncontrolled) {
+-    bool loop = true;
+-    while (NS_SUCCEEDED(enumerator->HasMoreElements(&loop)) && loop) {
+-      nsCOMPtr<nsISupports> ptr;
+-      rv = enumerator->GetNext(getter_AddRefs(ptr));
+-      if (NS_WARN_IF(NS_FAILED(rv))) {
+-        continue;
+-      }
+-
+-      nsCOMPtr<nsIDocument> doc = do_QueryInterface(ptr);
++    for (auto iter = mAllDocuments.Iter(); !iter.Done(); iter.Next()) {
++      nsCOMPtr<nsIDocument> doc = do_QueryInterface(iter.UserData());
+       ProcessDocument(aPrincipal, doc);
+     }
+   } else {
+     for (auto iter = mControlledDocuments.Iter(); !iter.Done(); iter.Next()) {
+       ServiceWorkerRegistrationInfo* thisRegistration = iter.UserData();
+       MOZ_ASSERT(thisRegistration);
+       if (!registration->mScope.Equals(thisRegistration->mScope)) {
+         continue;
+@@ -2820,17 +2808,17 @@ ServiceWorkerManager::MaybeClaimClient(n
+         aWorkerRegistration == controllingRegistration) {
+     return;
+   }
+ 
+   if (controllingRegistration) {
+     StopControllingADocument(controllingRegistration);
+   }
+ 
+-  StartControllingADocument(aWorkerRegistration, aDocument, NS_LITERAL_STRING(""));
++  StartControllingADocument(aWorkerRegistration, aDocument);
+   FireControllerChangeOnDocument(aDocument);
+ }
+ 
+ nsresult
+ ServiceWorkerManager::ClaimClients(nsIPrincipal* aPrincipal,
+                                    const nsCString& aScope, uint64_t aId)
+ {
+   RefPtr<ServiceWorkerRegistrationInfo> registration =
+@@ -2839,17 +2827,17 @@ ServiceWorkerManager::ClaimClients(nsIPr
+   if (!registration || !registration->GetActive() ||
+       !(registration->GetActive()->ID() == aId)) {
+     // The worker is not active.
+     return NS_ERROR_DOM_INVALID_STATE_ERR;
+   }
+ 
+   RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+   for (auto iter = mAllDocuments.Iter(); !iter.Done(); iter.Next()) {
+-    nsCOMPtr<nsIDocument> document = do_QueryInterface(iter.Get()->GetKey());
++    nsCOMPtr<nsIDocument> document = do_QueryInterface(iter.UserData());
+     swm->MaybeClaimClient(document, registration);
+   }
+ 
+   return NS_OK;
+ }
+ 
+ nsresult
+ ServiceWorkerManager::SetSkipWaitingFlag(nsIPrincipal* aPrincipal,
+diff --git a/dom/workers/ServiceWorkerManager.h b/dom/workers/ServiceWorkerManager.h
+--- a/dom/workers/ServiceWorkerManager.h
++++ b/dom/workers/ServiceWorkerManager.h
+@@ -22,16 +22,17 @@
+ #include "mozilla/dom/Promise.h"
+ #include "mozilla/dom/ServiceWorkerCommon.h"
+ #include "mozilla/dom/ServiceWorkerRegistrar.h"
+ #include "mozilla/dom/ServiceWorkerRegistrarTypes.h"
+ #include "mozilla/dom/workers/ServiceWorkerRegistrationInfo.h"
+ #include "mozilla/ipc/BackgroundUtils.h"
+ #include "nsClassHashtable.h"
+ #include "nsDataHashtable.h"
++#include "nsInterfaceHashtable.h"
+ #include "nsIIPCBackgroundChildCreateCallback.h"
+ #include "nsRefPtrHashtable.h"
+ #include "nsTArrayForwardDeclare.h"
+ #include "nsTObserverArray.h"
+ 
+ class mozIApplicationClearPrivateDataParams;
+ 
+ namespace mozilla {
+@@ -101,18 +102,19 @@ public:
+ 
+   struct RegistrationDataPerPrincipal;
+   nsClassHashtable<nsCStringHashKey, RegistrationDataPerPrincipal> mRegistrationInfos;
+ 
+   nsTObserverArray<ServiceWorkerRegistrationListener*> mServiceWorkerRegistrationListeners;
+ 
+   nsRefPtrHashtable<nsISupportsHashKey, ServiceWorkerRegistrationInfo> mControlledDocuments;
+ 
+-  // Set of all documents that may be controlled by a service worker.
+-  nsTHashtable<nsISupportsHashKey> mAllDocuments;
++  // Set of all documents that may be controlled by a service worker.  The
++  // Client ID is used as the key.
++  nsInterfaceHashtable<nsStringHashKey, nsIDocument> mAllDocuments;
+ 
+   // Track all documents that have attempted to register a service worker for a
+   // given scope.
+   typedef nsTArray<nsCOMPtr<nsIWeakReference>> WeakDocumentList;
+   nsClassHashtable<nsCStringHashKey, WeakDocumentList> mRegisteringDocuments;
+ 
+   // Track all intercepted navigation channels for a given scope.  Channels are
+   // placed in the appropriate list before dispatch the FetchEvent to the worker
+@@ -307,18 +309,17 @@ private:
+   InvalidateServiceWorkerRegistrationWorker(ServiceWorkerRegistrationInfo* aRegistration,
+                                             WhichServiceWorker aWhichOnes);
+ 
+   void
+   NotifyServiceWorkerRegistrationRemoved(ServiceWorkerRegistrationInfo* aRegistration);
+ 
+   void
+   StartControllingADocument(ServiceWorkerRegistrationInfo* aRegistration,
+-                            nsIDocument* aDoc,
+-                            const nsAString& aDocumentId);
++                            nsIDocument* aDoc);
+ 
+   void
+   StopControllingADocument(ServiceWorkerRegistrationInfo* aRegistration);
+ 
+   already_AddRefed<ServiceWorkerRegistrationInfo>
+   GetServiceWorkerRegistrationInfo(nsPIDOMWindowInner* aWindow);
+ 
+   already_AddRefed<ServiceWorkerRegistrationInfo>
