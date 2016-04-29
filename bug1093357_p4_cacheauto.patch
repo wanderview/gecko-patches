@@ -1,0 +1,263 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  057aacb2d5cf3f736e13032b7d39195c983c005f
+Bug 1093357 P4 Make dom/cache use new AutoIPCStreamChild class. r=ehsan
+
+diff --git a/dom/cache/AutoUtils.cpp b/dom/cache/AutoUtils.cpp
+--- a/dom/cache/AutoUtils.cpp
++++ b/dom/cache/AutoUtils.cpp
+@@ -215,49 +215,51 @@ AutoChildOpArgs::Add(InternalRequest* aR
+ {
+   MOZ_ASSERT(!mSent);
+ 
+   switch(mOpArgs.type()) {
+     case CacheOpArgs::TCacheMatchArgs:
+     {
+       CacheMatchArgs& args = mOpArgs.get_CacheMatchArgs();
+       mTypeUtils->ToCacheRequest(args.request(), aRequest, aBodyAction,
+-                                 aSchemeAction, aRv);
++                                 aSchemeAction, mStreamCleanupList, aRv);
+       break;
+     }
+     case CacheOpArgs::TCacheMatchAllArgs:
+     {
+       CacheMatchAllArgs& args = mOpArgs.get_CacheMatchAllArgs();
+       MOZ_ASSERT(args.requestOrVoid().type() == CacheRequestOrVoid::Tvoid_t);
+       args.requestOrVoid() = CacheRequest();
+       mTypeUtils->ToCacheRequest(args.requestOrVoid().get_CacheRequest(),
+-                                  aRequest, aBodyAction, aSchemeAction, aRv);
++                                 aRequest, aBodyAction, aSchemeAction,
++                                 mStreamCleanupList, aRv);
+       break;
+     }
+     case CacheOpArgs::TCacheDeleteArgs:
+     {
+       CacheDeleteArgs& args = mOpArgs.get_CacheDeleteArgs();
+       mTypeUtils->ToCacheRequest(args.request(), aRequest, aBodyAction,
+-                                 aSchemeAction, aRv);
++                                 aSchemeAction, mStreamCleanupList, aRv);
+       break;
+     }
+     case CacheOpArgs::TCacheKeysArgs:
+     {
+       CacheKeysArgs& args = mOpArgs.get_CacheKeysArgs();
+       MOZ_ASSERT(args.requestOrVoid().type() == CacheRequestOrVoid::Tvoid_t);
+       args.requestOrVoid() = CacheRequest();
+       mTypeUtils->ToCacheRequest(args.requestOrVoid().get_CacheRequest(),
+-                                  aRequest, aBodyAction, aSchemeAction, aRv);
++                                  aRequest, aBodyAction, aSchemeAction,
++                                  mStreamCleanupList, aRv);
+       break;
+     }
+     case CacheOpArgs::TStorageMatchArgs:
+     {
+       StorageMatchArgs& args = mOpArgs.get_StorageMatchArgs();
+       mTypeUtils->ToCacheRequest(args.request(), aRequest, aBodyAction,
+-                                 aSchemeAction, aRv);
++                                 aSchemeAction, mStreamCleanupList, aRv);
+       break;
+     }
+     default:
+       MOZ_CRASH("Cache args type cannot send a Request!");
+   }
+ }
+ 
+ namespace {
+@@ -392,19 +394,20 @@ AutoChildOpArgs::Add(InternalRequest* aR
+       //
+       // Avoid a lot of this hassle by making sure we only create one here.  On
+       // error we remove it.
+       CacheRequestResponse& pair = *args.requestResponseList().AppendElement();
+       pair.request().body() = void_t();
+       pair.response().body() = void_t();
+ 
+       mTypeUtils->ToCacheRequest(pair.request(), aRequest, aBodyAction,
+-                                 aSchemeAction, aRv);
++                                 aSchemeAction, mStreamCleanupList, aRv);
+       if (!aRv.Failed()) {
+-        mTypeUtils->ToCacheResponse(pair.response(), aResponse, aRv);
++        mTypeUtils->ToCacheResponse(pair.response(), aResponse,
++                                    mStreamCleanupList, aRv);
+       }
+ 
+       if (aRv.Failed()) {
+         CleanupChild(pair.request().body(), Delete);
+         args.requestResponseList().RemoveElementAt(
+           args.requestResponseList().Length() - 1);
+       }
+ 
+diff --git a/dom/cache/AutoUtils.h b/dom/cache/AutoUtils.h
+--- a/dom/cache/AutoUtils.h
++++ b/dom/cache/AutoUtils.h
+@@ -16,16 +16,17 @@
+ struct nsID;
+ 
+ namespace mozilla {
+ 
+ class ErrorResult;
+ 
+ namespace ipc {
+ class PBackgroundParent;
++class AutoIPCStreamChild;
+ } // namespace ipc
+ 
+ namespace dom {
+ 
+ class InternalRequest;
+ 
+ namespace cache {
+ 
+@@ -57,16 +58,17 @@ public:
+   void Add(InternalRequest* aRequest, BodyAction aBodyAction,
+            SchemeAction aSchemeAction, Response& aResponse, ErrorResult& aRv);
+ 
+   const CacheOpArgs& SendAsOpArgs();
+ 
+ private:
+   TypeUtils* mTypeUtils;
+   CacheOpArgs mOpArgs;
++  nsTArray<UniquePtr<mozilla::ipc::AutoIPCStreamChild>> mStreamCleanupList;
+   bool mSent;
+ };
+ 
+ class MOZ_STACK_CLASS AutoParentOpResult final
+ {
+ public:
+   AutoParentOpResult(mozilla::ipc::PBackgroundParent* aManager,
+                      const CacheOpResult& aOpResult);
+diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
+--- a/dom/cache/TypeUtils.cpp
++++ b/dom/cache/TypeUtils.cpp
+@@ -29,16 +29,17 @@
+ #include "nsURLParsers.h"
+ #include "nsCRT.h"
+ #include "nsHttp.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
++using mozilla::ipc::AutoIPCStreamChild;
+ using mozilla::ipc::BackgroundChild;
+ using mozilla::ipc::FileDescriptor;
+ using mozilla::ipc::PBackgroundChild;
+ using mozilla::ipc::PFileDescriptorSetChild;
+ 
+ namespace {
+ 
+ static bool
+@@ -140,16 +141,17 @@ TypeUtils::ToInternalRequest(const Ownin
+   }
+ 
+   return ToInternalRequest(aIn.GetAsUSVString(), aRv);
+ }
+ 
+ void
+ TypeUtils::ToCacheRequest(CacheRequest& aOut, InternalRequest* aIn,
+                           BodyAction aBodyAction, SchemeAction aSchemeAction,
++                          nsTArray<UniquePtr<AutoIPCStreamChild>>& aStreamCleanupList,
+                           ErrorResult& aRv)
+ {
+   MOZ_ASSERT(aIn);
+ 
+   aIn->GetMethod(aOut.method());
+ 
+   nsAutoCString url;
+   aIn->GetURL(url);
+@@ -228,17 +230,19 @@ TypeUtils::ToCacheResponseWithoutBody(Ca
+   if (aIn.GetPrincipalInfo()) {
+     aOut.principalInfo() = *aIn.GetPrincipalInfo();
+   } else {
+     aOut.principalInfo() = void_t();
+   }
+ }
+ 
+ void
+-TypeUtils::ToCacheResponse(CacheResponse& aOut, Response& aIn, ErrorResult& aRv)
++TypeUtils::ToCacheResponse(CacheResponse& aOut, Response& aIn,
++                           nsTArray<UniquePtr<AutoIPCStreamChild>>& aStreamCleanupList,
++                           ErrorResult& aRv)
+ {
+   if (aIn.BodyUsed()) {
+     aRv.ThrowTypeError<MSG_FETCH_BODY_CONSUMED_ERROR>();
+     return;
+   }
+ 
+   RefPtr<InternalResponse> ir = aIn.GetInternalResponse();
+   ToCacheResponseWithoutBody(aOut, *ir, aRv);
+diff --git a/dom/cache/TypeUtils.h b/dom/cache/TypeUtils.h
+--- a/dom/cache/TypeUtils.h
++++ b/dom/cache/TypeUtils.h
+@@ -15,16 +15,17 @@
+ class nsIGlobalObject;
+ class nsIAsyncInputStream;
+ class nsIInputStream;
+ 
+ namespace mozilla {
+ 
+ namespace ipc {
+ class SendStreamChild;
++class AutoIPCStreamChild;
+ }
+ 
+ namespace dom {
+ 
+ struct CacheQueryOptions;
+ class InternalRequest;
+ class InternalResponse;
+ class OwningRequestOrUSVString;
+@@ -73,24 +74,27 @@ public:
+ 
+   already_AddRefed<InternalRequest>
+   ToInternalRequest(const OwningRequestOrUSVString& aIn, BodyAction aBodyAction,
+                     ErrorResult& aRv);
+ 
+   void
+   ToCacheRequest(CacheRequest& aOut, InternalRequest* aIn,
+                  BodyAction aBodyAction, SchemeAction aSchemeAction,
++                 nsTArray<UniquePtr<mozilla::ipc::AutoIPCStreamChild>>& aStreamCleanupList,
+                  ErrorResult& aRv);
+ 
+   void
+   ToCacheResponseWithoutBody(CacheResponse& aOut, InternalResponse& aIn,
+                              ErrorResult& aRv);
+ 
+   void
+-  ToCacheResponse(CacheResponse& aOut, Response& aIn, ErrorResult& aRv);
++  ToCacheResponse(CacheResponse& aOut, Response& aIn,
++                  nsTArray<UniquePtr<mozilla::ipc::AutoIPCStreamChild>>& aStreamCleanupList,
++                  ErrorResult& aRv);
+ 
+   void
+   ToCacheQueryParams(CacheQueryParams& aOut, const CacheQueryOptions& aIn);
+ 
+   already_AddRefed<Response>
+   ToResponse(const CacheResponse& aIn);
+ 
+   already_AddRefed<InternalRequest>
+diff --git a/ipc/glue/InputStreamUtils.h b/ipc/glue/InputStreamUtils.h
+--- a/ipc/glue/InputStreamUtils.h
++++ b/ipc/glue/InputStreamUtils.h
+@@ -72,17 +72,21 @@ DeserializeInputStream(const OptionalInp
+ // The AutoIPCStreamChild class also supports OptionalInputStreamParamsWithFdsOrSendStream
+ // values.  As long as you did not initialize the object with a non-optional
+ // InputStreamParamsWithFdsOrSendStream, you can call TakeOptionalValue() instead.
+ //
+ // Like SerializeInputStream(), the AutoIPCStreamChild will crash if
+ // serialization cannot be completed.  Currently, this should only
+ // occur if the nsIInputStream cannot be serialized and is also blocking.
+ //
+-class MOZ_STACK_CLASS AutoIPCStreamChild final
++// NOTE: This is not a MOZ_STACK_CLASS so that it can be more easily integrated
++//       with complex ipdl structures.  For example, you may want to create an
++//       array of RAII AutoIPCStreamChild objects or build your own wrapping
++//       RAII object to handle other actors that need to be cleaned up.
++class AutoIPCStreamChild final
+ {
+   OptionalInputStreamParamsWithFdsOrSendStream mInlineValue;
+   InputStreamParamsWithFdsOrSendStream* mValue;
+   OptionalInputStreamParamsWithFdsOrSendStream* mOptionalValue;
+   bool mTaken;
+ 
+   bool
+   IsSet() const;
