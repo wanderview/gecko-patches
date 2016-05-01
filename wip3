@@ -1,0 +1,726 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  3f6e4ee5b287a063d6a309c0aec2853e931303a2
+
+diff --git a/dom/cache/AutoUtils.cpp b/dom/cache/AutoUtils.cpp
+--- a/dom/cache/AutoUtils.cpp
++++ b/dom/cache/AutoUtils.cpp
+@@ -56,61 +56,16 @@ CleanupChild(CacheReadStreamOrVoid& aRea
+ {
+   if (aReadStreamOrVoid.type() == CacheReadStreamOrVoid::Tvoid_t) {
+     return;
+   }
+ 
+   CleanupChild(aReadStreamOrVoid.get_CacheReadStream(), aAction);
+ }
+ 
+-void
+-CleanupParentFds(CacheReadStream& aReadStream, CleanupAction aAction)
+-{
+-  if (aReadStream.stream().type() ==
+-      InputStreamParamsWithFdsOrSendStream::T__None) {
+-    return;
+-  }
+-
+-  MOZ_ASSERT(aReadStream.stream().type() ==
+-             InputStreamParamsWithFdsOrSendStream::TInputStreamParamsWithFds);
+-
+-  InputStreamParamsWithFds& streamWithFds =
+-    aReadStream.stream().get_InputStreamParamsWithFds();
+-
+-  if (streamWithFds.optionalFds().type() !=
+-      OptionalFileDescriptorSet::TPFileDescriptorSetParent) {
+-    return;
+-  }
+-
+-  AutoTArray<FileDescriptor, 4> fds;
+-
+-  FileDescriptorSetParent* fdSetActor =
+-    static_cast<FileDescriptorSetParent*>(streamWithFds.optionalFds().get_PFileDescriptorSetParent());
+-  MOZ_ASSERT(fdSetActor);
+-
+-  if (aAction == Delete) {
+-    Unused << fdSetActor->Send__delete__(fdSetActor);
+-  }
+-
+-  // FileDescriptorSet doesn't clear its fds in its ActorDestroy, so we
+-  // unconditionally forget them here.  The fds themselves are auto-closed in
+-  // ~FileDescriptor since they originated in this process.
+-  fdSetActor->ForgetFileDescriptors(fds);
+-}
+-
+-void
+-CleanupParentFds(CacheReadStreamOrVoid& aReadStreamOrVoid, CleanupAction aAction)
+-{
+-  if (aReadStreamOrVoid.type() == CacheReadStreamOrVoid::Tvoid_t) {
+-    return;
+-  }
+-
+-  CleanupParentFds(aReadStreamOrVoid.get_CacheReadStream(), aAction);
+-}
+-
+ } // namespace
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ // --------------------------------------------
+ 
+@@ -364,24 +319,27 @@ AutoChildOpArgs::Add(InternalRequest* aR
+       // explicitly cleaned up.
+       //
+       // Avoid a lot of this hassle by making sure we only create one here.  On
+       // error we remove it.
+       CacheRequestResponse& pair = *args.requestResponseList().AppendElement();
+       pair.request().body() = void_t();
+       pair.response().body() = void_t();
+ 
++      printf_stderr("### ### add request\n");
+       mTypeUtils->ToCacheRequest(pair.request(), aRequest, aBodyAction,
+                                  aSchemeAction, mStreamCleanupList, aRv);
+       if (!aRv.Failed()) {
++        printf_stderr("### ### add response\n");
+         mTypeUtils->ToCacheResponse(pair.response(), aResponse,
+                                     mStreamCleanupList, aRv);
+       }
+ 
+       if (aRv.Failed()) {
++        printf_stderr("### ### something failed\n");
+         CleanupChild(pair.request().body(), Delete);
+         args.requestResponseList().RemoveElementAt(
+           args.requestResponseList().Length() - 1);
+       }
+ 
+       break;
+     }
+     default:
+@@ -412,63 +370,27 @@ AutoParentOpResult::AutoParentOpResult(m
+   MOZ_ASSERT(mManager);
+ }
+ 
+ AutoParentOpResult::~AutoParentOpResult()
+ {
+   CleanupAction action = mSent ? Forget : Delete;
+ 
+   switch (mOpResult.type()) {
+-    case CacheOpResult::TCacheMatchResult:
+-    {
+-      CacheMatchResult& result = mOpResult.get_CacheMatchResult();
+-      if (result.responseOrVoid().type() == CacheResponseOrVoid::Tvoid_t) {
+-        break;
+-      }
+-      CleanupParentFds(result.responseOrVoid().get_CacheResponse().body(),
+-                       action);
+-      break;
+-    }
+-    case CacheOpResult::TCacheMatchAllResult:
+-    {
+-      CacheMatchAllResult& result = mOpResult.get_CacheMatchAllResult();
+-      for (uint32_t i = 0; i < result.responseList().Length(); ++i) {
+-        CleanupParentFds(result.responseList()[i].body(), action);
+-      }
+-      break;
+-    }
+-    case CacheOpResult::TCacheKeysResult:
+-    {
+-      CacheKeysResult& result = mOpResult.get_CacheKeysResult();
+-      for (uint32_t i = 0; i < result.requestList().Length(); ++i) {
+-        CleanupParentFds(result.requestList()[i].body(), action);
+-      }
+-      break;
+-    }
+-    case CacheOpResult::TStorageMatchResult:
+-    {
+-      StorageMatchResult& result = mOpResult.get_StorageMatchResult();
+-      if (result.responseOrVoid().type() == CacheResponseOrVoid::Tvoid_t) {
+-        break;
+-      }
+-      CleanupParentFds(result.responseOrVoid().get_CacheResponse().body(),
+-                       action);
+-      break;
+-    }
+     case CacheOpResult::TStorageOpenResult:
+     {
+       StorageOpenResult& result = mOpResult.get_StorageOpenResult();
+       if (action == Forget || result.actorParent() == nullptr) {
+         break;
+       }
+       Unused << PCacheParent::Send__delete__(result.actorParent());
+       break;
+     }
+     default:
+-      // other types do not need clean up
++      // other types do not need additional clean up
+       break;
+   }
+ 
+   if (action == Delete && mStreamControl) {
+     Unused << PCacheStreamControlParent::Send__delete__(mStreamControl);
+   }
+ }
+ 
+@@ -547,16 +469,19 @@ AutoParentOpResult::Add(const SavedReque
+   }
+ }
+ 
+ const CacheOpResult&
+ AutoParentOpResult::SendAsOpResult()
+ {
+   MOZ_ASSERT(!mSent);
+   mSent = true;
++  for (UniquePtr<AutoIPCStream>& autoStream : mStreamCleanupList) {
++    autoStream->TakeValue();
++  }
+   return mOpResult;
+ }
+ 
+ void
+ AutoParentOpResult::SerializeResponseBody(const SavedResponse& aSavedResponse,
+                                           StreamList* aStreamList,
+                                           CacheResponse* aResponseOut)
+ {
+@@ -592,18 +517,17 @@ AutoParentOpResult::SerializeReadStream(
+     if (!mStreamControl) {
+       NS_WARNING("Cache failed to create stream control actor.");
+       return;
+     }
+   }
+ 
+   aStreamList->SetStreamControl(mStreamControl);
+ 
+-  RefPtr<ReadStream> readStream = ReadStream::Create(mStreamControl,
+-                                                       aId, stream);
+-  // TODO: fix this
+-  nsTArray<UniquePtr<AutoIPCStream>> fakeList;
+-  readStream->Serialize(aReadStreamOut, fakeList);
++  RefPtr<ReadStream> readStream = ReadStream::Create(mStreamControl, aId,
++                                                     stream);
++
++  readStream->Serialize(aReadStreamOut, mStreamCleanupList);
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/AutoUtils.h b/dom/cache/AutoUtils.h
+--- a/dom/cache/AutoUtils.h
++++ b/dom/cache/AutoUtils.h
+@@ -86,16 +86,17 @@ private:
+                              CacheResponse* aResponseOut);
+ 
+   void SerializeReadStream(const nsID& aId, StreamList* aStreamList,
+                            CacheReadStream* aReadStreamOut);
+ 
+   mozilla::ipc::PBackgroundParent* mManager;
+   CacheOpResult mOpResult;
+   CacheStreamControlParent* mStreamControl;
++  nsTArray<UniquePtr<mozilla::ipc::AutoIPCStream>> mStreamCleanupList;
+   bool mSent;
+ };
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_cache_AutoUtils_h
+diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
+--- a/dom/cache/Cache.cpp
++++ b/dom/cache/Cache.cpp
+@@ -405,16 +405,17 @@ Cache::Put(const RequestOrUSVString& aRe
+     return nullptr;
+   }
+ 
+   RefPtr<InternalRequest> ir = ToInternalRequest(aRequest, ReadBody, aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return nullptr;
+   }
+ 
++  printf_stderr("### ### Cache::Put() Creating AutoChildOpArgs\n");
+   AutoChildOpArgs args(this, CachePutAllArgs());
+ 
+   args.Add(ir, ReadBody, TypeErrorOnInvalidScheme,
+            aResponse, aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return nullptr;
+   }
+ 
+diff --git a/dom/cache/CacheStreamControlParent.cpp b/dom/cache/CacheStreamControlParent.cpp
+--- a/dom/cache/CacheStreamControlParent.cpp
++++ b/dom/cache/CacheStreamControlParent.cpp
+@@ -50,21 +50,23 @@ CacheStreamControlParent::SerializeContr
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+   aReadStreamOut->controlChild() = nullptr;
+   aReadStreamOut->controlParent() = this;
+ }
+ 
+ void
+ CacheStreamControlParent::SerializeStream(CacheReadStream* aReadStreamOut,
+                                           nsIInputStream* aStream,
+-                                          nsTArray<UniquePtr<AutoIPCStream>>&)
++                                          nsTArray<UniquePtr<AutoIPCStream>>& aStreamCleanupList)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+   MOZ_ASSERT(aStream);
+-  SerializeInputStream(aStream, aReadStreamOut->stream(), Manager());
++  UniquePtr<AutoIPCStream> autoStream(new AutoIPCStream(aReadStreamOut->stream()));
++  autoStream->Serialize(aStream, Manager());
++  aStreamCleanupList.AppendElement(Move(autoStream));
+ }
+ 
+ void
+ CacheStreamControlParent::NoteClosedAfterForget(const nsID& aId)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+   RecvNoteClosed(aId);
+ }
+diff --git a/dom/cache/ReadStream.cpp b/dom/cache/ReadStream.cpp
+--- a/dom/cache/ReadStream.cpp
++++ b/dom/cache/ReadStream.cpp
+@@ -199,19 +199,18 @@ ReadStream::Inner::Inner(StreamControl* 
+ }
+ 
+ void
+ ReadStream::Inner::Serialize(CacheReadStreamOrVoid* aReadStreamOut,
+                              nsTArray<UniquePtr<AutoIPCStream>>& aStreamCleanupList)
+ {
+   MOZ_ASSERT(NS_GetCurrentThread() == mOwningThread);
+   MOZ_ASSERT(aReadStreamOut);
+-  CacheReadStream stream;
+-  Serialize(&stream, aStreamCleanupList);
+-  *aReadStreamOut = stream;
++  *aReadStreamOut = CacheReadStream();
++  Serialize(&aReadStreamOut->get_CacheReadStream(), aStreamCleanupList);
+ }
+ 
+ void
+ ReadStream::Inner::Serialize(CacheReadStream* aReadStreamOut,
+                              nsTArray<UniquePtr<AutoIPCStream>>& aStreamCleanupList)
+ {
+   MOZ_ASSERT(NS_GetCurrentThread() == mOwningThread);
+   MOZ_ASSERT(aReadStreamOut);
+diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
+--- a/dom/cache/TypeUtils.cpp
++++ b/dom/cache/TypeUtils.cpp
+@@ -486,26 +486,28 @@ TypeUtils::SerializeCacheStream(nsIInput
+   *aStreamOut = void_t();
+   if (!aStream) {
+     return;
+   }
+ 
+   // Option 1: Send a cache-specific ReadStream if we can.
+   RefPtr<ReadStream> controlled = do_QueryObject(aStream);
+   if (controlled) {
++    printf_stderr("### ### create a controlled stream\n");
+     controlled->Serialize(aStreamOut, aStreamCleanupList);
+     return;
+   }
+ 
+-  CacheReadStream readStream;
+-  readStream.controlChild() = nullptr;
+-  readStream.controlParent() = nullptr;
++  *aStreamOut = CacheReadStream();
++  CacheReadStream& cacheStream = aStreamOut->get_CacheReadStream();
+ 
+-  UniquePtr<AutoIPCStream> autoStream(new AutoIPCStream(readStream.stream()));
++  cacheStream.controlChild() = nullptr;
++  cacheStream.controlParent() = nullptr;
++
++  UniquePtr<AutoIPCStream> autoStream(new AutoIPCStream(cacheStream.stream()));
+   autoStream->SerializeOrSend(aStream, GetIPCManager());
+ 
+   aStreamCleanupList.AppendElement(Move(autoStream));
+-  *aStreamOut = readStream;
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/ipc/glue/InputStreamUtils.cpp b/ipc/glue/InputStreamUtils.cpp
+--- a/ipc/glue/InputStreamUtils.cpp
++++ b/ipc/glue/InputStreamUtils.cpp
+@@ -281,23 +281,25 @@ SerializeOrSendInputStream(nsIInputStrea
+ {
+   MOZ_ASSERT(aStream);
+   MOZ_ASSERT(aManager);
+ 
+   // First attempt simple stream serialization
+   nsCOMPtr<nsIIPCSerializableInputStream> serializable =
+     do_QueryInterface(aStream);
+   if (serializable) {
++    printf_stderr("### ### serialize\n");
+     SerializeInputStreamWithFdsChild(aStream, aValue, aManager);
+     return;
+   }
+ 
+   // As a fallback, attempt to stream the data across using a SendStream
+   // actor.  This will fail for blocking streams.
+   nsCOMPtr<nsIAsyncInputStream> asyncStream = do_QueryInterface(aStream);
++  printf_stderr("### ### send\n");
+   aValue = SendStreamChild::Create(asyncStream, aManager);
+ 
+   if (!aValue.get_PSendStreamChild()) {
+     MOZ_CRASH("SendStream creation failed!");
+   }
+ }
+ 
+ template<typename M>
+@@ -315,39 +317,61 @@ SerializeOrSendInputStream(nsIInputStrea
+   SerializeOrSendInputStream(aStream, aValue.get_InputStreamParamsWithFdsOrSendStream(),
+                              aManager);
+ }
+ 
+ void
+ CleanupInputStreamParamsWithFdsOrSendStream(InputStreamParamsWithFdsOrSendStream& aValue,
+                                             bool aConsumedByIPC)
+ {
++  if (aValue.type() == InputStreamParamsWithFdsOrSendStream::T__None) {
++    return;
++  }
++
+   if (aValue.type() == InputStreamParamsWithFdsOrSendStream::TInputStreamParamsWithFds) {
+ 
+     InputStreamParamsWithFds& streamWithFds =
+       aValue.get_InputStreamParamsWithFds();
+ 
+     // Cleanup file descriptors if necessary
+     if (streamWithFds.optionalFds().type() ==
+         OptionalFileDescriptorSet::TPFileDescriptorSetChild) {
+ 
+       AutoTArray<FileDescriptor, 4> fds;
+ 
+-      FileDescriptorSetChild* fdSetActor = static_cast<FileDescriptorSetChild*>(
++      auto fdSetActor = static_cast<FileDescriptorSetChild*>(
+         streamWithFds.optionalFds().get_PFileDescriptorSetChild());
+       MOZ_ASSERT(fdSetActor);
+ 
+       if (!aConsumedByIPC) {
+         Unused << fdSetActor->Send__delete__(fdSetActor);
+       }
+ 
+       // FileDescriptorSet doesn't clear its fds in its ActorDestroy, so we
+       // unconditionally forget them here.  The fds themselves are auto-closed in
+       // ~FileDescriptor since they originated in this process.
+       fdSetActor->ForgetFileDescriptors(fds);
++
++    } else if (streamWithFds.optionalFds().type() ==
++               OptionalFileDescriptorSet::TPFileDescriptorSetParent) {
++
++      AutoTArray<FileDescriptor, 4> fds;
++
++      auto fdSetActor = static_cast<FileDescriptorSetParent*>(
++        streamWithFds.optionalFds().get_PFileDescriptorSetParent());
++      MOZ_ASSERT(fdSetActor);
++
++      if (!aConsumedByIPC) {
++        Unused << fdSetActor->Send__delete__(fdSetActor);
++      }
++
++      // FileDescriptorSet doesn't clear its fds in its ActorDestroy, so we
++      // unconditionally forget them here.  The fds themselves are auto-closed in
++      // ~FileDescriptor since they originated in this process.
++      fdSetActor->ForgetFileDescriptors(fds);
+     }
+ 
+     return;
+   }
+ 
+   MOZ_ASSERT(aValue.type() == InputStreamParamsWithFdsOrSendStream::TPSendStreamChild);
+ 
+   auto sendStream =
+@@ -462,124 +486,176 @@ SerializeInputStream(nsIInputStream* aIn
+ void
+ SerializeInputStream(nsIInputStream* aInputStream,
+                      InputStreamParamsWithFdsOrSendStream& aValue,
+                      PBackgroundParent* aManager)
+ {
+   SerializeInputStreamWithFdsParent(aInputStream, aValue, aManager);
+ }
+ 
++namespace {
++
++void
++AssertValidValueToTake(const InputStreamParamsWithFdsOrSendStream& aVal)
++{
++  printf_stderr("### ### %u\n", aVal.type());
++  MOZ_ASSERT(aVal.type() == InputStreamParamsWithFdsOrSendStream::TPSendStreamChild ||
++             aVal.type() == InputStreamParamsWithFdsOrSendStream::TInputStreamParamsWithFds);
++}
++
++void
++AssertValidValueToTake(const OptionalInputStreamParamsWithFdsOrSendStream& aVal)
++{
++  MOZ_ASSERT(aVal.type() == OptionalInputStreamParamsWithFdsOrSendStream::Tvoid_t ||
++             aVal.type() == OptionalInputStreamParamsWithFdsOrSendStream::TInputStreamParamsWithFdsOrSendStream);
++  if (aVal.type() == OptionalInputStreamParamsWithFdsOrSendStream::TInputStreamParamsWithFdsOrSendStream) {
++    AssertValidValueToTake(aVal.get_InputStreamParamsWithFdsOrSendStream());
++  }
++}
++
++} // anonymous namespace
++
+ AutoIPCStream::AutoIPCStream()
+   : mInlineValue(void_t())
+   , mValue(nullptr)
+   , mOptionalValue(&mInlineValue)
+   , mTaken(false)
+ {
++  printf_stderr("### ### [%p] AutoIPCStream() inline\n", this);
+ }
+ 
+ AutoIPCStream::AutoIPCStream(InputStreamParamsWithFdsOrSendStream& aTarget)
+   : mInlineValue(void_t())
+   , mValue(&aTarget)
+   , mOptionalValue(nullptr)
+   , mTaken(false)
+ {
++  printf_stderr("### ### [%p] AutoIPCStream() target\n", this);
+ }
+ 
+ AutoIPCStream::AutoIPCStream(OptionalInputStreamParamsWithFdsOrSendStream& aTarget)
+   : mInlineValue(void_t())
+   , mValue(nullptr)
+   , mOptionalValue(&aTarget)
+   , mTaken(false)
+ {
+   *mOptionalValue = void_t();
++  printf_stderr("### ### [%p] AutoIPCStream() optional target\n", this);
+ }
+ 
+ AutoIPCStream::~AutoIPCStream()
+ {
++  printf_stderr("### ### [%p] ~AutoIPCStream()\n", this);
+   MOZ_ASSERT(mValue || mOptionalValue);
+   if (mValue && IsSet()) {
+     CleanupInputStreamParamsWithFdsOrSendStream(*mValue, mTaken);
+   } else {
+     CleanupInputStreamParamsWithFdsOrSendStream(*mOptionalValue, mTaken);
+   }
+ }
+ 
+ void
+ AutoIPCStream::SerializeOrSend(nsIInputStream* aStream, PContentChild* aManager)
+ {
+   MOZ_ASSERT(aStream);
+   MOZ_ASSERT(aManager);
+   MOZ_ASSERT(mValue || mOptionalValue);
+   MOZ_ASSERT(!mTaken);
+   MOZ_ASSERT(!IsSet());
++  printf_stderr("### ### [%p] AutoIPCStream::SerializeOrSend()\n", this);
+ 
+   if (mValue) {
+     SerializeOrSendInputStream(aStream, *mValue, aManager);
++    AssertValidValueToTake(*mValue);
+   } else {
+     SerializeOrSendInputStream(aStream, *mOptionalValue, aManager);
++    AssertValidValueToTake(*mOptionalValue);
+   }
+ }
+ 
+ void
+ AutoIPCStream::SerializeOrSend(nsIInputStream* aStream,
+                                PBackgroundChild* aManager)
+ {
+   MOZ_ASSERT(aStream);
+   MOZ_ASSERT(aManager);
+   MOZ_ASSERT(mValue || mOptionalValue);
+   MOZ_ASSERT(!mTaken);
+   MOZ_ASSERT(!IsSet());
++  printf_stderr("### ### [%p] AutoIPCStream::SerializeOrSend()\n", this);
+ 
+   if (mValue) {
+     SerializeOrSendInputStream(aStream, *mValue, aManager);
++    AssertValidValueToTake(*mValue);
+   } else {
+     SerializeOrSendInputStream(aStream, *mOptionalValue, aManager);
++    AssertValidValueToTake(*mOptionalValue);
++  }
++}
++
++void
++AutoIPCStream::Serialize(nsIInputStream* aStream, dom::PContentParent* aManager)
++{
++  MOZ_ASSERT(aStream);
++  MOZ_ASSERT(aManager);
++  MOZ_ASSERT(mValue || mOptionalValue);
++  MOZ_ASSERT(!mTaken);
++  MOZ_ASSERT(!IsSet());
++  printf_stderr("### ### [%p] AutoIPCStream::Serialize()\n", this);
++
++  if (mValue) {
++    SerializeInputStreamWithFdsParent(aStream, *mValue, aManager);
++    AssertValidValueToTake(*mValue);
++  } else {
++    SerializeInputStreamWithFdsParent(aStream, *mOptionalValue, aManager);
++    AssertValidValueToTake(*mOptionalValue);
++  }
++}
++
++void
++AutoIPCStream::Serialize(nsIInputStream* aStream, PBackgroundParent* aManager)
++{
++  MOZ_ASSERT(aStream);
++  MOZ_ASSERT(aManager);
++  MOZ_ASSERT(mValue || mOptionalValue);
++  MOZ_ASSERT(!mTaken);
++  MOZ_ASSERT(!IsSet());
++  printf_stderr("### ### [%p] AutoIPCStream::Serialize()\n", this);
++
++  if (mValue) {
++    SerializeInputStreamWithFdsParent(aStream, *mValue, aManager);
++    AssertValidValueToTake(*mValue);
++  } else {
++    SerializeInputStreamWithFdsParent(aStream, *mOptionalValue, aManager);
++    AssertValidValueToTake(*mOptionalValue);
+   }
+ }
+ 
+ bool
+ AutoIPCStream::IsSet() const
+ {
+   MOZ_ASSERT(mValue || mOptionalValue);
+   if (mValue) {
+     return mValue->type() != InputStreamParamsWithFdsOrSendStream::T__None;
+   } else {
+     return mOptionalValue->type() !=
+            OptionalInputStreamParamsWithFdsOrSendStream::Tvoid_t;
+   }
+ }
+ 
+-namespace {
+-
+-void
+-AssertValidValueToTake(const InputStreamParamsWithFdsOrSendStream& aVal)
+-{
+-  MOZ_ASSERT(aVal.type() == InputStreamParamsWithFdsOrSendStream::TPSendStreamChild ||
+-             aVal.type() == InputStreamParamsWithFdsOrSendStream::TInputStreamParamsWithFds);
+-}
+-
+-void
+-AssertValidValueToTake(const OptionalInputStreamParamsWithFdsOrSendStream& aVal)
+-{
+-  MOZ_ASSERT(aVal.type() == OptionalInputStreamParamsWithFdsOrSendStream::Tvoid_t ||
+-             aVal.type() == OptionalInputStreamParamsWithFdsOrSendStream::TInputStreamParamsWithFdsOrSendStream);
+-  if (aVal.type() == OptionalInputStreamParamsWithFdsOrSendStream::TInputStreamParamsWithFdsOrSendStream) {
+-    AssertValidValueToTake(aVal.get_InputStreamParamsWithFdsOrSendStream());
+-  }
+-}
+-
+-} // anonymous namespace
+-
+ InputStreamParamsWithFdsOrSendStream&
+ AutoIPCStream::TakeValue()
+ {
+   MOZ_ASSERT(mValue || mOptionalValue);
+   MOZ_ASSERT(!mTaken);
+   MOZ_ASSERT(IsSet());
+ 
++  printf_stderr("### ### [%p] AutoIPCStream::TakeValue() mValue:%p mOptionaValue:%p\n",
++                this, mValue, mOptionalValue);
++
+   mTaken = true;
+ 
+   if (mValue) {
+     AssertValidValueToTake(*mValue);
+     return *mValue;
+   }
+ 
+   InputStreamParamsWithFdsOrSendStream& value =
+@@ -590,15 +666,16 @@ AutoIPCStream::TakeValue()
+ }
+ 
+ OptionalInputStreamParamsWithFdsOrSendStream&
+ AutoIPCStream::TakeOptionalValue()
+ {
+   MOZ_ASSERT(!mTaken);
+   MOZ_ASSERT(!mValue);
+   MOZ_ASSERT(mOptionalValue);
++  printf_stderr("### ### [%p] AutoIPCStream::TakeOptionalValue()\n", this);
+   mTaken = true;
+   AssertValidValueToTake(*mOptionalValue);
+   return *mOptionalValue;
+ }
+ 
+ } // namespace ipc
+ } // namespace mozilla
+diff --git a/ipc/glue/InputStreamUtils.h b/ipc/glue/InputStreamUtils.h
+--- a/ipc/glue/InputStreamUtils.h
++++ b/ipc/glue/InputStreamUtils.h
+@@ -43,50 +43,16 @@ DeserializeInputStream(const OptionalInp
+                        const nsTArray<FileDescriptor>& aFileDescriptors);
+ 
+ already_AddRefed<nsIInputStream>
+ DeserializeInputStream(const InputStreamParamsWithFdsOrSendStream& aValue);
+ 
+ already_AddRefed<nsIInputStream>
+ DeserializeInputStream(const OptionalInputStreamParamsWithFdsOrSendStream& aValue);
+ 
+-// These serialization methods do not support sending as a PSendStream.  Use
+-// AutoIPCStream::SerializeOrSend() if you need to support non-serializable
+-// streams.
+-void
+-SerializeInputStream(nsIInputStream* aInputStream,
+-                     InputStreamParamsWithFdsOrSendStream& aValue,
+-                     dom::PContentChild* aManager);
+-
+-void
+-SerializeInputStream(nsIInputStream* aInputStream,
+-                     InputStreamParamsWithFdsOrSendStream& aValue,
+-                     PBackgroundChild* aManager);
+-void
+-SerializeInputStream(nsIInputStream* aInputStream,
+-                     InputStreamParamsWithFdsOrSendStream& aValue,
+-                     dom::PContentParent* aManager);
+-
+-void
+-SerializeInputStream(nsIInputStream* aInputStream,
+-                     InputStreamParamsWithFdsOrSendStream& aValue,
+-                     PBackgroundParent* aManager);
+-
+-template<typename M>
+-void
+-SerializeInputStream(nsIInputStream* aStream,
+-                     OptionalInputStreamParamsWithFdsOrSendStream& aValue,
+-                     M* aManager)
+-{
+-  aValue = InputStreamParamsWithFdsOrSendStream();
+-  SerializeInputStream(aStream,
+-                       aValue.get_InputStreamParamsWithFdsOrSendStream(),
+-                       aManager);
+-}
+-
+ // RAII helper class that serializes an nsIInputStream into an
+ // InputStreamParamsWithFdsOrSendStream IPC struct.  Any SendStreamChild actors
+ // are automatically managed correctly.
+ //
+ // Use the TakeValue() method when passing the value (or just after passing the
+ // value) to the IPC Send*() method.
+ //
+ // For example:
+@@ -150,16 +116,26 @@ public:
+   SerializeOrSend(nsIInputStream* aStream, dom::PContentChild* aManager);
+ 
+   // Serialize the input stream or create a SendStream actor using the
+   // PBackground manager.  If neither of these succeed, then crash.  This can
+   // be called on the main thread or Worker threads.
+   void
+   SerializeOrSend(nsIInputStream* aStream, PBackgroundChild* aManager);
+ 
++  // Serialize the input stream.  A PSendStream cannot be used when going
++  // from parent-to-child.
++  void
++  Serialize(nsIInputStream* aStream, dom::PContentParent* aManager);
++
++  // Serialize the input stream.  A PSendStream cannot be used when going
++  // from parent-to-child.
++  void
++  Serialize(nsIInputStream* aStream, PBackgroundParent* aManager);
++
+   // Get the InputStreamParamsWithFdsOrSendStream as a non-optional value.  This will
+   // assert if a stream has not been serialized or if it has already been taken.
+   // This should only be called if the value is being, or has already been, sent
+   // to the parent
+   InputStreamParamsWithFdsOrSendStream&
+   TakeValue();
+ 
+   // Get the OptionalInputStreamParamsWithFdsOrSendStream value.  This will assert if
