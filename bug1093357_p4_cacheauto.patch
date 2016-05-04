@@ -1,12 +1,195 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  057aacb2d5cf3f736e13032b7d39195c983c005f
+# Parent  2f0ae7dfd6e0cfe529a41730be626368b299ff54
 Bug 1093357 P4 Make dom/cache use new AutoIPCStreamChild class. r=ehsan
 
 diff --git a/dom/cache/AutoUtils.cpp b/dom/cache/AutoUtils.cpp
 --- a/dom/cache/AutoUtils.cpp
 +++ b/dom/cache/AutoUtils.cpp
-@@ -215,49 +215,51 @@ AutoChildOpArgs::Add(InternalRequest* aR
+@@ -10,151 +10,76 @@
+ #include "mozilla/dom/InternalHeaders.h"
+ #include "mozilla/dom/InternalRequest.h"
+ #include "mozilla/dom/cache/CacheParent.h"
+ #include "mozilla/dom/cache/CacheStreamControlParent.h"
+ #include "mozilla/dom/cache/ReadStream.h"
+ #include "mozilla/dom/cache/SavedTypes.h"
+ #include "mozilla/dom/cache/StreamList.h"
+ #include "mozilla/dom/cache/TypeUtils.h"
+-#include "mozilla/ipc/FileDescriptorSetChild.h"
+-#include "mozilla/ipc/FileDescriptorSetParent.h"
++#include "mozilla/ipc/IPCStreamUtils.h"
+ #include "mozilla/ipc/PBackgroundParent.h"
+ #include "mozilla/ipc/SendStream.h"
+ #include "nsCRT.h"
+ #include "nsHttp.h"
+ 
+-namespace {
+-
+ using mozilla::Unused;
+ using mozilla::dom::cache::CacheReadStream;
+ using mozilla::dom::cache::CacheReadStreamOrVoid;
+-using mozilla::ipc::FileDescriptor;
+-using mozilla::ipc::FileDescriptorSetChild;
+-using mozilla::ipc::FileDescriptorSetParent;
+-using mozilla::ipc::OptionalFileDescriptorSet;
+-using mozilla::ipc::SendStreamChild;
++using mozilla::ipc::AutoIPCStream;
++using mozilla::ipc::PBackgroundParent;
++
++namespace {
+ 
+ enum CleanupAction
+ {
+   Forget,
+   Delete
+ };
+ 
+ void
+-CleanupChildFds(CacheReadStream& aReadStream, CleanupAction aAction)
+-{
+-  if (aReadStream.fds().type() !=
+-      OptionalFileDescriptorSet::TPFileDescriptorSetChild) {
+-    return;
+-  }
+-
+-  AutoTArray<FileDescriptor, 4> fds;
+-
+-  FileDescriptorSetChild* fdSetActor =
+-    static_cast<FileDescriptorSetChild*>(aReadStream.fds().get_PFileDescriptorSetChild());
+-  MOZ_ASSERT(fdSetActor);
+-
+-  if (aAction == Delete) {
+-    Unused << fdSetActor->Send__delete__(fdSetActor);
+-  }
+-
+-  // FileDescriptorSet doesn't clear its fds in its ActorDestroy, so we
+-  // unconditionally forget them here.  The fds themselves are auto-closed in
+-  // ~FileDescriptor since they originated in this process.
+-  fdSetActor->ForgetFileDescriptors(fds);
+-}
+-
+-void
+-CleanupChildSendStream(CacheReadStream& aReadStream, CleanupAction aAction)
+-{
+-  if (!aReadStream.sendStreamChild()) {
+-    return;
+-  }
+-
+-  auto sendStream =
+-    static_cast<SendStreamChild*>(aReadStream.sendStreamChild());
+-
+-  if (aAction == Delete) {
+-    sendStream->StartDestroy();
+-    return;
+-  }
+-
+-  // If we send the stream, then we need to start it before forgetting about it.
+-  sendStream->Start();
+-}
+-
+-void
+ CleanupChild(CacheReadStream& aReadStream, CleanupAction aAction)
+ {
+-  CleanupChildFds(aReadStream, aAction);
+-  CleanupChildSendStream(aReadStream, aAction);
++  // fds cleaned up by mStreamCleanupList
++  // PSendStream actors cleaned up by mStreamCleanupList
+ }
+ 
+ void
+ CleanupChild(CacheReadStreamOrVoid& aReadStreamOrVoid, CleanupAction aAction)
+ {
+   if (aReadStreamOrVoid.type() == CacheReadStreamOrVoid::Tvoid_t) {
+     return;
+   }
+ 
+   CleanupChild(aReadStreamOrVoid.get_CacheReadStream(), aAction);
+ }
+ 
+-void
+-CleanupParentFds(CacheReadStream& aReadStream, CleanupAction aAction)
+-{
+-  if (aReadStream.fds().type() !=
+-      OptionalFileDescriptorSet::TPFileDescriptorSetParent) {
+-    return;
+-  }
+-
+-  AutoTArray<FileDescriptor, 4> fds;
+-
+-  FileDescriptorSetParent* fdSetActor =
+-    static_cast<FileDescriptorSetParent*>(aReadStream.fds().get_PFileDescriptorSetParent());
+-  MOZ_ASSERT(fdSetActor);
+-
+-  if (aAction == Delete) {
+-    Unused << fdSetActor->Send__delete__(fdSetActor);
+-  }
+-
+-  // FileDescriptorSet doesn't clear its fds in its ActorDestroy, so we
+-  // unconditionally forget them here.  The fds themselves are auto-closed in
+-  // ~FileDescriptor since they originated in this process.
+-  fdSetActor->ForgetFileDescriptors(fds);
+-}
+-
+-void
+-CleanupParentFds(CacheReadStreamOrVoid& aReadStreamOrVoid, CleanupAction aAction)
+-{
+-  if (aReadStreamOrVoid.type() == CacheReadStreamOrVoid::Tvoid_t) {
+-    return;
+-  }
+-
+-  CleanupParentFds(aReadStreamOrVoid.get_CacheReadStream(), aAction);
+-}
+-
+ } // namespace
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+-using mozilla::ipc::PBackgroundParent;
+-
+ // --------------------------------------------
+ 
+ AutoChildOpArgs::AutoChildOpArgs(TypeUtils* aTypeUtils,
+-                                 const CacheOpArgs& aOpArgs)
++                                 const CacheOpArgs& aOpArgs,
++                                 uint32_t aEntryCount)
+   : mTypeUtils(aTypeUtils)
+   , mOpArgs(aOpArgs)
+   , mSent(false)
+ {
+   MOZ_ASSERT(mTypeUtils);
++  MOZ_RELEASE_ASSERT(aEntryCount != 0);
++  if (mOpArgs.type() == CacheOpArgs::TCachePutAllArgs) {
++    CachePutAllArgs& args = mOpArgs.get_CachePutAllArgs();
++    args.requestResponseList().SetCapacity(aEntryCount);
++  } else {
++    MOZ_ASSERT(aEntryCount == 1);
++  }
+ }
+ 
+ AutoChildOpArgs::~AutoChildOpArgs()
+ {
+   CleanupAction action = mSent ? Forget : Delete;
+ 
+   switch(mOpArgs.type()) {
+     case CacheOpArgs::TCacheMatchArgs:
+@@ -202,62 +127,66 @@ AutoChildOpArgs::~AutoChildOpArgs()
+       StorageMatchArgs& args = mOpArgs.get_StorageMatchArgs();
+       CleanupChild(args.request().body(), action);
+       break;
+     }
+     default:
+       // Other types do not need cleanup
+       break;
+   }
++
++  mStreamCleanupList.Clear();
+ }
+ 
+ void
+ AutoChildOpArgs::Add(InternalRequest* aRequest, BodyAction aBodyAction,
+                      SchemeAction aSchemeAction, ErrorResult& aRv)
  {
    MOZ_ASSERT(!mSent);
  
@@ -63,7 +246,22 @@ diff --git a/dom/cache/AutoUtils.cpp b/dom/cache/AutoUtils.cpp
  }
  
  namespace {
-@@ -392,19 +394,20 @@ AutoChildOpArgs::Add(InternalRequest* aR
+@@ -380,31 +309,35 @@ AutoChildOpArgs::Add(InternalRequest* aR
+       // Throw an error if a request/response pair would mask another
+       // request/response pair in the same PutAll operation.  This is
+       // step 2.3.2.3 from the "Batch Cache Operations" spec algorithm.
+       if (MatchInPutList(aRequest, args.requestResponseList())) {
+         aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+         return;
+       }
+ 
++      MOZ_RELEASE_ASSERT(args.requestResponseList().Length() <
++                         args.requestResponseList().Capacity());
++
+       // The FileDescriptorSetChild asserts in its destructor that all fds have
+       // been removed.  The copy constructor, however, simply duplicates the
+       // fds without removing any.  This means each temporary and copy must be
+       // explicitly cleaned up.
        //
        // Avoid a lot of this hassle by making sure we only create one here.  On
        // error we remove it.
@@ -86,6 +284,193 @@ diff --git a/dom/cache/AutoUtils.cpp b/dom/cache/AutoUtils.cpp
            args.requestResponseList().Length() - 1);
        }
  
+@@ -415,89 +348,69 @@ AutoChildOpArgs::Add(InternalRequest* aR
+   }
+ }
+ 
+ const CacheOpArgs&
+ AutoChildOpArgs::SendAsOpArgs()
+ {
+   MOZ_ASSERT(!mSent);
+   mSent = true;
++  for (UniquePtr<AutoIPCStream>& autoStream : mStreamCleanupList) {
++    autoStream->TakeValue();
++  }
+   return mOpArgs;
+ }
+ 
+ // --------------------------------------------
+ 
+ AutoParentOpResult::AutoParentOpResult(mozilla::ipc::PBackgroundParent* aManager,
+-                                       const CacheOpResult& aOpResult)
++                                       const CacheOpResult& aOpResult,
++                                       uint32_t aEntryCount)
+   : mManager(aManager)
+   , mOpResult(aOpResult)
+   , mStreamControl(nullptr)
+   , mSent(false)
+ {
+   MOZ_ASSERT(mManager);
++  MOZ_RELEASE_ASSERT(aEntryCount != 0);
++  if (mOpResult.type() == CacheOpResult::TCacheMatchAllResult) {
++    CacheMatchAllResult& result = mOpResult.get_CacheMatchAllResult();
++    result.responseList().SetCapacity(aEntryCount);
++  } else if (mOpResult.type() == CacheOpResult::TCacheKeysResult) {
++    CacheKeysResult& result = mOpResult.get_CacheKeysResult();
++    result.requestList().SetCapacity(aEntryCount);
++  } else {
++    MOZ_ASSERT(aEntryCount == 1);
++  }
+ }
+ 
+ AutoParentOpResult::~AutoParentOpResult()
+ {
+   CleanupAction action = mSent ? Forget : Delete;
+ 
+   switch (mOpResult.type()) {
+-    case CacheOpResult::TCacheMatchResult:
+-    {
+-      CacheMatchResult& result = mOpResult.get_CacheMatchResult();
+-      if (result.responseOrVoid().type() == CacheResponseOrVoid::Tvoid_t) {
+-        break;
+-      }
+-      CleanupParentFds(result.responseOrVoid().get_CacheResponse().body(),
+-                       action);
+-      break;
+-    }
+-    case CacheOpResult::TCacheMatchAllResult:
+-    {
+-      CacheMatchAllResult& result = mOpResult.get_CacheMatchAllResult();
+-      for (uint32_t i = 0; i < result.responseList().Length(); ++i) {
+-        CleanupParentFds(result.responseList()[i].body(), action);
+-      }
+-      break;
+-    }
+-    case CacheOpResult::TCacheKeysResult:
+-    {
+-      CacheKeysResult& result = mOpResult.get_CacheKeysResult();
+-      for (uint32_t i = 0; i < result.requestList().Length(); ++i) {
+-        CleanupParentFds(result.requestList()[i].body(), action);
+-      }
+-      break;
+-    }
+-    case CacheOpResult::TStorageMatchResult:
+-    {
+-      StorageMatchResult& result = mOpResult.get_StorageMatchResult();
+-      if (result.responseOrVoid().type() == CacheResponseOrVoid::Tvoid_t) {
+-        break;
+-      }
+-      CleanupParentFds(result.responseOrVoid().get_CacheResponse().body(),
+-                       action);
+-      break;
+-    }
+     case CacheOpResult::TStorageOpenResult:
+     {
+       StorageOpenResult& result = mOpResult.get_StorageOpenResult();
+       if (action == Forget || result.actorParent() == nullptr) {
+         break;
+       }
+       Unused << PCacheParent::Send__delete__(result.actorParent());
+       break;
+     }
+     default:
+-      // other types do not need clean up
++      // other types do not need additional clean up
+       break;
+   }
+ 
+   if (action == Delete && mStreamControl) {
+     Unused << PCacheStreamControlParent::Send__delete__(mStreamControl);
+   }
++
++  mStreamCleanupList.Clear();
+ }
+ 
+ void
+ AutoParentOpResult::Add(CacheId aOpenedCacheId, Manager* aManager)
+ {
+   MOZ_ASSERT(mOpResult.type() == CacheOpResult::TStorageOpenResult);
+   MOZ_ASSERT(mOpResult.get_StorageOpenResult().actorParent() == nullptr);
+   mOpResult.get_StorageOpenResult().actorParent() =
+@@ -518,16 +431,18 @@ AutoParentOpResult::Add(const SavedRespo
+       result.responseOrVoid() = aSavedResponse.mValue;
+       SerializeResponseBody(aSavedResponse, aStreamList,
+                             &result.responseOrVoid().get_CacheResponse());
+       break;
+     }
+     case CacheOpResult::TCacheMatchAllResult:
+     {
+       CacheMatchAllResult& result = mOpResult.get_CacheMatchAllResult();
++      MOZ_RELEASE_ASSERT(result.responseList().Length() <
++                         result.responseList().Capacity());
+       result.responseList().AppendElement(aSavedResponse.mValue);
+       SerializeResponseBody(aSavedResponse, aStreamList,
+                             &result.responseList().LastElement());
+       break;
+     }
+     case CacheOpResult::TStorageMatchResult:
+     {
+       StorageMatchResult& result = mOpResult.get_StorageMatchResult();
+@@ -547,16 +462,18 @@ AutoParentOpResult::Add(const SavedReque
+                         StreamList* aStreamList)
+ {
+   MOZ_ASSERT(!mSent);
+ 
+   switch (mOpResult.type()) {
+     case CacheOpResult::TCacheKeysResult:
+     {
+       CacheKeysResult& result = mOpResult.get_CacheKeysResult();
++      MOZ_RELEASE_ASSERT(result.requestList().Length() <
++                         result.requestList().Capacity());
+       result.requestList().AppendElement(aSavedRequest.mValue);
+       CacheRequest& request = result.requestList().LastElement();
+ 
+       if (!aSavedRequest.mHasBodyId) {
+         request.body() = void_t();
+         break;
+       }
+ 
+@@ -570,16 +487,19 @@ AutoParentOpResult::Add(const SavedReque
+   }
+ }
+ 
+ const CacheOpResult&
+ AutoParentOpResult::SendAsOpResult()
+ {
+   MOZ_ASSERT(!mSent);
+   mSent = true;
++  for (UniquePtr<AutoIPCStream>& autoStream : mStreamCleanupList) {
++    autoStream->TakeValue();
++  }
+   return mOpResult;
+ }
+ 
+ void
+ AutoParentOpResult::SerializeResponseBody(const SavedResponse& aSavedResponse,
+                                           StreamList* aStreamList,
+                                           CacheResponse* aResponseOut)
+ {
+@@ -615,16 +535,17 @@ AutoParentOpResult::SerializeReadStream(
+     if (!mStreamControl) {
+       NS_WARNING("Cache failed to create stream control actor.");
+       return;
+     }
+   }
+ 
+   aStreamList->SetStreamControl(mStreamControl);
+ 
+-  RefPtr<ReadStream> readStream = ReadStream::Create(mStreamControl,
+-                                                       aId, stream);
+-  readStream->Serialize(aReadStreamOut);
++  RefPtr<ReadStream> readStream = ReadStream::Create(mStreamControl, aId,
++                                                     stream);
++
++  readStream->Serialize(aReadStreamOut, mStreamCleanupList);
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
 diff --git a/dom/cache/AutoUtils.h b/dom/cache/AutoUtils.h
 --- a/dom/cache/AutoUtils.h
 +++ b/dom/cache/AutoUtils.h
@@ -98,7 +483,7 @@ diff --git a/dom/cache/AutoUtils.h b/dom/cache/AutoUtils.h
  
  namespace ipc {
  class PBackgroundParent;
-+class AutoIPCStreamChild;
++class AutoIPCStream;
  } // namespace ipc
  
  namespace dom {
@@ -107,7 +492,22 @@ diff --git a/dom/cache/AutoUtils.h b/dom/cache/AutoUtils.h
  
  namespace cache {
  
-@@ -57,16 +58,17 @@ public:
+@@ -44,37 +45,40 @@ class StreamList;
+ // deserialization case is handled by creating a ReadStream object.
+ 
+ class MOZ_STACK_CLASS AutoChildOpArgs final
+ {
+ public:
+   typedef TypeUtils::BodyAction BodyAction;
+   typedef TypeUtils::SchemeAction SchemeAction;
+ 
+-  AutoChildOpArgs(TypeUtils* aTypeUtils, const CacheOpArgs& aOpArgs);
++  AutoChildOpArgs(TypeUtils* aTypeUtils, const CacheOpArgs& aOpArgs,
++                  uint32_t aEntryCount);
+   ~AutoChildOpArgs();
+ 
+   void Add(InternalRequest* aRequest, BodyAction aBodyAction,
+            SchemeAction aSchemeAction, ErrorResult& aRv);
    void Add(InternalRequest* aRequest, BodyAction aBodyAction,
             SchemeAction aSchemeAction, Response& aResponse, ErrorResult& aRv);
  
@@ -116,7 +516,7 @@ diff --git a/dom/cache/AutoUtils.h b/dom/cache/AutoUtils.h
  private:
    TypeUtils* mTypeUtils;
    CacheOpArgs mOpArgs;
-+  nsTArray<UniquePtr<mozilla::ipc::AutoIPCStreamChild>> mStreamCleanupList;
++  nsTArray<UniquePtr<mozilla::ipc::AutoIPCStream>> mStreamCleanupList;
    bool mSent;
  };
  
@@ -124,7 +524,1017 @@ diff --git a/dom/cache/AutoUtils.h b/dom/cache/AutoUtils.h
  {
  public:
    AutoParentOpResult(mozilla::ipc::PBackgroundParent* aManager,
-                      const CacheOpResult& aOpResult);
+-                     const CacheOpResult& aOpResult);
++                     const CacheOpResult& aOpResult,
++                     uint32_t aEntryCount);
+   ~AutoParentOpResult();
+ 
+   void Add(CacheId aOpenedCacheId, Manager* aManager);
+   void Add(const SavedResponse& aSavedResponse, StreamList* aStreamList);
+   void Add(const SavedRequest& aSavedRequest, StreamList* aStreamList);
+ 
+   const CacheOpResult& SendAsOpResult();
+ 
+@@ -84,16 +88,17 @@ private:
+                              CacheResponse* aResponseOut);
+ 
+   void SerializeReadStream(const nsID& aId, StreamList* aStreamList,
+                            CacheReadStream* aReadStreamOut);
+ 
+   mozilla::ipc::PBackgroundParent* mManager;
+   CacheOpResult mOpResult;
+   CacheStreamControlParent* mStreamControl;
++  nsTArray<UniquePtr<mozilla::ipc::AutoIPCStream>> mStreamCleanupList;
+   bool mSent;
+ };
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_cache_AutoUtils_h
+diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
+--- a/dom/cache/Cache.cpp
++++ b/dom/cache/Cache.cpp
+@@ -12,29 +12,28 @@
+ #include "mozilla/dom/PromiseNativeHandler.h"
+ #include "mozilla/dom/Response.h"
+ #include "mozilla/dom/WorkerPrivate.h"
+ #include "mozilla/dom/CacheBinding.h"
+ #include "mozilla/dom/cache/AutoUtils.h"
+ #include "mozilla/dom/cache/CacheChild.h"
+ #include "mozilla/dom/cache/Feature.h"
+ #include "mozilla/dom/cache/ReadStream.h"
+-#include "mozilla/ipc/SendStream.h"
+ #include "mozilla/ErrorResult.h"
+ #include "mozilla/Preferences.h"
+ #include "mozilla/unused.h"
+ #include "nsIGlobalObject.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ using mozilla::dom::workers::GetCurrentThreadWorkerPrivate;
+ using mozilla::dom::workers::WorkerPrivate;
+-using mozilla::ipc::SendStreamChild;
++using mozilla::ipc::PBackgroundChild;
+ 
+ namespace {
+ 
+ bool
+ IsValidPutRequestURL(const nsAString& aUrl, ErrorResult& aRv)
+ {
+   bool validScheme = false;
+ 
+@@ -260,17 +259,17 @@ Cache::Match(const RequestOrUSVString& a
+   RefPtr<InternalRequest> ir = ToInternalRequest(aRequest, IgnoreBody, aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return nullptr;
+   }
+ 
+   CacheQueryParams params;
+   ToCacheQueryParams(params, aOptions);
+ 
+-  AutoChildOpArgs args(this, CacheMatchArgs(CacheRequest(), params));
++  AutoChildOpArgs args(this, CacheMatchArgs(CacheRequest(), params), 1);
+ 
+   args.Add(ir, IgnoreBody, IgnoreInvalidScheme, aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return nullptr;
+   }
+ 
+   return ExecuteOp(args, aRv);
+ }
+@@ -284,17 +283,17 @@ Cache::MatchAll(const Optional<RequestOr
+     return nullptr;
+   }
+ 
+   CacheChild::AutoLock actorLock(mActor);
+ 
+   CacheQueryParams params;
+   ToCacheQueryParams(params, aOptions);
+ 
+-  AutoChildOpArgs args(this, CacheMatchAllArgs(void_t(), params));
++  AutoChildOpArgs args(this, CacheMatchAllArgs(void_t(), params), 1);
+ 
+   if (aRequest.WasPassed()) {
+     RefPtr<InternalRequest> ir = ToInternalRequest(aRequest.Value(),
+                                                      IgnoreBody, aRv);
+     if (aRv.Failed()) {
+       return nullptr;
+     }
+ 
+@@ -406,17 +405,17 @@ Cache::Put(const RequestOrUSVString& aRe
+     return nullptr;
+   }
+ 
+   RefPtr<InternalRequest> ir = ToInternalRequest(aRequest, ReadBody, aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return nullptr;
+   }
+ 
+-  AutoChildOpArgs args(this, CachePutAllArgs());
++  AutoChildOpArgs args(this, CachePutAllArgs(), 1);
+ 
+   args.Add(ir, ReadBody, TypeErrorOnInvalidScheme,
+            aResponse, aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return nullptr;
+   }
+ 
+   return ExecuteOp(args, aRv);
+@@ -436,17 +435,17 @@ Cache::Delete(const RequestOrUSVString& 
+   RefPtr<InternalRequest> ir = ToInternalRequest(aRequest, IgnoreBody, aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return nullptr;
+   }
+ 
+   CacheQueryParams params;
+   ToCacheQueryParams(params, aOptions);
+ 
+-  AutoChildOpArgs args(this, CacheDeleteArgs(CacheRequest(), params));
++  AutoChildOpArgs args(this, CacheDeleteArgs(CacheRequest(), params), 1);
+ 
+   args.Add(ir, IgnoreBody, IgnoreInvalidScheme, aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return nullptr;
+   }
+ 
+   return ExecuteOp(args, aRv);
+ }
+@@ -460,17 +459,17 @@ Cache::Keys(const Optional<RequestOrUSVS
+     return nullptr;
+   }
+ 
+   CacheChild::AutoLock actorLock(mActor);
+ 
+   CacheQueryParams params;
+   ToCacheQueryParams(params, aOptions);
+ 
+-  AutoChildOpArgs args(this, CacheKeysArgs(void_t(), params));
++  AutoChildOpArgs args(this, CacheKeysArgs(void_t(), params), 1);
+ 
+   if (aRequest.WasPassed()) {
+     RefPtr<InternalRequest> ir = ToInternalRequest(aRequest.Value(),
+                                                      IgnoreBody, aRv);
+     if (NS_WARN_IF(aRv.Failed())) {
+       return nullptr;
+     }
+ 
+@@ -536,23 +535,22 @@ Cache::GetGlobalObject() const
+ #ifdef DEBUG
+ void
+ Cache::AssertOwningThread() const
+ {
+   NS_ASSERT_OWNINGTHREAD(Cache);
+ }
+ #endif
+ 
+-SendStreamChild*
+-Cache::CreateSendStream(nsIAsyncInputStream* aStream)
++PBackgroundChild*
++Cache::GetIPCManager()
+ {
+   NS_ASSERT_OWNINGTHREAD(Cache);
+   MOZ_ASSERT(mActor);
+-  MOZ_ASSERT(aStream);
+-  return SendStreamChild::Create(aStream, mActor->Manager());
++  return mActor->Manager();
+ }
+ 
+ Cache::~Cache()
+ {
+   NS_ASSERT_OWNINGTHREAD(Cache);
+   if (mActor) {
+     mActor->StartDestroyFromListener();
+     // DestroyInternal() is called synchronously by StartDestroyFromListener().
+@@ -637,17 +635,17 @@ Cache::PutAll(const nsTArray<RefPtr<Requ
+ 
+   if (NS_WARN_IF(!mActor)) {
+     aRv.Throw(NS_ERROR_UNEXPECTED);
+     return nullptr;
+   }
+ 
+   CacheChild::AutoLock actorLock(mActor);
+ 
+-  AutoChildOpArgs args(this, CachePutAllArgs());
++  AutoChildOpArgs args(this, CachePutAllArgs(), aRequestList.Length());
+ 
+   for (uint32_t i = 0; i < aRequestList.Length(); ++i) {
+     RefPtr<InternalRequest> ir = aRequestList[i]->GetInternalRequest();
+     args.Add(ir, ReadBody, TypeErrorOnInvalidScheme, *aResponseList[i], aRv);
+     if (NS_WARN_IF(aRv.Failed())) {
+       return nullptr;
+     }
+   }
+diff --git a/dom/cache/Cache.h b/dom/cache/Cache.h
+--- a/dom/cache/Cache.h
++++ b/dom/cache/Cache.h
+@@ -77,18 +77,18 @@ public:
+   // TypeUtils methods
+   virtual nsIGlobalObject*
+   GetGlobalObject() const override;
+ 
+ #ifdef DEBUG
+   virtual void AssertOwningThread() const override;
+ #endif
+ 
+-  virtual mozilla::ipc::SendStreamChild*
+-  CreateSendStream(nsIAsyncInputStream* aStream) override;
++  virtual mozilla::ipc::PBackgroundChild*
++  GetIPCManager() override;
+ 
+ private:
+   class FetchHandler;
+ 
+   ~Cache();
+ 
+   // Called when we're destroyed or CCed.
+   void DisconnectFromActor();
+diff --git a/dom/cache/CacheOpChild.cpp b/dom/cache/CacheOpChild.cpp
+--- a/dom/cache/CacheOpChild.cpp
++++ b/dom/cache/CacheOpChild.cpp
+@@ -12,16 +12,18 @@
+ #include "mozilla/dom/cache/Cache.h"
+ #include "mozilla/dom/cache/CacheChild.h"
+ #include "mozilla/dom/cache/CacheStreamControlChild.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
++using mozilla::ipc::PBackgroundChild;
++
+ namespace {
+ 
+ void
+ AddFeatureToStreamChild(const CacheReadStream& aReadStream, Feature* aFeature)
+ {
+   MOZ_ASSERT_IF(!NS_IsMainThread(), aFeature);
+   CacheStreamControlChild* cacheControl =
+     static_cast<CacheStreamControlChild*>(aReadStream.controlChild());
+@@ -189,18 +191,18 @@ CacheOpChild::GetGlobalObject() const
+ #ifdef DEBUG
+ void
+ CacheOpChild::AssertOwningThread() const
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheOpChild);
+ }
+ #endif
+ 
+-mozilla::ipc::SendStreamChild*
+-CacheOpChild::CreateSendStream(nsIAsyncInputStream* aStream)
++PBackgroundChild*
++CacheOpChild::GetIPCManager()
+ {
+   MOZ_CRASH("CacheOpChild should never create a send stream actor!");
+ }
+ 
+ void
+ CacheOpChild::HandleResponse(const CacheResponseOrVoid& aResponseOrVoid)
+ {
+   if (aResponseOrVoid.type() == CacheResponseOrVoid::Tvoid_t) {
+diff --git a/dom/cache/CacheOpChild.h b/dom/cache/CacheOpChild.h
+--- a/dom/cache/CacheOpChild.h
++++ b/dom/cache/CacheOpChild.h
+@@ -50,18 +50,18 @@ private:
+   virtual nsIGlobalObject*
+   GetGlobalObject() const override;
+ 
+ #ifdef DEBUG
+   virtual void
+   AssertOwningThread() const override;
+ #endif
+ 
+-  virtual mozilla::ipc::SendStreamChild*
+-  CreateSendStream(nsIAsyncInputStream* aStream) override;
++  virtual mozilla::ipc::PBackgroundChild*
++  GetIPCManager() override;
+ 
+   // Utility methods
+   void
+   HandleResponse(const CacheResponseOrVoid& aResponseOrVoid);
+ 
+   void
+   HandleResponseList(const nsTArray<CacheResponse>& aResponseList);
+ 
+diff --git a/dom/cache/CacheOpParent.cpp b/dom/cache/CacheOpParent.cpp
+--- a/dom/cache/CacheOpParent.cpp
++++ b/dom/cache/CacheOpParent.cpp
+@@ -166,23 +166,26 @@ CacheOpParent::OnOpComplete(ErrorResult&
+   // Never send an op-specific result if we have an error.  Instead, send
+   // void_t() to ensure that we don't leak actors on the child side.
+   if (NS_WARN_IF(aRv.Failed())) {
+     Unused << Send__delete__(this, aRv, void_t());
+     aRv.SuppressException(); // We serialiazed it, as best we could.
+     return;
+   }
+ 
++  uint32_t entryCount = std::max(1lu, std::max(aSavedResponseList.Length(),
++                                             aSavedRequestList.Length()));
++
+   // The result must contain the appropriate type at this point.  It may
+   // or may not contain the additional result data yet.  For types that
+   // do not need special processing, it should already be set.  If the
+   // result requires actor-specific operations, then we do that below.
+   // If the type and data types don't match, then we will trigger an
+   // assertion in AutoParentOpResult::Add().
+-  AutoParentOpResult result(mIpcManager, aResult);
++  AutoParentOpResult result(mIpcManager, aResult, entryCount);
+ 
+   if (aOpenedCacheId != INVALID_CACHE_ID) {
+     result.Add(aOpenedCacheId, mManager);
+   }
+ 
+   for (uint32_t i = 0; i < aSavedResponseList.Length(); ++i) {
+     result.Add(aSavedResponseList[i], aStreamList);
+   }
+@@ -199,49 +202,24 @@ CacheOpParent::DeserializeCacheStream(co
+ {
+   if (aStreamOrVoid.type() == CacheReadStreamOrVoid::Tvoid_t) {
+     return nullptr;
+   }
+ 
+   nsCOMPtr<nsIInputStream> stream;
+   const CacheReadStream& readStream = aStreamOrVoid.get_CacheReadStream();
+ 
+-  // Option 1: A send stream actor was sent for nsPipe data
+-  if (readStream.sendStreamParent()) {
+-    MOZ_ASSERT(!readStream.controlParent());
+-    auto sendStream =
+-      static_cast<SendStreamParent*>(readStream.sendStreamParent());
+-    stream = sendStream->TakeReader();
+-    MOZ_ASSERT(stream);
+-    return stream.forget();
+-  }
+-
+-  // Option 2: One of our own ReadStreams was passed back to us with a stream
++  // Option 1: One of our own ReadStreams was passed back to us with a stream
+   //           control actor.
+   stream = ReadStream::Create(readStream);
+   if (stream) {
+     return stream.forget();
+   }
+ 
+-  // Option 3: A stream was serialized using normal methods.
+-  AutoTArray<FileDescriptor, 4> fds;
+-  if (readStream.fds().type() ==
+-      OptionalFileDescriptorSet::TPFileDescriptorSetChild) {
+-
+-    FileDescriptorSetParent* fdSetActor =
+-      static_cast<FileDescriptorSetParent*>(readStream.fds().get_PFileDescriptorSetParent());
+-    MOZ_ASSERT(fdSetActor);
+-
+-    fdSetActor->ForgetFileDescriptors(fds);
+-    MOZ_ASSERT(!fds.IsEmpty());
+-
+-    if (!fdSetActor->Send__delete__(fdSetActor)) {
+-      // child process is gone, warn and allow actor to clean up normally
+-      NS_WARNING("Cache failed to delete fd set actor.");
+-    }
+-  }
+-
+-  return DeserializeInputStream(readStream.params(), fds);
++  // Option 2: A stream was serialized using normal methods or passed
++  //           as a PSendStream actor.  Use the standard method for
++  //           extracting the resulting stream.
++  return DeserializeInputStream(readStream.stream());
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/cache/CacheStorage.cpp b/dom/cache/CacheStorage.cpp
+--- a/dom/cache/CacheStorage.cpp
++++ b/dom/cache/CacheStorage.cpp
+@@ -574,18 +574,18 @@ CacheStorage::GetGlobalObject() const
+ #ifdef DEBUG
+ void
+ CacheStorage::AssertOwningThread() const
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorage);
+ }
+ #endif
+ 
+-mozilla::ipc::SendStreamChild*
+-CacheStorage::CreateSendStream(nsIAsyncInputStream* aStream)
++PBackgroundChild*
++CacheStorage::GetIPCManager()
+ {
+   // This is true because CacheStorage always uses IgnoreBody for requests.
+   MOZ_CRASH("CacheStorage should never create a send stream.");
+ }
+ 
+ CacheStorage::~CacheStorage()
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorage);
+@@ -602,17 +602,17 @@ CacheStorage::MaybeRunPendingRequests()
+ {
+   if (!mActor) {
+     return;
+   }
+ 
+   for (uint32_t i = 0; i < mPendingRequests.Length(); ++i) {
+     ErrorResult rv;
+     nsAutoPtr<Entry> entry(mPendingRequests[i].forget());
+-    AutoChildOpArgs args(this, entry->mArgs);
++    AutoChildOpArgs args(this, entry->mArgs, 1);
+     if (entry->mRequest) {
+       args.Add(entry->mRequest, IgnoreBody, IgnoreInvalidScheme, rv);
+     }
+     if (NS_WARN_IF(rv.Failed())) {
+       entry->mPromise->MaybeReject(rv);
+       continue;
+     }
+     mActor->ExecuteOp(mGlobal, entry->mPromise, this, args.SendAsOpArgs());
+diff --git a/dom/cache/CacheStorage.h b/dom/cache/CacheStorage.h
+--- a/dom/cache/CacheStorage.h
++++ b/dom/cache/CacheStorage.h
+@@ -87,18 +87,18 @@ public:
+   void DestroyInternal(CacheStorageChild* aActor);
+ 
+   // TypeUtils methods
+   virtual nsIGlobalObject* GetGlobalObject() const override;
+ #ifdef DEBUG
+   virtual void AssertOwningThread() const override;
+ #endif
+ 
+-  virtual mozilla::ipc::SendStreamChild*
+-  CreateSendStream(nsIAsyncInputStream* aStream) override;
++  virtual mozilla::ipc::PBackgroundChild*
++  GetIPCManager() override;
+ 
+ private:
+   CacheStorage(Namespace aNamespace, nsIGlobalObject* aGlobal,
+                const mozilla::ipc::PrincipalInfo& aPrincipalInfo, Feature* aFeature);
+   explicit CacheStorage(nsresult aFailureResult);
+   ~CacheStorage();
+ 
+   void MaybeRunPendingRequests();
+diff --git a/dom/cache/CacheStreamControlChild.cpp b/dom/cache/CacheStreamControlChild.cpp
+--- a/dom/cache/CacheStreamControlChild.cpp
++++ b/dom/cache/CacheStreamControlChild.cpp
+@@ -15,16 +15,17 @@
+ #include "mozilla/ipc/PBackgroundChild.h"
+ #include "mozilla/ipc/PFileDescriptorSetChild.h"
+ #include "nsISupportsImpl.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
++using mozilla::ipc::AutoIPCStream;
+ using mozilla::ipc::FileDescriptor;
+ using mozilla::ipc::FileDescriptorSetChild;
+ using mozilla::ipc::OptionalFileDescriptorSet;
+ using mozilla::ipc::PFileDescriptorSetChild;
+ 
+ // declared in ActorUtils.h
+ PCacheStreamControlChild*
+ AllocPCacheStreamControlChild()
+@@ -88,52 +89,26 @@ void
+ CacheStreamControlChild::SerializeControl(CacheReadStream* aReadStreamOut)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+   aReadStreamOut->controlParent() = nullptr;
+   aReadStreamOut->controlChild() = this;
+ }
+ 
+ void
+-CacheStreamControlChild::SerializeFds(CacheReadStream* aReadStreamOut,
+-                                      const nsTArray<FileDescriptor>& aFds)
++CacheStreamControlChild::SerializeStream(CacheReadStream* aReadStreamOut,
++                                         nsIInputStream* aStream,
++                                         nsTArray<UniquePtr<AutoIPCStream>>& aStreamCleanupList)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+-  PFileDescriptorSetChild* fdSet = nullptr;
+-  if (!aFds.IsEmpty()) {
+-    fdSet = Manager()->SendPFileDescriptorSetConstructor(aFds[0]);
+-    for (uint32_t i = 1; i < aFds.Length(); ++i) {
+-      Unused << fdSet->SendAddFileDescriptor(aFds[i]);
+-    }
+-  }
+-
+-  if (fdSet) {
+-    aReadStreamOut->fds() = fdSet;
+-  } else {
+-    aReadStreamOut->fds() = void_t();
+-  }
+-}
+-
+-void
+-CacheStreamControlChild::DeserializeFds(const CacheReadStream& aReadStream,
+-                                        nsTArray<FileDescriptor>& aFdsOut)
+-{
+-  if (aReadStream.fds().type() !=
+-      OptionalFileDescriptorSet::TPFileDescriptorSetChild) {
+-    return;
+-  }
+-
+-  auto fdSetActor = static_cast<FileDescriptorSetChild*>(
+-    aReadStream.fds().get_PFileDescriptorSetChild());
+-  MOZ_ASSERT(fdSetActor);
+-
+-  fdSetActor->ForgetFileDescriptors(aFdsOut);
+-  MOZ_ASSERT(!aFdsOut.IsEmpty());
+-
+-  Unused << fdSetActor->Send__delete__(fdSetActor);
++  MOZ_ASSERT(aReadStreamOut);
++  MOZ_ASSERT(aStream);
++  UniquePtr<AutoIPCStream> autoStream(new AutoIPCStream(aReadStreamOut->stream()));
++  autoStream->Serialize(aStream, Manager());
++  aStreamCleanupList.AppendElement(Move(autoStream));
+ }
+ 
+ void
+ CacheStreamControlChild::NoteClosedAfterForget(const nsID& aId)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+   Unused << SendNoteClosed(aId);
+ 
+diff --git a/dom/cache/CacheStreamControlChild.h b/dom/cache/CacheStreamControlChild.h
+--- a/dom/cache/CacheStreamControlChild.h
++++ b/dom/cache/CacheStreamControlChild.h
+@@ -8,16 +8,19 @@
+ #define mozilla_dom_cache_CacheStreamControlChild_h
+ 
+ #include "mozilla/dom/cache/ActorChild.h"
+ #include "mozilla/dom/cache/PCacheStreamControlChild.h"
+ #include "mozilla/dom/cache/StreamControl.h"
+ #include "nsTObserverArray.h"
+ 
+ namespace mozilla {
++namespace ipc {
++class AutoIPCStream;
++} // namespace ipc
+ namespace dom {
+ namespace cache {
+ 
+ class ReadStream;
+ 
+ class CacheStreamControlChild final : public PCacheStreamControlChild
+                                     , public StreamControl
+                                     , public ActorChild
+@@ -29,22 +32,18 @@ public:
+   // ActorChild methods
+   virtual void StartDestroy() override;
+ 
+   // StreamControl methods
+   virtual void
+   SerializeControl(CacheReadStream* aReadStreamOut) override;
+ 
+   virtual void
+-  SerializeFds(CacheReadStream* aReadStreamOut,
+-               const nsTArray<mozilla::ipc::FileDescriptor>& aFds) override;
+-
+-  virtual void
+-  DeserializeFds(const CacheReadStream& aReadStream,
+-                 nsTArray<mozilla::ipc::FileDescriptor>& aFdsOut) override;
++  SerializeStream(CacheReadStream* aReadStreamOut, nsIInputStream* aStream,
++                  nsTArray<UniquePtr<mozilla::ipc::AutoIPCStream>>& aStreamCleanupList) override;
+ 
+ private:
+   virtual void
+   NoteClosedAfterForget(const nsID& aId) override;
+ 
+ #ifdef DEBUG
+   virtual void
+   AssertOwningThread() override;
+diff --git a/dom/cache/CacheStreamControlParent.cpp b/dom/cache/CacheStreamControlParent.cpp
+--- a/dom/cache/CacheStreamControlParent.cpp
++++ b/dom/cache/CacheStreamControlParent.cpp
+@@ -48,55 +48,25 @@ void
+ CacheStreamControlParent::SerializeControl(CacheReadStream* aReadStreamOut)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+   aReadStreamOut->controlChild() = nullptr;
+   aReadStreamOut->controlParent() = this;
+ }
+ 
+ void
+-CacheStreamControlParent::SerializeFds(CacheReadStream* aReadStreamOut,
+-                                       const nsTArray<FileDescriptor>& aFds)
++CacheStreamControlParent::SerializeStream(CacheReadStream* aReadStreamOut,
++                                          nsIInputStream* aStream,
++                                          nsTArray<UniquePtr<AutoIPCStream>>& aStreamCleanupList)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+-  PFileDescriptorSetParent* fdSet = nullptr;
+-  if (!aFds.IsEmpty()) {
+-    fdSet = Manager()->SendPFileDescriptorSetConstructor(aFds[0]);
+-    for (uint32_t i = 1; i < aFds.Length(); ++i) {
+-      Unused << fdSet->SendAddFileDescriptor(aFds[i]);
+-    }
+-  }
+-
+-  if (fdSet) {
+-    aReadStreamOut->fds() = fdSet;
+-  } else {
+-    aReadStreamOut->fds() = void_t();
+-  }
+-}
+-
+-void
+-CacheStreamControlParent::DeserializeFds(const CacheReadStream& aReadStream,
+-                                         nsTArray<FileDescriptor>& aFdsOut)
+-{
+-  if (aReadStream.fds().type() !=
+-      OptionalFileDescriptorSet::TPFileDescriptorSetParent) {
+-    return;
+-  }
+-
+-  FileDescriptorSetParent* fdSetActor =
+-    static_cast<FileDescriptorSetParent*>(aReadStream.fds().get_PFileDescriptorSetParent());
+-  MOZ_ASSERT(fdSetActor);
+-
+-  fdSetActor->ForgetFileDescriptors(aFdsOut);
+-  MOZ_ASSERT(!aFdsOut.IsEmpty());
+-
+-  if (!fdSetActor->Send__delete__(fdSetActor)) {
+-    // child process is gone, warn and allow actor to clean up normally
+-    NS_WARNING("Cache failed to delete fd set actor.");
+-  }
++  MOZ_ASSERT(aStream);
++  UniquePtr<AutoIPCStream> autoStream(new AutoIPCStream(aReadStreamOut->stream()));
++  autoStream->Serialize(aStream, Manager());
++  aStreamCleanupList.AppendElement(Move(autoStream));
+ }
+ 
+ void
+ CacheStreamControlParent::NoteClosedAfterForget(const nsID& aId)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+   RecvNoteClosed(aId);
+ }
+diff --git a/dom/cache/CacheStreamControlParent.h b/dom/cache/CacheStreamControlParent.h
+--- a/dom/cache/CacheStreamControlParent.h
++++ b/dom/cache/CacheStreamControlParent.h
+@@ -7,16 +7,19 @@
+ #ifndef mozilla_dom_cache_CacheStreamControlParent_h
+ #define mozilla_dom_cache_CacheStreamControlParent_h
+ 
+ #include "mozilla/dom/cache/PCacheStreamControlParent.h"
+ #include "mozilla/dom/cache/StreamControl.h"
+ #include "nsTObserverArray.h"
+ 
+ namespace mozilla {
++namespace ipc {
++class AutoIPCStream;
++} // namespace ipc
+ namespace dom {
+ namespace cache {
+ 
+ class ReadStream;
+ class StreamList;
+ 
+ class CacheStreamControlParent final : public PCacheStreamControlParent
+                                      , public StreamControl
+@@ -30,22 +33,18 @@ public:
+   void CloseAll();
+   void Shutdown();
+ 
+   // StreamControl methods
+   virtual void
+   SerializeControl(CacheReadStream* aReadStreamOut) override;
+ 
+   virtual void
+-  SerializeFds(CacheReadStream* aReadStreamOut,
+-               const nsTArray<mozilla::ipc::FileDescriptor>& aFds) override;
+-
+-  virtual void
+-  DeserializeFds(const CacheReadStream& aReadStream,
+-                 nsTArray<mozilla::ipc::FileDescriptor>& aFdsOut) override;
++  SerializeStream(CacheReadStream* aReadStreamOut, nsIInputStream* aStream,
++                  nsTArray<UniquePtr<mozilla::ipc::AutoIPCStream>>& aStreamCleanupList) override;
+ 
+ private:
+   virtual void
+   NoteClosedAfterForget(const nsID& aId) override;
+ 
+ #ifdef DEBUG
+   virtual void
+   AssertOwningThread() override;
+diff --git a/dom/cache/CacheTypes.ipdlh b/dom/cache/CacheTypes.ipdlh
+--- a/dom/cache/CacheTypes.ipdlh
++++ b/dom/cache/CacheTypes.ipdlh
+@@ -1,16 +1,16 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ include protocol PCache;
+ include protocol PCacheStreamControl;
+ include protocol PSendStream;
+-include InputStreamParams;
++include IPCStream;
+ include ChannelInfo;
+ include PBackgroundSharedTypes;
+ 
+ using HeadersGuardEnum from "mozilla/dom/cache/IPCUtils.h";
+ using ReferrerPolicy from "mozilla/dom/cache/IPCUtils.h";
+ using RequestCredentials from "mozilla/dom/cache/IPCUtils.h";
+ using RequestMode from "mozilla/dom/cache/IPCUtils.h";
+ using RequestCache from "mozilla/dom/cache/IPCUtils.h";
+@@ -30,20 +30,18 @@ struct CacheQueryParams
+   bool ignoreVary;
+   bool cacheNameSet;
+   nsString cacheName;
+ };
+ 
+ struct CacheReadStream
+ {
+   nsID id;
+-  OptionalInputStreamParams params;
+-  OptionalFileDescriptorSet fds;
+   nullable PCacheStreamControl control;
+-  nullable PSendStream sendStream;
++  IPCStream stream;
+ };
+ 
+ union CacheReadStreamOrVoid
+ {
+   void_t;
+   CacheReadStream;
+ };
+ 
+diff --git a/dom/cache/ReadStream.cpp b/dom/cache/ReadStream.cpp
+--- a/dom/cache/ReadStream.cpp
++++ b/dom/cache/ReadStream.cpp
+@@ -5,45 +5,47 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/cache/ReadStream.h"
+ 
+ #include "mozilla/unused.h"
+ #include "mozilla/dom/cache/CacheStreamControlChild.h"
+ #include "mozilla/dom/cache/CacheStreamControlParent.h"
+ #include "mozilla/dom/cache/CacheTypes.h"
+-#include "mozilla/ipc/FileDescriptor.h"
+-#include "mozilla/ipc/InputStreamUtils.h"
++#include "mozilla/ipc/IPCStreamUtils.h"
+ #include "mozilla/SnappyUncompressInputStream.h"
+ #include "nsIAsyncInputStream.h"
+ #include "nsTArray.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ using mozilla::Unused;
+-using mozilla::ipc::FileDescriptor;
++using mozilla::ipc::AutoIPCStream;
++using mozilla::ipc::IPCStream;
+ 
+ // ----------------------------------------------------------------------------
+ 
+ // The inner stream class.  This is where all of the real work is done.  As
+ // an invariant Inner::Close() must be called before ~Inner().  This is
+ // guaranteed by our outer ReadStream class.
+ class ReadStream::Inner final : public ReadStream::Controllable
+ {
+ public:
+   Inner(StreamControl* aControl, const nsID& aId,
+         nsIInputStream* aStream);
+ 
+   void
+-  Serialize(CacheReadStreamOrVoid* aReadStreamOut);
++  Serialize(CacheReadStreamOrVoid* aReadStreamOut,
++            nsTArray<UniquePtr<AutoIPCStream>>& aStreamCleanupList);
+ 
+   void
+-  Serialize(CacheReadStream* aReadStreamOut);
++  Serialize(CacheReadStream* aReadStreamOut,
++            nsTArray<UniquePtr<AutoIPCStream>>& aStreamCleanupList);
+ 
+   // ReadStream::Controllable methods
+   virtual void
+   CloseStream() override;
+ 
+   virtual void
+   CloseStreamWithoutReporting() override;
+ 
+@@ -192,45 +194,40 @@ ReadStream::Inner::Inner(StreamControl* 
+   , mState(Open)
+ {
+   MOZ_ASSERT(mStream);
+   MOZ_ASSERT(mControl);
+   mControl->AddReadStream(this);
+ }
+ 
+ void
+-ReadStream::Inner::Serialize(CacheReadStreamOrVoid* aReadStreamOut)
++ReadStream::Inner::Serialize(CacheReadStreamOrVoid* aReadStreamOut,
++                             nsTArray<UniquePtr<AutoIPCStream>>& aStreamCleanupList)
+ {
+   MOZ_ASSERT(NS_GetCurrentThread() == mOwningThread);
+   MOZ_ASSERT(aReadStreamOut);
+-  CacheReadStream stream;
+-  Serialize(&stream);
+-  *aReadStreamOut = stream;
++  *aReadStreamOut = CacheReadStream();
++  Serialize(&aReadStreamOut->get_CacheReadStream(), aStreamCleanupList);
+ }
+ 
+ void
+-ReadStream::Inner::Serialize(CacheReadStream* aReadStreamOut)
++ReadStream::Inner::Serialize(CacheReadStream* aReadStreamOut,
++                             nsTArray<UniquePtr<AutoIPCStream>>& aStreamCleanupList)
+ {
+   MOZ_ASSERT(NS_GetCurrentThread() == mOwningThread);
+   MOZ_ASSERT(aReadStreamOut);
+   MOZ_ASSERT(mState == Open);
+   MOZ_ASSERT(mControl);
+ 
+-  // If we are sending a ReadStream, then we never want to set the
+-  // sendStream actors at the same time.
+-  aReadStreamOut->sendStreamChild() = nullptr;
+-  aReadStreamOut->sendStreamParent() = nullptr;
+-
+   aReadStreamOut->id() = mId;
+   mControl->SerializeControl(aReadStreamOut);
++  mControl->SerializeStream(aReadStreamOut, mStream, aStreamCleanupList);
+ 
+-  AutoTArray<FileDescriptor, 4> fds;
+-  SerializeInputStream(mStream, aReadStreamOut->params(), fds);
+-
+-  mControl->SerializeFds(aReadStreamOut, fds);
++  MOZ_ASSERT(aReadStreamOut->stream().type() ==
++             IPCStream::TInputStreamParamsWithFds);
+ 
+   // We're passing ownership across the IPC barrier with the control, so
+   // do not signal that the stream is closed here.
+   Forget();
+ }
+ 
+ void
+ ReadStream::Inner::CloseStream()
+@@ -431,36 +428,32 @@ ReadStream::Create(const CacheReadStream
+ {
+   // The parameter may or may not be for a Cache created stream.  The way we
+   // tell is by looking at the stream control actor.  If the actor exists,
+   // then we know the Cache created it.
+   if (!aReadStream.controlChild() && !aReadStream.controlParent()) {
+     return nullptr;
+   }
+ 
+-  MOZ_ASSERT(!aReadStream.sendStreamChild());
+-  MOZ_ASSERT(!aReadStream.sendStreamParent());
++  MOZ_ASSERT(aReadStream.stream().type() ==
++             IPCStream::TInputStreamParamsWithFds);
+ 
+   // Control is guaranteed to survive this method as ActorDestroy() cannot
+   // run on this thread until we complete.
+   StreamControl* control;
+   if (aReadStream.controlChild()) {
+     auto actor = static_cast<CacheStreamControlChild*>(aReadStream.controlChild());
+     control = actor;
+   } else {
+     auto actor = static_cast<CacheStreamControlParent*>(aReadStream.controlParent());
+     control = actor;
+   }
+   MOZ_ASSERT(control);
+ 
+-  AutoTArray<FileDescriptor, 4> fds;
+-  control->DeserializeFds(aReadStream, fds);
+-
+-  nsCOMPtr<nsIInputStream> stream =
+-    DeserializeInputStream(aReadStream.params(), fds);
++  nsCOMPtr<nsIInputStream> stream = DeserializeInputStream(aReadStream.stream());
+   MOZ_ASSERT(stream);
+ 
+   // Currently we expect all cache read streams to be blocking file streams.
+ #ifdef DEBUG
+   nsCOMPtr<nsIAsyncInputStream> asyncStream = do_QueryInterface(stream);
+   MOZ_ASSERT(!asyncStream);
+ #endif
+ 
+@@ -477,25 +470,27 @@ ReadStream::Create(PCacheStreamControlPa
+   MOZ_ASSERT(aControl);
+   auto actor = static_cast<CacheStreamControlParent*>(aControl);
+   RefPtr<Inner> inner = new Inner(actor, aId, aStream);
+   RefPtr<ReadStream> ref = new ReadStream(inner);
+   return ref.forget();
+ }
+ 
+ void
+-ReadStream::Serialize(CacheReadStreamOrVoid* aReadStreamOut)
++ReadStream::Serialize(CacheReadStreamOrVoid* aReadStreamOut,
++                      nsTArray<UniquePtr<AutoIPCStream>>& aStreamCleanupList)
+ {
+-  mInner->Serialize(aReadStreamOut);
++  mInner->Serialize(aReadStreamOut, aStreamCleanupList);
+ }
+ 
+ void
+-ReadStream::Serialize(CacheReadStream* aReadStreamOut)
++ReadStream::Serialize(CacheReadStream* aReadStreamOut,
++                      nsTArray<UniquePtr<AutoIPCStream>>& aStreamCleanupList)
+ {
+-  mInner->Serialize(aReadStreamOut);
++  mInner->Serialize(aReadStreamOut, aStreamCleanupList);
+ }
+ 
+ ReadStream::ReadStream(ReadStream::Inner* aInner)
+   : mInner(aInner)
+ {
+   MOZ_ASSERT(mInner);
+ }
+ 
+diff --git a/dom/cache/ReadStream.h b/dom/cache/ReadStream.h
+--- a/dom/cache/ReadStream.h
++++ b/dom/cache/ReadStream.h
+@@ -11,16 +11,19 @@
+ #include "nsCOMPtr.h"
+ #include "nsID.h"
+ #include "nsIInputStream.h"
+ #include "nsISupportsImpl.h"
+ #include "mozilla/RefPtr.h"
+ #include "nsTArrayForwardDeclare.h"
+ 
+ namespace mozilla {
++namespace ipc {
++class AutoIPCStream;
++} // namespace ipc
+ namespace dom {
+ namespace cache {
+ 
+ class CacheReadStream;
+ class CacheReadStreamOrVoid;
+ class PCacheStreamControlParent;
+ 
+ // IID for the dom::cache::ReadStream interface
+@@ -76,18 +79,20 @@ public:
+ 
+   static already_AddRefed<ReadStream>
+   Create(const CacheReadStream& aReadStream);
+ 
+   static already_AddRefed<ReadStream>
+   Create(PCacheStreamControlParent* aControl, const nsID& aId,
+          nsIInputStream* aStream);
+ 
+-  void Serialize(CacheReadStreamOrVoid* aReadStreamOut);
+-  void Serialize(CacheReadStream* aReadStreamOut);
++  void Serialize(CacheReadStreamOrVoid* aReadStreamOut,
++                 nsTArray<UniquePtr<mozilla::ipc::AutoIPCStream>>& aStreamCleanupList);
++  void Serialize(CacheReadStream* aReadStreamOut,
++                 nsTArray<UniquePtr<mozilla::ipc::AutoIPCStream>>& aStreamCleanupList);
+ 
+ private:
+   class Inner;
+ 
+   explicit ReadStream(Inner* aInner);
+   ~ReadStream();
+ 
+   // Hold a strong ref to an inner class that actually implements the
+diff --git a/dom/cache/StreamControl.h b/dom/cache/StreamControl.h
+--- a/dom/cache/StreamControl.h
++++ b/dom/cache/StreamControl.h
+@@ -10,17 +10,17 @@
+ #include "mozilla/dom/cache/ReadStream.h"
+ #include "mozilla/RefPtr.h"
+ #include "nsTObserverArray.h"
+ 
+ struct nsID;
+ 
+ namespace mozilla {
+ namespace ipc {
+- class FileDescriptor;
++class AutoIPCStream;
+ } // namespace ipc
+ namespace dom {
+ namespace cache {
+ 
+ class CacheReadStream;
+ 
+ // Abstract class to help implement the stream control Child and Parent actors.
+ // This provides an interface to partly help with serialization of IPC types,
+@@ -28,22 +28,18 @@ class CacheReadStream;
+ class StreamControl
+ {
+ public:
+   // abstract interface that must be implemented by child class
+   virtual void
+   SerializeControl(CacheReadStream* aReadStreamOut) = 0;
+ 
+   virtual void
+-  SerializeFds(CacheReadStream* aReadStreamOut,
+-               const nsTArray<mozilla::ipc::FileDescriptor>& aFds) = 0;
+-
+-  virtual void
+-  DeserializeFds(const CacheReadStream& aReadStream,
+-                 nsTArray<mozilla::ipc::FileDescriptor>& aFdsOut) = 0;
++  SerializeStream(CacheReadStream* aReadStreamOut, nsIInputStream* aStream,
++                  nsTArray<UniquePtr<mozilla::ipc::AutoIPCStream>>& aStreamCleanupList) = 0;
+ 
+   // inherited implementation of the ReadStream::Controllable list
+ 
+   // Begin controlling the given ReadStream.  This causes a strong ref to
+   // be held by the control.  The ReadStream must call NoteClosed() or
+   // ForgetReadStream() to release this ref.
+   void
+   AddReadStream(ReadStream::Controllable* aReadStream);
 diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
 --- a/dom/cache/TypeUtils.cpp
 +++ b/dom/cache/TypeUtils.cpp
@@ -137,7 +1547,7 @@ diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
  namespace dom {
  namespace cache {
  
-+using mozilla::ipc::AutoIPCStreamChild;
++using mozilla::ipc::AutoIPCStream;
  using mozilla::ipc::BackgroundChild;
  using mozilla::ipc::FileDescriptor;
  using mozilla::ipc::PBackgroundChild;
@@ -146,7 +1556,49 @@ diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
  namespace {
  
  static bool
-@@ -140,16 +141,17 @@ TypeUtils::ToInternalRequest(const Ownin
+@@ -60,41 +61,16 @@ HasVaryStar(mozilla::dom::InternalHeader
+         return true;
+       }
+     }
+   }
+   return false;
+ }
+ 
+ void
+-SerializeNormalStream(nsIInputStream* aStream, CacheReadStream& aReadStreamOut)
+-{
+-  AutoTArray<FileDescriptor, 4> fds;
+-  SerializeInputStream(aStream, aReadStreamOut.params(), fds);
+-
+-  PFileDescriptorSetChild* fdSet = nullptr;
+-  if (!fds.IsEmpty()) {
+-    // We should not be serializing until we have an actor ready
+-    PBackgroundChild* manager = BackgroundChild::GetForCurrentThread();
+-    MOZ_ASSERT(manager);
+-
+-    fdSet = manager->SendPFileDescriptorSetConstructor(fds[0]);
+-    for (uint32_t i = 1; i < fds.Length(); ++i) {
+-      Unused << fdSet->SendAddFileDescriptor(fds[i]);
+-    }
+-  }
+-
+-  if (fdSet) {
+-    aReadStreamOut.fds() = fdSet;
+-  } else {
+-    aReadStreamOut.fds() = void_t();
+-  }
+-}
+-
+-void
+ ToHeadersEntryList(nsTArray<HeadersEntry>& aOut, InternalHeaders* aHeaders)
+ {
+   MOZ_ASSERT(aHeaders);
+ 
+   AutoTArray<InternalHeaders::Entry, 16> entryList;
+   aHeaders->GetEntries(entryList);
+ 
+   for (uint32_t i = 0; i < entryList.Length(); ++i) {
+@@ -140,16 +116,17 @@ TypeUtils::ToInternalRequest(const Ownin
    }
  
    return ToInternalRequest(aIn.GetAsUSVString(), aRv);
@@ -155,7 +1607,7 @@ diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
  void
  TypeUtils::ToCacheRequest(CacheRequest& aOut, InternalRequest* aIn,
                            BodyAction aBodyAction, SchemeAction aSchemeAction,
-+                          nsTArray<UniquePtr<AutoIPCStreamChild>>& aStreamCleanupList,
++                          nsTArray<UniquePtr<AutoIPCStream>>& aStreamCleanupList,
                            ErrorResult& aRv)
  {
    MOZ_ASSERT(aIn);
@@ -164,7 +1616,7 @@ diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
  
    nsAutoCString url;
    aIn->GetURL(url);
-@@ -186,17 +188,17 @@ TypeUtils::ToCacheRequest(CacheRequest& 
+@@ -186,17 +163,17 @@ TypeUtils::ToCacheRequest(CacheRequest& 
      aOut.body() = void_t();
      return;
    }
@@ -183,7 +1635,7 @@ diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
  void
  TypeUtils::ToCacheResponseWithoutBody(CacheResponse& aOut,
                                        InternalResponse& aIn, ErrorResult& aRv)
-@@ -228,17 +230,19 @@ TypeUtils::ToCacheResponseWithoutBody(Ca
+@@ -228,17 +205,19 @@ TypeUtils::ToCacheResponseWithoutBody(Ca
    if (aIn.GetPrincipalInfo()) {
      aOut.principalInfo() = *aIn.GetPrincipalInfo();
    } else {
@@ -194,7 +1646,7 @@ diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
  void
 -TypeUtils::ToCacheResponse(CacheResponse& aOut, Response& aIn, ErrorResult& aRv)
 +TypeUtils::ToCacheResponse(CacheResponse& aOut, Response& aIn,
-+                           nsTArray<UniquePtr<AutoIPCStreamChild>>& aStreamCleanupList,
++                           nsTArray<UniquePtr<AutoIPCStream>>& aStreamCleanupList,
 +                           ErrorResult& aRv)
  {
    if (aIn.BodyUsed()) {
@@ -204,7 +1656,7 @@ diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
  
    RefPtr<InternalResponse> ir = aIn.GetInternalResponse();
    ToCacheResponseWithoutBody(aOut, *ir, aRv);
-@@ -247,17 +251,17 @@ TypeUtils::ToCacheResponse(CacheResponse
+@@ -247,17 +226,17 @@ TypeUtils::ToCacheResponse(CacheResponse
    }
  
    nsCOMPtr<nsIInputStream> stream;
@@ -223,7 +1675,7 @@ diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
  // static
  void
  TypeUtils::ToCacheQueryParams(CacheQueryParams& aOut,
-@@ -496,16 +500,17 @@ TypeUtils::ToInternalRequest(const nsASt
+@@ -496,75 +475,39 @@ TypeUtils::ToInternalRequest(const nsASt
    if (NS_WARN_IF(aRv.Failed())) { return nullptr; }
  
    return request->GetInternalRequest();
@@ -232,7 +1684,7 @@ diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
  void
  TypeUtils::SerializeCacheStream(nsIInputStream* aStream,
                                  CacheReadStreamOrVoid* aStreamOut,
-+                                nsTArray<UniquePtr<mozilla::ipc::AutoIPCStreamChild>>& aStreamCleanupList,
++                                nsTArray<UniquePtr<AutoIPCStream>>& aStreamCleanupList,
                                  ErrorResult& aRv)
  {
    *aStreamOut = void_t();
@@ -241,10 +1693,79 @@ diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
    }
  
    // Option 1: Send a cache-specific ReadStream if we can.
+   RefPtr<ReadStream> controlled = do_QueryObject(aStream);
+   if (controlled) {
+-    controlled->Serialize(aStreamOut);
++    printf_stderr("### ### create a controlled stream\n");
++    controlled->Serialize(aStreamOut, aStreamCleanupList);
+     return;
+   }
+ 
+-  CacheReadStream readStream;
+-  readStream.controlChild() = nullptr;
+-  readStream.controlParent() = nullptr;
+-  readStream.sendStreamChild() = nullptr;
+-  readStream.sendStreamParent() = nullptr;
++  *aStreamOut = CacheReadStream();
++  CacheReadStream& cacheStream = aStreamOut->get_CacheReadStream();
+ 
+-  // Option 2: Do normal stream serialization if its supported.
+-  nsCOMPtr<nsIIPCSerializableInputStream> serial = do_QueryInterface(aStream);
+-  if (serial) {
+-    SerializeNormalStream(aStream, readStream);
++  cacheStream.controlChild() = nullptr;
++  cacheStream.controlParent() = nullptr;
+ 
+-  // Option 3: As a last resort send data across manually.  Should only be
+-  //           needed for nsPipe input stream.  Only works for async,
+-  //           non-blocking streams.
+-  } else {
+-    SerializeSendStream(aStream, readStream, aRv);
+-    if (NS_WARN_IF(aRv.Failed())) { return; }
+-  }
++  UniquePtr<AutoIPCStream> autoStream(new AutoIPCStream(cacheStream.stream()));
++  autoStream->Serialize(aStream, GetIPCManager());
+ 
+-  *aStreamOut = readStream;
+-}
+-
+-void
+-TypeUtils::SerializeSendStream(nsIInputStream* aStream,
+-                               CacheReadStream& aReadStreamOut,
+-                               ErrorResult& aRv)
+-{
+-  nsCOMPtr<nsIAsyncInputStream> asyncStream = do_QueryInterface(aStream);
+-  if (NS_WARN_IF(!asyncStream)) {
+-    aRv = NS_ERROR_FAILURE;
+-    return;
+-  }
+-
+-  bool nonBlocking = false;
+-  aRv = asyncStream->IsNonBlocking(&nonBlocking);
+-  if (NS_WARN_IF(aRv.Failed())) { return; }
+-  if (NS_WARN_IF(!nonBlocking)) {
+-    aRv = NS_ERROR_FAILURE;
+-    return;
+-  }
+-
+-  aReadStreamOut.sendStreamChild() = CreateSendStream(asyncStream);
+-  MOZ_ASSERT(aReadStreamOut.sendStreamChild());
+-  aReadStreamOut.params() = void_t();
+-  aReadStreamOut.fds() = void_t();
+-
+-  // SendStreamChild::Start() must be called after sending the stream
+-  // across to the parent side.
++  aStreamCleanupList.AppendElement(Move(autoStream));
+ }
+ 
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
 diff --git a/dom/cache/TypeUtils.h b/dom/cache/TypeUtils.h
 --- a/dom/cache/TypeUtils.h
 +++ b/dom/cache/TypeUtils.h
-@@ -15,16 +15,17 @@
+@@ -14,17 +14,19 @@
+ 
  class nsIGlobalObject;
  class nsIAsyncInputStream;
  class nsIInputStream;
@@ -252,8 +1773,9 @@ diff --git a/dom/cache/TypeUtils.h b/dom/cache/TypeUtils.h
  namespace mozilla {
  
  namespace ipc {
++class PBackgroundChild;
  class SendStreamChild;
-+class AutoIPCStreamChild;
++class AutoIPCStream;
  }
  
  namespace dom {
@@ -262,7 +1784,23 @@ diff --git a/dom/cache/TypeUtils.h b/dom/cache/TypeUtils.h
  class InternalRequest;
  class InternalResponse;
  class OwningRequestOrUSVString;
-@@ -73,24 +74,27 @@ public:
+@@ -59,38 +61,41 @@ public:
+   ~TypeUtils() { }
+   virtual nsIGlobalObject* GetGlobalObject() const = 0;
+ #ifdef DEBUG
+   virtual void AssertOwningThread() const = 0;
+ #else
+   inline void AssertOwningThread() const { }
+ #endif
+ 
+-  virtual mozilla::ipc::SendStreamChild*
+-  CreateSendStream(nsIAsyncInputStream* aStream) = 0;
++  virtual mozilla::ipc::PBackgroundChild*
++  GetIPCManager() = 0;
+ 
+   already_AddRefed<InternalRequest>
+   ToInternalRequest(const RequestOrUSVString& aIn, BodyAction aBodyAction,
+                     ErrorResult& aRv);
  
    already_AddRefed<InternalRequest>
    ToInternalRequest(const OwningRequestOrUSVString& aIn, BodyAction aBodyAction,
@@ -271,7 +1809,7 @@ diff --git a/dom/cache/TypeUtils.h b/dom/cache/TypeUtils.h
    void
    ToCacheRequest(CacheRequest& aOut, InternalRequest* aIn,
                   BodyAction aBodyAction, SchemeAction aSchemeAction,
-+                 nsTArray<UniquePtr<mozilla::ipc::AutoIPCStreamChild>>& aStreamCleanupList,
++                 nsTArray<UniquePtr<mozilla::ipc::AutoIPCStream>>& aStreamCleanupList,
                   ErrorResult& aRv);
  
    void
@@ -281,7 +1819,7 @@ diff --git a/dom/cache/TypeUtils.h b/dom/cache/TypeUtils.h
    void
 -  ToCacheResponse(CacheResponse& aOut, Response& aIn, ErrorResult& aRv);
 +  ToCacheResponse(CacheResponse& aOut, Response& aIn,
-+                  nsTArray<UniquePtr<mozilla::ipc::AutoIPCStreamChild>>& aStreamCleanupList,
++                  nsTArray<UniquePtr<mozilla::ipc::AutoIPCStream>>& aStreamCleanupList,
 +                  ErrorResult& aRv);
  
    void
@@ -291,7 +1829,7 @@ diff --git a/dom/cache/TypeUtils.h b/dom/cache/TypeUtils.h
    ToResponse(const CacheResponse& aIn);
  
    already_AddRefed<InternalRequest>
-@@ -128,16 +132,17 @@ private:
+@@ -128,16 +133,17 @@ private:
    CheckAndSetBodyUsed(Request* aRequest, BodyAction aBodyAction,
                        ErrorResult& aRv);
  
@@ -300,7 +1838,7 @@ diff --git a/dom/cache/TypeUtils.h b/dom/cache/TypeUtils.h
  
    void
    SerializeCacheStream(nsIInputStream* aStream, CacheReadStreamOrVoid* aStreamOut,
-+                       nsTArray<UniquePtr<mozilla::ipc::AutoIPCStreamChild>>& aStreamCleanupList,
++                       nsTArray<UniquePtr<mozilla::ipc::AutoIPCStream>>& aStreamCleanupList,
                         ErrorResult& aRv);
  
    void
@@ -309,29 +1847,1175 @@ diff --git a/dom/cache/TypeUtils.h b/dom/cache/TypeUtils.h
  };
  
  } // namespace cache
+diff --git a/ipc/glue/InputStreamParamsWithFdsOrSendStream.ipdlh b/ipc/glue/IPCStream.ipdlh
+rename from ipc/glue/InputStreamParamsWithFdsOrSendStream.ipdlh
+rename to ipc/glue/IPCStream.ipdlh
+--- a/ipc/glue/InputStreamParamsWithFdsOrSendStream.ipdlh
++++ b/ipc/glue/IPCStream.ipdlh
+@@ -9,22 +9,22 @@ namespace mozilla {
+ namespace ipc {
+ 
+ struct InputStreamParamsWithFds
+ {
+   InputStreamParams stream;
+   OptionalFileDescriptorSet optionalFds;
+ };
+ 
+-union InputStreamParamsWithFdsOrSendStream
++union IPCStream
+ {
+   InputStreamParamsWithFds;
+   PSendStream;
+ };
+ 
+-union OptionalInputStreamParamsWithFdsOrSendStream
++union OptionalIPCStream
+ {
+-  InputStreamParamsWithFdsOrSendStream;
++  IPCStream;
+   void_t;
+ };
+ 
+ } // namespace ipc
+ } // namespace mozilla
+diff --git a/ipc/glue/IPCStreamUtils.cpp b/ipc/glue/IPCStreamUtils.cpp
+new file mode 100644
+--- /dev/null
++++ b/ipc/glue/IPCStreamUtils.cpp
+@@ -0,0 +1,457 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "IPCStreamUtils.h"
++
++#include "nsIIPCSerializableInputStream.h"
++
++#include "mozilla/Assertions.h"
++#include "mozilla/dom/PContentChild.h"
++#include "mozilla/dom/File.h"
++#include "mozilla/ipc/FileDescriptorSetChild.h"
++#include "mozilla/ipc/FileDescriptorSetParent.h"
++#include "mozilla/ipc/PBackgroundChild.h"
++#include "mozilla/ipc/SendStream.h"
++#include "nsIAsyncInputStream.h"
++
++namespace mozilla {
++namespace ipc {
++
++namespace {
++
++// These serialization and cleanup functions could be externally exposed.  For
++// now, though, keep them private to encourage use of the safer RAII
++// AutoIPCStream class.
++
++template<typename M>
++void
++SerializeInputStreamWithFdsChild(nsIInputStream* aStream,
++                                 IPCStream& aValue,
++                                 M* aManager)
++{
++  MOZ_ASSERT(aStream);
++  MOZ_ASSERT(aManager);
++
++  // First attempt simple stream serialization
++  nsCOMPtr<nsIIPCSerializableInputStream> serializable =
++    do_QueryInterface(aStream);
++  if (!serializable) {
++    MOZ_CRASH("Input stream is not serializable!");
++  }
++
++  aValue = InputStreamParamsWithFds();
++  InputStreamParamsWithFds& streamWithFds =
++    aValue.get_InputStreamParamsWithFds();
++
++  AutoTArray<FileDescriptor, 4> fds;
++  serializable->Serialize(streamWithFds.stream(), fds);
++
++  if (streamWithFds.stream().type() == InputStreamParams::T__None) {
++    MOZ_CRASH("Serialize failed!");
++  }
++
++  if (fds.IsEmpty()) {
++    streamWithFds.optionalFds() = void_t();
++  } else {
++    PFileDescriptorSetChild* fdSet =
++      aManager->SendPFileDescriptorSetConstructor(fds[0]);
++    for (uint32_t i = 1; i < fds.Length(); ++i) {
++      Unused << fdSet->SendAddFileDescriptor(fds[i]);
++    }
++
++    streamWithFds.optionalFds() = fdSet;
++  }
++}
++
++template<typename M>
++void
++SerializeInputStreamWithFdsParent(nsIInputStream* aStream,
++                                  IPCStream& aValue,
++                                  M* aManager)
++{
++  MOZ_ASSERT(aStream);
++  MOZ_ASSERT(aManager);
++
++  // First attempt simple stream serialization
++  nsCOMPtr<nsIIPCSerializableInputStream> serializable =
++    do_QueryInterface(aStream);
++  if (!serializable) {
++    MOZ_CRASH("Input stream is not serializable!");
++  }
++
++  aValue = InputStreamParamsWithFds();
++  InputStreamParamsWithFds& streamWithFds =
++    aValue.get_InputStreamParamsWithFds();
++
++  AutoTArray<FileDescriptor, 4> fds;
++  serializable->Serialize(streamWithFds.stream(), fds);
++
++  if (streamWithFds.stream().type() == InputStreamParams::T__None) {
++    MOZ_CRASH("Serialize failed!");
++  }
++
++  if (fds.IsEmpty()) {
++    streamWithFds.optionalFds() = void_t();
++  } else {
++    PFileDescriptorSetParent* fdSet =
++      aManager->SendPFileDescriptorSetConstructor(fds[0]);
++    for (uint32_t i = 1; i < fds.Length(); ++i) {
++      Unused << fdSet->SendAddFileDescriptor(fds[i]);
++    }
++
++    streamWithFds.optionalFds() = fdSet;
++  }
++}
++
++template<typename M>
++void
++SerializeInputStream(nsIInputStream* aStream, IPCStream& aValue, M* aManager)
++{
++  MOZ_ASSERT(aStream);
++  MOZ_ASSERT(aManager);
++
++  // First attempt simple stream serialization
++  nsCOMPtr<nsIIPCSerializableInputStream> serializable =
++    do_QueryInterface(aStream);
++  if (serializable) {
++    SerializeInputStreamWithFdsChild(aStream, aValue, aManager);
++    return;
++  }
++
++  // As a fallback, attempt to stream the data across using a SendStream
++  // actor.  This will fail for blocking streams.
++  nsCOMPtr<nsIAsyncInputStream> asyncStream = do_QueryInterface(aStream);
++  aValue = SendStreamChild::Create(asyncStream, aManager);
++
++  if (!aValue.get_PSendStreamChild()) {
++    MOZ_CRASH("SendStream creation failed!");
++  }
++}
++
++template<typename M>
++void
++SerializeInputStream(nsIInputStream* aStream, OptionalIPCStream& aValue,
++                     M* aManager)
++{
++  if (!aStream) {
++    aValue = void_t();
++    return;
++  }
++
++  aValue = IPCStream();
++  SerializeInputStream(aStream, aValue.get_IPCStream(),
++                             aManager);
++}
++
++void
++CleanupIPCStream(IPCStream& aValue, bool aConsumedByIPC)
++{
++  if (aValue.type() == IPCStream::T__None) {
++    return;
++  }
++
++  if (aValue.type() == IPCStream::TInputStreamParamsWithFds) {
++
++    InputStreamParamsWithFds& streamWithFds =
++      aValue.get_InputStreamParamsWithFds();
++
++    // Cleanup file descriptors if necessary
++    if (streamWithFds.optionalFds().type() ==
++        OptionalFileDescriptorSet::TPFileDescriptorSetChild) {
++
++      AutoTArray<FileDescriptor, 4> fds;
++
++      auto fdSetActor = static_cast<FileDescriptorSetChild*>(
++        streamWithFds.optionalFds().get_PFileDescriptorSetChild());
++      MOZ_ASSERT(fdSetActor);
++
++      if (!aConsumedByIPC) {
++        Unused << fdSetActor->Send__delete__(fdSetActor);
++      }
++
++      // FileDescriptorSet doesn't clear its fds in its ActorDestroy, so we
++      // unconditionally forget them here.  The fds themselves are auto-closed in
++      // ~FileDescriptor since they originated in this process.
++      fdSetActor->ForgetFileDescriptors(fds);
++
++    } else if (streamWithFds.optionalFds().type() ==
++               OptionalFileDescriptorSet::TPFileDescriptorSetParent) {
++
++      AutoTArray<FileDescriptor, 4> fds;
++
++      auto fdSetActor = static_cast<FileDescriptorSetParent*>(
++        streamWithFds.optionalFds().get_PFileDescriptorSetParent());
++      MOZ_ASSERT(fdSetActor);
++
++      if (!aConsumedByIPC) {
++        Unused << fdSetActor->Send__delete__(fdSetActor);
++      }
++
++      // FileDescriptorSet doesn't clear its fds in its ActorDestroy, so we
++      // unconditionally forget them here.  The fds themselves are auto-closed in
++      // ~FileDescriptor since they originated in this process.
++      fdSetActor->ForgetFileDescriptors(fds);
++    }
++
++    return;
++  }
++
++  MOZ_ASSERT(aValue.type() == IPCStream::TPSendStreamChild);
++
++  auto sendStream =
++    static_cast<SendStreamChild*>(aValue.get_PSendStreamChild());
++
++  if (!aConsumedByIPC) {
++    sendStream->StartDestroy();
++    return;
++  }
++
++  // If the SendStream was taken to be sent to the parent, then we need to
++  // start it before forgetting about it.
++  sendStream->Start();
++}
++
++void
++CleanupIPCStream(OptionalIPCStream& aValue, bool aConsumedByIPC)
++{
++  if (aValue.type() == OptionalIPCStream::Tvoid_t) {
++    return;
++  }
++
++  CleanupIPCStream(aValue.get_IPCStream(), aConsumedByIPC);
++}
++
++} // anonymous namespace
++
++already_AddRefed<nsIInputStream>
++DeserializeInputStream(const IPCStream& aValue)
++{
++  if (aValue.type() == IPCStream::TPSendStreamParent) {
++    auto sendStream =
++      static_cast<SendStreamParent*>(aValue.get_PSendStreamParent());
++    return sendStream->TakeReader();
++  }
++
++  // Note, we explicitly do not support deserializing the PSendStream actor on
++  // the child side.  It can only be send from child to parent.
++  MOZ_ASSERT(aValue.type() == IPCStream::TInputStreamParamsWithFds);
++
++  const InputStreamParamsWithFds& streamWithFds =
++    aValue.get_InputStreamParamsWithFds();
++
++  AutoTArray<FileDescriptor, 4> fds;
++  if (streamWithFds.optionalFds().type() ==
++      OptionalFileDescriptorSet::TPFileDescriptorSetParent) {
++
++    auto fdSetActor = static_cast<FileDescriptorSetParent*>(
++      streamWithFds.optionalFds().get_PFileDescriptorSetParent());
++    MOZ_ASSERT(fdSetActor);
++
++    fdSetActor->ForgetFileDescriptors(fds);
++    MOZ_ASSERT(!fds.IsEmpty());
++
++    if (!fdSetActor->Send__delete__(fdSetActor)) {
++      // child process is gone, warn and allow actor to clean up normally
++      NS_WARNING("Failed to delete fd set actor.");
++    }
++  } else if (streamWithFds.optionalFds().type() ==
++             OptionalFileDescriptorSet::TPFileDescriptorSetChild) {
++
++    auto fdSetActor = static_cast<FileDescriptorSetChild*>(
++      streamWithFds.optionalFds().get_PFileDescriptorSetChild());
++    MOZ_ASSERT(fdSetActor);
++
++    fdSetActor->ForgetFileDescriptors(fds);
++    MOZ_ASSERT(!fds.IsEmpty());
++
++    Unused << fdSetActor->Send__delete__(fdSetActor);
++  }
++
++  return DeserializeInputStream(streamWithFds.stream(), fds);
++}
++
++already_AddRefed<nsIInputStream>
++DeserializeInputStream(const OptionalIPCStream& aValue)
++{
++  if (aValue.type() == OptionalIPCStream::Tvoid_t) {
++    return nullptr;
++  }
++
++  return DeserializeInputStream(aValue.get_IPCStream());
++}
++
++namespace {
++
++void
++AssertValidValueToTake(const IPCStream& aVal)
++{
++  MOZ_ASSERT(aVal.type() == IPCStream::TPSendStreamChild ||
++             aVal.type() == IPCStream::TInputStreamParamsWithFds);
++}
++
++void
++AssertValidValueToTake(const OptionalIPCStream& aVal)
++{
++  MOZ_ASSERT(aVal.type() == OptionalIPCStream::Tvoid_t ||
++             aVal.type() == OptionalIPCStream::TIPCStream);
++  if (aVal.type() == OptionalIPCStream::TIPCStream) {
++    AssertValidValueToTake(aVal.get_IPCStream());
++  }
++}
++
++} // anonymous namespace
++
++AutoIPCStream::AutoIPCStream()
++  : mInlineValue(void_t())
++  , mValue(nullptr)
++  , mOptionalValue(&mInlineValue)
++  , mTaken(false)
++{
++}
++
++AutoIPCStream::AutoIPCStream(IPCStream& aTarget)
++  : mInlineValue(void_t())
++  , mValue(&aTarget)
++  , mOptionalValue(nullptr)
++  , mTaken(false)
++{
++}
++
++AutoIPCStream::AutoIPCStream(OptionalIPCStream& aTarget)
++  : mInlineValue(void_t())
++  , mValue(nullptr)
++  , mOptionalValue(&aTarget)
++  , mTaken(false)
++{
++  *mOptionalValue = void_t();
++}
++
++AutoIPCStream::~AutoIPCStream()
++{
++  MOZ_ASSERT(mValue || mOptionalValue);
++  if (mValue && IsSet()) {
++    CleanupIPCStream(*mValue, mTaken);
++  } else {
++    CleanupIPCStream(*mOptionalValue, mTaken);
++  }
++}
++
++void
++AutoIPCStream::Serialize(nsIInputStream* aStream, PContentChild* aManager)
++{
++  MOZ_ASSERT(aStream);
++  MOZ_ASSERT(aManager);
++  MOZ_ASSERT(mValue || mOptionalValue);
++  MOZ_ASSERT(!mTaken);
++  MOZ_ASSERT(!IsSet());
++
++  if (mValue) {
++    SerializeInputStream(aStream, *mValue, aManager);
++    AssertValidValueToTake(*mValue);
++  } else {
++    SerializeInputStream(aStream, *mOptionalValue, aManager);
++    AssertValidValueToTake(*mOptionalValue);
++  }
++}
++
++void
++AutoIPCStream::Serialize(nsIInputStream* aStream, PBackgroundChild* aManager)
++{
++  MOZ_ASSERT(aStream);
++  MOZ_ASSERT(aManager);
++  MOZ_ASSERT(mValue || mOptionalValue);
++  MOZ_ASSERT(!mTaken);
++  MOZ_ASSERT(!IsSet());
++
++  if (mValue) {
++    SerializeInputStream(aStream, *mValue, aManager);
++    AssertValidValueToTake(*mValue);
++  } else {
++    SerializeInputStream(aStream, *mOptionalValue, aManager);
++    AssertValidValueToTake(*mOptionalValue);
++  }
++}
++
++void
++AutoIPCStream::Serialize(nsIInputStream* aStream, dom::PContentParent* aManager)
++{
++  MOZ_ASSERT(aStream);
++  MOZ_ASSERT(aManager);
++  MOZ_ASSERT(mValue || mOptionalValue);
++  MOZ_ASSERT(!mTaken);
++  MOZ_ASSERT(!IsSet());
++
++  if (mValue) {
++    SerializeInputStreamWithFdsParent(aStream, *mValue, aManager);
++    AssertValidValueToTake(*mValue);
++  } else {
++    SerializeInputStreamWithFdsParent(aStream, *mOptionalValue, aManager);
++    AssertValidValueToTake(*mOptionalValue);
++  }
++}
++
++void
++AutoIPCStream::Serialize(nsIInputStream* aStream, PBackgroundParent* aManager)
++{
++  MOZ_ASSERT(aStream);
++  MOZ_ASSERT(aManager);
++  MOZ_ASSERT(mValue || mOptionalValue);
++  MOZ_ASSERT(!mTaken);
++  MOZ_ASSERT(!IsSet());
++
++  if (mValue) {
++    SerializeInputStreamWithFdsParent(aStream, *mValue, aManager);
++    AssertValidValueToTake(*mValue);
++  } else {
++    SerializeInputStreamWithFdsParent(aStream, *mOptionalValue, aManager);
++    AssertValidValueToTake(*mOptionalValue);
++  }
++}
++
++bool
++AutoIPCStream::IsSet() const
++{
++  MOZ_ASSERT(mValue || mOptionalValue);
++  if (mValue) {
++    return mValue->type() != IPCStream::T__None;
++  } else {
++    return mOptionalValue->type() != OptionalIPCStream::Tvoid_t &&
++           mOptionalValue->get_IPCStream().type() != IPCStream::T__None;
++  }
++}
++
++IPCStream&
++AutoIPCStream::TakeValue()
++{
++  MOZ_ASSERT(mValue || mOptionalValue);
++  MOZ_ASSERT(!mTaken);
++  MOZ_ASSERT(IsSet());
++
++  mTaken = true;
++
++  if (mValue) {
++    AssertValidValueToTake(*mValue);
++    return *mValue;
++  }
++
++  IPCStream& value =
++    mOptionalValue->get_IPCStream();
++
++  AssertValidValueToTake(value);
++  return value;
++}
++
++OptionalIPCStream&
++AutoIPCStream::TakeOptionalValue()
++{
++  MOZ_ASSERT(!mTaken);
++  MOZ_ASSERT(!mValue);
++  MOZ_ASSERT(mOptionalValue);
++  mTaken = true;
++  AssertValidValueToTake(*mOptionalValue);
++  return *mOptionalValue;
++}
++
++} // namespace ipc
++} // namespace mozilla
+diff --git a/ipc/glue/IPCStreamUtils.h b/ipc/glue/IPCStreamUtils.h
+new file mode 100644
+--- /dev/null
++++ b/ipc/glue/IPCStreamUtils.h
+@@ -0,0 +1,129 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_ipc_IPCStreamUtils_h
++#define mozilla_ipc_IPCStreamUtils_h
++
++#include "mozilla/ipc/IPCStream.h"
++#include "nsIInputStream.h"
++
++namespace mozilla {
++
++namespace dom {
++class PContentChild;
++class PContentParent;
++}
++
++namespace ipc {
++
++class PBackgroundChild;
++class PBackgroundParent;
++
++already_AddRefed<nsIInputStream>
++DeserializeInputStream(const IPCStream& aValue);
++
++already_AddRefed<nsIInputStream>
++DeserializeInputStream(const OptionalIPCStream& aValue);
++
++// RAII helper class that serializes an nsIInputStream into an
++// IPCStream IPC struct.  Any SendStreamChild actors
++// are automatically managed correctly.
++//
++// Use the TakeValue() method when passing the value (or just after passing the
++// value) to the IPC Send*() method.
++//
++// For example:
++//
++//  AutoIPCStream stream();
++//  stream.SerializeOrSend(inputStream, actor->Manager());
++//  actor->SendData(stream.TakeValue());
++//
++// If you need to manage an IPCStream struct embedded in
++// another type, you can create the AutoIPCStream around the existing
++// struct like this:
++//
++//  MyIPCStruct data;
++//  AutoIPCStream stream(data.myStream());
++//  stream.SerializeOrSend(inputStream, actor->Manager());
++//  actor->SendData(data);
++//  stream.TakeValue();
++//
++// The AutoIPCStream class also supports OptionalIPCStream
++// values.  As long as you did not initialize the object with a non-optional
++// IPCStream, you can call TakeOptionalValue() instead.
++//
++// Like SerializeInputStream(), the AutoIPCStream will crash if
++// serialization cannot be completed.  Currently, this should only
++// occur if the nsIInputStream cannot be serialized and is also blocking.
++//
++// NOTE: This is not a MOZ_STACK_CLASS so that it can be more easily integrated
++//       with complex ipdl structures.  For example, you may want to create an
++//       array of RAII AutoIPCStream objects or build your own wrapping
++//       RAII object to handle other actors that need to be cleaned up.
++class AutoIPCStream final
++{
++  OptionalIPCStream mInlineValue;
++  IPCStream* mValue;
++  OptionalIPCStream* mOptionalValue;
++  bool mTaken;
++
++  bool
++  IsSet() const;
++
++public:
++  // Implicitly create an OptionalIPCStream value.  Either
++  // TakeValue() or TakeOptionalValue() can be used.
++  AutoIPCStream();
++
++  // Wrap an existing IPCStream.  Only TakeValue() may be
++  // used.  If a nullptr nsIInputStream is passed to SerializeOrSend() then
++  // a crash will be forced.
++  explicit AutoIPCStream(IPCStream& aTarget);
++
++  // Wrap an existing OptionalIPCStream.  Either TakeValue()
++  // or TakeOptionalValue can be used.
++  explicit AutoIPCStream(OptionalIPCStream& aTarget);
++
++  ~AutoIPCStream();
++
++  // Serialize the input stream or create a SendStream actor using the PContent
++  // manager.  If neither of these succeed, then crash.  This should only be
++  // used on the main thread.
++  void
++  Serialize(nsIInputStream* aStream, dom::PContentChild* aManager);
++
++  // Serialize the input stream or create a SendStream actor using the
++  // PBackground manager.  If neither of these succeed, then crash.  This can
++  // be called on the main thread or Worker threads.
++  void
++  Serialize(nsIInputStream* aStream, PBackgroundChild* aManager);
++
++  // Serialize the input stream.  A PSendStream cannot be used when going
++  // from parent-to-child.
++  void
++  Serialize(nsIInputStream* aStream, dom::PContentParent* aManager);
++
++  // Serialize the input stream.  A PSendStream cannot be used when going
++  // from parent-to-child.
++  void
++  Serialize(nsIInputStream* aStream, PBackgroundParent* aManager);
++
++  // Get the IPCStream as a non-optional value.  This will
++  // assert if a stream has not been serialized or if it has already been taken.
++  // This should only be called if the value is being, or has already been, sent
++  // to the parent
++  IPCStream&
++  TakeValue();
++
++  // Get the OptionalIPCStream value.  This will assert if
++  // the value has already been taken.  This should only be called if the value
++  // is being, or has already been, sent to the parent
++  OptionalIPCStream&
++  TakeOptionalValue();
++};
++
++} // namespace ipc
++} // namespace mozilla
++
++#endif // mozilla_ipc_IPCStreamUtils_h
+diff --git a/ipc/glue/InputStreamUtils.cpp b/ipc/glue/InputStreamUtils.cpp
+--- a/ipc/glue/InputStreamUtils.cpp
++++ b/ipc/glue/InputStreamUtils.cpp
+@@ -2,24 +2,19 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "InputStreamUtils.h"
+ 
+ #include "nsIIPCSerializableInputStream.h"
+ 
+ #include "mozilla/Assertions.h"
+-#include "mozilla/dom/PContentChild.h"
+ #include "mozilla/dom/File.h"
+ #include "mozilla/dom/ipc/BlobChild.h"
+ #include "mozilla/dom/ipc/BlobParent.h"
+-#include "mozilla/ipc/FileDescriptorSetChild.h"
+-#include "mozilla/ipc/FileDescriptorSetParent.h"
+-#include "mozilla/ipc/PBackgroundChild.h"
+-#include "mozilla/ipc/SendStream.h"
+ #include "nsComponentManagerUtils.h"
+ #include "nsDebug.h"
+ #include "nsID.h"
+ #include "nsIXULRuntime.h"
+ #include "nsMIMEInputStream.h"
+ #include "nsMultiplexInputStream.h"
+ #include "nsNetCID.h"
+ #include "nsStringStream.h"
+@@ -182,321 +177,10 @@ DeserializeInputStream(const OptionalInp
+ 
+     default:
+       MOZ_ASSERT(false, "Unknown params!");
+   }
+ 
+   return stream.forget();
+ }
+ 
+-namespace {
+-
+-// The SerializeOrSendInputStream() and CleanupSendInputStreamParamsWithFdsOrSendStream
+-// functions could be externally exposed.  For now, though, keep them private
+-// to encourage use of the safer RAII AutoIPCStreamChild class.
+-
+-template<typename M>
+-void
+-SerializeOrSendInputStream(nsIInputStream* aStream,
+-                           InputStreamParamsWithFdsOrSendStream& aValue,
+-                           M* aManager)
+-{
+-  MOZ_ASSERT(aStream);
+-  MOZ_ASSERT(aManager);
+-
+-  // First attempt simple stream serialization
+-  nsCOMPtr<nsIIPCSerializableInputStream> serializable =
+-    do_QueryInterface(aStream);
+-  if (serializable) {
+-    InputStreamParams params;
+-    AutoTArray<FileDescriptor, 4> fds;
+-
+-    serializable->Serialize(params, fds);
+-
+-    if (params.type() == InputStreamParams::T__None) {
+-      MOZ_CRASH("Serialize failed!");
+-    }
+-
+-    InputStreamParamsWithFds streamWithFds(params, void_t());
+-
+-    if (!fds.IsEmpty()) {
+-      PFileDescriptorSetChild* fdSet =
+-        aManager->SendPFileDescriptorSetConstructor(fds[0]);
+-      for (uint32_t i = 1; i < fds.Length(); ++i) {
+-        Unused << fdSet->SendAddFileDescriptor(fds[i]);
+-      }
+-
+-      streamWithFds.optionalFds() = fdSet;
+-    }
+-
+-    aValue = streamWithFds;
+-
+-    return;
+-  }
+-
+-  // As a fallback, attempt to stream the data across using a SendStream
+-  // actor.  This will fail for blocking streams.
+-  nsCOMPtr<nsIAsyncInputStream> asyncStream = do_QueryInterface(aStream);
+-  aValue = SendStreamChild::Create(asyncStream, aManager);
+-
+-  if (!aValue.get_PSendStreamChild()) {
+-    MOZ_CRASH("SendStream creation failed!");
+-  }
+-}
+-
+-template<typename M>
+-void
+-SerializeOrSendInputStream(nsIInputStream* aStream,
+-                           OptionalInputStreamParamsWithFdsOrSendStream& aValue,
+-                           M* aManager)
+-{
+-  if (!aStream) {
+-    aValue = void_t();
+-    return;
+-  }
+-
+-  aValue = InputStreamParamsWithFdsOrSendStream();
+-  SerializeOrSendInputStream(aStream, aValue.get_InputStreamParamsWithFdsOrSendStream(),
+-                             aManager);
+-}
+-
+-void
+-CleanupInputStreamParamsWithFdsOrSendStream(InputStreamParamsWithFdsOrSendStream& aValue,
+-                                            bool aConsumedByIPC)
+-{
+-  if (aValue.type() == InputStreamParamsWithFdsOrSendStream::TInputStreamParamsWithFds) {
+-
+-    InputStreamParamsWithFds& streamWithFds =
+-      aValue.get_InputStreamParamsWithFds();
+-
+-    // Cleanup file descriptors if necessary
+-    if (streamWithFds.optionalFds().type() ==
+-        OptionalFileDescriptorSet::TPFileDescriptorSetChild) {
+-
+-      AutoTArray<FileDescriptor, 4> fds;
+-
+-      FileDescriptorSetChild* fdSetActor = static_cast<FileDescriptorSetChild*>(
+-        streamWithFds.optionalFds().get_PFileDescriptorSetChild());
+-      MOZ_ASSERT(fdSetActor);
+-
+-      if (!aConsumedByIPC) {
+-        Unused << fdSetActor->Send__delete__(fdSetActor);
+-      }
+-
+-      // FileDescriptorSet doesn't clear its fds in its ActorDestroy, so we
+-      // unconditionally forget them here.  The fds themselves are auto-closed in
+-      // ~FileDescriptor since they originated in this process.
+-      fdSetActor->ForgetFileDescriptors(fds);
+-    }
+-
+-    return;
+-  }
+-
+-  MOZ_ASSERT(aValue.type() == InputStreamParamsWithFdsOrSendStream::TPSendStreamChild);
+-
+-  auto sendStream =
+-    static_cast<SendStreamChild*>(aValue.get_PSendStreamChild());
+-
+-  if (!aConsumedByIPC) {
+-    sendStream->StartDestroy();
+-    return;
+-  }
+-
+-  // If the SendStream was taken to be sent to the parent, then we need to
+-  // start it before forgetting about it.
+-  sendStream->Start();
+-}
+-
+-void
+-CleanupInputStreamParamsWithFdsOrSendStream(OptionalInputStreamParamsWithFdsOrSendStream& aValue,
+-                                            bool aConsumedByIPC)
+-{
+-  if (aValue.type() == OptionalInputStreamParamsWithFdsOrSendStream::Tvoid_t) {
+-    return;
+-  }
+-
+-  CleanupInputStreamParamsWithFdsOrSendStream(aValue.get_InputStreamParamsWithFdsOrSendStream(),
+-                                       aConsumedByIPC);
+-}
+-
+-} // anonymous namespace
+-
+-already_AddRefed<nsIInputStream>
+-DeserializeInputStream(const InputStreamParamsWithFdsOrSendStream& aValue)
+-{
+-  if (aValue.type() == InputStreamParamsWithFdsOrSendStream::TPSendStreamParent) {
+-    auto sendStream =
+-      static_cast<SendStreamParent*>(aValue.get_PSendStreamParent());
+-    return sendStream->TakeReader();
+-  }
+-
+-  MOZ_ASSERT(aValue.type() ==
+-             InputStreamParamsWithFdsOrSendStream::TInputStreamParamsWithFds);
+-
+-  const InputStreamParamsWithFds& streamWithFds =
+-    aValue.get_InputStreamParamsWithFds();
+-
+-  AutoTArray<FileDescriptor, 4> fds;
+-  if (streamWithFds.optionalFds().type() ==
+-      OptionalFileDescriptorSet::TPFileDescriptorSetParent) {
+-
+-    FileDescriptorSetParent* fdSetActor = static_cast<FileDescriptorSetParent*>(
+-      streamWithFds.optionalFds().get_PFileDescriptorSetParent());
+-    MOZ_ASSERT(fdSetActor);
+-
+-    fdSetActor->ForgetFileDescriptors(fds);
+-    MOZ_ASSERT(!fds.IsEmpty());
+-
+-    if (!fdSetActor->Send__delete__(fdSetActor)) {
+-      // child process is gone, warn and allow actor to clean up normally
+-      NS_WARNING("Failed to delete fd set actor.");
+-    }
+-  }
+-
+-  return DeserializeInputStream(streamWithFds.stream(), fds);
+-}
+-
+-already_AddRefed<nsIInputStream>
+-DeserializeInputStream(const OptionalInputStreamParamsWithFdsOrSendStream& aValue)
+-{
+-  if (aValue.type() == OptionalInputStreamParamsWithFdsOrSendStream::Tvoid_t) {
+-    return nullptr;
+-  }
+-
+-  return DeserializeInputStream(aValue.get_InputStreamParamsWithFdsOrSendStream());
+-}
+-
+-AutoIPCStreamChild::AutoIPCStreamChild()
+-  : mInlineValue(void_t())
+-  , mValue(nullptr)
+-  , mOptionalValue(&mInlineValue)
+-  , mTaken(false)
+-{
+-}
+-
+-AutoIPCStreamChild::AutoIPCStreamChild(InputStreamParamsWithFdsOrSendStream& aTarget)
+-  : mInlineValue(void_t())
+-  , mValue(&aTarget)
+-  , mOptionalValue(nullptr)
+-  , mTaken(false)
+-{
+-}
+-
+-AutoIPCStreamChild::AutoIPCStreamChild(OptionalInputStreamParamsWithFdsOrSendStream& aTarget)
+-  : mInlineValue(void_t())
+-  , mValue(nullptr)
+-  , mOptionalValue(&aTarget)
+-  , mTaken(false)
+-{
+-  *mOptionalValue = void_t();
+-}
+-
+-AutoIPCStreamChild::~AutoIPCStreamChild()
+-{
+-  MOZ_ASSERT(mValue || mOptionalValue);
+-  if (mValue && IsSet()) {
+-    CleanupInputStreamParamsWithFdsOrSendStream(*mValue, mTaken);
+-  } else {
+-    CleanupInputStreamParamsWithFdsOrSendStream(*mOptionalValue, mTaken);
+-  }
+-}
+-
+-void
+-AutoIPCStreamChild::SerializeOrSend(nsIInputStream* aStream,
+-                                    PContentChild* aManager)
+-{
+-  MOZ_ASSERT(aStream);
+-  MOZ_ASSERT(aManager);
+-  MOZ_ASSERT(mValue || mOptionalValue);
+-  MOZ_ASSERT(!mTaken);
+-  MOZ_ASSERT(!IsSet());
+-
+-  if (mValue) {
+-    SerializeOrSendInputStream(aStream, *mValue, aManager);
+-  } else {
+-    SerializeOrSendInputStream(aStream, *mOptionalValue, aManager);
+-  }
+-}
+-
+-void
+-AutoIPCStreamChild::SerializeOrSend(nsIInputStream* aStream,
+-                                    PBackgroundChild* aManager)
+-{
+-  MOZ_ASSERT(aStream);
+-  MOZ_ASSERT(aManager);
+-  MOZ_ASSERT(mValue || mOptionalValue);
+-  MOZ_ASSERT(!mTaken);
+-  MOZ_ASSERT(!IsSet());
+-
+-  if (mValue) {
+-    SerializeOrSendInputStream(aStream, *mValue, aManager);
+-  } else {
+-    SerializeOrSendInputStream(aStream, *mOptionalValue, aManager);
+-  }
+-}
+-
+-bool
+-AutoIPCStreamChild::IsSet() const
+-{
+-  MOZ_ASSERT(mValue || mOptionalValue);
+-  if (mValue) {
+-    return mValue->type() != InputStreamParamsWithFdsOrSendStream::T__None;
+-  } else {
+-    return mOptionalValue->type() !=
+-           OptionalInputStreamParamsWithFdsOrSendStream::Tvoid_t;
+-  }
+-}
+-
+-namespace {
+-
+-void
+-AssertValidValueToTake(const InputStreamParamsWithFdsOrSendStream& aVal)
+-{
+-  MOZ_ASSERT(aVal.type() == InputStreamParamsWithFdsOrSendStream::TPSendStreamChild ||
+-             aVal.type() == InputStreamParamsWithFdsOrSendStream::TInputStreamParamsWithFds);
+-}
+-
+-void
+-AssertValidValueToTake(const OptionalInputStreamParamsWithFdsOrSendStream& aVal)
+-{
+-  MOZ_ASSERT(aVal.type() == OptionalInputStreamParamsWithFdsOrSendStream::Tvoid_t ||
+-             aVal.type() == OptionalInputStreamParamsWithFdsOrSendStream::TInputStreamParamsWithFdsOrSendStream);
+-  if (aVal.type() == OptionalInputStreamParamsWithFdsOrSendStream::TInputStreamParamsWithFdsOrSendStream) {
+-    AssertValidValueToTake(aVal.get_InputStreamParamsWithFdsOrSendStream());
+-  }
+-}
+-
+-} // anonymous namespace
+-
+-InputStreamParamsWithFdsOrSendStream&
+-AutoIPCStreamChild::TakeValue()
+-{
+-  MOZ_ASSERT(mValue || mOptionalValue);
+-  MOZ_ASSERT(!mTaken);
+-  MOZ_ASSERT(IsSet());
+-
+-  mTaken = true;
+-
+-  if (mValue) {
+-    AssertValidValueToTake(*mValue);
+-    return *mValue;
+-  }
+-
+-  InputStreamParamsWithFdsOrSendStream& value =
+-    mOptionalValue->get_InputStreamParamsWithFdsOrSendStream();
+-
+-  AssertValidValueToTake(value);
+-  return value;
+-}
+-
+-OptionalInputStreamParamsWithFdsOrSendStream&
+-AutoIPCStreamChild::TakeOptionalValue()
+-{
+-  MOZ_ASSERT(!mTaken);
+-  MOZ_ASSERT(!mValue);
+-  MOZ_ASSERT(mOptionalValue);
+-  mTaken = true;
+-  AssertValidValueToTake(*mOptionalValue);
+-  return *mOptionalValue;
+-}
+-
+ } // namespace ipc
+ } // namespace mozilla
 diff --git a/ipc/glue/InputStreamUtils.h b/ipc/glue/InputStreamUtils.h
 --- a/ipc/glue/InputStreamUtils.h
 +++ b/ipc/glue/InputStreamUtils.h
-@@ -72,17 +72,21 @@ DeserializeInputStream(const OptionalInp
- // The AutoIPCStreamChild class also supports OptionalInputStreamParamsWithFdsOrSendStream
- // values.  As long as you did not initialize the object with a non-optional
- // InputStreamParamsWithFdsOrSendStream, you can call TakeOptionalValue() instead.
- //
- // Like SerializeInputStream(), the AutoIPCStreamChild will crash if
- // serialization cannot be completed.  Currently, this should only
- // occur if the nsIInputStream cannot be serialized and is also blocking.
- //
--class MOZ_STACK_CLASS AutoIPCStreamChild final
-+// NOTE: This is not a MOZ_STACK_CLASS so that it can be more easily integrated
-+//       with complex ipdl structures.  For example, you may want to create an
-+//       array of RAII AutoIPCStreamChild objects or build your own wrapping
-+//       RAII object to handle other actors that need to be cleaned up.
-+class AutoIPCStreamChild final
- {
-   OptionalInputStreamParamsWithFdsOrSendStream mInlineValue;
-   InputStreamParamsWithFdsOrSendStream* mValue;
-   OptionalInputStreamParamsWithFdsOrSendStream* mOptionalValue;
-   bool mTaken;
+@@ -1,31 +1,24 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
  
-   bool
-   IsSet() const;
+ #ifndef mozilla_ipc_InputStreamUtils_h
+ #define mozilla_ipc_InputStreamUtils_h
+ 
+ #include "mozilla/ipc/InputStreamParams.h"
+-#include "mozilla/ipc/InputStreamParamsWithFdsOrSendStream.h"
+ #include "nsCOMPtr.h"
+ #include "nsIInputStream.h"
+ #include "nsTArray.h"
+ 
+ namespace mozilla {
+-
+-namespace dom {
+-class PContentChild;
+-}
+-
+ namespace ipc {
+ 
+ class FileDescriptor;
+-class PBackgroundChild;
+ 
+ void
+ SerializeInputStream(nsIInputStream* aInputStream,
+                      InputStreamParams& aParams,
+                      nsTArray<FileDescriptor>& aFileDescriptors);
+ 
+ void
+ SerializeInputStream(nsIInputStream* aInputStream,
+@@ -35,101 +28,12 @@ SerializeInputStream(nsIInputStream* aIn
+ already_AddRefed<nsIInputStream>
+ DeserializeInputStream(const InputStreamParams& aParams,
+                        const nsTArray<FileDescriptor>& aFileDescriptors);
+ 
+ already_AddRefed<nsIInputStream>
+ DeserializeInputStream(const OptionalInputStreamParams& aParams,
+                        const nsTArray<FileDescriptor>& aFileDescriptors);
+ 
+-already_AddRefed<nsIInputStream>
+-DeserializeInputStream(const InputStreamParamsWithFdsOrSendStream& aValue);
+-
+-already_AddRefed<nsIInputStream>
+-DeserializeInputStream(const OptionalInputStreamParamsWithFdsOrSendStream& aValue);
+-
+-// RAII helper class that serializes an nsIInputStream into an
+-// InputStreamParamsWithFdsOrSendStream IPC struct.  Any SendStreamChild actors
+-// are automatically managed correctly.
+-//
+-// Use the TakeValue() method when passing the value (or just after passing the
+-// value) to the IPC Send*() method.
+-//
+-// For example:
+-//
+-//  AutoIPCStreamChild streamChild();
+-//  streamChild.SerializeOrSend(inputStream, actor->Manager());
+-//  actor->SendData(streamChild.TakeValue());
+-//
+-// If you need to manage an InputStreamParamsWithFdsOrSendStream struct embedded in
+-// another type, you can create the AutoIPCStreamChild around the existing
+-// struct like this:
+-//
+-//  MyIPCStruct data;
+-//  AutoIpcStreamChild streamChild(data.myStream());
+-//  streamChild.SerializeOrSend(inputStream, actor->Manager());
+-//  actor->SendData(data);
+-//  streamChild.TakeValue();
+-//
+-// The AutoIPCStreamChild class also supports OptionalInputStreamParamsWithFdsOrSendStream
+-// values.  As long as you did not initialize the object with a non-optional
+-// InputStreamParamsWithFdsOrSendStream, you can call TakeOptionalValue() instead.
+-//
+-// Like SerializeInputStream(), the AutoIPCStreamChild will crash if
+-// serialization cannot be completed.  Currently, this should only
+-// occur if the nsIInputStream cannot be serialized and is also blocking.
+-//
+-class MOZ_STACK_CLASS AutoIPCStreamChild final
+-{
+-  OptionalInputStreamParamsWithFdsOrSendStream mInlineValue;
+-  InputStreamParamsWithFdsOrSendStream* mValue;
+-  OptionalInputStreamParamsWithFdsOrSendStream* mOptionalValue;
+-  bool mTaken;
+-
+-  bool
+-  IsSet() const;
+-
+-public:
+-  // Implicitly create an OptionalInputStreamParamsWithFdsOrSendStream value.  Either
+-  // TakeValue() or TakeOptionalValue() can be used.
+-  AutoIPCStreamChild();
+-
+-  // Wrap an existing InputStreamParamsWithFdsOrSendStream.  Only TakeValue() may be
+-  // used.  If a nullptr nsIInputStream is passed to SerializeOrSend() then
+-  // a crash will be forced.
+-  explicit AutoIPCStreamChild(InputStreamParamsWithFdsOrSendStream& aTarget);
+-
+-  // Wrap an existing OptionalInputStreamParamsWithFdsOrSendStream.  Either TakeValue()
+-  // or TakeOptionalValue can be used.
+-  explicit AutoIPCStreamChild(OptionalInputStreamParamsWithFdsOrSendStream& aTarget);
+-
+-  ~AutoIPCStreamChild();
+-
+-  // Serialize the input stream or create a SendStream actor using the PContent
+-  // manager.  If neither of these succeed, then crash.  This should only be
+-  // used on the main thread.
+-  void
+-  SerializeOrSend(nsIInputStream* aStream, dom::PContentChild* aManager);
+-
+-  // Serialize the input stream or create a SendStream actor using the
+-  // PBackground manager.  If neither of these succeed, then crash.  This can
+-  // be called on the main thread or Worker threads.
+-  void
+-  SerializeOrSend(nsIInputStream* aStream, PBackgroundChild* aManager);
+-
+-  // Get the InputStreamParamsWithFdsOrSendStream as a non-optional value.  This will
+-  // assert if a stream has not been serialized or if it has already been taken.
+-  // This should only be called if the value is being, or has already been, sent
+-  // to the parent
+-  InputStreamParamsWithFdsOrSendStream&
+-  TakeValue();
+-
+-  // Get the OptionalInputStreamParamsWithFdsOrSendStream value.  This will assert if
+-  // the value has already been taken.  This should only be called if the value
+-  // is being, or has already been, sent to the parent
+-  OptionalInputStreamParamsWithFdsOrSendStream&
+-  TakeOptionalValue();
+-};
+-
+ } // namespace ipc
+ } // namespace mozilla
+ 
+ #endif // mozilla_ipc_InputStreamUtils_h
+diff --git a/ipc/glue/moz.build b/ipc/glue/moz.build
+--- a/ipc/glue/moz.build
++++ b/ipc/glue/moz.build
+@@ -18,16 +18,17 @@ EXPORTS.mozilla.ipc += [
+     'CrossProcessMutex.h',
+     'FileDescriptor.h',
+     'FileDescriptorSetChild.h',
+     'FileDescriptorSetParent.h',
+     'FileDescriptorUtils.h',
+     'GeckoChildProcessHost.h',
+     'InputStreamUtils.h',
+     'IOThreadChild.h',
++    'IPCStreamUtils.h',
+     'MessageChannel.h',
+     'MessageLink.h',
+     'Neutering.h',
+     'ProcessChild.h',
+     'ProtocolUtils.h',
+     'ScopedXREEmbed.h',
+     'SendStream.h',
+     'SendStreamAlloc.h',
+@@ -112,16 +113,17 @@ EXPORTS.ipc += [
+ UNIFIED_SOURCES += [
+     'BackgroundImpl.cpp',
+     'BackgroundUtils.cpp',
+     'BrowserProcessSubThread.cpp',
+     'FileDescriptor.cpp',
+     'FileDescriptorUtils.cpp',
+     'InputStreamUtils.cpp',
+     'IPCMessageUtils.cpp',
++    'IPCStreamUtils.cpp',
+     'MessageChannel.cpp',
+     'MessageLink.cpp',
+     'MessagePump.cpp',
+     'ProcessChild.cpp',
+     'ProtocolUtils.cpp',
+     'ScopedXREEmbed.cpp',
+     'SendStreamChild.cpp',
+     'SendStreamParent.cpp',
+@@ -153,17 +155,17 @@ LOCAL_INCLUDES += [
+     '/dom/indexedDB',
+     '/dom/workers',
+     '/media/webrtc/trunk',
+     '/xpcom/build',
+ ]
+ 
+ IPDL_SOURCES = [
+     'InputStreamParams.ipdlh',
+-    'InputStreamParamsWithFdsOrSendStream.ipdlh',
++    'IPCStream.ipdlh',
+     'PBackground.ipdl',
+     'PBackgroundSharedTypes.ipdlh',
+     'PBackgroundTest.ipdl',
+     'PFileDescriptorSet.ipdl',
+     'PProcLoader.ipdl',
+     'ProtocolTypes.ipdlh',
+     'PSendStream.ipdl',
+     'URIParams.ipdlh',
