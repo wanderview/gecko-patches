@@ -1,0 +1,154 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  0a3b6e2df6567d845f31c000c68dd67816c6153d
+Bug 1278253 Hold service worker alive until event dispatching code is notified. r=asuth
+
+diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPrivate.cpp
+--- a/dom/workers/ServiceWorkerPrivate.cpp
++++ b/dom/workers/ServiceWorkerPrivate.cpp
+@@ -390,48 +390,56 @@ public:
+     AssertIsOnMainThread();
+     MOZ_ASSERT(aWorkerPrivate);
+     MOZ_ASSERT(aKeepAliveToken);
+ 
+     mKeepAliveToken =
+       new nsMainThreadPtrHolder<KeepAliveToken>(aKeepAliveToken);
+   }
+ 
+-  void
++  bool
+   DispatchExtendableEventOnWorkerScope(JSContext* aCx,
+                                        WorkerGlobalScope* aWorkerScope,
+                                        ExtendableEvent* aEvent,
+-                                       Promise** aWaitUntilPromise)
++                                       PromiseNativeHandler* aPromiseHandler)
+   {
+     MOZ_ASSERT(aWorkerScope);
+     MOZ_ASSERT(aEvent);
+     nsCOMPtr<nsIGlobalObject> sgo = aWorkerScope;
+     WidgetEvent* internalEvent = aEvent->WidgetEventPtr();
+ 
+     ErrorResult result;
+     result = aWorkerScope->DispatchDOMEvent(nullptr, aEvent, nullptr, nullptr);
+     if (NS_WARN_IF(result.Failed()) || internalEvent->mFlags.mExceptionWasRaised) {
+       result.SuppressException();
+-      return;
++      return false;
+     }
+ 
+     RefPtr<Promise> waitUntilPromise = aEvent->GetPromise();
+     if (!waitUntilPromise) {
+       waitUntilPromise =
+         Promise::Resolve(sgo, aCx, JS::UndefinedHandleValue, result);
+       MOZ_RELEASE_ASSERT(!result.Failed());
+     }
+ 
+     MOZ_ASSERT(waitUntilPromise);
++
++    // Make sure to append the caller's promise handler before attaching
++    // our keep alive handler.  This can avoid terminating the worker
++    // before a success result is delivered to the caller in cases where
++    // the idle timeout has been set to zero.  This low timeout value is
++    // sometimes set in tests.
++    if (aPromiseHandler) {
++      waitUntilPromise->AppendNativeHandler(aPromiseHandler);
++    }
++
+     KeepAliveHandler::CreateAndAttachToPromise(mKeepAliveToken,
+                                                waitUntilPromise);
+ 
+-    if (aWaitUntilPromise) {
+-      waitUntilPromise.forget(aWaitUntilPromise);
+-    }
++    return true;
+   }
+ };
+ 
+ // Handle functional event
+ // 9.9.7 If the time difference in seconds calculated by the current time minus
+ // registration's last update check time is greater than 86400, invoke Soft Update
+ // algorithm.
+ class ExtendableFunctionalEventWorkerRunnable : public ExtendableEventWorkerRunnable
+@@ -649,22 +657,18 @@ LifecycleEventWorkerRunnable::DispatchLi
+   // is still executing. This can happen with infinite loops, for example.
+   RefPtr<LifeCycleEventWatcher> watcher =
+     new LifeCycleEventWatcher(aWorkerPrivate, mCallback);
+ 
+   if (!watcher->Init()) {
+     return true;
+   }
+ 
+-  RefPtr<Promise> waitUntil;
+-  DispatchExtendableEventOnWorkerScope(aCx, aWorkerPrivate->GlobalScope(),
+-                                       event, getter_AddRefs(waitUntil));
+-  if (waitUntil) {
+-    waitUntil->AppendNativeHandler(watcher);
+-  } else {
++  if (!DispatchExtendableEventOnWorkerScope(aCx, aWorkerPrivate->GlobalScope(),
++                                       event, watcher)) {
+     watcher->ReportResult(false);
+   }
+ 
+   return true;
+ }
+ 
+ } // anonymous namespace
+ 
+@@ -801,22 +805,18 @@ public:
+       PushEvent::Constructor(globalObj, NS_LITERAL_STRING("push"), pei, result);
+     if (NS_WARN_IF(result.Failed())) {
+       result.SuppressException();
+       errorReporter->Report();
+       return false;
+     }
+     event->SetTrusted(true);
+ 
+-    RefPtr<Promise> waitUntil;
+-    DispatchExtendableEventOnWorkerScope(aCx, aWorkerPrivate->GlobalScope(),
+-                                         event, getter_AddRefs(waitUntil));
+-    if (waitUntil) {
+-      waitUntil->AppendNativeHandler(errorReporter);
+-    } else {
++    if (!DispatchExtendableEventOnWorkerScope(aCx, aWorkerPrivate->GlobalScope(),
++                                              event, errorReporter)) {
+       errorReporter->Report(nsIPushErrorReporter::DELIVERY_UNCAUGHT_EXCEPTION);
+     }
+ 
+     return true;
+   }
+ };
+ 
+ class SendPushSubscriptionChangeEventRunnable final : public ExtendableEventWorkerRunnable
+@@ -1149,26 +1149,24 @@ public:
+     RefPtr<NotificationEvent> event =
+       NotificationEvent::Constructor(target, mEventName,
+                                      nei, result);
+     if (NS_WARN_IF(result.Failed())) {
+       return false;
+     }
+ 
+     event->SetTrusted(true);
+-    RefPtr<Promise> waitUntil;
+     aWorkerPrivate->GlobalScope()->AllowWindowInteraction();
+-    DispatchExtendableEventOnWorkerScope(aCx, aWorkerPrivate->GlobalScope(),
+-                                         event, getter_AddRefs(waitUntil));
+-      aWorkerPrivate->GlobalScope()->ConsumeWindowInteraction();
+-    if (waitUntil) {
+-      RefPtr<AllowWindowInteractionHandler> allowWindowInteraction =
+-        new AllowWindowInteractionHandler(aWorkerPrivate);
+-      waitUntil->AppendNativeHandler(allowWindowInteraction);
++    RefPtr<AllowWindowInteractionHandler> allowWindowInteraction =
++      new AllowWindowInteractionHandler(aWorkerPrivate);
++    if (!DispatchExtendableEventOnWorkerScope(aCx, aWorkerPrivate->GlobalScope(),
++                                              event, allowWindowInteraction)) {
++      allowWindowInteraction->RejectedCallback(aCx, JS::UndefinedHandleValue);
+     }
++    aWorkerPrivate->GlobalScope()->ConsumeWindowInteraction();
+ 
+     return true;
+   }
+ };
+ 
+ } // namespace anonymous
+ 
+ nsresult
