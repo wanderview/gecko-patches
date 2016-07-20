@@ -1,0 +1,496 @@
+# HG changeset patch
+# User Alessio Placitelli <alessio.placitelli@gmail.com>
+# Parent  53c0dead7400d53da48de747cc4bf1b8370056c3
+Bug 1271313 - Measure the number of total URIs and unique domains visited in a "session fragment". r=gijs, data-review?bsmedberg
+
+MozReview-Commit-ID: 4sYvZTcSM3u
+
+diff --git a/browser/modules/BrowserUsageTelemetry.jsm b/browser/modules/BrowserUsageTelemetry.jsm
+--- a/browser/modules/BrowserUsageTelemetry.jsm
++++ b/browser/modules/BrowserUsageTelemetry.jsm
+@@ -5,58 +5,123 @@
+ 
+ "use strict";
+ 
+ this.EXPORTED_SYMBOLS = ["BrowserUsageTelemetry"];
+ 
+ const {classes: Cc, interfaces: Ci, utils: Cu} = Components;
+ 
+ Cu.import("resource://gre/modules/Services.jsm");
++Cu.import("resource://gre/modules/XPCOMUtils.jsm");
++
++XPCOMUtils.defineLazyModuleGetter(this, "PrivateBrowsingUtils",
++                                  "resource://gre/modules/PrivateBrowsingUtils.jsm");
++
++// The upper bound for the count of the visited unique domain names.
++const MAX_UNIQUE_VISITED_DOMAINS = 100;
+ 
+ // Observed topic names.
+ const WINDOWS_RESTORED_TOPIC = "sessionstore-windows-restored";
+ const TELEMETRY_SUBSESSIONSPLIT_TOPIC = "internal-telemetry-after-subsession-split";
+ const DOMWINDOW_OPENED_TOPIC = "domwindowopened";
+ const DOMWINDOW_CLOSED_TOPIC = "domwindowclosed";
+ 
+ // Probe names.
+ const MAX_TAB_COUNT_SCALAR_NAME = "browser.engagement.max_concurrent_tab_count";
+ const MAX_WINDOW_COUNT_SCALAR_NAME = "browser.engagement.max_concurrent_window_count";
+ const TAB_OPEN_EVENT_COUNT_SCALAR_NAME = "browser.engagement.tab_open_event_count";
+ const WINDOW_OPEN_EVENT_COUNT_SCALAR_NAME = "browser.engagement.window_open_event_count";
++const UNIQUE_DOMAINS_COUNT_SCALAR_NAME = "browser.engagement.unique_domains_count";
++const TOTAL_URI_COUNT_SCALAR_NAME = "browser.engagement.total_uri_count";
+ 
+ function getOpenTabsAndWinsCounts() {
+   let tabCount = 0;
+   let winCount = 0;
+ 
+   let browserEnum = Services.wm.getEnumerator("navigator:browser");
+   while (browserEnum.hasMoreElements()) {
+     let win = browserEnum.getNext();
+     winCount++;
+     tabCount += win.gBrowser.tabs.length;
+   }
+ 
+   return { tabCount, winCount };
+ }
+ 
++let URICountListener = {
++  // A set containing the visited domains, see bug 1271310.
++  _domainSet: new Set(),
++
++  onLocationChange(browser, webProgress, request, uri, flags) {
++    // Don't count this URI if it's an error page.
++    if (flags & Ci.nsIWebProgressListener.LOCATION_CHANGE_ERROR_PAGE) {
++      return;
++    }
++
++    // We only care about top level loads.
++    if (!webProgress.isTopLevel) {
++      return;
++    }
++
++    // Only consider http(s) schemas.
++    if (!uri.schemeIs("http") && !uri.schemeIs("https")) {
++      return;
++    }
++
++    // Update the URI counts.
++    Services.telemetry.scalarAdd(TOTAL_URI_COUNT_SCALAR_NAME, 1);
++
++    // We only want to count the unique domains up to MAX_UNIQUE_VISITED_DOMAINS.
++    if (this._domainSet.size == MAX_UNIQUE_VISITED_DOMAINS) {
++      return;
++    }
++
++    // Unique domains should be aggregated by (eTLD + 1): x.test.com and y.test.com
++    // are counted once as test.com.
++    try {
++      // Even if only considering http(s) URIs, |getBaseDomain| could still throw
++      // due to the URI containing invalid characters or the domain actually being
++      // an ipv4 or ipv6 address.
++      this._domainSet.add(Services.eTLD.getBaseDomain(uri));
++    } catch (e) {
++      return;
++    }
++
++    Services.telemetry.scalarSet(UNIQUE_DOMAINS_COUNT_SCALAR_NAME, this._domainSet.size);
++  },
++
++  /**
++   * Reset the counts. This should be called when breaking a session in Telemetry.
++   */
++  reset() {
++    this._domainSet.clear();
++  },
++
++  QueryInterface: XPCOMUtils.generateQI([Ci.nsIWebProgressListener,
++                                         Ci.nsISupportsWeakReference]),
++};
++
+ let BrowserUsageTelemetry = {
+   init() {
+     Services.obs.addObserver(this, WINDOWS_RESTORED_TOPIC, false);
+   },
+ 
+   /**
+    * Handle subsession splits in the parent process.
+    */
+   afterSubsessionSplit() {
+     // Scalars just got cleared due to a subsession split. We need to set the maximum
+     // concurrent tab and window counts so that they reflect the correct value for the
+     // new subsession.
+     const counts = getOpenTabsAndWinsCounts();
+     Services.telemetry.scalarSetMaximum(MAX_TAB_COUNT_SCALAR_NAME, counts.tabCount);
+     Services.telemetry.scalarSetMaximum(MAX_WINDOW_COUNT_SCALAR_NAME, counts.winCount);
++
++    // Reset the URI counter.
++    URICountListener.reset();
+   },
+ 
+   uninit() {
+     Services.obs.removeObserver(this, DOMWINDOW_OPENED_TOPIC, false);
+     Services.obs.removeObserver(this, DOMWINDOW_CLOSED_TOPIC, false);
+     Services.obs.removeObserver(this, TELEMETRY_SUBSESSIONSPLIT_TOPIC, false);
+     Services.obs.removeObserver(this, WINDOWS_RESTORED_TOPIC, false);
+   },
+@@ -109,29 +174,41 @@ let BrowserUsageTelemetry = {
+     Services.telemetry.scalarSetMaximum(MAX_WINDOW_COUNT_SCALAR_NAME, counts.winCount);
+   },
+ 
+   /**
+    * Adds listeners to a single chrome window.
+    */
+   _registerWindow(win) {
+     win.addEventListener("TabOpen", this, true);
++
++    // Don't include URI and domain counts when in private mode.
++    if (PrivateBrowsingUtils.isWindowPrivate(win)) {
++      return;
++    }
++    win.gBrowser.addTabsProgressListener(URICountListener);
+   },
+ 
+   /**
+    * Removes listeners from a single chrome window.
+    */
+   _unregisterWindow(win) {
+     // Ignore non-browser windows.
+     if (!(win instanceof Ci.nsIDOMWindow) ||
+         win.document.documentElement.getAttribute("windowtype") != "navigator:browser") {
+       return;
+     }
+ 
+     win.removeEventListener("TabOpen", this, true);
++
++    // Don't include URI and domain counts when in private mode.
++    if (PrivateBrowsingUtils.isWindowPrivate(win)) {
++      return;
++    }
++    win.gBrowser.removeTabsProgressListener(URICountListener);
+   },
+ 
+   /**
+    * Updates the tab counts.
+    * @param {Number} [newTabCount=0] The count of the opened tabs across all windows. This
+    *        is computed manually if not provided.
+    */
+   _onTabOpen(tabCount = 0) {
+diff --git a/browser/modules/test/browser_UsageTelemetry.js b/browser/modules/test/browser_UsageTelemetry.js
+--- a/browser/modules/test/browser_UsageTelemetry.js
++++ b/browser/modules/test/browser_UsageTelemetry.js
+@@ -1,143 +1,268 @@
+ "use strict";
+ 
+ const MAX_CONCURRENT_TABS = "browser.engagement.max_concurrent_tab_count";
+ const TAB_EVENT_COUNT = "browser.engagement.tab_open_event_count";
+ const MAX_CONCURRENT_WINDOWS = "browser.engagement.max_concurrent_window_count";
+ const WINDOW_OPEN_COUNT = "browser.engagement.window_open_event_count";
++const TOTAL_URI_COUNT = "browser.engagement.total_uri_count";
++const UNIQUE_DOMAINS_COUNT = "browser.engagement.unique_domains_count";
+ 
+ const TELEMETRY_SUBSESSION_TOPIC = "internal-telemetry-after-subsession-split";
+ 
+ /**
++ * Waits for the web progress listener associated with this tab to fire an
++ * onLocationChange for a non-error page.
++ *
++ * @param {xul:browser} browser
++ *        A xul:browser.
++ *
++ * @return {Promise}
++ * @resolves When navigating to a non-error page.
++ */
++function browserLocationChanged(browser) {
++  return new Promise(resolve => {
++    let wpl = {
++      onStateChange() {},
++      onSecurityChange() {},
++      onStatusChange() {},
++      onLocationChange(aWebProgress, aRequest, aURI, aFlags) {
++        if (!(aFlags & Ci.nsIWebProgressListener.LOCATION_CHANGE_ERROR_PAGE)) {
++          browser.webProgress.removeProgressListener(filter);
++          filter.removeProgressListener(wpl);
++          resolve();
++        };
++      },
++      QueryInterface: XPCOMUtils.generateQI([
++        Ci.nsIWebProgressListener,
++        Ci.nsIWebProgressListener2,
++      ]),
++    };
++    const filter = Cc["@mozilla.org/appshell/component/browser-status-filter;1"]
++                     .createInstance(Ci.nsIWebProgress);
++    filter.addProgressListener(wpl, Ci.nsIWebProgress.NOTIFY_ALL);
++    browser.webProgress.addProgressListener(filter, Ci.nsIWebProgress.NOTIFY_ALL);
++  });
++};
++
++/**
+  * An helper that checks the value of a scalar if it's expected to be > 0,
+  * otherwise makes sure that the scalar it's not reported.
+  */
+ let checkScalar = (scalars, scalarName, value, msg) => {
+   if (value > 0) {
+     is(scalars[scalarName], value, msg);
+     return;
+   }
+   ok(!(scalarName in scalars), scalarName + " must not be reported.");
+ };
+ 
+ /**
+  * Get a snapshot of the scalars and check them against the provided values.
+  */
+-let checkScalars = (maxTabs, tabOpenCount, maxWindows, windowsOpenCount) => {
++let checkScalars = (maxTabs, tabOpenCount, maxWindows, windowsOpenCount, totalURIs, domainCount) => {
+   const scalars =
+     Services.telemetry.snapshotScalars(Ci.nsITelemetry.DATASET_RELEASE_CHANNEL_OPTIN);
+ 
+   // Check the expected values. Scalars that are never set must not be reported.
+   checkScalar(scalars, MAX_CONCURRENT_TABS, maxTabs,
+               "The maximum tab count must match the expected value.");
+   checkScalar(scalars, TAB_EVENT_COUNT, tabOpenCount,
+               "The number of open tab event count must match the expected value.");
+   checkScalar(scalars, MAX_CONCURRENT_WINDOWS, maxWindows,
+               "The maximum window count must match the expected value.");
+   checkScalar(scalars, WINDOW_OPEN_COUNT, windowsOpenCount,
+               "The number of window open event count must match the expected value.");
++  checkScalar(scalars, TOTAL_URI_COUNT, totalURIs,
++              "The total URI count must match the expected value.");
++  checkScalar(scalars, UNIQUE_DOMAINS_COUNT, domainCount,
++              "The unique domains count must match the expected value.");
+ };
+ 
+ add_task(function* test_tabsAndWindows() {
+   // Let's reset the counts.
+   Services.telemetry.clearScalars();
+ 
+   let openedTabs = [];
+   let expectedTabOpenCount = 0;
+   let expectedWinOpenCount = 0;
+   let expectedMaxTabs = 0;
+   let expectedMaxWins = 0;
+ 
+   // Add a new tab and check that the count is right.
+   openedTabs.push(yield BrowserTestUtils.openNewForegroundTab(gBrowser, "about:blank"));
+   expectedTabOpenCount = 1;
+   expectedMaxTabs = 2;
+-  checkScalars(expectedMaxTabs, expectedTabOpenCount, expectedMaxWins, expectedWinOpenCount);
++  checkScalars(expectedMaxTabs, expectedTabOpenCount, expectedMaxWins, expectedWinOpenCount, 0, 0);
+ 
+   // Add two new tabs in the same window.
+   openedTabs.push(yield BrowserTestUtils.openNewForegroundTab(gBrowser, "about:blank"));
+   openedTabs.push(yield BrowserTestUtils.openNewForegroundTab(gBrowser, "about:blank"));
+   expectedTabOpenCount += 2;
+   expectedMaxTabs += 2;
+-  checkScalars(expectedMaxTabs, expectedTabOpenCount, expectedMaxWins, expectedWinOpenCount);
++  checkScalars(expectedMaxTabs, expectedTabOpenCount, expectedMaxWins, expectedWinOpenCount, 0, 0);
+ 
+   // Add a new window and then some tabs in it. An empty new windows counts as a tab.
+   let win = yield BrowserTestUtils.openNewBrowserWindow();
+   openedTabs.push(yield BrowserTestUtils.openNewForegroundTab(win.gBrowser, "about:blank"));
+   openedTabs.push(yield BrowserTestUtils.openNewForegroundTab(win.gBrowser, "about:blank"));
+   openedTabs.push(yield BrowserTestUtils.openNewForegroundTab(gBrowser, "about:blank"));
+   // The new window started with a new tab, so account for it.
+   expectedTabOpenCount += 4;
+   expectedWinOpenCount += 1;
+   expectedMaxWins = 2;
+   expectedMaxTabs += 4;
+ 
+   // Remove a tab from the first window, the max shouldn't change.
+   yield BrowserTestUtils.removeTab(openedTabs.pop());
+-  checkScalars(expectedMaxTabs, expectedTabOpenCount, expectedMaxWins, expectedWinOpenCount);
++  checkScalars(expectedMaxTabs, expectedTabOpenCount, expectedMaxWins, expectedWinOpenCount, 0, 0);
+ 
+   // Remove all the extra windows and tabs.
+   for (let tab of openedTabs) {
+     yield BrowserTestUtils.removeTab(tab);
+   }
+   yield BrowserTestUtils.closeWindow(win);
+ 
+   // Make sure all the scalars still have the expected values.
+-  checkScalars(expectedMaxTabs, expectedTabOpenCount, expectedMaxWins, expectedWinOpenCount);
++  checkScalars(expectedMaxTabs, expectedTabOpenCount, expectedMaxWins, expectedWinOpenCount, 0, 0);
+ });
+ 
+ add_task(function* test_subsessionSplit() {
+   // Let's reset the counts.
+   Services.telemetry.clearScalars();
+ 
+   // Add a new window (that will have 4 tabs).
+   let win = yield BrowserTestUtils.openNewBrowserWindow();
+   let openedTabs = [];
+   openedTabs.push(yield BrowserTestUtils.openNewForegroundTab(win.gBrowser, "about:blank"));
+   openedTabs.push(yield BrowserTestUtils.openNewForegroundTab(win.gBrowser, "about:blank"));
+-  openedTabs.push(yield BrowserTestUtils.openNewForegroundTab(win.gBrowser, "about:blank"));
++  openedTabs.push(yield BrowserTestUtils.openNewForegroundTab(win.gBrowser, "http://www.example.com"));
+ 
+   // Check that the scalars have the right values.
+-  checkScalars(5 /*maxTabs*/, 4 /*tabOpen*/, 2 /*maxWins*/, 1 /*winOpen*/);
++  checkScalars(5 /*maxTabs*/, 4 /*tabOpen*/, 2 /*maxWins*/, 1 /*winOpen*/,
++               1 /* toalURIs */, 1 /* uniqueDomains */);
+ 
+   // Remove a tab.
+   yield BrowserTestUtils.removeTab(openedTabs.pop());
+ 
+   // Simulate a subsession split by clearing the scalars (via |snapshotScalars|) and
+   // notifying the subsession split topic.
+   Services.telemetry.snapshotScalars(Ci.nsITelemetry.DATASET_RELEASE_CHANNEL_OPTIN,
+                                      true /* clearScalars*/);
+   Services.obs.notifyObservers(null, TELEMETRY_SUBSESSION_TOPIC, "");
+ 
+   // After a subsession split, only the MAX_CONCURRENT_* scalars must be available
+   // and have the correct value. No tabs or windows were opened so other scalars
+   // must not be reported.
+-  checkScalars(4 /*maxTabs*/, 0 /*tabOpen*/, 2 /*maxWins*/, 0 /*winOpen*/);
++  checkScalars(4 /*maxTabs*/, 0 /*tabOpen*/, 2 /*maxWins*/, 0 /*winOpen*/,
++               0 /* toalURIs */, 0 /* uniqueDomains */);
+ 
+   // Remove all the extra windows and tabs.
+   for (let tab of openedTabs) {
+     yield BrowserTestUtils.removeTab(tab);
+   }
+   yield BrowserTestUtils.closeWindow(win);
+ });
+ 
++add_task(function* test_URIAndDomainCounts() {
++  // Let's reset the counts.
++  Services.telemetry.clearScalars();
++
++  let checkCounts = (URICount, domainCount) => {
++    // Get a snapshot of the scalars and then clear them.
++    const scalars =
++      Services.telemetry.snapshotScalars(Ci.nsITelemetry.DATASET_RELEASE_CHANNEL_OPTIN);
++    checkScalar(scalars, TOTAL_URI_COUNT, URICount,
++                "The URI scalar must contain the expected value.");
++    checkScalar(scalars, UNIQUE_DOMAINS_COUNT, domainCount,
++                "The unique domains scalar must contain the expected value.");
++  };
++
++  // Check that about:blank doesn't get counted in the URI total.
++  let firstTab = yield BrowserTestUtils.openNewForegroundTab(gBrowser, "about:blank");
++  checkCounts(0, 0);
++
++  // Open a different page and check the counts.
++  yield BrowserTestUtils.loadURI(firstTab.linkedBrowser, "http://example.com/");
++  yield BrowserTestUtils.browserLoaded(firstTab.linkedBrowser);
++  checkCounts(1, 1);
++
++  // Activating a different tab must not increase the URI count.
++  let secondTab = yield BrowserTestUtils.openNewForegroundTab(gBrowser, "about:blank");
++  yield BrowserTestUtils.switchTab(gBrowser, firstTab);
++  checkCounts(1, 1);
++  yield BrowserTestUtils.removeTab(secondTab);
++
++  // Open a new window and set the tab to a new address.
++  let newWin = yield BrowserTestUtils.openNewBrowserWindow();
++  yield BrowserTestUtils.loadURI(newWin.gBrowser.selectedBrowser, "http://example.com/");
++  yield BrowserTestUtils.browserLoaded(newWin.gBrowser.selectedBrowser);
++  checkCounts(2, 1);
++
++  // We should not count AJAX requests.
++  const XHR_URL = "http://example.com/r";
++  yield ContentTask.spawn(newWin.gBrowser.selectedBrowser, XHR_URL, function(url) {
++    return new Promise(resolve => {
++      var xhr = new content.window.XMLHttpRequest();
++      xhr.open("GET", url);
++      xhr.onload = () => resolve();
++      xhr.send();
++    });
++  });
++  checkCounts(2, 1);
++
++  // Check that we're counting page fragments.
++  let loadingStopped = browserLocationChanged(newWin.gBrowser.selectedBrowser);
++  yield BrowserTestUtils.loadURI(newWin.gBrowser.selectedBrowser, "http://example.com/#2");
++  yield loadingStopped;
++  checkCounts(3, 1);
++
++  // Check test.domain.com and some.domain.com are only counted once unique.
++  yield BrowserTestUtils.loadURI(newWin.gBrowser.selectedBrowser, "http://test1.example.com/");
++  yield BrowserTestUtils.browserLoaded(newWin.gBrowser.selectedBrowser);
++  checkCounts(4, 1);
++
++  // Make sure that the unique domains counter is incrementing for a different domain.
++  yield BrowserTestUtils.loadURI(newWin.gBrowser.selectedBrowser, "https://example.org/");
++  yield BrowserTestUtils.browserLoaded(newWin.gBrowser.selectedBrowser);
++  checkCounts(5, 2);
++
++  // Check that we only account for top level loads (e.g. we don't count URIs from
++  // embedded iframes).
++  yield ContentTask.spawn(newWin.gBrowser.selectedBrowser, null, function* () {
++    let doc = content.document;
++    let iframe = doc.createElement("iframe");
++    let promiseIframeLoaded = ContentTaskUtils.waitForEvent(iframe, "load", false);
++    iframe.src = "https://example.org/test";
++    doc.body.insertBefore(iframe, doc.body.firstChild);
++    yield promiseIframeLoaded;
++  });
++  checkCounts(5, 2);
++
++  // Clean up.
++  yield BrowserTestUtils.removeTab(firstTab);
++  yield BrowserTestUtils.closeWindow(newWin);
++});
++
+ add_task(function* test_privateMode() {
+   // Let's reset the counts.
+   Services.telemetry.clearScalars();
+ 
+   // Open a private window and load a website in it.
+   let privateWin = yield BrowserTestUtils.openNewBrowserWindow({private: true});
+   yield BrowserTestUtils.loadURI(privateWin.gBrowser.selectedBrowser, "http://example.com/");
+   yield BrowserTestUtils.browserLoaded(privateWin.gBrowser.selectedBrowser);
+ 
+   // Check that tab and window count is recorded.
+   const scalars =
+     Services.telemetry.snapshotScalars(Ci.nsITelemetry.DATASET_RELEASE_CHANNEL_OPTIN);
+ 
++  ok(!(TOTAL_URI_COUNT in scalars), "We should not track URIs in private mode.");
++  ok(!(UNIQUE_DOMAINS_COUNT in scalars), "We should not track unique domains in private mode.");
+   is(scalars[TAB_EVENT_COUNT], 1, "The number of open tab event count must match the expected value.");
+   is(scalars[MAX_CONCURRENT_TABS], 2, "The maximum tab count must match the expected value.");
+   is(scalars[WINDOW_OPEN_COUNT], 1, "The number of window open event count must match the expected value.");
+   is(scalars[MAX_CONCURRENT_WINDOWS], 2, "The maximum window count must match the expected value.");
+ 
+   // Clean up.
+   yield BrowserTestUtils.closeWindow(privateWin);
+ });
+diff --git a/toolkit/components/telemetry/Scalars.yaml b/toolkit/components/telemetry/Scalars.yaml
+--- a/toolkit/components/telemetry/Scalars.yaml
++++ b/toolkit/components/telemetry/Scalars.yaml
+@@ -116,8 +116,36 @@ browser.engagement:
+     description: >
+       The count of browser window open events per subsession, after the session
+       has been restored. The count includes the private windows.
+     expires: "55"
+     kind: uint
+     notification_emails:
+       - rweiss@mozilla.com
+     release_channel_collection: opt-out
++
++  total_uri_count:
++    bug_numbers:
++      - 1271313
++    description: >
++      The count of the total non-unique http(s) URIs visited in a subsession, including
++      page reloads, after the session has been restored. This does not include background
++      page requests and URIs from embedded pages or private browsing.
++    expires: "55"
++    kind: uint
++    notification_emails:
++      - rweiss@mozilla.com
++    release_channel_collection: opt-out
++
++  unique_domains_count:
++    bug_numbers:
++      - 1271310
++    description: >
++      The count of the unique domains visited in a subsession, after the session
++      has been restored. Subdomains under eTLD are aggregated after the first level
++      (i.e. test.example.com and other.example.com are only counted once).
++      This does not include background page requests and domains from embedded pages
++      or private browsing.
++    expires: "55"
++    kind: uint
++    notification_emails:
++      - rweiss@mozilla.com
++    release_channel_collection: opt-out

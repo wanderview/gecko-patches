@@ -1,0 +1,175 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  214884d507ee369c1cf14edb26527c4f9a97bf48
+Bug 1267693 P3 Add a test to detect window leaks when using sdk/window/events. r=gabor
+
+diff --git a/addon-sdk/moz.build b/addon-sdk/moz.build
+--- a/addon-sdk/moz.build
++++ b/addon-sdk/moz.build
+@@ -8,17 +8,18 @@
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ # Makefile.in uses a misc target through test_addons_TARGET.
+ HAS_MISC_RULE = True
+ 
+ BROWSER_CHROME_MANIFESTS += ['test/browser.ini']
+-JETPACK_PACKAGE_MANIFESTS += ['source/test/jetpack-package.ini']
++JETPACK_PACKAGE_MANIFESTS += ['source/test/jetpack-package.ini',
++                              'source/test/leak/jetpack-package.ini']
+ JETPACK_ADDON_MANIFESTS += ['source/test/addons/jetpack-addon.ini']
+ 
+ addons = [
+     'addon-manager',
+     'author-email',
+     'child_process',
+     'chrome',
+     'content-permissions',
+diff --git a/addon-sdk/source/test/leak/jetpack-package.ini b/addon-sdk/source/test/leak/jetpack-package.ini
+new file mode 100644
+--- /dev/null
++++ b/addon-sdk/source/test/leak/jetpack-package.ini
+@@ -0,0 +1,5 @@
++[DEFAULT]
++support-files =
++  leak-utils.js
++
++[test-leak-window-events.js]
+diff --git a/addon-sdk/source/test/leak/leak-utils.js b/addon-sdk/source/test/leak/leak-utils.js
+new file mode 100644
+--- /dev/null
++++ b/addon-sdk/source/test/leak/leak-utils.js
+@@ -0,0 +1,80 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++"use strict";
++
++const { Cu, Ci } = require("chrome");
++const { Services } = Cu.import("resource://gre/modules/Services.jsm", {});
++const { SelfSupportBackend } = Cu.import("resource:///modules/SelfSupportBackend.jsm", {});
++const Startup = Cu.import("resource://gre/modules/sdk/system/Startup.js", {}).exports;
++
++// Adapted from the SpecialPowers.exactGC() code.  We don't have a
++// window to operate on so we cannot use the exact same logic.  We
++// use 6 GC iterations here as that is what is needed to clean up
++// the windows we have tested with.
++function gc() {
++  return new Promise(resolve => {
++    Cu.forceGC();
++    Cu.forceCC();
++    let count = 0;
++    function genGCCallback() {
++      Cu.forceCC();
++      return function() {
++        if (++count < 5) {
++          Cu.schedulePreciseGC(genGCCallback());
++        } else {
++          resolve();
++        }
++      }
++    }
++
++    Cu.schedulePreciseGC(genGCCallback());
++  });
++}
++
++// Execute the given test function and verify that we did not leak windows
++// in the process.  The test function must return a promise or be a generator.
++// If the promise is resolved, or generator completes, with an sdk loader
++// object then it will be unloaded after the memory measurements.
++exports.asyncWindowLeakTest = function*(assert, asyncTestFunc) {
++
++  // SelfSupportBackend periodically tries to open windows.  This can
++  // mess up our window leak detection below, so turn it off.
++  SelfSupportBackend.uninit();
++
++  // Wait for the browser to finish loading.
++  yield Startup.onceInitialized;
++
++  // Track windows that are opened in an array of weak references.
++  let weakWindows = [];
++  function windowObserver(subject, topic) {
++    let supportsWeak = subject.QueryInterface(Ci.nsISupportsWeakReference);
++    if (supportsWeak) {
++      weakWindows.push(Cu.getWeakReference(supportsWeak));
++    }
++  }
++  Services.obs.addObserver(windowObserver, "domwindowopened", false);
++
++  // Execute the body of the test.
++  let testLoader = yield asyncTestFunc(assert);
++
++  // Stop tracking new windows and attempt to GC any resources allocated
++  // by the test body.
++  Services.obs.removeObserver(windowObserver, "domwindowopened", false);
++  yield gc();
++
++  // Check to see if any of the windows we saw survived the GC.  We consider
++  // these leaks.
++  assert.ok(weakWindows.length > 0, "should see at least one new window");
++  for (let i = 0; i < weakWindows.length; ++i) {
++    assert.equal(weakWindows[i].get(), null, "window " + i + " should be GC'd");
++  }
++
++  // Finally, unload the test body's loader if it provided one.  We do this
++  // after our leak detection to avoid free'ing things on unload.  Users
++  // don't tend to unload their addons very often, so we want to find leaks
++  // that happen while addons are in use.
++  if (testLoader) {
++    testLoader.unload();
++  }
++}
+diff --git a/addon-sdk/source/test/leak/test-leak-window-events.js b/addon-sdk/source/test/leak/test-leak-window-events.js
+new file mode 100644
+--- /dev/null
++++ b/addon-sdk/source/test/leak/test-leak-window-events.js
+@@ -0,0 +1,47 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++"use strict";
++
++// Opening new windows in Fennec causes issues
++module.metadata = {
++  engines: {
++    'Firefox': '*'
++  }
++};
++
++const { asyncWindowLeakTest } = require("./leak-utils.js");
++const { Loader } = require("sdk/test/loader");
++const { open } = require("sdk/window/utils");
++
++exports["test window/events for leaks"] = function*(assert) {
++  yield asyncWindowLeakTest(assert, _ => {
++    return new Promise((resolve, reject) => {
++      let loader = Loader(module);
++      let { events } = loader.require("sdk/window/events");
++      let { on, off } = loader.require("sdk/event/core");
++
++      on(events, "data", function handler(e) {
++        try {
++          if (e.type === "load") {
++            e.target.close();
++          }
++          else if (e.type === "close") {
++            off(events, "data", handler);
++
++            // Let asyncWindowLeakTest call loader.unload() after the
++            // leak check.
++            resolve(loader);
++          }
++        } catch (e) {
++          reject(e);
++        }
++      });
++
++      // Open a window.  This will trigger our data events.
++      open();
++    });
++  });
++};
++
++require("sdk/test").run(exports);

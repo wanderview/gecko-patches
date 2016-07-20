@@ -1,0 +1,107 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  69a9474a32061e0afc22ad93f0683934cff0c531
+Bug 1287906 Deduplicate serialized principal strings in SessionHistory.jsm. r=smaug
+
+diff --git a/browser/components/sessionstore/SessionHistory.jsm b/browser/components/sessionstore/SessionHistory.jsm
+--- a/browser/components/sessionstore/SessionHistory.jsm
++++ b/browser/components/sessionstore/SessionHistory.jsm
+@@ -214,21 +214,30 @@ var SessionHistoryInternal = {
+         entry.children = children;
+       }
+     }
+ 
+     return entry;
+   },
+ 
+   /**
+-   * Serialize owner data contained in the given session history entry.
++   * An array of nsIWeakReferences to { value: <b64string> } objects.
++   */
++  _ownerB64Cache: [],
++
++  /**
++   * Serialize owner data contained in the given session history entry. The
++   * result is an object like { value: <b64string> }.  If you save a reference
++   * to the result please retain the entire object and not just the string.
++   * This allows our de-duping code to function properly.
+    *
+    * @param shEntry
+    *        The session history entry.
+-   * @return The base64 encoded owner data.
++   * @return The base64 encoded owner data wrapped in an object like
++   *         { value: <b64string> }.
+    */
+   serializeOwner: function (shEntry) {
+     if (!shEntry.owner) {
+       return null;
+     }
+ 
+     let binaryStream = Cc["@mozilla.org/binaryoutputstream;1"].
+                        createInstance(Ci.nsIObjectOutputStream);
+@@ -243,17 +252,45 @@ var SessionHistoryInternal = {
+                            createInstance(Ci.nsIBinaryInputStream);
+     scriptableStream.setInputStream(pipe.inputStream);
+     let ownerBytes =
+       scriptableStream.readByteArray(scriptableStream.available());
+ 
+     // We can stop doing base64 encoding once our serialization into JSON
+     // is guaranteed to handle all chars in strings, including embedded
+     // nulls.
+-    return btoa(String.fromCharCode.apply(null, ownerBytes));
++    let result = btoa(String.fromCharCode.apply(null, ownerBytes));
++
++    // Look for any matching entries in our base64 cache.  At the same time,
++    // prune any stale entries for old strings that were GC'd.
++    let cached = null;
++    this._ownerB64Cache = this._ownerB64Cache.filter(v => {
++      let c = v.get();
++      if (!c) {
++        return false;
++      }
++      if (c.value === result) {
++        cached = c;
++      }
++      return true;
++    });
++
++    // Favor the cached string if we found one.  While we still have to
++    // perform the base64 encoding work here, this allows us to avoid
++    // large numbers of duplicate strings.  Sites like twitter create many
++    // history entries with the same principal due to the way they use
++    // iframes.
++    if (cached) {
++      return cached;
++    }
++
++    // Otherwise cache the new result and return.
++    result = { value: result };
++    this._ownerB64Cache.push(Cu.getWeakReference(result));
++    return result;
+   },
+ 
+   /**
+    * Restores session history data for a given docShell.
+    *
+    * @param docShell
+    *        The docShell that owns the session history.
+    * @param tabData
+@@ -377,17 +414,17 @@ var SessionHistoryInternal = {
+         shEntry.adoptBFCacheEntry(matchingEntry.shEntry);
+         childDocIdents = matchingEntry.childDocIdents;
+       }
+     }
+ 
+     if (entry.owner_b64) {
+       var ownerInput = Cc["@mozilla.org/io/string-input-stream;1"].
+                        createInstance(Ci.nsIStringInputStream);
+-      var binaryData = atob(entry.owner_b64);
++      var binaryData = atob(entry.owner_b64.value);
+       ownerInput.setData(binaryData, binaryData.length);
+       var binaryStream = Cc["@mozilla.org/binaryinputstream;1"].
+                          createInstance(Ci.nsIObjectInputStream);
+       binaryStream.setInputStream(ownerInput);
+       try { // Catch possible deserialization exceptions
+         shEntry.owner = binaryStream.readObject(true);
+       } catch (ex) { debug(ex); }
+     }
