@@ -1,0 +1,316 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  d320ef56876f52db9bc0eb79554c7332d4793769
+Spawn a separate thread every time an event is dispatched to a service worker.
+
+diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPrivate.cpp
+--- a/dom/workers/ServiceWorkerPrivate.cpp
++++ b/dom/workers/ServiceWorkerPrivate.cpp
+@@ -57,32 +57,37 @@ Atomic<uint32_t> gDOMDisableOpenClickDel
+ 
+ // Used to keep track of pending waitUntil as well as in-flight extendable events.
+ // When the last token is released, we attempt to terminate the worker.
+ class KeepAliveToken final : public nsISupports
+ {
+ public:
+   NS_DECL_ISUPPORTS
+ 
+-  explicit KeepAliveToken(ServiceWorkerPrivate* aPrivate)
++  KeepAliveToken(ServiceWorkerPrivate* aPrivate, WorkerPrivate* aWorkerPrivate)
+     : mPrivate(aPrivate)
++    , mWorkerPrivate(aWorkerPrivate)
+   {
+     AssertIsOnMainThread();
+     MOZ_ASSERT(aPrivate);
++    MOZ_ASSERT(aWorkerPrivate);
+     mPrivate->AddToken();
+   }
+ 
+ private:
+   ~KeepAliveToken()
+   {
+     AssertIsOnMainThread();
++    mWorkerPrivate->Terminate();
++    mWorkerPrivate = nullptr;
+     mPrivate->ReleaseToken();
+   }
+ 
+   RefPtr<ServiceWorkerPrivate> mPrivate;
++  RefPtr<WorkerPrivate> mWorkerPrivate;
+ };
+ 
+ NS_IMPL_ISUPPORTS0(KeepAliveToken)
+ 
+ ServiceWorkerPrivate::ServiceWorkerPrivate(ServiceWorkerInfo* aInfo)
+   : mInfo(aInfo)
+   , mDebuggerCount(0)
+   , mTokenCount(0)
+@@ -154,16 +159,21 @@ ServiceWorkerPrivate::SendMessageEvent(J
+   nsMainThreadPtrHandle<nsISupports> token(
+     new nsMainThreadPtrHolder<nsISupports>(CreateEventKeepAliveToken()));
+ 
+   RefPtr<PromiseNativeHandler> handler = new MessageWaitUntilHandler(token);
+ 
+   mWorkerPrivate->PostMessageToServiceWorker(aCx, aMessage, aTransferable,
+                                              Move(aClientInfo), handler,
+                                              rv);
++  if (NS_WARN_IF(rv.Failed())) {
++    return rv.StealNSResult();
++  }
++
++  SpawnWorkerIfNeeded(Preload, nullptr);
+   return rv.StealNSResult();
+ }
+ 
+ namespace {
+ 
+ class CheckScriptEvaluationWithCallback final : public WorkerRunnable
+ {
+   nsMainThreadPtrHandle<KeepAliveToken> mKeepAliveToken;
+@@ -230,16 +240,17 @@ ServiceWorkerPrivate::CheckScriptEvaluat
+   RefPtr<KeepAliveToken> token = CreateEventKeepAliveToken();
+   RefPtr<WorkerRunnable> r = new CheckScriptEvaluationWithCallback(mWorkerPrivate,
+                                                                    token,
+                                                                    aCallback);
+   if (NS_WARN_IF(!r->Dispatch())) {
+     return NS_ERROR_FAILURE;
+   }
+ 
++  SpawnWorkerIfNeeded(Preload, nullptr);
+   return NS_OK;
+ }
+ 
+ namespace {
+ 
+ // Holds the worker alive until the waitUntil promise is resolved or
+ // rejected.
+ class KeepAliveHandler final
+@@ -721,16 +732,17 @@ ServiceWorkerPrivate::SendLifeCycleEvent
+   RefPtr<WorkerRunnable> r = new LifecycleEventWorkerRunnable(mWorkerPrivate,
+                                                               token,
+                                                               aEventType,
+                                                               aCallback);
+   if (NS_WARN_IF(!r->Dispatch())) {
+     return NS_ERROR_FAILURE;
+   }
+ 
++  SpawnWorkerIfNeeded(Preload, nullptr);
+   return NS_OK;
+ }
+ 
+ #ifndef MOZ_SIMPLEPUSH
+ namespace {
+ 
+ class PushErrorReporter final : public PromiseNativeHandler
+ {
+@@ -925,16 +937,17 @@ ServiceWorkerPrivate::SendPushEvent(cons
+   }
+ 
+   MOZ_ASSERT(mInfo->State() == ServiceWorkerState::Activated);
+ 
+   if (NS_WARN_IF(!r->Dispatch())) {
+     return NS_ERROR_FAILURE;
+   }
+ 
++  SpawnWorkerIfNeeded(Preload, nullptr);
+   return NS_OK;
+ #endif // MOZ_SIMPLEPUSH
+ }
+ 
+ nsresult
+ ServiceWorkerPrivate::SendPushSubscriptionChangeEvent()
+ {
+ #ifdef MOZ_SIMPLEPUSH
+@@ -945,16 +958,17 @@ ServiceWorkerPrivate::SendPushSubscripti
+ 
+   RefPtr<KeepAliveToken> token = CreateEventKeepAliveToken();
+   RefPtr<WorkerRunnable> r =
+     new SendPushSubscriptionChangeEventRunnable(mWorkerPrivate, token);
+   if (NS_WARN_IF(!r->Dispatch())) {
+     return NS_ERROR_FAILURE;
+   }
+ 
++  SpawnWorkerIfNeeded(Preload, nullptr);
+   return NS_OK;
+ #endif // MOZ_SIMPLEPUSH
+ }
+ 
+ namespace {
+ 
+ static void
+ DummyNotificationTimerCallback(nsITimer* aTimer, void* aClosure)
+@@ -1239,16 +1253,17 @@ ServiceWorkerPrivate::SendNotificationEv
+     new SendNotificationEventRunnable(mWorkerPrivate, token,
+                                       aEventName, aID, aTitle, aDir, aLang,
+                                       aBody, aTag, aIcon, aData, aBehavior,
+                                       aScope);
+   if (NS_WARN_IF(!r->Dispatch())) {
+     return NS_ERROR_FAILURE;
+   }
+ 
++  SpawnWorkerIfNeeded(Preload, nullptr);
+   return NS_OK;
+ }
+ 
+ namespace {
+ 
+ // Inheriting ExtendableEventWorkerRunnable so that the worker is not terminated
+ // while handling the fetch event, though that's very unlikely.
+ class FetchEventRunnable : public ExtendableFunctionalEventWorkerRunnable
+@@ -1654,33 +1669,34 @@ ServiceWorkerPrivate::SendFetchEvent(nsI
+   }
+ 
+   MOZ_ASSERT(mInfo->State() == ServiceWorkerState::Activated);
+ 
+   if (NS_WARN_IF(!r->Dispatch())) {
+     return NS_ERROR_FAILURE;
+   }
+ 
++  SpawnWorkerIfNeeded(Preload, nullptr);
+   return NS_OK;
+ }
+ 
+ nsresult
+ ServiceWorkerPrivate::SpawnWorkerIfNeeded(WakeUpReason aWhy,
+                                           nsIRunnable* aLoadFailedRunnable,
+                                           nsILoadGroup* aLoadGroup)
+ {
+   AssertIsOnMainThread();
+ 
+   // XXXcatalinb: We need to have a separate load group that's linked to
+   // an existing tab child to pass security checks on b2g.
+   // This should be fixed in bug 1125961, but for now we enforce updating
+   // the overriden load group when intercepting a fetch.
+   MOZ_ASSERT_IF(aWhy == FetchEvent, aLoadGroup);
+ 
+-  if (mWorkerPrivate) {
++  if (mWorkerPrivate && mIdleKeepAliveToken) {
+     mWorkerPrivate->UpdateOverridenLoadGroup(aLoadGroup);
+     RenewKeepAliveToken(aWhy);
+ 
+     return NS_OK;
+   }
+ 
+   // Sanity check: mSupportsArray should be empty if we're about to
+   // spin up a new worker.
+@@ -1743,24 +1759,28 @@ ServiceWorkerPrivate::SpawnWorkerIfNeede
+ 
+   WorkerPrivate::OverrideLoadInfoLoadGroup(info);
+ 
+   AutoJSAPI jsapi;
+   jsapi.Init();
+   ErrorResult error;
+   NS_ConvertUTF8toUTF16 scriptSpec(mInfo->ScriptSpec());
+ 
+-  mWorkerPrivate = WorkerPrivate::Constructor(jsapi.cx(),
++  RefPtr<WorkerPrivate> newWorkerPrivate = WorkerPrivate::Constructor(jsapi.cx(),
+                                               scriptSpec,
+                                               false, WorkerTypeService,
+                                               mInfo->Scope(), &info, error);
+   if (NS_WARN_IF(error.Failed())) {
+     return error.StealNSResult();
+   }
+ 
++  RefPtr<WorkerPrivate> lastWorkerPrivate = mWorkerPrivate.forget();
++  RefPtr<KeepAliveToken> lastIdleKeepAliveToken = mIdleKeepAliveToken.forget();
++
++  mWorkerPrivate = newWorkerPrivate.forget();
+   RenewKeepAliveToken(aWhy);
+ 
+   return NS_OK;
+ }
+ 
+ void
+ ServiceWorkerPrivate::StoreISupports(nsISupports* aSupports)
+ {
+@@ -1855,29 +1875,33 @@ ServiceWorkerPrivate::GetDebugger(nsIWor
+   return NS_OK;
+ }
+ 
+ nsresult
+ ServiceWorkerPrivate::AttachDebugger()
+ {
+   AssertIsOnMainThread();
+ 
++  return NS_ERROR_FAILURE;
++
++  /*
+   // When the first debugger attaches to a worker, we spawn a worker if needed,
+   // and cancel the idle timeout. The idle timeout should not be reset until
+   // the last debugger detached from the worker.
+   if (!mDebuggerCount) {
+     nsresult rv = SpawnWorkerIfNeeded(AttachEvent, nullptr);
+     NS_ENSURE_SUCCESS(rv, rv);
+ 
+     mIdleWorkerTimer->Cancel();
+   }
+ 
+   ++mDebuggerCount;
+ 
+   return NS_OK;
++  */
+ }
+ 
+ nsresult
+ ServiceWorkerPrivate::DetachDebugger()
+ {
+   AssertIsOnMainThread();
+ 
+   if (!mDebuggerCount) {
+@@ -1965,17 +1989,17 @@ ServiceWorkerPrivate::RenewKeepAliveToke
+   // If there is at least one debugger attached to the worker, the idle worker
+   // timeout was canceled when the first debugger attached to the worker. It
+   // should not be reset until the last debugger detaches from the worker.
+   if (!mDebuggerCount) {
+     ResetIdleTimeout();
+   }
+ 
+   if (!mIdleKeepAliveToken) {
+-    mIdleKeepAliveToken = new KeepAliveToken(this);
++    mIdleKeepAliveToken = new KeepAliveToken(this, mWorkerPrivate);
+   }
+ }
+ 
+ void
+ ServiceWorkerPrivate::ResetIdleTimeout()
+ {
+   uint32_t timeout = Preferences::GetInt("dom.serviceWorkers.idle_timeout");
+   DebugOnly<nsresult> rv =
+@@ -2010,13 +2034,13 @@ ServiceWorkerPrivate::ReleaseToken()
+ }
+ 
+ already_AddRefed<KeepAliveToken>
+ ServiceWorkerPrivate::CreateEventKeepAliveToken()
+ {
+   AssertIsOnMainThread();
+   MOZ_ASSERT(mWorkerPrivate);
+   MOZ_ASSERT(mIdleKeepAliveToken);
+-  RefPtr<KeepAliveToken> ref = new KeepAliveToken(this);
++  RefPtr<KeepAliveToken> ref = mIdleKeepAliveToken.forget();
+   return ref.forget();
+ }
+ 
+ END_WORKERS_NAMESPACE
+diff --git a/dom/workers/ServiceWorkerPrivate.h b/dom/workers/ServiceWorkerPrivate.h
+--- a/dom/workers/ServiceWorkerPrivate.h
++++ b/dom/workers/ServiceWorkerPrivate.h
+@@ -153,17 +153,18 @@ private:
+   enum WakeUpReason {
+     FetchEvent = 0,
+     PushEvent,
+     PushSubscriptionChangeEvent,
+     MessageEvent,
+     NotificationClickEvent,
+     NotificationCloseEvent,
+     LifeCycleEvent,
+-    AttachEvent
++    AttachEvent,
++    Preload
+   };
+ 
+   // Timer callbacks
+   static void
+   NoteIdleWorkerCallback(nsITimer* aTimer, void* aPrivate);
+ 
+   static void
+   TerminateWorkerCallback(nsITimer* aTimer, void *aPrivate);
