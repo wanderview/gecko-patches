@@ -1,0 +1,251 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  72606a1d48f33d9f9273edd1d222463d0bb8d2c5
+Multiple SW instance P3
+
+diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPrivate.cpp
+--- a/dom/workers/ServiceWorkerPrivate.cpp
++++ b/dom/workers/ServiceWorkerPrivate.cpp
+@@ -79,16 +79,17 @@ private:
+ 
+   RefPtr<ServiceWorkerPrivate> mPrivate;
+ };
+ 
+ NS_IMPL_ISUPPORTS0(KeepAliveToken)
+ 
+ ServiceWorkerPrivate::ServiceWorkerPrivate(ServiceWorkerInfo* aInfo)
+   : mInfo(aInfo)
++  , mNextWorkerPrivateIndex(0)
+   , mDebuggerCount(0)
+   , mTokenCount(0)
+ {
+   AssertIsOnMainThread();
+   MOZ_ASSERT(aInfo);
+ 
+   mIdleWorkerTimer = do_CreateInstance(NS_TIMER_CONTRACTID);
+   MOZ_ASSERT(mIdleWorkerTimer);
+@@ -1664,71 +1665,46 @@ ServiceWorkerPrivate::SendFetchEvent(nsI
+ 
+   if (NS_WARN_IF(!r->Dispatch())) {
+     return NS_ERROR_FAILURE;
+   }
+ 
+   return NS_OK;
+ }
+ 
++namespace {
++
+ nsresult
+-ServiceWorkerPrivate::SpawnWorkerIfNeeded(WakeUpReason aWhy,
+-                                          nsIRunnable* aLoadFailedRunnable,
+-                                          nsILoadGroup* aLoadGroup)
++SpawnWorker(ServiceWorkerInfo* aInfo, nsIRunnable* aLoadFailedRunnable,
++            nsILoadGroup* aLoadGroup, WorkerPrivate** aWorkerPrivateOut)
+ {
+-  AssertIsOnMainThread();
+-
+-  // XXXcatalinb: We need to have a separate load group that's linked to
+-  // an existing tab child to pass security checks on b2g.
+-  // This should be fixed in bug 1125961, but for now we enforce updating
+-  // the overriden load group when intercepting a fetch.
+-  MOZ_ASSERT_IF(aWhy == FetchEvent, aLoadGroup);
+-
+-  if (!mWorkerPrivateList.IsEmpty()) {
+-    mWorkerPrivateList[0]->UpdateOverridenLoadGroup(aLoadGroup);
+-    RenewKeepAliveToken(aWhy);
+-
+-    return NS_OK;
+-  }
+-
+-  // Sanity check: mSupportsArray should be empty if we're about to
+-  // spin up a new worker.
+-  MOZ_ASSERT(mSupportsArray.IsEmpty());
+-
+-  if (NS_WARN_IF(!mInfo)) {
+-    NS_WARNING("Trying to wake up a dead service worker.");
+-    return NS_ERROR_FAILURE;
+-  }
+-
+-  // TODO(catalinb): Bug 1192138 - Add telemetry for service worker wake-ups.
+-
+   // Ensure that the IndexedDatabaseManager is initialized
+   NS_WARN_IF(!IndexedDatabaseManager::GetOrCreate());
+ 
+   WorkerLoadInfo info;
+-  nsresult rv = NS_NewURI(getter_AddRefs(info.mBaseURI), mInfo->ScriptSpec(),
++  nsresult rv = NS_NewURI(getter_AddRefs(info.mBaseURI), aInfo->ScriptSpec(),
+                           nullptr, nullptr);
+ 
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return rv;
+   }
+ 
+   info.mResolvedScriptURI = info.mBaseURI;
+-  MOZ_ASSERT(!mInfo->CacheName().IsEmpty());
+-  info.mServiceWorkerCacheName = mInfo->CacheName();
+-  info.mServiceWorkerID = mInfo->ID();
++  MOZ_ASSERT(!aInfo->CacheName().IsEmpty());
++  info.mServiceWorkerCacheName = aInfo->CacheName();
++  info.mServiceWorkerID = aInfo->ID();
+   info.mLoadGroup = aLoadGroup;
+   info.mLoadFailedAsyncRunnable = aLoadFailedRunnable;
+ 
+   rv = info.mBaseURI->GetHost(info.mDomain);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return rv;
+   }
+ 
+-  info.mPrincipal = mInfo->GetPrincipal();
++  info.mPrincipal = aInfo->GetPrincipal();
+ 
+   nsContentUtils::StorageAccess access =
+     nsContentUtils::StorageAllowedForPrincipal(info.mPrincipal);
+   info.mStorageAllowed = access > nsContentUtils::StorageAccess::ePrivateBrowsing;
+   info.mPrivateBrowsing = false;
+ 
+   nsCOMPtr<nsIContentSecurityPolicy> csp;
+   rv = info.mPrincipal->GetCsp(getter_AddRefs(csp));
+@@ -1748,27 +1724,78 @@ ServiceWorkerPrivate::SpawnWorkerIfNeede
+     info.mReportCSPViolations = false;
+   }
+ 
+   WorkerPrivate::OverrideLoadInfoLoadGroup(info);
+ 
+   AutoJSAPI jsapi;
+   jsapi.Init();
+   ErrorResult error;
+-  NS_ConvertUTF8toUTF16 scriptSpec(mInfo->ScriptSpec());
++  NS_ConvertUTF8toUTF16 scriptSpec(aInfo->ScriptSpec());
+ 
+   RefPtr<WorkerPrivate> workerPrivate = WorkerPrivate::Constructor(jsapi.cx(),
+                                               scriptSpec,
+                                               false, WorkerTypeService,
+-                                              mInfo->Scope(), &info, error);
++                                              aInfo->Scope(), &info, error);
+   if (NS_WARN_IF(error.Failed())) {
+     return error.StealNSResult();
+   }
+ 
+-  mWorkerPrivateList.AppendElement(workerPrivate.forget());
++  workerPrivate.forget(aWorkerPrivateOut);
++  return NS_OK;
++}
++
++} // anonymous namespace
++
++nsresult
++ServiceWorkerPrivate::SpawnWorkerIfNeeded(WakeUpReason aWhy,
++                                          nsIRunnable* aLoadFailedRunnable,
++                                          nsILoadGroup* aLoadGroup)
++{
++  AssertIsOnMainThread();
++
++  // XXXcatalinb: We need to have a separate load group that's linked to
++  // an existing tab child to pass security checks on b2g.
++  // This should be fixed in bug 1125961, but for now we enforce updating
++  // the overriden load group when intercepting a fetch.
++  MOZ_ASSERT_IF(aWhy == FetchEvent, aLoadGroup);
++
++  if (!mWorkerPrivateList.IsEmpty()) {
++    for (uint32_t i = 0; i < mWorkerPrivateList.Length(); ++i) {
++      mWorkerPrivateList[i]->UpdateOverridenLoadGroup(aLoadGroup);
++    }
++    RenewKeepAliveToken(aWhy);
++
++    return NS_OK;
++  }
++
++  // Sanity check: mSupportsArray should be empty if we're about to
++  // spin up a new worker.
++  MOZ_ASSERT(mSupportsArray.IsEmpty());
++
++  if (NS_WARN_IF(!mInfo)) {
++    NS_WARNING("Trying to wake up a dead service worker.");
++    return NS_ERROR_FAILURE;
++  }
++
++  const uint32_t kNumInstances = 3;
++  mNextWorkerPrivateIndex = 0;
++
++  nsTArray<RefPtr<WorkerPrivate>> workerPrivateList(kNumInstances);
++  for (uint32_t i = 0; i < kNumInstances; ++i) {
++    RefPtr<WorkerPrivate> workerPrivate;
++    nsresult rv = SpawnWorker(mInfo, aLoadFailedRunnable, aLoadGroup,
++                              getter_AddRefs(workerPrivate));
++    if (NS_WARN_IF(NS_FAILED(rv))) {
++      return rv;
++    }
++    workerPrivateList.AppendElement(workerPrivate.forget());
++  }
++
++  mWorkerPrivateList.SwapElements(workerPrivateList);
+ 
+   RenewKeepAliveToken(aWhy);
+ 
+   return NS_OK;
+ }
+ 
+ void
+ ServiceWorkerPrivate::StoreISupports(nsISupports* aSupports)
+@@ -2027,14 +2054,26 @@ ServiceWorkerPrivate::CreateEventKeepAli
+   AssertIsOnMainThread();
+   MOZ_ASSERT(!mWorkerPrivateList.IsEmpty());
+   MOZ_ASSERT(mIdleKeepAliveToken);
+   RefPtr<KeepAliveToken> ref = new KeepAliveToken(this);
+   return ref.forget();
+ }
+ 
+ WorkerPrivate*
+-ServiceWorkerPrivate::GetNextWorkerPrivate() const
++ServiceWorkerPrivate::GetNextWorkerPrivate()
+ {
+-  return mWorkerPrivateList.IsEmpty() ? nullptr : mWorkerPrivateList.ElementAt(0).get();
++  if (mWorkerPrivateList.IsEmpty()) {
++    return nullptr;
++  }
++
++  if (mNextWorkerPrivateIndex >= mWorkerPrivateList.Length()) {
++    mNextWorkerPrivateIndex = 0;
++  }
++
++  WorkerPrivate* result = mWorkerPrivateList[mNextWorkerPrivateIndex].get();
++
++  mNextWorkerPrivateIndex += 1;
++
++  return result;
+ }
+ 
+ END_WORKERS_NAMESPACE
+diff --git a/dom/workers/ServiceWorkerPrivate.h b/dom/workers/ServiceWorkerPrivate.h
+--- a/dom/workers/ServiceWorkerPrivate.h
++++ b/dom/workers/ServiceWorkerPrivate.h
+@@ -188,27 +188,28 @@ private:
+                       nsILoadGroup* aLoadGroup = nullptr);
+ 
+   ~ServiceWorkerPrivate();
+ 
+   already_AddRefed<KeepAliveToken>
+   CreateEventKeepAliveToken();
+ 
+   WorkerPrivate*
+-  GetNextWorkerPrivate() const;
++  GetNextWorkerPrivate();
+ 
+   // The info object owns us. It is possible to outlive it for a brief period
+   // of time if there are pending waitUntil promises, in which case it
+   // will be null and |SpawnWorkerIfNeeded| will always fail.
+   ServiceWorkerInfo* MOZ_NON_OWNING_REF mInfo;
+ 
+   // The WorkerPrivate object can only be closed by this class or by the
+   // RuntimeService class if gecko is shutting down. Closing the worker
+   // multiple times is OK, since the second attempt will be a no-op.
+   nsTArray<RefPtr<WorkerPrivate>> mWorkerPrivateList;
++  uint32_t mNextWorkerPrivateIndex;
+ 
+   nsCOMPtr<nsITimer> mIdleWorkerTimer;
+ 
+   // We keep a token for |dom.serviceWorkers.idle_timeout| seconds to give the
+   // worker a grace period after each event.
+   RefPtr<KeepAliveToken> mIdleKeepAliveToken;
+ 
+   uint64_t mDebuggerCount;
