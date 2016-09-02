@@ -1,0 +1,133 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  d5f20820c80514476f596090292a5d77c4b41e3b
+Make TaskQueue work with AbstractThread targets.
+
+diff --git a/xpcom/threads/TaskQueue.cpp b/xpcom/threads/TaskQueue.cpp
+--- a/xpcom/threads/TaskQueue.cpp
++++ b/xpcom/threads/TaskQueue.cpp
+@@ -6,20 +6,20 @@
+ 
+ #include "mozilla/TaskQueue.h"
+ 
+ #include "nsThreadUtils.h"
+ #include "mozilla/SharedThreadPool.h"
+ 
+ namespace mozilla {
+ 
+-TaskQueue::TaskQueue(already_AddRefed<SharedThreadPool> aPool,
+-                               bool aRequireTailDispatch)
++TaskQueue::TaskQueue(already_AddRefed<nsIEventTarget> aTarget,
++                     bool aRequireTailDispatch)
+   : AbstractThread(aRequireTailDispatch)
+-  , mPool(aPool)
++  , mTarget(aTarget)
+   , mQueueMonitor("TaskQueue::Queue")
+   , mTailDispatcher(nullptr)
+   , mIsRunning(false)
+   , mIsShutdown(false)
+   , mIsFlushing(false)
+ {
+   MOZ_COUNT_CTOR(TaskQueue);
+ }
+@@ -59,17 +59,17 @@ TaskQueue::DispatchLocked(nsCOMPtr<nsIRu
+   if (mIsShutdown) {
+     return NS_ERROR_FAILURE;
+   }
+   mTasks.push(aRunnable.forget());
+   if (mIsRunning) {
+     return NS_OK;
+   }
+   RefPtr<nsIRunnable> runner(new Runner(this));
+-  nsresult rv = mPool->Dispatch(runner.forget(), NS_DISPATCH_NORMAL);
++  nsresult rv = mTarget->Dispatch(runner.forget(), NS_DISPATCH_NORMAL);
+   if (NS_FAILED(rv)) {
+     NS_WARNING("Failed to dispatch runnable to run TaskQueue");
+     return rv;
+   }
+   mIsRunning = true;
+ 
+   return NS_OK;
+ }
+@@ -190,17 +190,17 @@ TaskQueue::Runner::Run()
+     }
+   }
+ 
+   // There's at least one more event that we can run. Dispatch this Runner
+   // to the thread pool again to ensure it runs again. Note that we don't just
+   // run in a loop here so that we don't hog the thread pool. This means we may
+   // run on another thread next time, but we rely on the memory fences from
+   // mQueueMonitor for thread safety of non-threadsafe tasks.
+-  nsresult rv = mQueue->mPool->TailDispatch(this);
++  nsresult rv = mQueue->mTarget->Dispatch(this, NS_DISPATCH_TAIL);
+   if (NS_FAILED(rv)) {
+     // Failed to dispatch, shutdown!
+     MonitorAutoLock mon(mQueue->mQueueMonitor);
+     mQueue->mIsRunning = false;
+     mQueue->mIsShutdown = true;
+     mQueue->MaybeResolveShutdown();
+     mon.NotifyAll();
+   }
+diff --git a/xpcom/threads/TaskQueue.h b/xpcom/threads/TaskQueue.h
+--- a/xpcom/threads/TaskQueue.h
++++ b/xpcom/threads/TaskQueue.h
+@@ -13,32 +13,32 @@
+ #include "mozilla/TaskDispatcher.h"
+ #include "mozilla/Unused.h"
+ 
+ #include <queue>
+ 
+ #include "mozilla/SharedThreadPool.h"
+ #include "nsThreadUtils.h"
+ 
++class nsIEventTarget;
+ class nsIRunnable;
+ 
+ namespace mozilla {
+ 
+-class SharedThreadPool;
+-
+ typedef MozPromise<bool, bool, false> ShutdownPromise;
+ 
+ // Abstracts executing runnables in order in a thread pool. The runnables
+ // dispatched to the TaskQueue will be executed in the order in which
+ // they're received, and are guaranteed to not be executed concurrently.
+ // They may be executed on different threads, and a memory barrier is used
+ // to make this threadsafe for objects that aren't already threadsafe.
+ class TaskQueue : public AbstractThread {
+ public:
+-  explicit TaskQueue(already_AddRefed<SharedThreadPool> aPool, bool aSupportsTailDispatch = false);
++  explicit TaskQueue(already_AddRefed<nsIEventTarget> aPool,
++                     bool aSupportsTailDispatch = false);
+ 
+   TaskDispatcher& TailDispatcher() override;
+ 
+   TaskQueue* AsTaskQueue() override { return this; }
+ 
+   void Dispatch(already_AddRefed<nsIRunnable> aRunnable,
+                 DispatchFailureHandling aFailureHandling = AssertDispatchSuccess,
+                 DispatchReason aReason = NormalDispatch) override
+@@ -93,21 +93,21 @@ protected:
+                           DispatchFailureHandling aFailureHandling,
+                           DispatchReason aReason = NormalDispatch);
+ 
+   void MaybeResolveShutdown()
+   {
+     mQueueMonitor.AssertCurrentThreadOwns();
+     if (mIsShutdown && !mIsRunning) {
+       mShutdownPromise.ResolveIfExists(true, __func__);
+-      mPool = nullptr;
++      mTarget = nullptr;
+     }
+   }
+ 
+-  RefPtr<SharedThreadPool> mPool;
++  nsCOMPtr<nsIEventTarget> mTarget;
+ 
+   // Monitor that protects the queue and mIsRunning;
+   Monitor mQueueMonitor;
+ 
+   // Queue of tasks to run.
+   std::queue<nsCOMPtr<nsIRunnable>> mTasks;
+ 
+   // The thread currently running the task queue. We store a reference

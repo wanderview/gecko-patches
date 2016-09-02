@@ -1,0 +1,285 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  b881a1bb123feab6551860ce8f3d0de70f2212db
+Expose a main thread TaskQueue on the top window and WorkerPrivate.
+
+diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
+--- a/dom/base/nsGlobalWindow.cpp
++++ b/dom/base/nsGlobalWindow.cpp
+@@ -3593,16 +3593,35 @@ nsPIDOMWindow<T>::GetDocumentURI() const
+ template <class T>
+ nsIURI*
+ nsPIDOMWindow<T>::GetDocBaseURI() const
+ {
+   return mDoc ? mDoc->GetDocBaseURI() : mDocBaseURI.get();
+ }
+ 
+ template <class T>
++TaskQueue*
++nsPIDOMWindow<T>::MainThreadTaskQueue()
++{
++  nsCOMPtr<nsPIDOMWindowOuter> topWindow = GetScriptableTop();
++  if (topWindow) {
++    return topWindow->MainThreadTaskQueue();
++  }
++
++  if (!mMainThreadTaskQueue) {
++    nsCOMPtr<nsIThread> target;
++    NS_GetMainThread(getter_AddRefs(target));
++    MOZ_DIAGNOSTIC_ASSERT(target);
++    mMainThreadTaskQueue = new TaskQueue(target.forget());
++  }
++
++  return mMainThreadTaskQueue;
++}
++
++template <class T>
+ void
+ nsPIDOMWindow<T>::MaybeCreateDoc()
+ {
+   MOZ_ASSERT(!mDoc);
+   if (nsIDocShell* docShell = GetDocShell()) {
+     // Note that |document| here is the same thing as our mDoc, but we
+     // don't have to explicitly set the member variable because the docshell
+     // has already called SetNewDocument().
+diff --git a/dom/base/nsPIDOMWindow.h b/dom/base/nsPIDOMWindow.h
+--- a/dom/base/nsPIDOMWindow.h
++++ b/dom/base/nsPIDOMWindow.h
+@@ -34,16 +34,17 @@ class nsPIDOMWindowInner;
+ class nsPIDOMWindowOuter;
+ class nsPIWindowRoot;
+ class nsXBLPrototypeHandler;
+ struct nsTimeout;
+ 
+ typedef uint32_t SuspendTypes;
+ 
+ namespace mozilla {
++class TaskQueue;
+ namespace dom {
+ class AudioContext;
+ class Element;
+ class Performance;
+ class ServiceWorkerRegistration;
+ class CustomElementsRegistry;
+ } // namespace dom
+ } // namespace mozilla
+@@ -173,16 +174,19 @@ public:
+     if (!mDoc) {
+       MaybeCreateDoc();
+     }
+     return mDoc;
+   }
+ 
+   virtual bool IsRunningTimeout() = 0;
+ 
++  mozilla::TaskQueue*
++  MainThreadTaskQueue();
++
+ protected:
+   // Lazily instantiate an about:blank document if necessary, and if
+   // we have what it takes to do so.
+   void MaybeCreateDoc();
+ 
+ public:
+   inline bool IsLoadingOrRunningTimeout() const;
+ 
+@@ -601,16 +605,18 @@ protected:
+   // This reference is used by the subclass nsGlobalWindow, and cleared in it's
+   // DetachFromDocShell() method. This method is called by nsDocShell::Destroy(),
+   // which is called before the nsDocShell is destroyed.
+   nsIDocShell* MOZ_NON_OWNING_REF mDocShell;  // Weak Reference
+ 
+   // mPerformance is only used on inner windows.
+   RefPtr<mozilla::dom::Performance> mPerformance;
+ 
++  RefPtr<mozilla::TaskQueue> mMainThreadTaskQueue;
++
+   typedef nsRefPtrHashtable<nsStringHashKey,
+                             mozilla::dom::ServiceWorkerRegistration>
+           ServiceWorkerRegistrationTable;
+   ServiceWorkerRegistrationTable mServiceWorkerRegistrationTable;
+ 
+   uint32_t               mModalStateDepth;
+ 
+   // These variables are only used on inner windows.
+diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
+--- a/dom/workers/WorkerPrivate.cpp
++++ b/dom/workers/WorkerPrivate.cpp
+@@ -65,16 +65,17 @@
+ #include "mozilla/dom/SimpleGlobalObject.h"
+ #include "mozilla/dom/ScriptSettings.h"
+ #include "mozilla/dom/StructuredCloneHolder.h"
+ #include "mozilla/dom/TabChild.h"
+ #include "mozilla/dom/WorkerBinding.h"
+ #include "mozilla/dom/WorkerDebuggerGlobalScopeBinding.h"
+ #include "mozilla/dom/WorkerGlobalScopeBinding.h"
+ #include "mozilla/Preferences.h"
++#include "mozilla/TaskQueue.h"
+ #include "mozilla/TimelineConsumers.h"
+ #include "mozilla/WorkerTimelineMarker.h"
+ #include "nsAlgorithm.h"
+ #include "nsContentUtils.h"
+ #include "nsCycleCollector.h"
+ #include "nsError.h"
+ #include "nsDOMJSUtils.h"
+ #include "nsHostObjectProtocolHandler.h"
+@@ -3879,34 +3880,52 @@ WorkerPrivate::WorkerPrivate(WorkerPriva
+   , mPendingEventQueueClearing(false)
+   , mMemoryReporterRunning(false)
+   , mBlockedForMemoryReporter(false)
+   , mCancelAllPendingRunnables(false)
+   , mPeriodicGCTimerRunning(false)
+   , mIdleGCTimerRunning(false)
+   , mWorkerScriptExecutedSuccessfully(false)
+   , mOnLine(false)
++  , mShutdownMainThreadTaskQueue(false)
+ {
+   MOZ_ASSERT_IF(!IsDedicatedWorker(), !aWorkerName.IsVoid());
+   MOZ_ASSERT_IF(IsDedicatedWorker(), aWorkerName.IsEmpty());
+ 
+   if (aParent) {
+     aParent->AssertIsOnWorkerThread();
+     aParent->GetAllPreferences(mPreferences);
+     mOnLine = aParent->OnLine();
+   }
+   else {
+     AssertIsOnMainThread();
+     RuntimeService::GetDefaultPreferences(mPreferences);
+     mOnLine = !NS_IsOffline() && !NS_IsAppOffline(aLoadInfo.mPrincipal);
++    if (aLoadInfo.mWindow) {
++      mMainThreadTaskQueue = aLoadInfo.mWindow->MainThreadTaskQueue();
++    }
++  }
++
++  if (!aParent && !mMainThreadTaskQueue) {
++    // Every worker thread gets its own bucket for dispatching to the main
++    // thread.  In theory we could share this with the document that owns
++    // the worker or its parent.
++    nsCOMPtr<nsIThread> target;
++    NS_GetMainThread(getter_AddRefs(target));
++    MOZ_DIAGNOSTIC_ASSERT(target);
++    mMainThreadTaskQueue = new TaskQueue(target.forget(), true /* tail dispatch */);
++    mShutdownMainThreadTaskQueue = true;
+   }
+ }
+ 
+ WorkerPrivate::~WorkerPrivate()
+ {
++  if (mShutdownMainThreadTaskQueue) {
++    mMainThreadTaskQueue->BeginShutdown();
++  }
+ }
+ 
+ // static
+ already_AddRefed<WorkerPrivate>
+ WorkerPrivate::Constructor(const GlobalObject& aGlobal,
+                            const nsAString& aScriptURL,
+                            ErrorResult& aRv)
+ {
+@@ -4542,16 +4561,29 @@ WorkerPrivate::MaybeDispatchLoadFailedRu
+   nsCOMPtr<nsIRunnable> runnable = StealLoadFailedAsyncRunnable();
+   if (!runnable) {
+     return;
+   }
+ 
+   MOZ_ALWAYS_SUCCEEDS(NS_DispatchToMainThread(runnable.forget()));
+ }
+ 
++TaskQueue*
++WorkerPrivate::MainThreadTaskQueue()
++{
++  WorkerPrivate* parent = GetParent();
++  if (parent) {
++    return parent->MainThreadTaskQueue();
++  }
++
++  MOZ_ASSERT(mMainThreadTaskQueue);
++
++  return mMainThreadTaskQueue;
++}
++
+ void
+ WorkerPrivate::InitializeGCTimers()
+ {
+   AssertIsOnWorkerThread();
+ 
+   // We need a timer for GC. The basic plan is to run a non-shrinking GC
+   // periodically (PERIODIC_GC_TIMER_DELAY_SEC) while the worker is running.
+   // Once the worker goes idle we set a short (IDLE_GC_TIMER_DELAY_SEC) timer to
+diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
+--- a/dom/workers/WorkerPrivate.h
++++ b/dom/workers/WorkerPrivate.h
+@@ -52,16 +52,17 @@ class nsITimer;
+ class nsIURI;
+ template<class T> class nsMainThreadPtrHandle;
+ 
+ namespace JS {
+ struct RuntimeStats;
+ } // namespace JS
+ 
+ namespace mozilla {
++class TaskQueue;
+ namespace dom {
+ class Function;
+ class MessagePort;
+ class MessagePortIdentifier;
+ class PromiseNativeHandler;
+ class StructuredCloneHolder;
+ class WorkerDebuggerGlobalScope;
+ class WorkerGlobalScope;
+@@ -907,16 +908,17 @@ class WorkerPrivate : public WorkerPriva
+ 
+   // Things touched on worker thread only.
+   RefPtr<WorkerGlobalScope> mScope;
+   RefPtr<WorkerDebuggerGlobalScope> mDebuggerScope;
+   nsTArray<ParentType*> mChildWorkers;
+   nsTObserverArray<WorkerHolder*> mHolders;
+   nsTArray<nsAutoPtr<TimeoutInfo>> mTimeouts;
+   uint32_t mDebuggerEventLoopLevel;
++  RefPtr<TaskQueue> mMainThreadTaskQueue;
+ 
+   struct SyncLoopInfo
+   {
+     explicit SyncLoopInfo(EventTarget* aEventTarget);
+ 
+     RefPtr<EventTarget> mEventTarget;
+     bool mCompleted;
+     bool mResult;
+@@ -954,16 +956,17 @@ class WorkerPrivate : public WorkerPriva
+   bool mMemoryReporterRunning;
+   bool mBlockedForMemoryReporter;
+   bool mCancelAllPendingRunnables;
+   bool mPeriodicGCTimerRunning;
+   bool mIdleGCTimerRunning;
+   bool mWorkerScriptExecutedSuccessfully;
+   bool mPreferences[WORKERPREF_COUNT];
+   bool mOnLine;
++  bool mShutdownMainThreadTaskQueue;
+ 
+ protected:
+   ~WorkerPrivate();
+ 
+ public:
+   static already_AddRefed<WorkerPrivate>
+   Constructor(const GlobalObject& aGlobal, const nsAString& aScriptURL,
+               ErrorResult& aRv);
+@@ -1331,16 +1334,19 @@ public:
+   {
+     AssertIsOnWorkerThread();
+     return mWorkerScriptExecutedSuccessfully;
+   }
+ 
+   void
+   MaybeDispatchLoadFailedRunnable();
+ 
++  TaskQueue*
++  MainThreadTaskQueue();
++
+ private:
+   WorkerPrivate(WorkerPrivate* aParent,
+                 const nsAString& aScriptURL, bool aIsChromeWorker,
+                 WorkerType aWorkerType, const nsACString& aSharedWorkerName,
+                 WorkerLoadInfo& aLoadInfo);
+ 
+   bool
+   MayContinueRunning()
