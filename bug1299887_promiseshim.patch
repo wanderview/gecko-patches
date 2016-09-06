@@ -1,0 +1,198 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  394f02edb7cb33ad70074c77b523451749c5ed0b
+Bug 1299887 Use a PromiseNativeHandler shim to ensure real PromiseNativeHandlers are released when the Promise settles. r=bz
+
+diff --git a/dom/promise/Promise.cpp b/dom/promise/Promise.cpp
+--- a/dom/promise/Promise.cpp
++++ b/dom/promise/Promise.cpp
+@@ -735,17 +735,17 @@ NativeHandlerCallback(JSContext* aCx, un
+ {
+   JS::CallArgs args = CallArgsFromVp(aArgc, aVp);
+ 
+   JS::Rooted<JS::Value> v(aCx,
+                           js::GetFunctionNativeReserved(&args.callee(),
+                                                         SLOT_NATIVEHANDLER));
+   MOZ_ASSERT(v.isObject());
+ 
+-  PromiseNativeHandler* handler;
++  PromiseNativeHandler* handler = nullptr;
+   if (NS_FAILED(UNWRAP_OBJECT(PromiseNativeHandler, &v.toObject(),
+                               handler))) {
+     return Throw(aCx, NS_ERROR_UNEXPECTED);
+   }
+ 
+   v = js::GetFunctionNativeReserved(&args.callee(), SLOT_NATIVEHANDLER_TASK);
+   NativeHandlerTask task = static_cast<NativeHandlerTask>(v.toInt32());
+ 
+@@ -776,33 +776,93 @@ CreateNativeHandlerFunction(JSContext* a
+   js::SetFunctionNativeReserved(obj, SLOT_NATIVEHANDLER,
+                                 JS::ObjectValue(*aHolder));
+   js::SetFunctionNativeReserved(obj, SLOT_NATIVEHANDLER_TASK,
+                                 JS::Int32Value(static_cast<int32_t>(aTask)));
+ 
+   return obj;
+ }
+ 
++namespace {
++
++class PromiseNativeHandlerShim final : public PromiseNativeHandler
++{
++  RefPtr<PromiseNativeHandler> mInner;
++
++  ~PromiseNativeHandlerShim()
++  {
++  }
++
++public:
++  explicit PromiseNativeHandlerShim(PromiseNativeHandler* aInner)
++    : mInner(aInner)
++  {
++    MOZ_ASSERT(mInner);
++  }
++
++  void
++  ResolvedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue) override
++  {
++    mInner->ResolvedCallback(aCx, aValue);
++    mInner = nullptr;
++  }
++
++  void
++  RejectedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue) override
++  {
++    mInner->RejectedCallback(aCx, aValue);
++    mInner = nullptr;
++  }
++
++  bool
++  WrapObject(JSContext* aCx, JS::Handle<JSObject*> aGivenProto,
++             JS::MutableHandle<JSObject*> aWrapper)
++  {
++    return PromiseNativeHandlerBinding::Wrap(aCx, this, aGivenProto, aWrapper);
++  }
++
++  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTION_CLASS(PromiseNativeHandlerShim)
++};
++
++NS_IMPL_CYCLE_COLLECTION(PromiseNativeHandlerShim, mInner)
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF(PromiseNativeHandlerShim)
++NS_IMPL_CYCLE_COLLECTING_RELEASE(PromiseNativeHandlerShim)
++
++NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(PromiseNativeHandlerShim)
++  NS_INTERFACE_MAP_ENTRY(nsISupports)
++NS_INTERFACE_MAP_END
++
++} // anonymous namespace
++
+ void
+ Promise::AppendNativeHandler(PromiseNativeHandler* aRunnable)
+ {
+   NS_ASSERT_OWNINGTHREAD(Promise);
+ 
+   AutoJSAPI jsapi;
+   if (NS_WARN_IF(!jsapi.Init(mGlobal))) {
+     // Our API doesn't allow us to return a useful error.  Not like this should
+     // happen anyway.
+     return;
+   }
+ 
++  // The self-hosted promise js may keep the object we pass to it alive
++  // for quite a while depending on when GC runs.  Therefore, pass a shim
++  // object instead.  The shim will free its inner PromiseNativeHandler
++  // after the promise has settled just like our previous c++ promises did.
++  RefPtr<PromiseNativeHandlerShim> shim =
++    new PromiseNativeHandlerShim(aRunnable);
++
+   JSContext* cx = jsapi.cx();
+   JS::Rooted<JSObject*> handlerWrapper(cx);
+   // Note: PromiseNativeHandler is NOT wrappercached.  So we can't use
+   // ToJSValue here, because it will try to do XPConnect wrapping on it, sadly.
+-  if (NS_WARN_IF(!aRunnable->WrapObject(cx, nullptr, &handlerWrapper))) {
++  if (NS_WARN_IF(!shim->WrapObject(cx, nullptr, &handlerWrapper))) {
+     // Again, no way to report errors.
+     jsapi.ClearException();
+     return;
+   }
+ 
+   JS::Rooted<JSObject*> resolveFunc(cx);
+   resolveFunc =
+     CreateNativeHandlerFunction(cx, handlerWrapper, NativeHandlerTask::Resolve);
+diff --git a/dom/promise/PromiseNativeHandler.cpp b/dom/promise/PromiseNativeHandler.cpp
+deleted file mode 100644
+--- a/dom/promise/PromiseNativeHandler.cpp
++++ /dev/null
+@@ -1,26 +0,0 @@
+-/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+-/* vim: set ts=8 sts=2 et sw=2 tw=80: */
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+-* License, v. 2.0. If a copy of the MPL was not distributed with this file,
+-* You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-#include "mozilla/dom/PromiseNativeHandler.h"
+-#include "mozilla/dom/PromiseBinding.h"
+-
+-namespace mozilla {
+-namespace dom {
+-
+-#ifdef SPIDERMONKEY_PROMISE
+-bool
+-PromiseNativeHandler::WrapObject(JSContext* aCx,
+-                                       JS::Handle<JSObject*> aGivenProto,
+-                                       JS::MutableHandle<JSObject*> aWrapper)
+-{
+-  return PromiseNativeHandlerBinding::Wrap(aCx, this, aGivenProto, aWrapper);
+-}
+-#endif // SPIDERMONKEY_PROMISE
+-
+-} // namespace dom
+-} // namespace mozilla
+-
+-
+diff --git a/dom/promise/PromiseNativeHandler.h b/dom/promise/PromiseNativeHandler.h
+--- a/dom/promise/PromiseNativeHandler.h
++++ b/dom/promise/PromiseNativeHandler.h
+@@ -25,20 +25,14 @@ protected:
+   { }
+ 
+ public:
+   virtual void
+   ResolvedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue) = 0;
+ 
+   virtual void
+   RejectedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue) = 0;
+-
+-#ifdef SPIDERMONKEY_PROMISE
+-  bool WrapObject(JSContext* aCx, JS::Handle<JSObject*> aGivenProto,
+-                  JS::MutableHandle<JSObject*> aWrapper);
+-#endif // SPIDERMONKEY_PROMISE
+-
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_PromiseNativeHandler_h
+diff --git a/dom/promise/moz.build b/dom/promise/moz.build
+--- a/dom/promise/moz.build
++++ b/dom/promise/moz.build
+@@ -10,17 +10,16 @@ EXPORTS.mozilla.dom += [
+     'PromiseNativeHandler.h',
+     'PromiseWorkerProxy.h',
+ ]
+ 
+ UNIFIED_SOURCES += [
+     'Promise.cpp',
+     'PromiseCallback.cpp',
+     'PromiseDebugging.cpp',
+-    'PromiseNativeHandler.cpp',
+ ]
+ 
+ LOCAL_INCLUDES += [
+     '../base',
+     '../ipc',
+     '../workers',
+ ]
+ 
