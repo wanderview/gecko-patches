@@ -1,0 +1,309 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  f7993aee1a0137e55894598d5503fee8a1ccfcd5
+Bug 1300659 P1 Expose a main thread TaskQueue on nsGlobalWindow. r=bz
+
+diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
+--- a/dom/base/nsGlobalWindow.cpp
++++ b/dom/base/nsGlobalWindow.cpp
+@@ -1245,16 +1245,18 @@ nsGlobalWindow::nsGlobalWindow(nsGlobalW
+         // Watch for online/offline status changes so we can fire events. Use
+         // a strong reference.
+         os->AddObserver(mObserver, NS_IOSERVICE_OFFLINE_STATUS_TOPIC,
+                         false);
+ 
+         // Watch for dom-storage2-changed so we can fire storage
+         // events. Use a strong reference.
+         os->AddObserver(mObserver, "dom-storage2-changed", false);
++
++        os->AddObserver(mObserver, "xpcom-shutdown", false);
+       }
+ 
+       Preferences::AddStrongObserver(mObserver, "intl.accept_languages");
+     }
+   } else {
+     // |this| is an outer window. Outer windows start out frozen and
+     // remain frozen until they get an inner window, so freeze this
+     // outer window here.
+@@ -1631,16 +1633,18 @@ nsGlobalWindow::CleanUp()
+   }
+   mAudioContexts.Clear();
+ 
+   if (mIdleTimer) {
+     mIdleTimer->Cancel();
+     mIdleTimer = nullptr;
+   }
+ 
++  MaybeShutdownMainThreadTaskQueue();
++
+   mServiceWorkerRegistrationTable.Clear();
+ }
+ 
+ void
+ nsGlobalWindow::ClearControllers()
+ {
+   if (mControllers) {
+     uint32_t count;
+@@ -3021,18 +3025,22 @@ nsGlobalWindow::SetDocShell(nsIDocShell*
+ {
+   NS_ASSERTION(IsOuterWindow(), "Uh, SetDocShell() called on inner window!");
+   MOZ_ASSERT(aDocShell);
+ 
+   if (aDocShell == mDocShell) {
+     return;
+   }
+ 
++  MaybeShutdownMainThreadTaskQueue();
++
+   mDocShell = aDocShell; // Weak Reference
+ 
++  MaybeCreateMainThreadTaskQueue();
++
+   NS_ASSERTION(!mNavigator, "Non-null mNavigator in outer window!");
+ 
+   if (mFrames) {
+     mFrames->SetDocShell(aDocShell);
+   }
+ 
+   // Get our enclosing chrome shell and retrieve its global window impl, so
+   // that we can do some forwarding to the chrome document.
+@@ -3574,16 +3582,111 @@ nsGlobalWindow::GetPrincipal()
+ 
+   if (objPrincipal) {
+     return objPrincipal->GetPrincipal();
+   }
+ 
+   return nullptr;
+ }
+ 
++void
++nsGlobalWindow::MaybeCreateMainThreadTaskQueue()
++{
++  MOZ_ASSERT(IsOuterWindow());
++  MOZ_ASSERT(!mMainThreadTaskQueue);
++
++  // For now we do not throttle events on chrome windows.  This is for a couple
++  // reasons. First, we may not want to throttle chrome events since they should
++  // be well behaved and we want to maximize throughput of these events.  Second,
++  // it makes it hard to clean up the final top level chrome window during shutdown
++  // if it has a TaskQueue with more runnables in it.  We could solve this in
++  // the future, though.
++  if (GetPrincipal() == nsContentUtils::GetSystemPrincipal()) {
++    return;
++  }
++
++  nsCOMPtr<nsIEventTarget> target;
++
++  nsCOMPtr<nsPIDOMWindowOuter> parent = GetParent();
++  if (parent) {
++    target = parent->GetMainThreadTaskQueue();
++  }
++
++  if (!target) {
++    nsCOMPtr<nsIThread> mainThread;
++    NS_GetMainThread(getter_AddRefs(mainThread));
++    MOZ_DIAGNOSTIC_ASSERT(mainThread);
++    target = mainThread;
++  }
++
++  mMainThreadTaskQueue = new TaskQueue(target.forget());
++}
++
++namespace {
++
++class TaskQueueShutdownHandler final
++{
++  RefPtr<TaskQueue> mTaskQueue;
++
++  ~TaskQueueShutdownHandler()
++  {
++    MOZ_ASSERT(!mTaskQueue);
++  }
++
++public:
++  explicit TaskQueueShutdownHandler(already_AddRefed<TaskQueue> aTaskQueue)
++    : mTaskQueue(aTaskQueue)
++  {
++    MOZ_ASSERT(mTaskQueue);
++  }
++
++  void
++  Done(bool aResult)
++  {
++    MOZ_ASSERT(NS_IsMainThread());
++    MOZ_ASSERT(mTaskQueue);
++    NS_ProxyRelease(NS_GetCurrentThread(), mTaskQueue.forget(),
++                    true /* always proxy */);
++  }
++
++  // TODO: Do we need a browser shutdown observer to spin the event loop
++  //       if this isn't complete when we teardown the browser?
++
++  NS_INLINE_DECL_REFCOUNTING(TaskQueueShutdownHandler)
++};
++
++} // anonymous namespace
++
++void
++nsGlobalWindow::MaybeShutdownMainThreadTaskQueue()
++{
++  if (!mMainThreadTaskQueue) {
++    return;
++  }
++
++  MOZ_ASSERT(IsOuterWindow());
++
++  RefPtr<ShutdownPromise> p = mMainThreadTaskQueue->BeginShutdown();
++
++  RefPtr<TaskQueueShutdownHandler> handler =
++    new TaskQueueShutdownHandler(mMainThreadTaskQueue.forget());
++
++  p->Then<TaskQueueShutdownHandler>(
++    AbstractThread::MainThread(), __func__, handler,
++    &TaskQueueShutdownHandler::Done,
++    &TaskQueueShutdownHandler::Done);
++}
++
++TaskQueue*
++nsGlobalWindow::GetMainThreadTaskQueue()
++{
++  FORWARD_TO_OUTER(GetMainThreadTaskQueue, (), nullptr);
++  return mMainThreadTaskQueue;
++}
++
+ //*****************************************************************************
+ // nsGlobalWindow::nsIDOMWindow
+ //*****************************************************************************
+ 
+ template <class T>
+ nsIURI*
+ nsPIDOMWindow<T>::GetDocumentURI() const
+ {
+@@ -11549,16 +11652,21 @@ nsGlobalWindow::Observe(nsISupports* aSu
+     RefPtr<Event> event = NS_NewDOMEvent(this, nullptr, nullptr);
+     event->InitEvent(NS_LITERAL_STRING("languagechange"), false, false);
+     event->SetTrusted(true);
+ 
+     bool dummy;
+     return DispatchEvent(event, &dummy);
+   }
+ 
++  if (!nsCRT::strcmp(aTopic, "xpcom-shutdown")) {
++    MaybeShutdownMainThreadTaskQueue();
++    return NS_OK;
++  }
++
+   NS_WARNING("unrecognized topic in nsGlobalWindow::Observe");
+   return NS_ERROR_FAILURE;
+ }
+ 
+ already_AddRefed<StorageEvent>
+ nsGlobalWindow::CloneStorageEvent(const nsAString& aType,
+                                   const RefPtr<StorageEvent>& aEvent,
+                                   ErrorResult& aRv)
+diff --git a/dom/base/nsGlobalWindow.h b/dom/base/nsGlobalWindow.h
+--- a/dom/base/nsGlobalWindow.h
++++ b/dom/base/nsGlobalWindow.h
+@@ -495,16 +495,19 @@ public:
+                            nsIWidget* aWidget, nsIScreen* aScreen);
+   bool FullScreen() const;
+ 
+   // Inner windows only.
+   virtual void SetHasGamepadEventListener(bool aHasGamepad = true) override;
+   void NotifyVREventListenerAdded();
+   virtual void EventListenerAdded(nsIAtom* aType) override;
+ 
++  virtual mozilla::TaskQueue*
++  GetMainThreadTaskQueue() override;
++
+   // nsIInterfaceRequestor
+   NS_DECL_NSIINTERFACEREQUESTOR
+ 
+   // WebIDL interface.
+   already_AddRefed<nsPIDOMWindowOuter> IndexedGetterOuter(uint32_t aIndex);
+   already_AddRefed<nsPIDOMWindowOuter> IndexedGetter(uint32_t aIndex);
+ 
+   static bool IsPrivilegedChromeWindow(JSContext* /* unused */, JSObject* aObj);
+@@ -1707,16 +1710,22 @@ private:
+   void FireOnNewGlobalObject();
+ 
+   void DisconnectEventTargetObjects();
+ 
+   // Called only on outer windows to compute the value that will be returned by
+   // IsSecureContext() for the inner window that corresponds to aDocument.
+   bool ComputeIsSecureContext(nsIDocument* aDocument);
+ 
++  void
++  MaybeCreateMainThreadTaskQueue();
++
++  void
++  MaybeShutdownMainThreadTaskQueue();
++
+ protected:
+   // This member is also used on both inner and outer windows, but
+   // for slightly different purposes. On inner windows it means the
+   // inner window is held onto by session history and should not
+   // change. On outer windows it means that the window is in a state
+   // where we don't want to force creation of a new inner window since
+   // we're in the middle of doing just that.
+   bool                          mIsFrozen : 1;
+@@ -1887,16 +1896,18 @@ protected:
+   // responsible for unsuspending events on the document. If we don't (for
+   // example, if the outer window is closed before the LeaveModalState call),
+   // then the inner window whose mDoc is our mSuspendedDoc is responsible for
+   // unsuspending it.
+   nsCOMPtr<nsIDocument> mSuspendedDoc;
+ 
+   RefPtr<mozilla::dom::IDBFactory> mIndexedDB;
+ 
++  RefPtr<mozilla::TaskQueue> mMainThreadTaskQueue;
++
+   // This counts the number of windows that have been opened in rapid succession
+   // (i.e. within dom.successive_dialog_time_limit of each other). It is reset
+   // to 0 once a dialog is opened after dom.successive_dialog_time_limit seconds
+   // have elapsed without any other dialogs.
+   uint32_t                      mDialogAbuseCount;
+ 
+   // This holds the time when the last modal dialog was shown. If more than
+   // MAX_DIALOG_LIMIT dialogs are shown within the time span defined by
+diff --git a/dom/base/nsPIDOMWindow.h b/dom/base/nsPIDOMWindow.h
+--- a/dom/base/nsPIDOMWindow.h
++++ b/dom/base/nsPIDOMWindow.h
+@@ -34,16 +34,17 @@ class nsPIDOMWindowInner;
+ class nsPIDOMWindowOuter;
+ class nsPIWindowRoot;
+ class nsXBLPrototypeHandler;
+ struct nsTimeout;
+ 
+ typedef uint32_t SuspendTypes;
+ 
+ namespace mozilla {
++class TaskQueue;
+ namespace dom {
+ class AudioContext;
+ class Element;
+ class Performance;
+ class ServiceWorkerRegistration;
+ class CustomElementsRegistry;
+ } // namespace dom
+ } // namespace mozilla
+@@ -173,16 +174,19 @@ public:
+     if (!mDoc) {
+       MaybeCreateDoc();
+     }
+     return mDoc;
+   }
+ 
+   virtual bool IsRunningTimeout() = 0;
+ 
++  virtual mozilla::TaskQueue*
++  GetMainThreadTaskQueue() = 0;
++
+ protected:
+   // Lazily instantiate an about:blank document if necessary, and if
+   // we have what it takes to do so.
+   void MaybeCreateDoc();
+ 
+ public:
+   inline bool IsLoadingOrRunningTimeout() const;
+ 
