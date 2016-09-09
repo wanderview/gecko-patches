@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  2544efdf663e46a808b7373b8c821ed8d50f848c
+# Parent  52a70a5d8c6fa7a21495a6e424c3b7887f0fb33e
 Bug 1300658 P1 Expose a main thread TaskQueue WorkerPrivate. r=baku
 
 diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
@@ -24,7 +24,25 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
  #include "nsError.h"
  #include "nsDOMJSUtils.h"
  #include "nsHostObjectProtocolHandler.h"
-@@ -3893,16 +3894,34 @@ WorkerPrivate::WorkerPrivate(WorkerPriva
+@@ -3865,16 +3866,17 @@ WorkerPrivate::WorkerPrivate(WorkerPriva
+   : WorkerPrivateParent<WorkerPrivate>(aParent, aScriptURL,
+                                        aIsChromeWorker, aWorkerType,
+                                        aWorkerName, aLoadInfo)
+   , mDebuggerRegistered(false)
+   , mDebugger(nullptr)
+   , mJSContext(nullptr)
+   , mPRThread(nullptr)
+   , mDebuggerEventLoopLevel(0)
++  , mMainThreadEventTarget(do_GetMainThread())
+   , mErrorHandlerRecursionCount(0)
+   , mNextTimeoutId(1)
+   , mStatus(Pending)
+   , mFrozen(false)
+   , mTimerRunning(false)
+   , mRunningExpiredTimeouts(false)
+   , mPendingEventQueueClearing(false)
+   , mMemoryReporterRunning(false)
+@@ -3893,16 +3895,39 @@ WorkerPrivate::WorkerPrivate(WorkerPriva
      aParent->GetAllPreferences(mPreferences);
      mOnLine = aParent->OnLine();
    }
@@ -37,7 +55,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
 +  nsCOMPtr<nsIEventTarget> target;
 +
 +  if (aParent) {
-+    target = aParent->GetMainThreadTaskQueue();
++    target = aParent->MainThreadEventTarget();
 +  }
 +
 +  // TODO: If we have a window, try to use its MainThreadTaskQueue as the
@@ -50,7 +68,12 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
 +    target = mainThread;
 +  }
 +
++  // Throttle events to the main thread using a TaskQueue specific to this
++  // worker thread.
 +  mMainThreadTaskQueue = new TaskQueue(target.forget());
++
++  // Expose our task queue as the worker's main thread nsIEventTarget.
++  mMainThreadEventTarget = mMainThreadTaskQueue->WrapAsEventTarget();
  }
  
  WorkerPrivate::~WorkerPrivate()
@@ -59,7 +82,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
  
  // static
  already_AddRefed<WorkerPrivate>
-@@ -4432,16 +4451,24 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
+@@ -4432,16 +4457,24 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
  
          {
            MutexAutoLock lock(mMutex);
@@ -69,9 +92,9 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
          }
  
 +        // Shutdown the main thread TaskQueue and wait for it to drain.  Make
-+        // sure to clear our reference, however, so that new runnables are
-+        // not dispatched into the closing TaskQueue.
-+        // TODO: Cancel main thread task queue?
++        // sure to clear our references first, however, so that new runnables
++        // are not dispatched into the closing TaskQueue.
++        mMainThreadEventTarget = do_GetMainThread();
 +        RefPtr<TaskQueue> taskQueue = mMainThreadTaskQueue.forget();
 +        taskQueue->BeginShutdown();
 +        taskQueue->AwaitShutdownAndIdle();
@@ -84,7 +107,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
              runnable->Cancel();
              runnable->Release();
            }
-@@ -4497,16 +4524,23 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
+@@ -4497,16 +4530,24 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
        }
      }
  
@@ -97,7 +120,8 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
 +    // If the worker thread is spamming the main thread faster than it can
 +    // process the work, then pause the worker thread until the MT catches
 +    // up.
-+    if (mMainThreadTaskQueue && mMainThreadTaskQueue->Length() > 5000) {
++    if (mMainThreadTaskQueue &&
++        mMainThreadTaskQueue->ImpreciseLengthForHeuristics() > 5000) {
 +      mMainThreadTaskQueue->AwaitIdle();
 +    }
    }
@@ -108,7 +132,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
  void
  WorkerPrivate::OnProcessNextEvent()
  {
-@@ -4542,16 +4576,42 @@ WorkerPrivate::MaybeDispatchLoadFailedRu
+@@ -4542,16 +4583,36 @@ WorkerPrivate::MaybeDispatchLoadFailedRu
    nsCOMPtr<nsIRunnable> runnable = StealLoadFailedAsyncRunnable();
    if (!runnable) {
      return;
@@ -117,10 +141,10 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
    MOZ_ALWAYS_SUCCEEDS(NS_DispatchToMainThread(runnable.forget()));
  }
  
-+TaskQueue*
-+WorkerPrivate::GetMainThreadTaskQueue()
++nsIEventTarget*
++WorkerPrivate::MainThreadEventTarget()
 +{
-+  return mMainThreadTaskQueue;
++  return mMainThreadEventTarget;
 +}
 +
 +nsresult
@@ -134,13 +158,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
 +WorkerPrivate::DispatchToMainThread(already_AddRefed<nsIRunnable> aRunnable,
 +                                    uint32_t aFlags)
 +{
-+  nsCOMPtr<nsIEventTarget> target;
-+  if (mMainThreadTaskQueue) {
-+    target = mMainThreadTaskQueue->AsEventTarget();
-+  } else {
-+    target = do_GetMainThread();
-+  }
-+  return target->Dispatch(Move(aRunnable), aFlags);
++  return mMainThreadEventTarget->Dispatch(Move(aRunnable), aFlags);
 +}
 +
  void
@@ -172,7 +190,7 @@ diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
  class StructuredCloneHolder;
  class WorkerDebuggerGlobalScope;
  class WorkerGlobalScope;
-@@ -907,16 +908,17 @@ class WorkerPrivate : public WorkerPriva
+@@ -907,16 +908,18 @@ class WorkerPrivate : public WorkerPriva
  
    // Things touched on worker thread only.
    RefPtr<WorkerGlobalScope> mScope;
@@ -182,6 +200,7 @@ diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
    nsTArray<nsAutoPtr<TimeoutInfo>> mTimeouts;
    uint32_t mDebuggerEventLoopLevel;
 +  RefPtr<TaskQueue> mMainThreadTaskQueue;
++  nsCOMPtr<nsIEventTarget> mMainThreadEventTarget;
  
    struct SyncLoopInfo
    {
@@ -190,7 +209,7 @@ diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
      RefPtr<EventTarget> mEventTarget;
      bool mCompleted;
      bool mResult;
-@@ -1331,16 +1333,27 @@ public:
+@@ -1331,16 +1334,30 @@ public:
    {
      AssertIsOnWorkerThread();
      return mWorkerScriptExecutedSuccessfully;
@@ -199,8 +218,11 @@ diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
    void
    MaybeDispatchLoadFailedRunnable();
  
-+  TaskQueue*
-+  GetMainThreadTaskQueue();
++  // Get the event target to use when dispatching to the main thread
++  // from this Worker thread.  This may be the main thread itself or
++  // a TaskQueue throttling runnables to the main thread.
++  nsIEventTarget*
++  MainThreadEventTarget();
 +
 +  nsresult
 +  DispatchToMainThread(nsIRunnable* aRunnable,
