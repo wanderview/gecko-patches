@@ -1,0 +1,149 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  c00a3c761199a045b56be256b4be5ca6e5241c8a
+Bug 1300659 P3 Make setTimeout() and setInterval() use the MainThreadTaskQueue. r=bz
+
+diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
+--- a/dom/base/nsGlobalWindow.cpp
++++ b/dom/base/nsGlobalWindow.cpp
+@@ -78,16 +78,17 @@
+ #include "mozilla/ProcessHangMonitor.h"
+ #include "mozilla/SelfClosingTaskQueueTarget.h"
+ #include "AudioChannelService.h"
+ #include "nsAboutProtocolUtils.h"
+ #include "nsCharTraits.h" // NS_IS_HIGH/LOW_SURROGATE
+ #include "PostMessageEvent.h"
+ 
+ // Interfaces Needed
++#include "nsIEventTarget.h"
+ #include "nsIFrame.h"
+ #include "nsCanvasFrame.h"
+ #include "nsIWidget.h"
+ #include "nsIWidgetListener.h"
+ #include "nsIBaseWindow.h"
+ #include "nsIDeviceSensors.h"
+ #include "nsIContent.h"
+ #include "nsIDocShell.h"
+@@ -546,16 +547,26 @@ NS_IMPL_CYCLE_COLLECTION_UNLINK_0(nsTime
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsTimeout)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mWindow)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mScriptHandler)
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+ NS_IMPL_CYCLE_COLLECTION_ROOT_NATIVE(nsTimeout, AddRef)
+ NS_IMPL_CYCLE_COLLECTION_UNROOT_NATIVE(nsTimeout, Release)
+ 
+ nsresult
++do_InitTimer(nsTimeout* aTimeout, nsIEventTarget* aTarget, uint32_t aDelay)
++{
++  // Attempt to throttle timers through if a task queue is present.  If
++  // our target is nullptr then the current thread will be used.  We do
++  // this every time in order to stop using the TaskQueue if its shutdown.
++  Unused << aTimeout->mTimer->SetTarget(aTarget);
++  return aTimeout->InitTimer(aDelay);
++}
++
++nsresult
+ nsTimeout::InitTimer(uint32_t aDelay)
+ {
+   return mTimer->InitWithNameableFuncCallback(
+     nsGlobalWindow::TimerCallback, this, aDelay,
+     nsITimer::TYPE_ONE_SHOT, nsGlobalWindow::TimerNameCallback);
+ }
+ 
+ // Return true if this timeout has a refcount of 1. This is used to check
+@@ -12098,17 +12109,17 @@ nsGlobalWindow::SetTimeoutOrInterval(nsI
+     nsresult rv;
+     timeout->mTimer = do_CreateInstance("@mozilla.org/timer;1", &rv);
+     if (NS_FAILED(rv)) {
+       return rv;
+     }
+ 
+     RefPtr<nsTimeout> copy = timeout;
+ 
+-    rv = timeout->InitTimer(realInterval);
++    rv = do_InitTimer(timeout, GetMainThreadTaskQueue(), realInterval);
+     if (NS_FAILED(rv)) {
+       return rv;
+     }
+ 
+     // The timeout is now also held in the timer's closure.
+     Unused << copy.forget();
+   } else {
+     // If we are frozen, however, then we instead simply set
+@@ -12370,17 +12381,17 @@ nsGlobalWindow::RescheduleTimeout(nsTime
+     aTimeout->mTimeRemaining = delay;
+     return true;
+   }
+ 
+   aTimeout->mWhen = currentNow + delay;
+ 
+   // Reschedule the OS timer. Don't bother returning any error codes if
+   // this fails since the callers of this method don't care about them.
+-  nsresult rv = aTimeout->InitTimer(delay.ToMilliseconds());
++  nsresult rv = do_InitTimer(aTimeout, GetMainThreadTaskQueue(), delay.ToMilliseconds());
+ 
+   if (NS_FAILED(rv)) {
+     NS_ERROR("Error initializing timer for DOM timeout!");
+ 
+     // We failed to initialize the new OS timer, this timer does
+     // us no good here so we just cancel it (just in case) and
+     // null out the pointer to the OS timer, this will release the
+     // OS timer. As we continue executing the code below we'll end
+@@ -12446,16 +12457,19 @@ nsGlobalWindow::RunTimeout(nsTimeout *aT
+   for (nsTimeout *timeout = mTimeouts.getFirst();
+        timeout && timeout->mWhen <= deadline;
+        timeout = timeout->getNext()) {
+     if (timeout->mFiringDepth == 0) {
+       // Mark any timeouts that are on the list to be fired with the
+       // firing depth so that we can reentrantly run timeouts
+       timeout->mFiringDepth = firingDepth;
+       last_expired_timeout = timeout;
++
++      // Only run a single timer in order to avoid janking the main thread.
++      break;
+     }
+   }
+ 
+   // Maybe the timeout that the event was fired for has been deleted
+   // and there are no others timeouts with deadlines that make them
+   // eligible for execution yet. Go away.
+   if (!last_expired_timeout) {
+     return;
+@@ -12664,17 +12678,17 @@ nsresult nsGlobalWindow::ResetTimersForN
+       timeout->remove();
+       // InsertTimeoutIntoList will addref |timeout| and reset
+       // mFiringDepth.  Make sure to undo that after calling it.
+       uint32_t firingDepth = timeout->mFiringDepth;
+       InsertTimeoutIntoList(timeout);
+       timeout->mFiringDepth = firingDepth;
+       timeout->Release();
+ 
+-      nsresult rv = timeout->InitTimer(delay.ToMilliseconds());
++      nsresult rv = do_InitTimer(timeout, GetMainThreadTaskQueue(), delay.ToMilliseconds());
+ 
+       if (NS_FAILED(rv)) {
+         NS_WARNING("Error resetting non background timer for DOM timeout!");
+         return rv;
+       }
+ 
+       timeout = nextTimeout;
+     } else {
+@@ -13120,17 +13134,17 @@ nsGlobalWindow::ResumeTimeouts(bool aTha
+ 
+       // Set mWhen back to the time when the timer is supposed to
+       // fire.
+       t->mWhen = now + t->mTimeRemaining;
+ 
+       t->mTimer = do_CreateInstance("@mozilla.org/timer;1");
+       NS_ENSURE_TRUE(t->mTimer, NS_ERROR_OUT_OF_MEMORY);
+ 
+-      rv = t->InitTimer(delay);
++      rv = do_InitTimer(t, GetMainThreadTaskQueue(), delay);
+       if (NS_FAILED(rv)) {
+         t->mTimer = nullptr;
+         return rv;
+       }
+ 
+       // Add a reference for the new timer's closure.
+       t->AddRef();
+     }
