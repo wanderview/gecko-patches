@@ -1,30 +1,12 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  7d0795cdd3870e8300a1647b400898e0f55d3472
+# Parent  51516112205eb3dbfef09d265c452b9ff3b57907
 Bug 1300659 P3 Make setTimeout() and setInterval() use the MainThreadTaskQueue. r=bz
 
 diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 --- a/dom/base/nsGlobalWindow.cpp
 +++ b/dom/base/nsGlobalWindow.cpp
-@@ -78,16 +78,17 @@
- #include "mozilla/ProcessHangMonitor.h"
- #include "mozilla/SelfClosingTaskQueueTarget.h"
- #include "AudioChannelService.h"
- #include "nsAboutProtocolUtils.h"
- #include "nsCharTraits.h" // NS_IS_HIGH/LOW_SURROGATE
- #include "PostMessageEvent.h"
- 
- // Interfaces Needed
-+#include "nsIEventTarget.h"
- #include "nsIFrame.h"
- #include "nsCanvasFrame.h"
- #include "nsIWidget.h"
- #include "nsIWidgetListener.h"
- #include "nsIBaseWindow.h"
- #include "nsIDeviceSensors.h"
- #include "nsIContent.h"
- #include "nsIDocShell.h"
-@@ -546,16 +547,26 @@ NS_IMPL_CYCLE_COLLECTION_UNLINK_0(nsTime
+@@ -546,18 +546,32 @@ NS_IMPL_CYCLE_COLLECTION_UNLINK_0(nsTime
  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsTimeout)
    NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mWindow)
    NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mScriptHandler)
@@ -33,25 +15,33 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
  NS_IMPL_CYCLE_COLLECTION_UNROOT_NATIVE(nsTimeout, Release)
  
  nsresult
-+do_InitTimer(nsTimeout* aTimeout, nsIEventTarget* aTarget, uint32_t aDelay)
+-nsTimeout::InitTimer(uint32_t aDelay)
+-{
++nsTimeout::InitTimer(nsIEventTarget* aTarget, uint32_t aDelay)
 +{
-+  // Attempt to throttle timers through if a task queue is present.  If
-+  // our target is nullptr then the current thread will be used.  We do
-+  // this every time in order to stop using the TaskQueue if its shutdown.
-+  Unused << aTimeout->mTimer->SetTarget(aTarget);
-+  return aTimeout->InitTimer(aDelay);
-+}
++  // If the given target does not match the timer's current target
++  // then we need to override it before the Init.  Note that GetTarget()
++  // will return the current thread after setting the target to nullptr.
++  // So we need to special case the nullptr target comparison.
++  nsCOMPtr<nsIEventTarget> currentTarget;
++  MOZ_ALWAYS_SUCCEEDS(mTimer->GetTarget(getter_AddRefs(currentTarget)));
++  if ((aTarget && currentTarget != aTarget) ||
++      (!aTarget && currentTarget != NS_GetCurrentThread())) {
++    // Always call Cancel() in case we are re-using a timer.  Otherwise
++    // the subsequent SetTarget() may fail.
++    MOZ_ALWAYS_SUCCEEDS(mTimer->Cancel());
++    MOZ_ALWAYS_SUCCEEDS(mTimer->SetTarget(aTarget));
++  }
 +
-+nsresult
- nsTimeout::InitTimer(uint32_t aDelay)
- {
    return mTimer->InitWithNameableFuncCallback(
      nsGlobalWindow::TimerCallback, this, aDelay,
      nsITimer::TYPE_ONE_SHOT, nsGlobalWindow::TimerNameCallback);
  }
  
  // Return true if this timeout has a refcount of 1. This is used to check
-@@ -12098,17 +12109,17 @@ nsGlobalWindow::SetTimeoutOrInterval(nsI
+ // that dummy_timeout doesn't leak from nsGlobalWindow::RunTimeout.
+ bool
+@@ -12105,17 +12119,17 @@ nsGlobalWindow::SetTimeoutOrInterval(nsI
      nsresult rv;
      timeout->mTimer = do_CreateInstance("@mozilla.org/timer;1", &rv);
      if (NS_FAILED(rv)) {
@@ -61,7 +51,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
      RefPtr<nsTimeout> copy = timeout;
  
 -    rv = timeout->InitTimer(realInterval);
-+    rv = do_InitTimer(timeout, GetMainThreadTaskQueue(), realInterval);
++    rv = timeout->InitTimer(GetMainThreadTaskQueue(), realInterval);
      if (NS_FAILED(rv)) {
        return rv;
      }
@@ -70,7 +60,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
      Unused << copy.forget();
    } else {
      // If we are frozen, however, then we instead simply set
-@@ -12370,17 +12381,17 @@ nsGlobalWindow::RescheduleTimeout(nsTime
+@@ -12377,17 +12391,18 @@ nsGlobalWindow::RescheduleTimeout(nsTime
      aTimeout->mTimeRemaining = delay;
      return true;
    }
@@ -80,7 +70,8 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
    // Reschedule the OS timer. Don't bother returning any error codes if
    // this fails since the callers of this method don't care about them.
 -  nsresult rv = aTimeout->InitTimer(delay.ToMilliseconds());
-+  nsresult rv = do_InitTimer(aTimeout, GetMainThreadTaskQueue(), delay.ToMilliseconds());
++  nsresult rv = aTimeout->InitTimer(GetMainThreadTaskQueue(),
++                                    delay.ToMilliseconds());
  
    if (NS_FAILED(rv)) {
      NS_ERROR("Error initializing timer for DOM timeout!");
@@ -89,7 +80,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
      // us no good here so we just cancel it (just in case) and
      // null out the pointer to the OS timer, this will release the
      // OS timer. As we continue executing the code below we'll end
-@@ -12431,31 +12442,42 @@ nsGlobalWindow::RunTimeout(nsTimeout *aT
+@@ -12438,31 +12453,63 @@ nsGlobalWindow::RunTimeout(nsTimeout *aT
      // timers that *should* have fired before aTimeout *will* be fired
      // now.
  
@@ -98,7 +89,11 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
      deadline = now;
    }
  
-+  static const uint32_t kMaxSequentialTimeouts = 10;
++  // Run a limited number of timers at once to avoid janking the main
++  // thread.  Any timers beyond this will get picked up on the next
++  // timer runnable which should fire immediately.  Chrome windows are
++  // exempty from this limit.
++  static const uint32_t kMaxSequentialTimeouts = 1;
 +
    // The timeout list is kept in deadline order. Discover the latest timeout
    // whose deadline has expired. On some platforms, native timeout events fire
@@ -108,6 +103,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
    // nothing past that point is expired.
    last_expired_timeout = nullptr;
 +  uint32_t count = 0;
++  bool foundTarget = false;
    for (nsTimeout *timeout = mTimeouts.getFirst();
         timeout && timeout->mWhen <= deadline;
         timeout = timeout->getNext()) {
@@ -117,11 +113,27 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
        timeout->mFiringDepth = firingDepth;
        last_expired_timeout = timeout;
 +
-+      // Run a limited number of timers at once to avoid janking the main
-+      // thread.  Any timers beyond this will get picked up on the next
-+      // timer runnable which should fire immediately.
++      // Note that we have seen the timer this runnable was dispatched
++      // to fire.
++      if (timeout == aTimeout) {
++        foundTarget = true;
++      }
++
++      // Apply throttling to the number of timers we will fire in a
++      // single runnable before yielding the main thread.
++      //
++      // While we would like to throttle immediately after finding our
++      // limited number of timers, we MUST fire our target timer.  We
++      // cannot rely on another timer's runnable firing because that
++      // timer might get cleared as a result of this runnable.
++      //
++      // Note, the fact that our target timeout is not always the first
++      // timer we encounter suggests we have other bugs.  We should
++      // receive timer callbacks in the same order we store our mTimers
++      // list.  It seems they can come slightly out of order after
++      // suspend/resume, however.
 +      count += 1;
-+      if (count > kMaxSequentialTimeouts) {
++      if (foundTarget && count >= kMaxSequentialTimeouts && !IsChromeWindow()) {
 +        break;
 +      }
      }
@@ -132,7 +144,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
    // eligible for execution yet. Go away.
    if (!last_expired_timeout) {
      return;
-@@ -12664,17 +12686,17 @@ nsresult nsGlobalWindow::ResetTimersForN
+@@ -12671,17 +12718,18 @@ nsresult nsGlobalWindow::ResetTimersForN
        timeout->remove();
        // InsertTimeoutIntoList will addref |timeout| and reset
        // mFiringDepth.  Make sure to undo that after calling it.
@@ -142,7 +154,8 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
        timeout->Release();
  
 -      nsresult rv = timeout->InitTimer(delay.ToMilliseconds());
-+      nsresult rv = do_InitTimer(timeout, GetMainThreadTaskQueue(), delay.ToMilliseconds());
++      nsresult rv = timeout->InitTimer(GetMainThreadTaskQueue(),
++                                       delay.ToMilliseconds());
  
        if (NS_FAILED(rv)) {
          NS_WARNING("Error resetting non background timer for DOM timeout!");
@@ -151,7 +164,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
  
        timeout = nextTimeout;
      } else {
-@@ -13120,17 +13142,17 @@ nsGlobalWindow::ResumeTimeouts(bool aTha
+@@ -13127,17 +13175,17 @@ nsGlobalWindow::ResumeTimeouts(bool aTha
  
        // Set mWhen back to the time when the timer is supposed to
        // fire.
@@ -161,7 +174,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
        NS_ENSURE_TRUE(t->mTimer, NS_ERROR_OUT_OF_MEMORY);
  
 -      rv = t->InitTimer(delay);
-+      rv = do_InitTimer(t, GetMainThreadTaskQueue(), delay);
++      rv = t->InitTimer(GetMainThreadTaskQueue(), delay);
        if (NS_FAILED(rv)) {
          t->mTimer = nullptr;
          return rv;
@@ -170,3 +183,28 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
        // Add a reference for the new timer's closure.
        t->AddRef();
      }
+diff --git a/dom/base/nsGlobalWindow.h b/dom/base/nsGlobalWindow.h
+--- a/dom/base/nsGlobalWindow.h
++++ b/dom/base/nsGlobalWindow.h
+@@ -160,17 +160,20 @@ private:
+   ~nsTimeout();
+ 
+ public:
+   nsTimeout();
+ 
+   NS_DECL_CYCLE_COLLECTION_NATIVE_CLASS(nsTimeout)
+   NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(nsTimeout)
+ 
+-  nsresult InitTimer(uint32_t aDelay);
++  // The callback target may be specified to use a particular task queue
++  // for the resulting timer runnable.  A nullptr callback target will result
++  // in the default main thread being used.
++  nsresult InitTimer(nsIEventTarget* aCallbackTarget, uint32_t aDelay);
+ 
+   bool HasRefCntOne();
+ 
+   // Window for which this timeout fires
+   RefPtr<nsGlobalWindow> mWindow;
+ 
+   // The actual timer object
+   nsCOMPtr<nsITimer> mTimer;

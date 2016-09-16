@@ -1,13 +1,13 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  0a7af8d577e6fa125d870fc59644bbbdadd512c7
+# Parent  8a494adbc5cced90a4edf0c98cffde906bf7f3ae
 Bug 1300659 P1 Add a TaskQueue wrapper that automatically shuts down when appropriate. r=froydnj
 
 diff --git a/xpcom/threads/SelfClosingTaskQueueTarget.cpp b/xpcom/threads/SelfClosingTaskQueueTarget.cpp
 new file mode 100644
 --- /dev/null
 +++ b/xpcom/threads/SelfClosingTaskQueueTarget.cpp
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,296 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -29,6 +29,38 @@ new file mode 100644
 +
 +} // anonymous namespace
 +
++// The SelfClosingTaskQueueTarget is designed with an inner and outer object:
++//
++//       XPCOM code    nsObserverService
++//            |               |
++//            |               |
++//            v               |
++//        +-------+           |
++//        | Outer |           |
++//        +-------+           |
++//            |               |
++//            |   +-------+   |
++//            +-->| Inner |<--+
++//                +-------+
++//
++// Client code references the outer nsIEventTarget which in turn references
++// an inner object.  The inner object is also held alive by the observer
++// service.
++//
++// If the outer object is dereferenced and destroyed, it will trigger a
++// shutdown operation on the inner object.  Similarly if the observer
++// service notifies that the browser is shutting down, then the inner
++// object also starts shutting down its TaskQueue.
++//
++// Once the TaskQueue is shutdown and idle we unregister for the observer
++// service.  If the outer object is already gone, then the inner object
++// is free'd at this point.  If the outer object still exists then calls
++// fall back to the TaskQueue's base target.  We just don't queue things
++// any more.  The inner is then released once the outer object is released.
++//
++// Note, we must keep the inner object alive and attached to the observer
++// service until the TaskQueue is fully shutdown and idle.  We must delay
++// xpcom shutdown if the TaskQueue is in the middle of draining.
 +class SelfClosingTaskQueueTarget::Inner final : public nsIObserver
 +{
 +  // Written on the main thread, read from any thread
@@ -36,7 +68,7 @@ new file mode 100644
 +  RefPtr<TaskQueue> mTaskQueue;
 +  nsCOMPtr<nsIEventTarget> mTaskQueueTarget;
 +
-+  // Written and read from any thread
++  // Written and read from any thread.
 +  Atomic<bool> mShutdownStarted;
 +
 +  Inner(nsIEventTarget* aBaseTarget, TaskQueue* aTaskQueue)
@@ -51,6 +83,16 @@ new file mode 100644
 +  ~Inner()
 +  {
 +    // We cannot call MaybeBeginShutdown() here because it AddRef's this.
++    MOZ_ASSERT(mTaskQueue->IsEmpty());
++  }
++
++  nsIEventTarget*
++  InternalTarget() const
++  {
++    // This can be called by any thread.  Consult our Atomic<bool> shutdown
++    // flag.  If we have not been shutdown then return the task queue.  Otherwise
++    // return the base target.
++    return mShutdownStarted ? mBaseTarget : mTaskQueueTarget;
 +  }
 +
 +public:
@@ -74,7 +116,8 @@ new file mode 100644
 +
 +    RefPtr<Inner> ref = new Inner(aBaseTarget, taskQueue);
 +
-+    nsresult rv = obs->AddObserver(ref, kShutdownTopic, false /* weak ref */);
++    nsresult rv = obs->AddObserver(ref, kShutdownTopic,
++                                   false /* means OS will hold a strong ref */);
 +    if (NS_WARN_IF(NS_FAILED(rv))) {
 +      taskQueue->BeginShutdown();
 +      MOZ_ASSERT(taskQueue->IsEmpty());
@@ -87,10 +130,14 @@ new file mode 100644
 +  NS_IMETHOD
 +  Observe(nsISupports*, const char* aTopic, const char16_t*) override
 +  {
++    MOZ_ASSERT(NS_IsMainThread());
 +    MOZ_ASSERT(!strcmp(aTopic, kShutdownTopic));
 +
 +    MaybeStartShutdown();
 +
++    // Once shutdown begins we set the Atomic<bool> mShutdownStarted flag.
++    // This prevents any new runnables from being dispatched into the
++    // TaskQueue.  Therefore this loop should be finite.
 +    while (!mTaskQueue->IsEmpty()) {
 +      MOZ_ALWAYS_TRUE(NS_ProcessNextEvent());
 +    }
@@ -101,11 +148,14 @@ new file mode 100644
 +  void
 +  MaybeStartShutdown()
 +  {
-+    if (mShutdownStarted) {
++    // Any thread
++
++    // Test-and-set the mShutdownStarted flag.  We exit immediately if
++    // the flag is already set.  Otherwise this sets the flag to true
++    // and proceeds with the method.
++    if (!mShutdownStarted.compareExchange(false, true)) {
 +      return;
 +    }
-+
-+    mShutdownStarted = true;
 +
 +    mTaskQueue->BeginShutdown()->Then(
 +      AbstractThread::MainThread(), __func__, this,
@@ -129,41 +179,56 @@ new file mode 100644
 +  bool
 +  IsEmpty() const
 +  {
++    // Any thread
 +    return mTaskQueue->IsEmpty();
 +  }
 +
 +  uint32_t
 +  ImpreciseLengthForHeuristics() const
 +  {
++    // Any thread
 +    return mTaskQueue->ImpreciseLengthForHeuristics();
 +  }
 +
 +  nsresult
 +  DispatchFromScript(nsIRunnable* aEvent, uint32_t aFlags)
 +  {
-+    nsIEventTarget* target = mShutdownStarted ? mBaseTarget : mTaskQueueTarget;
-+    return target->DispatchFromScript(aEvent, aFlags);
++    // Any thread
++    nsCOMPtr<nsIRunnable> r = aEvent;
++    return Dispatch(r.forget(), aFlags);
 +  }
 +
 +  nsresult
 +  Dispatch(already_AddRefed<nsIRunnable> aEvent, uint32_t aFlags)
 +  {
-+    nsIEventTarget* target = mShutdownStarted ? mBaseTarget : mTaskQueueTarget;
-+    return target->Dispatch(Move(aEvent), aFlags);
++    // Any thread
++    nsresult rv = InternalTarget()->Dispatch(Move(aEvent), aFlags);
++    // Between selecting the target in InternalTarget() and calling
++    // Dispatch() the TaskQueue might get shutdown.  If that happens,
++    // then try again.  This time we will get the base target which
++    // should succeed.
++    if (NS_FAILED(rv) && mShutdownStarted) {
++      rv = InternalTarget()->Dispatch(Move(aEvent), aFlags);
++    }
++    return rv;
 +  }
 +
 +  nsresult
 +  DelayedDispatch(already_AddRefed<nsIRunnable> aEvent, uint32_t aFlags)
 +  {
-+    nsIEventTarget* target = mShutdownStarted ? mBaseTarget : mTaskQueueTarget;
-+    return target->DelayedDispatch(Move(aEvent), aFlags);
++    // Any thread
++
++    // TaskQueue does not implement this.  Be consistent in returning
++    // failure instead of possibly failing and then succeeding when
++    // the TaskQueue is shutdown.
++    return NS_ERROR_NOT_IMPLEMENTED;
 +  }
 +
 +  nsresult
 +  IsOnCurrentThread(bool* aResult)
 +  {
-+    nsIEventTarget* target = mShutdownStarted ? mBaseTarget : mTaskQueueTarget;
-+    return target->IsOnCurrentThread(aResult);
++    // Any thread
++    return InternalTarget()->IsOnCurrentThread(aResult);
 +  }
 +
 +  NS_DECL_THREADSAFE_ISUPPORTS
@@ -243,7 +308,7 @@ diff --git a/xpcom/threads/SelfClosingTaskQueueTarget.h b/xpcom/threads/SelfClos
 new file mode 100644
 --- /dev/null
 +++ b/xpcom/threads/SelfClosingTaskQueueTarget.h
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,53 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -264,6 +329,11 @@ new file mode 100644
 +// this wrapper object is no longer referenced.  It will also close
 +// if xpcom shutdown occurs.  In the shutdown case runnables will
 +// be dispatched to the originl base target instead.
++//
++// This is intended to be used in places we want to throttle runnables,
++// but don't have a convenient place to shutdown the particular task
++// queue.  You should be able to simply pass this event target around
++// to where its needed and trust that it will Do The Right Thing.
 +class SelfClosingTaskQueueTarget final : public nsIEventTarget
 +{
 +  class Inner;
@@ -273,6 +343,9 @@ new file mode 100644
 +  ~SelfClosingTaskQueueTarget();
 +
 +public:
++  // Attempt to create a new self-closing TaskQueue target.  Will return
++  // nullptr during xpcom shutdown.  May only be called on the main thread
++  // since it uses the observer service.
 +  static already_AddRefed<SelfClosingTaskQueueTarget>
 +  Create(nsIEventTarget* aBaseTarget);
 +

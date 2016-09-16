@@ -1,0 +1,112 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  aa0cf9c5fda46bb351b2ecc1fa6fe0ff196a3fd2
+Bug 1300659 P5 Suspend a window if its main thread TaskQueue falls to far behind. r=smaug
+
+diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
+--- a/dom/base/nsGlobalWindow.cpp
++++ b/dom/base/nsGlobalWindow.cpp
+@@ -3632,16 +3632,58 @@ nsGlobalWindow::MaybeCreateMainThreadTas
+   NS_GetMainThread(getter_AddRefs(mainThread));
+   MOZ_DIAGNOSTIC_ASSERT(mainThread);
+ 
+   // This may return nullptr during xpcom shutdown.  This is ok as we
+   // do not guarantee a task queue will be present.
+   mMainThreadTaskQueue = SelfClosingTaskQueueTarget::Create(mainThread);
+ }
+ 
++void
++nsGlobalWindow::MaybeApplyMainThreadTaskQueueBackPressure()
++{
++  MOZ_ASSERT(NS_IsMainThread());
++
++  // If we are already suspended, then we don't need to apply back
++  // pressure for TaskQueue reasons.  This also avoids repeatedly
++  // calling SuspendTimeout() if this routine is executed many times
++  // before dropping below the backpressure threshold.
++  if (mTimeoutsSuspendDepth != 0) {
++    return;
++  }
++
++  RefPtr<SelfClosingTaskQueueTarget> taskQueue = GetMainThreadTaskQueue();
++  if (!taskQueue) {
++    return;
++  }
++
++  static const uint32_t kTaskQueueBackPressure = 5000;
++  if (taskQueue->ImpreciseLengthForHeuristics() < kTaskQueueBackPressure) {
++    return;
++  }
++
++  // We only need to suspend and not fully freeze.  Freezing triggers
++  // a bunch of secondary logic via observers that we probably don't
++  // want to perform when the main thread is backed up already.
++  const bool kFreezeChildren = false;
++  const bool kFreezeWorkers = false;
++
++  // First attempt to queue a runnable to resume running timeouts.  We do
++  // this first in order to verify we can dispatch successfully.
++  nsCOMPtr<nsIRunnable> r = NewRunnableMethod<bool, bool>(
++    this, &nsGlobalWindow::ResumeTimeouts, kFreezeChildren, kFreezeWorkers);
++  nsresult rv = taskQueue->Dispatch(r.forget(), NS_DISPATCH_NORMAL);
++  NS_ENSURE_SUCCESS_VOID(rv);
++
++  // Since the resume is dispatched we can go ahead and suspend the window
++  // now.  Once the task queue drains the resume will automatically get
++  // executed balancing this suspend.
++  SuspendTimeouts(1, kFreezeChildren, kFreezeWorkers);
++}
++
+ SelfClosingTaskQueueTarget*
+ nsGlobalWindow::GetMainThreadTaskQueue()
+ {
+   FORWARD_TO_OUTER(GetMainThreadTaskQueue, (), nullptr);
+   return mMainThreadTaskQueue;
+ }
+ 
+ //*****************************************************************************
+@@ -12607,16 +12649,18 @@ nsGlobalWindow::RunTimeout(nsTimeout *aT
+   }
+ 
+   // Take the dummy timeout off the head of the list
+   dummy_timeout->remove();
+   timeoutExtraRef = nullptr;
+   MOZ_ASSERT(dummy_timeout->HasRefCntOne(), "dummy_timeout may leak");
+ 
+   mTimeoutInsertionPoint = last_insertion_point;
++
++  MaybeApplyMainThreadTaskQueueBackPressure();
+ }
+ 
+ void
+ nsGlobalWindow::ClearTimeoutOrInterval(int32_t aTimerID)
+ {
+   MOZ_RELEASE_ASSERT(IsInnerWindow());
+ 
+   uint32_t public_id = (uint32_t)aTimerID;
+diff --git a/dom/base/nsGlobalWindow.h b/dom/base/nsGlobalWindow.h
+--- a/dom/base/nsGlobalWindow.h
++++ b/dom/base/nsGlobalWindow.h
+@@ -1718,16 +1718,22 @@ private:
+   // Maybe create a TaskQueue for dispatching runnables to the main thread
+   // from this window.  This TaskQueue will throttle these runnables and
+   // prevent the window content from significantly impacting main thread
+   // responsiveness.  Certain situations will result in a nullptr task
+   // queue even after calling this method.
+   void
+   MaybeCreateMainThreadTaskQueue();
+ 
++  // Apply back pressure to the window if the main thread TaskQueue exists
++  // and has too many runnables waiting to run.  For example, suspend timers
++  // until we have a chance to catch up, etc.
++  void
++  MaybeApplyMainThreadTaskQueueBackPressure();
++
+ protected:
+   // This member is also used on both inner and outer windows, but
+   // for slightly different purposes. On inner windows it means the
+   // inner window is held onto by session history and should not
+   // change. On outer windows it means that the window is in a state
+   // where we don't want to force creation of a new inner window since
+   // we're in the middle of doing just that.
+   bool                          mIsFrozen : 1;
