@@ -1,11 +1,11 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  f1dbeb5dee22cabc56b2cf25d2eab1435abbf131
+# Parent  fd0564234eca242b7fb753a110312679020f8059
 
 diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 --- a/dom/base/nsGlobalWindow.cpp
 +++ b/dom/base/nsGlobalWindow.cpp
-@@ -11619,16 +11619,259 @@ nsGlobalWindow::CloneStorageEvent(const 
+@@ -11619,16 +11619,326 @@ nsGlobalWindow::CloneStorageEvent(const 
    MOZ_ASSERT(storage->IsForkOf(storageArea));
  
    dict.mStorageArea = storage;
@@ -37,13 +37,10 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 +
 +  mozilla::dom::workers::SuspendWorkersForWindow(AsInner());
 +
-+  TimeStamp now = TimeStamp::Now();
 +  for (nsTimeout *t = mTimeouts.getFirst(); t; t = t->getNext()) {
-+    // Set mTimeRemaining to be the time remaining for this timer.
-+    if (t->mWhen > now)
-+      t->mTimeRemaining = t->mWhen - now;
-+    else
-+      t->mTimeRemaining = TimeDuration(0);
++    // Leave the timers with the current time remaining.  This will
++    // cause the timers to potentially fire when the window is
++    // Resume()'d.  Time effectively passes while suspended.
 +
 +    // Drop the XPCOM timer; we'll reschedule when restoring the state.
 +    if (t->mTimer) {
@@ -51,7 +48,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 +      t->mTimer = nullptr;
 +
 +      // Drop the reference that the timer's closure had on this timeout, we'll
-+      // add it back in ResumeTimeouts. Note that it shouldn't matter that we're
++      // add it back in Resume(). Note that it shouldn't matter that we're
 +      // passing null for the context, since this shouldn't actually release this
 +      // timeout.
 +      t->Release();
@@ -79,6 +76,9 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 +    return;
 +  }
 +
++  // We should not be able to resume a frozen window.  It must be Thaw()'d first.
++  MOZ_ASSERT(mFreezeDepth == 0);
++
 +  nsCOMPtr<nsIDeviceSensors> ac = do_GetService(NS_DEVICE_SENSORS_CONTRACTID);
 +  if (ac) {
 +    for (uint32_t i = 0; i < mEnabledSensors.Length(); i++)
@@ -93,37 +93,32 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 +    RefPtr<Promise> d = mAudioContexts[i]->Resume(dummy);
 +  }
 +
-+  // Restore all of the timeouts, using the stored time remaining
-+  // (stored in timeout->mTimeRemaining).
-+
 +  TimeStamp now = TimeStamp::Now();
-+
-+#ifdef DEBUG
-+  bool _seenDummyTimeout = false;
-+#endif
++  DebugOnly<bool> _seenDummyTimeout = false;
 +
 +  for (nsTimeout *t = mTimeouts.getFirst(); t; t = t->getNext()) {
 +    // There's a chance we're being called with RunTimeout on the stack in which
 +    // case we have a dummy timeout in the list that *must not* be resumed. It
 +    // can be identified by a null mWindow.
 +    if (!t->mWindow) {
-+#ifdef DEBUG
 +      NS_ASSERTION(!_seenDummyTimeout, "More than one dummy timeout?!");
 +      _seenDummyTimeout = true;
-+#endif
 +      continue;
 +    }
 +
-+    // XXXbz the combination of the way |delay| and |t->mWhen| are set here
-+    // makes no sense.  Are we trying to impose that min timeout value or
-+    // not???
-+    uint32_t delay =
-+      std::max(int32_t(t->mTimeRemaining.ToMilliseconds()),
-+             DOMMinTimeoutValue());
++    MOZ_ASSERT(!t->mTimer);
 +
-+    // Set mWhen back to the time when the timer is supposed to
-+    // fire.
-+    t->mWhen = now + t->mTimeRemaining;
++    // The timeout mWhen is set to the absolute time when the timer should
++    // fire.  Recalculate the delay from now until that deadline.  If the
++    // the deadline has already passed or falls within our minimum delay
++    // deadline, then clamp the resulting value to the minimum delay.  The
++    // mWhen will remain at its absolute time, but we won't fire the OS
++    // timer until our calculated delay has passed.
++    int32_t remaining = 0;
++    if (t->mWhen > now) {
++      remaining = static_cast<int32_t>((t->mWhen - now).ToMilliseconds());
++    }
++    uint32_t delay = std::max(remaining, DOMMinTimeoutValue());
 +
 +    t->mTimer = do_CreateInstance("@mozilla.org/timer;1");
 +    if (!t->mTimer) {
@@ -179,6 +174,25 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 +    return;
 +  }
 +
++  mozilla::dom::workers::FreezeWorkersForWindow(AsInner());
++
++  TimeStamp now = TimeStamp::Now();
++  for (nsTimeout *t = mTimeouts.getFirst(); t; t = t->getNext()) {
++    // Save the current remaining time for this timeout.  We will
++    // re-apply it when the window is Thaw()'d.  This effectively
++    // shifts timers to the right as if time does not pass while
++    // the window is frozen.
++    if (t->mWhen > now) {
++      t->mTimeRemaining = t->mWhen - now;
++    } else {
++      t->mTimeRemaining = TimeDuration(0);
++    }
++
++    // Since we are suspended there should be no OS timer set for
++    // this timeout entry.
++    MOZ_ASSERT(!t->mTimer);
++  }
++
 +  NotifyDOMWindowFrozen(this);
 +}
 +
@@ -205,6 +219,27 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 +    return;
 +  }
 +
++  TimeStamp now = TimeStamp::Now();
++  DebugOnly<bool> _seenDummyTimeout = false;
++
++  for (nsTimeout *t = mTimeouts.getFirst(); t; t = t->getNext()) {
++    // There's a chance we're being called with RunTimeout on the stack in which
++    // case we have a dummy timeout in the list that *must not* be resumed. It
++    // can be identified by a null mWindow.
++    if (!t->mWindow) {
++      NS_ASSERTION(!_seenDummyTimeout, "More than one dummy timeout?!");
++      _seenDummyTimeout = true;
++      continue;
++    }
++
++    // Set mWhen back to the time when the timer is supposed to fire.
++    t->mWhen = now + t->mTimeRemaining;
++
++    MOZ_ASSERT(!t->mTimer);
++  }
++
++  mozilla::dom::workers::ThawWorkersForWindow(AsInner());
++
 +  NotifyDOMWindowThawed(this);
 +}
 +
@@ -217,6 +252,38 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 +  bool frozen =  mFreezeDepth != 0;
 +  MOZ_ASSERT_IF(frozen, NewIsSuspended());
 +  return frozen;
++}
++
++void
++nsGlobalWindow::NewSyncSuspendAndFreezeStateToParentWindow()
++{
++  nsPIDOMWindowOuter* parentOuter = GetParentInternal();
++  if (!parentOuter) {
++    return;
++  }
++
++  nsGlobalWindow* parentInner = nsGlobalWindow::Cast(parentOuter->AsInner());
++  if (!parentInner) {
++    return;
++  }
++
++  uint32_t parentFreezeDepth = parentInner->mFreezeDepth;
++  uint32_t parentSuspendDepth = parentInner->mSuspendDepth;
++
++  // Since every Freeze() calls Suspend(), the suspend count must
++  // be equal or greater to the freeze count.
++  MOZ_ASSERT(parentFreezeDepth <= parentSuspendDepth);
++
++  // First apply the Freeze() calls.
++  for (uint32_t i = 0; i < parentFreezeDepth; ++i) {
++    NewFreeze();
++  }
++
++  // Now apply only the number of Suspend() calls to reach the target
++  // suspend count after applying the Freeze() calls.
++  for (uint32_t i = 0; i < (parentSuspendDepth - parentFreezeDepth); ++i) {
++    NewSuspend();
++  }
 +}
 +
 +template<typename Method>
@@ -268,7 +335,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 diff --git a/dom/base/nsGlobalWindow.h b/dom/base/nsGlobalWindow.h
 --- a/dom/base/nsGlobalWindow.h
 +++ b/dom/base/nsGlobalWindow.h
-@@ -435,16 +435,24 @@ public:
+@@ -435,16 +435,25 @@ public:
    virtual already_AddRefed<nsISupports> SaveWindowState() override;
    virtual nsresult RestoreWindowState(nsISupports *aState) override;
    virtual void SuspendTimeouts(uint32_t aIncrease = 1,
@@ -284,6 +351,7 @@ diff --git a/dom/base/nsGlobalWindow.h b/dom/base/nsGlobalWindow.h
 +  virtual void NewFreeze() override;
 +  virtual void NewThaw() override;
 +  virtual bool NewIsFrozen() const override;
++  virtual void NewSyncSuspendAndFreezeStateToParentWindow() override;
 +
    virtual nsresult FireDelayedDOMEvents() override;
    virtual bool IsFrozen() const override
@@ -293,7 +361,7 @@ diff --git a/dom/base/nsGlobalWindow.h b/dom/base/nsGlobalWindow.h
    virtual bool IsRunningTimeout() override { return mTimeoutFiringDepth > 0; }
  
    // Outer windows only.
-@@ -1459,16 +1467,22 @@ private:
+@@ -1459,16 +1468,22 @@ private:
                          bool aContentModal,
                          bool aCalledNoScript,
                          bool aDoJSFixups,
@@ -316,7 +384,7 @@ diff --git a/dom/base/nsGlobalWindow.h b/dom/base/nsGlobalWindow.h
                                  int32_t interval,
                                  bool aIsInterval, int32_t* aReturn);
    int32_t SetTimeoutOrInterval(JSContext* aCx,
-@@ -1857,16 +1871,19 @@ protected:
+@@ -1857,16 +1872,19 @@ protected:
    // These member variables are used on both inner and the outer windows.
    nsCOMPtr<nsIPrincipal> mDocumentPrincipal;
  
@@ -339,7 +407,7 @@ diff --git a/dom/base/nsGlobalWindow.h b/dom/base/nsGlobalWindow.h
 diff --git a/dom/base/nsPIDOMWindow.h b/dom/base/nsPIDOMWindow.h
 --- a/dom/base/nsPIDOMWindow.h
 +++ b/dom/base/nsPIDOMWindow.h
-@@ -213,16 +213,38 @@ public:
+@@ -213,16 +213,42 @@ public:
                                 bool aFreezeWorkers = true) = 0;
  
    // Resume suspended timeouts in this window and in child windows.
@@ -369,6 +437,10 @@ diff --git a/dom/base/nsPIDOMWindow.h b/dom/base/nsPIDOMWindow.h
 +  virtual void NewFreeze() = 0;
 +  virtual void NewThaw() = 0;
 +  virtual bool NewIsFrozen() const = 0;
++
++  // When a window is inserted into the tree it should inherit its parent
++  // window's suspend and freeze state.
++  virtual void NewSyncSuspendAndFreezeStateToParentWindow() = 0;
 +
    // Fire any DOM notification events related to things that happened while
    // the window was frozen.

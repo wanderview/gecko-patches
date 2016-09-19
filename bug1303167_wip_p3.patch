@@ -1,0 +1,397 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  12bc1bb0868217b930487647b654efd51c223c83
+
+diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
+--- a/dom/base/nsGlobalWindow.cpp
++++ b/dom/base/nsGlobalWindow.cpp
+@@ -1176,17 +1176,16 @@ NewOuterWindowProxy(JSContext *cx, JS::H
+ //*****************************************************************************
+ 
+ nsGlobalWindow::nsGlobalWindow(nsGlobalWindow *aOuterWindow)
+   : nsPIDOMWindow<nsISupports>(aOuterWindow ? aOuterWindow->AsOuter() : nullptr),
+     mIdleFuzzFactor(0),
+     mIdleCallbackIndex(-1),
+     mCurrentlyIdle(false),
+     mAddActiveEventFuzzTime(true),
+-    mIsFrozen(false)
+     mFullScreen(false),
+     mFullscreenMode(false),
+     mIsClosed(false),
+     mInClose(false),
+     mHavePendingClose(false),
+     mHadOriginalOpener(false),
+     mOriginalOpenerWasSecureContext(false),
+     mIsPopupSpam(false),
+@@ -13256,226 +13255,16 @@ nsGlobalWindow::RestoreWindowState(nsISu
+   inner->NewThaw();
+ 
+   holder->DidRestoreWindow();
+ 
+   return NS_OK;
+ }
+ 
+ void
+-nsGlobalWindow::SuspendTimeouts(uint32_t aIncrease,
+-                                bool aFreezeChildren,
+-                                bool aFreezeWorkers)
+-{
+-  FORWARD_TO_INNER_VOID(SuspendTimeouts,
+-                        (aIncrease, aFreezeChildren, aFreezeWorkers));
+-
+-  bool suspended = (mTimeoutsSuspendDepth != 0);
+-  mTimeoutsSuspendDepth += aIncrease;
+-
+-  if (!suspended) {
+-    nsCOMPtr<nsIDeviceSensors> ac = do_GetService(NS_DEVICE_SENSORS_CONTRACTID);
+-    if (ac) {
+-      for (uint32_t i = 0; i < mEnabledSensors.Length(); i++)
+-        ac->RemoveWindowListener(mEnabledSensors[i], this);
+-    }
+-    DisableGamepadUpdates();
+-    DisableVRUpdates();
+-
+-    // Freeze or suspend all of the workers for this window.
+-    if (aFreezeWorkers) {
+-      mozilla::dom::workers::FreezeWorkersForWindow(AsInner());
+-    } else {
+-      mozilla::dom::workers::SuspendWorkersForWindow(AsInner());
+-    }
+-
+-    TimeStamp now = TimeStamp::Now();
+-    for (nsTimeout *t = mTimeouts.getFirst(); t; t = t->getNext()) {
+-      // Set mTimeRemaining to be the time remaining for this timer.
+-      if (t->mWhen > now)
+-        t->mTimeRemaining = t->mWhen - now;
+-      else
+-        t->mTimeRemaining = TimeDuration(0);
+-
+-      // Drop the XPCOM timer; we'll reschedule when restoring the state.
+-      if (t->mTimer) {
+-        t->mTimer->Cancel();
+-        t->mTimer = nullptr;
+-
+-        // Drop the reference that the timer's closure had on this timeout, we'll
+-        // add it back in ResumeTimeouts. Note that it shouldn't matter that we're
+-        // passing null for the context, since this shouldn't actually release this
+-        // timeout.
+-        t->Release();
+-      }
+-    }
+-
+-    // Suspend all of the AudioContexts for this window
+-    for (uint32_t i = 0; i < mAudioContexts.Length(); ++i) {
+-      ErrorResult dummy;
+-      RefPtr<Promise> d = mAudioContexts[i]->Suspend(dummy);
+-    }
+-  }
+-
+-  // Suspend our children as well.
+-  nsCOMPtr<nsIDocShell> docShell = GetDocShell();
+-  if (docShell) {
+-    int32_t childCount = 0;
+-    docShell->GetChildCount(&childCount);
+-
+-    for (int32_t i = 0; i < childCount; ++i) {
+-      nsCOMPtr<nsIDocShellTreeItem> childShell;
+-      docShell->GetChildAt(i, getter_AddRefs(childShell));
+-      NS_ASSERTION(childShell, "null child shell");
+-
+-      if (nsCOMPtr<nsPIDOMWindowOuter> pWin = childShell->GetWindow()) {
+-        auto* win = nsGlobalWindow::Cast(pWin);
+-        nsGlobalWindow* inner = win->GetCurrentInnerWindowInternal();
+-
+-        // This is a bit hackish. Only freeze/suspend windows which are truly our
+-        // subwindows.
+-        nsCOMPtr<Element> frame = pWin->GetFrameElementInternal();
+-        if (!mDoc || !frame || mDoc != frame->OwnerDoc() || !inner) {
+-          continue;
+-        }
+-
+-        win->SuspendTimeouts(aIncrease, aFreezeChildren, aFreezeWorkers);
+-
+-        if (inner && aFreezeChildren) {
+-          inner->NewFreeze();
+-        }
+-      }
+-    }
+-  }
+-}
+-
+-nsresult
+-nsGlobalWindow::ResumeTimeouts(bool aThawChildren, bool aThawWorkers)
+-{
+-  FORWARD_TO_INNER(ResumeTimeouts, (aThawChildren, aThawWorkers),
+-                   NS_ERROR_NOT_INITIALIZED);
+-
+-  NS_ASSERTION(mTimeoutsSuspendDepth, "Mismatched calls to ResumeTimeouts!");
+-  --mTimeoutsSuspendDepth;
+-  bool shouldResume = (mTimeoutsSuspendDepth == 0) && !mInnerObjectsFreed;
+-  nsresult rv;
+-
+-  if (shouldResume) {
+-    nsCOMPtr<nsIDeviceSensors> ac = do_GetService(NS_DEVICE_SENSORS_CONTRACTID);
+-    if (ac) {
+-      for (uint32_t i = 0; i < mEnabledSensors.Length(); i++)
+-        ac->AddWindowListener(mEnabledSensors[i], this);
+-    }
+-    EnableGamepadUpdates();
+-    EnableVRUpdates();
+-
+-    // Resume all of the AudioContexts for this window
+-    for (uint32_t i = 0; i < mAudioContexts.Length(); ++i) {
+-      ErrorResult dummy;
+-      RefPtr<Promise> d = mAudioContexts[i]->Resume(dummy);
+-    }
+-
+-    // Restore all of the timeouts, using the stored time remaining
+-    // (stored in timeout->mTimeRemaining).
+-
+-    TimeStamp now = TimeStamp::Now();
+-
+-#ifdef DEBUG
+-    bool _seenDummyTimeout = false;
+-#endif
+-
+-    for (nsTimeout *t = mTimeouts.getFirst(); t; t = t->getNext()) {
+-      // There's a chance we're being called with RunTimeout on the stack in which
+-      // case we have a dummy timeout in the list that *must not* be resumed. It
+-      // can be identified by a null mWindow.
+-      if (!t->mWindow) {
+-#ifdef DEBUG
+-        NS_ASSERTION(!_seenDummyTimeout, "More than one dummy timeout?!");
+-        _seenDummyTimeout = true;
+-#endif
+-        continue;
+-      }
+-
+-      // XXXbz the combination of the way |delay| and |t->mWhen| are set here
+-      // makes no sense.  Are we trying to impose that min timeout value or
+-      // not???
+-      uint32_t delay =
+-        std::max(int32_t(t->mTimeRemaining.ToMilliseconds()),
+-               DOMMinTimeoutValue());
+-
+-      // Set mWhen back to the time when the timer is supposed to
+-      // fire.
+-      t->mWhen = now + t->mTimeRemaining;
+-
+-      t->mTimer = do_CreateInstance("@mozilla.org/timer;1");
+-      NS_ENSURE_TRUE(t->mTimer, NS_ERROR_OUT_OF_MEMORY);
+-
+-      rv = t->InitTimer(delay);
+-      if (NS_FAILED(rv)) {
+-        t->mTimer = nullptr;
+-        return rv;
+-      }
+-
+-      // Add a reference for the new timer's closure.
+-      t->AddRef();
+-    }
+-
+-    // Thaw or resume all of the workers for this window.  We must do this
+-    // after timeouts since workers may have queued events that can trigger
+-    // a setTimeout().
+-    if (aThawWorkers) {
+-      mozilla::dom::workers::ThawWorkersForWindow(AsInner());
+-    } else {
+-      mozilla::dom::workers::ResumeWorkersForWindow(AsInner());
+-    }
+-  }
+-
+-  // Resume our children as well.
+-  nsCOMPtr<nsIDocShell> docShell = GetDocShell();
+-  if (docShell) {
+-    int32_t childCount = 0;
+-    docShell->GetChildCount(&childCount);
+-
+-    for (int32_t i = 0; i < childCount; ++i) {
+-      nsCOMPtr<nsIDocShellTreeItem> childShell;
+-      docShell->GetChildAt(i, getter_AddRefs(childShell));
+-      NS_ASSERTION(childShell, "null child shell");
+-
+-      if (nsCOMPtr<nsPIDOMWindowOuter> pWin = childShell->GetWindow()) {
+-        auto* win = nsGlobalWindow::Cast(pWin);
+-        nsGlobalWindow* inner = win->GetCurrentInnerWindowInternal();
+-
+-        // This is a bit hackish. Only thaw/resume windows which are truly our
+-        // subwindows.
+-        nsCOMPtr<Element> frame = pWin->GetFrameElementInternal();
+-        if (!mDoc || !frame || mDoc != frame->OwnerDoc() || !inner) {
+-          continue;
+-        }
+-
+-        if (inner && aThawChildren) {
+-          inner->NewThaw();
+-        }
+-
+-        rv = win->ResumeTimeouts(aThawChildren, aThawWorkers);
+-        NS_ENSURE_SUCCESS(rv, rv);
+-      }
+-    }
+-  }
+-
+-  return NS_OK;
+-}
+-
+-uint32_t
+-nsGlobalWindow::TimeoutSuspendCount()
+-{
+-  FORWARD_TO_INNER(TimeoutSuspendCount, (), 0);
+-  return mTimeoutsSuspendDepth;
+-}
+-
+-void
+ nsGlobalWindow::EnableDeviceSensor(uint32_t aType)
+ {
+   MOZ_ASSERT(IsInnerWindow());
+ 
+   bool alreadyEnabled = false;
+   for (uint32_t i = 0; i < mEnabledSensors.Length(); i++) {
+     if (mEnabledSensors[i] == aType) {
+       alreadyEnabled = true;
+diff --git a/dom/base/nsGlobalWindow.h b/dom/base/nsGlobalWindow.h
+--- a/dom/base/nsGlobalWindow.h
++++ b/dom/base/nsGlobalWindow.h
+@@ -429,36 +429,26 @@ public:
+   virtual void SetInitialPrincipalToSubject() override;
+ 
+   virtual PopupControlState PushPopupControlState(PopupControlState state, bool aForce) const override;
+   virtual void PopPopupControlState(PopupControlState state) const override;
+   virtual PopupControlState GetPopupControlState() const override;
+ 
+   virtual already_AddRefed<nsISupports> SaveWindowState() override;
+   virtual nsresult RestoreWindowState(nsISupports *aState) override;
+-  virtual void SuspendTimeouts(uint32_t aIncrease = 1,
+-                               bool aFreezeChildren = true,
+-                               bool aFreezeWorkers = true) override;
+-  virtual nsresult ResumeTimeouts(bool aThawChildren = true,
+-                                  bool aThawWorkers = true) override;
+-  virtual uint32_t TimeoutSuspendCount() override;
+ 
+   virtual void NewSuspend() override;
+   virtual void NewResume() override;
+   virtual bool NewIsSuspended() const override;
+   virtual void NewFreeze() override;
+   virtual void NewThaw() override;
+   virtual bool NewIsFrozen() const override;
+   virtual void NewSyncSuspendAndFreezeStateToParentWindow() override;
+ 
+   virtual nsresult FireDelayedDOMEvents() override;
+-  virtual bool IsFrozen() const override
+-  {
+-    return mIsFrozen;
+-  }
+   virtual bool IsRunningTimeout() override { return mTimeoutFiringDepth > 0; }
+ 
+   // Outer windows only.
+   virtual bool WouldReuseInnerWindow(nsIDocument* aNewDocument) override;
+ 
+   virtual void SetDocShell(nsIDocShell* aDocShell) override;
+   virtual void DetachFromDocShell() override;
+   virtual nsresult SetNewDocument(nsIDocument *aDocument,
+@@ -1591,29 +1581,16 @@ public:
+   // If aLookForCallerOnJSStack is true, this method will look at the JS stack
+   // to determine who the caller is.  If it's false, it'll use |this| as the
+   // caller.
+   bool WindowExists(const nsAString& aName, bool aLookForCallerOnJSStack);
+ 
+   already_AddRefed<nsIWidget> GetMainWidget();
+   nsIWidget* GetNearestWidget() const;
+ 
+-  void Freeze()
+-  {
+-    NS_ASSERTION(!IsFrozen(), "Double-freezing?");
+-    mIsFrozen = true;
+-    NotifyDOMWindowFrozen(this);
+-  }
+-
+-  void Thaw()
+-  {
+-    mIsFrozen = false;
+-    NotifyDOMWindowThawed(this);
+-  }
+-
+   bool IsInModalState();
+ 
+   // Convenience functions for the many methods that need to scale
+   // from device to CSS pixels or vice versa.  Note: if a presentation
+   // context is not available, they will assume a 1:1 ratio.
+   int32_t DevToCSSIntPixels(int32_t px);
+   int32_t CSSToDevIntPixels(int32_t px);
+   nsIntSize DevToCSSIntPixels(nsIntSize px);
+@@ -1724,24 +1701,16 @@ private:
+   // IsSecureContext() for the inner window that corresponds to aDocument.
+   bool ComputeIsSecureContext(nsIDocument* aDocument);
+ 
+ public:
+ 
+   void GetConstellation(nsACString& aConstellation);
+ 
+ protected:
+-  // This member is also used on both inner and outer windows, but
+-  // for slightly different purposes. On inner windows it means the
+-  // inner window is held onto by session history and should not
+-  // change. On outer windows it means that the window is in a state
+-  // where we don't want to force creation of a new inner window since
+-  // we're in the middle of doing just that.
+-  bool                          mIsFrozen : 1;
+-
+   // These members are only used on outer window objects. Make sure
+   // you never set any of these on an inner object!
+   bool                          mFullScreen : 1;
+   bool                          mFullscreenMode : 1;
+   bool                          mIsClosed : 1;
+   bool                          mInClose : 1;
+   // mHavePendingClose means we've got a termination function set to
+   // close us when the JS stops executing or that we have a close
+diff --git a/dom/base/nsPIDOMWindow.h b/dom/base/nsPIDOMWindow.h
+--- a/dom/base/nsPIDOMWindow.h
++++ b/dom/base/nsPIDOMWindow.h
+@@ -202,27 +202,16 @@ public:
+ 
+   // Returns an object containing the window's state.  This also suspends
+   // all running timeouts in the window.
+   virtual already_AddRefed<nsISupports> SaveWindowState() = 0;
+ 
+   // Restore the window state from aState.
+   virtual nsresult RestoreWindowState(nsISupports *aState) = 0;
+ 
+-  // Suspend timeouts in this window and in child windows.
+-  virtual void SuspendTimeouts(uint32_t aIncrease = 1,
+-                               bool aFreezeChildren = true,
+-                               bool aFreezeWorkers = true) = 0;
+-
+-  // Resume suspended timeouts in this window and in child windows.
+-  virtual nsresult ResumeTimeouts(bool aThawChildren = true,
+-                                  bool aThawWorkers = true) = 0;
+-
+-  virtual uint32_t TimeoutSuspendCount() = 0;
+-
+   // Calling suspend should prevent any asynchronous tasks from
+   // executing javascript for this window.  This means setTimeout,
+   // requestAnimationFrame, and events should not be fired. Suspending
+   // a window also suspends its children and workers.  Workers may
+   // continue to perform computations in the background.  A window
+   // can have Suspend() called multiple times and will only resume after
+   // a matching number of Resume() calls.
+   virtual void NewSuspend() = 0;
+@@ -243,18 +232,16 @@ public:
+   // When a window is inserted into the tree it should inherit its parent
+   // window's suspend and freeze state.
+   virtual void NewSyncSuspendAndFreezeStateToParentWindow() = 0;
+ 
+   // Fire any DOM notification events related to things that happened while
+   // the window was frozen.
+   virtual nsresult FireDelayedDOMEvents() = 0;
+ 
+-  virtual bool IsFrozen() const = 0;
+-
+   nsPIDOMWindowOuter* GetOuterWindow()
+   {
+     return mIsInnerWindow ? mOuterWindow.get() : AsOuter();
+   }
+ 
+   bool IsInnerWindow() const
+   {
+     return mIsInnerWindow;
