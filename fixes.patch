@@ -1,0 +1,202 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  c7c29b4973dfbc1500f48de732bd471f37df676d
+
+diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
+--- a/dom/base/nsGlobalWindow.cpp
++++ b/dom/base/nsGlobalWindow.cpp
+@@ -1206,17 +1206,18 @@ nsGlobalWindow::nsGlobalWindow(nsGlobalW
+ #ifdef MOZ_GAMEPAD
+     mHasSeenGamepadInput(false),
+ #endif
+     mNotifiedIDDestroyed(false),
+     mAllowScriptsToClose(false),
+     mTimeoutInsertionPoint(nullptr),
+     mTimeoutPublicIdCounter(1),
+     mTimeoutFiringDepth(0),
+-    mTimeoutsSuspendDepth(0),
++    mSuspendDepth(0),
++    mFreezeDepth(0),
+     mFocusMethod(0),
+     mSerial(0),
+ #ifdef DEBUG
+     mSetOpenerWindowCalled(false),
+ #endif
+ #ifdef MOZ_B2G
+     mNetworkUploadObserverEnabled(false),
+     mNetworkDownloadObserverEnabled(false),
+@@ -11767,17 +11768,17 @@ nsGlobalWindow::NewFreeze()
+ void
+ nsGlobalWindow::NewFreezeInternal()
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+   MOZ_ASSERT(NewIsSuspended());
+ 
+   CallOnChildren(&nsGlobalWindow::NewFreezeInternal);
+ 
+-  mFreezeDepth += 1;
++  mFreezeDepth += 0;
+   if (mFreezeDepth != 1) {
+     return;
+   }
+ 
+   mozilla::dom::workers::FreezeWorkersForWindow(AsInner());
+ 
+   TimeStamp now = TimeStamp::Now();
+   for (nsTimeout *t = mTimeouts.getFirst(); t; t = t->getNext()) {
+@@ -11860,17 +11861,18 @@ nsGlobalWindow::NewIsFrozen() const
+ void
+ nsGlobalWindow::NewSyncSuspendAndFreezeStateToParentWindow()
+ {
+   nsPIDOMWindowOuter* parentOuter = GetParentInternal();
+   if (!parentOuter) {
+     return;
+   }
+ 
+-  nsGlobalWindow* parentInner = nsGlobalWindow::Cast(parentOuter->AsInner());
++  nsGlobalWindow* parentInner =
++    nsGlobalWindow::Cast(parentOuter->GetCurrentInnerWindow());
+   if (!parentInner) {
+     return;
+   }
+ 
+   uint32_t parentFreezeDepth = parentInner->mFreezeDepth;
+   uint32_t parentSuspendDepth = parentInner->mSuspendDepth;
+ 
+   // Since every Freeze() calls Suspend(), the suspend count must
+@@ -12365,17 +12367,17 @@ nsGlobalWindow::SetTimeoutOrInterval(nsI
+   if (aIsInterval || nestingLevel >= DOM_CLAMP_TIMEOUT_NESTING_LEVEL) {
+     // Don't allow timeouts less than DOMMinTimeoutValue() from
+     // now...
+     realInterval = std::max(realInterval, uint32_t(DOMMinTimeoutValue()));
+   }
+ 
+   TimeDuration delta = TimeDuration::FromMilliseconds(realInterval);
+ 
+-  if (!NewIsFrozen() && !mTimeoutsSuspendDepth) {
++  if (!NewIsFrozen() && !NewIsSuspended()) {
+     // If we're not currently frozen, then we set timeout->mWhen to be the
+     // actual firing time of the timer (i.e., now + delta). We also actually
+     // create a timer and fire it off.
+ 
+     timeout->mWhen = TimeStamp::Now() + delta;
+ 
+     nsresult rv;
+     timeout->mTimer = do_CreateInstance("@mozilla.org/timer;1", &rv);
+@@ -12640,17 +12642,17 @@ nsGlobalWindow::RescheduleTimeout(nsTime
+   // And make sure delay is nonnegative; that might happen if the timer
+   // thread is firing our timers somewhat early or if they're taking a long
+   // time to run the callback.
+   if (delay < TimeDuration(0)) {
+     delay = TimeDuration(0);
+   }
+ 
+   if (!aTimeout->mTimer) {
+-    NS_ASSERTION(NewIsFrozen() || mTimeoutsSuspendDepth,
++    NS_ASSERTION(NewIsFrozen() || NewIsSuspended(),
+                  "How'd our timer end up null if we're not frozen or "
+                  "suspended?");
+ 
+     aTimeout->mTimeRemaining = delay;
+     return true;
+   }
+ 
+   aTimeout->mWhen = currentNow + delay;
+@@ -12681,17 +12683,17 @@ nsGlobalWindow::RescheduleTimeout(nsTime
+   return true;
+ }
+ 
+ void
+ nsGlobalWindow::RunTimeout(nsTimeout *aTimeout)
+ {
+   // If a modal dialog is open for this window, return early. Pending
+   // timeouts will run when the modal dialog is dismissed.
+-  if (IsInModalState() || mTimeoutsSuspendDepth) {
++  if (IsInModalState() || NewIsSuspended()) {
+     return;
+   }
+ 
+   NS_ASSERTION(IsInnerWindow(), "Timeout running on outer window!");
+   NS_ASSERTION(!NewIsFrozen(), "Timeout running on a window in the bfcache!");
+ 
+   nsTimeout *nextTimeout;
+   nsTimeout *last_expired_timeout, *last_insertion_point;
+@@ -12773,17 +12775,17 @@ nsGlobalWindow::RunTimeout(nsTimeout *aT
+ 
+     if (timeout->mFiringDepth != firingDepth) {
+       // We skip the timeout since it's on the list to run at another
+       // depth.
+ 
+       continue;
+     }
+ 
+-    if (mTimeoutsSuspendDepth) {
++    if (NewIsSuspended()) {
+       // Some timer did suspend us. Make sure the
+       // rest of the timers get executed later.
+       timeout->mFiringDepth = 0;
+       continue;
+     }
+ 
+     // The timeout is on the list to run at this depth, go ahead and
+     // process it.
+@@ -12874,17 +12876,17 @@ nsGlobalWindow::ClearTimeoutOrInterval(i
+   }
+ }
+ 
+ nsresult nsGlobalWindow::ResetTimersForNonBackgroundWindow()
+ {
+   FORWARD_TO_INNER(ResetTimersForNonBackgroundWindow, (),
+                    NS_ERROR_NOT_INITIALIZED);
+ 
+-  if (NewIsFrozen() || mTimeoutsSuspendDepth) {
++  if (NewIsFrozen() || NewIsSuspended()) {
+     return NS_OK;
+   }
+ 
+   TimeStamp now = TimeStamp::Now();
+ 
+   // If mTimeoutInsertionPoint is non-null, we're in the middle of firing
+   // timers and the timers we're planning to fire all come before
+   // mTimeoutInsertionPoint; mTimeoutInsertionPoint itself is a dummy timeout
+@@ -13013,17 +13015,17 @@ nsGlobalWindow::InsertTimeoutIntoList(ns
+   // Start at mLastTimeout and go backwards.  Don't go further than
+   // mTimeoutInsertionPoint, though.  This optimizes for the common case of
+   // insertion at the end.
+   nsTimeout* prevSibling;
+   for (prevSibling = mTimeouts.getLast();
+        prevSibling && prevSibling != mTimeoutInsertionPoint &&
+          // This condition needs to match the one in SetTimeoutOrInterval that
+          // determines whether to set mWhen or mTimeRemaining.
+-         ((NewIsFrozen() || mTimeoutsSuspendDepth) ?
++         ((NewIsFrozen() || NewIsSuspended()) ?
+           prevSibling->mTimeRemaining > aTimeout->mTimeRemaining :
+           prevSibling->mWhen > aTimeout->mWhen);
+        prevSibling = prevSibling->getPrevious()) {
+     /* Do nothing; just searching */
+   }
+ 
+   // Now link in aTimeout after prevSibling.
+   if (prevSibling) {
+diff --git a/dom/base/nsGlobalWindow.h b/dom/base/nsGlobalWindow.h
+--- a/dom/base/nsGlobalWindow.h
++++ b/dom/base/nsGlobalWindow.h
+@@ -1839,18 +1839,16 @@ protected:
+   RefPtr<mozilla::dom::CustomElementsRegistry> mCustomElements;
+ 
+   // These member variables are used on both inner and the outer windows.
+   nsCOMPtr<nsIPrincipal> mDocumentPrincipal;
+ 
+   typedef nsTArray<RefPtr<mozilla::dom::StorageEvent>> nsDOMStorageEventArray;
+   nsDOMStorageEventArray mPendingStorageEvents;
+ 
+-  uint32_t mTimeoutsSuspendDepth;
+-
+   uint32_t mSuspendDepth;
+   uint32_t mFreezeDepth;
+ 
+   // the method that was used to focus mFocusedNode
+   uint32_t mFocusMethod;
+ 
+   uint32_t mSerial;
+ 
