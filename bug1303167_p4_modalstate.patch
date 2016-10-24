@@ -1,11 +1,54 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  a400d467f8a6f1264e161ba0d950491dc5d0f13e
+# Parent  34c21328bca5f49b411283dedee8927ebf850422
+Bug 1303167 P4 Make ModalState use new window suspend method. r=smaug
 
+diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
+--- a/docshell/base/nsDocShell.cpp
++++ b/docshell/base/nsDocShell.cpp
+@@ -8913,17 +8913,18 @@ nsDocShell::RestoreFromHistory()
+       NS_ASSERTION(newRootView->GetNextSibling() == rootViewSibling,
+                    "error in InsertChild");
+     }
+   }
+ 
+   // If parent is suspended, increase suspension count.
+   // This can't be done as early as event suppression since this
+   // depends on docshell tree.
+-  privWin->NewSyncSuspendAndFreezeStateToParentWindow();
++  MOZ_ASSERT(privWin->GetCurrentInnerWindow());
++  privWin->GetCurrentInnerWindow()->NewSyncSuspendAndFreezeStateToParentWindow();
+ 
+   // Now that all of the child docshells have been put into place, we can
+   // restart the timers for the window and all of the child frames.
+   privWin->NewResume();
+ 
+   // Restore the refresh URI list.  The refresh timers will be restarted
+   // when EndPageLoad() is called.
+   mRefreshURIList = refreshURIList;
 diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 --- a/dom/base/nsGlobalWindow.cpp
 +++ b/dom/base/nsGlobalWindow.cpp
-@@ -8720,101 +8720,40 @@ nsGlobalWindow::EnterModalState()
+@@ -2832,17 +2832,17 @@ nsGlobalWindow::SetNewDocument(nsIDocume
+     JS::Rooted<JSObject*> rootedJSObject(cx, GetWrapperPreserveColor());
+     JS::Rooted<JSObject*> proto1(cx), proto2(cx);
+     JS_GetPrototype(cx, rootedJSObject, &proto1);
+     JS_GetPrototype(cx, newInnerGlobal, &proto2);
+     NS_ASSERTION(proto1 == proto2,
+                  "outer and inner globals should have the same prototype");
+ #endif
+ 
+-    NewSyncSuspendAndFreezeStateToParentWindow();
++    newInnerWindow->NewSyncSuspendAndFreezeStateToParentWindow();
+   }
+ 
+   // Add an extra ref in case we release mContext during GC.
+   nsCOMPtr<nsIScriptContext> kungFuDeathGrip(mContext);
+ 
+   aDocument->SetScriptGlobalObject(newInnerWindow);
+ 
+   if (!aState) {
+@@ -8756,101 +8756,41 @@ nsGlobalWindow::EnterModalState()
  
    if (topWin->mModalStateDepth == 0) {
      NS_ASSERTION(!topWin->mSuspendedDoc, "Shouldn't have mSuspendedDoc here!");
@@ -96,6 +139,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
    }
  
 +  MOZ_ASSERT(topWin->mModalStateDepth != 0);
++  MOZ_ASSERT(NewIsSuspended());
 +  MOZ_ASSERT(topWin->NewIsSuspended());
    topWin->mModalStateDepth--;
  
@@ -112,32 +156,68 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
        topWin->mSuspendedDoc = nullptr;
      }
    }
-@@ -11878,16 +11817,24 @@ nsGlobalWindow::NewSyncSuspendAndFreezeS
+@@ -11897,39 +11837,40 @@ nsGlobalWindow::NewIsFrozen() const
+   bool frozen =  mFreezeDepth != 0;
+   MOZ_ASSERT_IF(frozen, NewIsSuspended());
+   return frozen;
+ }
  
-   uint32_t parentFreezeDepth = parentInner->mFreezeDepth;
-   uint32_t parentSuspendDepth = parentInner->mSuspendDepth;
+ void
+ nsGlobalWindow::NewSyncSuspendAndFreezeStateToParentWindow()
+ {
++  // This method should only be called on an inner window that has been
++  // assigned to an outer window already.
++  MOZ_ASSERT(IsInnerWindow());
+   nsPIDOMWindowOuter* outer = GetOuterWindow();
+-  if (!outer) {
+-    return;
+-  }
+-
++  MOZ_ASSERT(outer);
++
++  // Attempt to find our parent windows.
+   nsCOMPtr<Element> frame = outer->GetFrameElementInternal();
+-  if (!frame) {
+-    return;
+-  }
+-
+-  nsPIDOMWindowOuter* parentOuter = frame->OwnerDoc()->GetWindow();
+-  if (!parentOuter) {
+-    return;
+-  }
+-
++  nsPIDOMWindowOuter* parentOuter = frame ? frame->OwnerDoc()->GetWindow()
++                                          : nullptr;
+   nsGlobalWindow* parentInner =
+-    nsGlobalWindow::Cast(parentOuter->GetCurrentInnerWindow());
+-  if (!parentInner) {
+-    return;
+-  }
+-
+-  uint32_t parentFreezeDepth = parentInner->mFreezeDepth;
+-  uint32_t parentSuspendDepth = parentInner->mSuspendDepth;
++    parentOuter ? nsGlobalWindow::Cast(parentOuter->GetCurrentInnerWindow())
++                : nullptr;
++
++  // If our outer is in a modal state, but our parent is not in a modal
++  // state, then we must apply the suspend directly.  If our parent is
++  // in a modal state then we should get the suspend automatically
++  // via the parentSuspendDepth application below.
++  if ((!parentInner || !parentInner->IsInModalState()) && IsInModalState()) {
++    NewSuspend();
++  }
++
++  uint32_t parentFreezeDepth = parentInner ? parentInner->mFreezeDepth : 0;
++  uint32_t parentSuspendDepth = parentInner ? parentInner->mSuspendDepth : 0;
  
    // Since every Freeze() calls Suspend(), the suspend count must
    // be equal or greater to the freeze count.
    MOZ_ASSERT(parentFreezeDepth <= parentSuspendDepth);
  
-+  // If our outer is in a modal state, but our parent is not in a modal
-+  // state, then we must apply the suspend directly.  If our parent is
-+  // in a modal state then we should get the suspend automatically
-+  // via the parentSuspendDepth application below.
-+  if (!parentInner->IsInModalState() && IsInModalState()) {
-+    NewSuspend();
-+  }
-+
    // First apply the Freeze() calls.
    for (uint32_t i = 0; i < parentFreezeDepth; ++i) {
      NewFreeze();
-   }
- 
-   // Now apply only the number of Suspend() calls to reach the target
-   // suspend count after applying the Freeze() calls.
-   for (uint32_t i = 0; i < (parentSuspendDepth - parentFreezeDepth); ++i) {
-@@ -12685,19 +12632,17 @@ nsGlobalWindow::RescheduleTimeout(nsTime
+@@ -12732,19 +12673,17 @@ nsGlobalWindow::RescheduleTimeout(nsTime
    }
  
    return true;
@@ -161,7 +241,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 diff --git a/dom/base/nsGlobalWindow.h b/dom/base/nsGlobalWindow.h
 --- a/dom/base/nsGlobalWindow.h
 +++ b/dom/base/nsGlobalWindow.h
-@@ -643,19 +643,16 @@ public:
+@@ -647,19 +647,16 @@ public:
    // Outer windows only.
    void UnblockScriptedClosing();
  
