@@ -1,0 +1,249 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  316b3ec8093354057aa3679288fce35aefc6d1b0
+Bug 1303167 P1 Interdiff 001 Address review feedback
+
+diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
+--- a/dom/base/nsGlobalWindow.cpp
++++ b/dom/base/nsGlobalWindow.cpp
+@@ -3898,19 +3898,19 @@ nsPIDOMWindowInner::NewFreeze()
+ 
+ void
+ nsPIDOMWindowInner::NewThaw()
+ {
+   nsGlobalWindow::Cast(this)->NewThaw();
+ }
+ 
+ void
+-nsPIDOMWindowInner::NewSyncParentWindowState()
+-{
+-  nsGlobalWindow::Cast(this)->NewSyncParentWindowState();
++nsPIDOMWindowInner::NewSyncStateFromParentWindow()
++{
++  nsGlobalWindow::Cast(this)->NewSyncStateFromParentWindow();
+ }
+ 
+ SuspendTypes
+ nsPIDOMWindowOuter::GetMediaSuspend() const
+ {
+   if (IsInnerWindow()) {
+     return mOuterWindow->GetMediaSuspend();
+   }
+@@ -11737,16 +11737,18 @@ nsGlobalWindow::CloneStorageEvent(const 
+ }
+ 
+ void
+ nsGlobalWindow::NewSuspend()
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+   MOZ_ASSERT(IsInnerWindow());
+ 
++  // All children are also suspended.  This ensure mSuspendDepth is
++  // set properly and the timers are properly canceled for each child.
+   CallOnChildren(&nsGlobalWindow::NewSuspend);
+ 
+   mSuspendDepth += 1;
+   if (mSuspendDepth != 1) {
+     return;
+   }
+ 
+   nsCOMPtr<nsIDeviceSensors> ac = do_GetService(NS_DEVICE_SENSORS_CONTRACTID);
+@@ -11754,30 +11756,28 @@ nsGlobalWindow::NewSuspend()
+     for (uint32_t i = 0; i < mEnabledSensors.Length(); i++)
+       ac->RemoveWindowListener(mEnabledSensors[i], this);
+   }
+   DisableGamepadUpdates();
+   DisableVRUpdates();
+ 
+   mozilla::dom::workers::SuspendWorkersForWindow(AsInner());
+ 
+-  for (nsTimeout *t = mTimeouts.getFirst(); t; t = t->getNext()) {
++  for (nsTimeout* t = mTimeouts.getFirst(); t; t = t->getNext()) {
+     // Leave the timers with the current time remaining.  This will
+     // cause the timers to potentially fire when the window is
+     // Resume()'d.  Time effectively passes while suspended.
+ 
+     // Drop the XPCOM timer; we'll reschedule when restoring the state.
+     if (t->mTimer) {
+       t->mTimer->Cancel();
+       t->mTimer = nullptr;
+ 
+       // Drop the reference that the timer's closure had on this timeout, we'll
+-      // add it back in Resume(). Note that it shouldn't matter that we're
+-      // passing null for the context, since this shouldn't actually release this
+-      // timeout.
++      // add it back in Resume().
+       t->Release();
+     }
+   }
+ 
+   // Suspend all of the AudioContexts for this window
+   for (uint32_t i = 0; i < mAudioContexts.Length(); ++i) {
+     ErrorResult dummy;
+     RefPtr<Promise> d = mAudioContexts[i]->Suspend(dummy);
+@@ -11785,16 +11785,18 @@ nsGlobalWindow::NewSuspend()
+ }
+ 
+ void
+ nsGlobalWindow::NewResume()
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+   MOZ_ASSERT(IsInnerWindow());
+ 
++  // Resume all children.  This restores timers recursively canceled
++  // in Suspend() and ensures all children have the correct mSuspendDepth.
+   CallOnChildren(&nsGlobalWindow::NewResume);
+ 
+   MOZ_ASSERT(mSuspendDepth != 0);
+   mSuspendDepth -= 1;
+   if (mSuspendDepth != 0) {
+     return;
+   }
+ 
+@@ -11813,17 +11815,17 @@ nsGlobalWindow::NewResume()
+   for (uint32_t i = 0; i < mAudioContexts.Length(); ++i) {
+     ErrorResult dummy;
+     RefPtr<Promise> d = mAudioContexts[i]->Resume(dummy);
+   }
+ 
+   TimeStamp now = TimeStamp::Now();
+   DebugOnly<bool> _seenDummyTimeout = false;
+ 
+-  for (nsTimeout *t = mTimeouts.getFirst(); t; t = t->getNext()) {
++  for (nsTimeout* t = mTimeouts.getFirst(); t; t = t->getNext()) {
+     // There's a chance we're being called with RunTimeout on the stack in which
+     // case we have a dummy timeout in the list that *must not* be resumed. It
+     // can be identified by a null mWindow.
+     if (!t->mWindow) {
+       NS_ASSERTION(!_seenDummyTimeout, "More than one dummy timeout?!");
+       _seenDummyTimeout = true;
+       continue;
+     }
+@@ -11832,20 +11834,17 @@ nsGlobalWindow::NewResume()
+ 
+     // The timeout mWhen is set to the absolute time when the timer should
+     // fire.  Recalculate the delay from now until that deadline.  If the
+     // the deadline has already passed or falls within our minimum delay
+     // deadline, then clamp the resulting value to the minimum delay.  The
+     // mWhen will remain at its absolute time, but we won't fire the OS
+     // timer until our calculated delay has passed.
+     int32_t remaining = 0;
+-    if (t->mWhen.IsNull()) {
+-      remaining = t->mInterval;
+-      t->mWhen = now + TimeDuration::FromMilliseconds(t->mInterval);
+-    } else if (t->mWhen > now) {
++    if (t->mWhen > now) {
+       remaining = static_cast<int32_t>((t->mWhen - now).ToMilliseconds());
+     }
+     uint32_t delay = std::max(remaining, DOMMinTimeoutValue());
+ 
+     t->mTimer = do_CreateInstance("@mozilla.org/timer;1");
+     if (!t->mTimer) {
+       t->remove();
+       continue;
+@@ -11895,16 +11894,17 @@ void
+ nsGlobalWindow::NewFreezeInternal()
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+   MOZ_ASSERT(NewIsSuspended());
+ 
+   CallOnChildren(&nsGlobalWindow::NewFreezeInternal);
+ 
+   mFreezeDepth += 1;
++  MOZ_ASSERT(mSuspendDepth >= mFreezeDepth);
+   if (mFreezeDepth != 1) {
+     return;
+   }
+ 
+   mozilla::dom::workers::FreezeWorkersForWindow(AsInner());
+ 
+   TimeStamp now = TimeStamp::Now();
+   for (nsTimeout *t = mTimeouts.getFirst(); t; t = t->getNext()) {
+@@ -11940,16 +11940,17 @@ nsGlobalWindow::NewThawInternal()
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+   MOZ_ASSERT(NewIsSuspended());
+ 
+   CallOnChildren(&nsGlobalWindow::NewThawInternal);
+ 
+   MOZ_ASSERT(mFreezeDepth != 0);
+   mFreezeDepth -= 1;
++  MOZ_ASSERT(mSuspendDepth >= mFreezeDepth);
+   if (mFreezeDepth != 0) {
+     return;
+   }
+ 
+   TimeStamp now = TimeStamp::Now();
+   DebugOnly<bool> _seenDummyTimeout = false;
+ 
+   for (nsTimeout *t = mTimeouts.getFirst(); t; t = t->getNext()) {
+@@ -11979,23 +11980,23 @@ nsGlobalWindow::NewIsFrozen() const
+   MOZ_ASSERT(NS_IsMainThread());
+   // No inner means we are effectively frozen
+   if (IsOuterWindow()) {
+     if (!mInnerWindow) {
+       return true;
+     }
+     return mInnerWindow->NewIsFrozen();
+   }
+-  bool frozen =  mFreezeDepth != 0;
++  bool frozen = mFreezeDepth != 0;
+   MOZ_ASSERT_IF(frozen, NewIsSuspended());
+   return frozen;
+ }
+ 
+ void
+-nsGlobalWindow::NewSyncParentWindowState()
++nsGlobalWindow::NewSyncStateFromParentWindow()
+ {
+   nsPIDOMWindowOuter* outer = GetOuterWindow();
+   if (!outer) {
+     return;
+   }
+ 
+   nsCOMPtr<Element> frame = outer->GetFrameElementInternal();
+   if (!frame) {
+diff --git a/dom/base/nsGlobalWindow.h b/dom/base/nsGlobalWindow.h
+--- a/dom/base/nsGlobalWindow.h
++++ b/dom/base/nsGlobalWindow.h
+@@ -446,17 +446,17 @@ public:
+   virtual uint32_t TimeoutSuspendCount() override;
+ 
+   virtual void NewSuspend();
+   virtual void NewResume();
+   virtual bool NewIsSuspended() const override;
+   virtual void NewFreeze();
+   virtual void NewThaw();
+   virtual bool NewIsFrozen() const override;
+-  virtual void NewSyncParentWindowState();
++  virtual void NewSyncStateFromParentWindow();
+ 
+   virtual nsresult FireDelayedDOMEvents() override;
+   virtual bool IsFrozen() const override
+   {
+     return mIsFrozen;
+   }
+   virtual bool IsRunningTimeout() override { return mTimeoutFiringDepth > 0; }
+ 
+diff --git a/dom/base/nsPIDOMWindow.h b/dom/base/nsPIDOMWindow.h
+--- a/dom/base/nsPIDOMWindow.h
++++ b/dom/base/nsPIDOMWindow.h
+@@ -846,17 +846,17 @@ public:
+   // bringing them to a complete stop.  A window can have Freeze() called
+   // multiple times and will only thaw after a matching number of Thaw()
+   // calls.
+   void NewFreeze();
+   void NewThaw();
+ 
+   // Apply the parent window's suspend, freeze, and modal state to the current
+   // window.
+-  void NewSyncParentWindowState();
++  void NewSyncStateFromParentWindow();
+ 
+ protected:
+   void CreatePerformanceObjectIfNeeded();
+ };
+ 
+ NS_DEFINE_STATIC_IID_ACCESSOR(nsPIDOMWindowInner, NS_PIDOMWINDOWINNER_IID)
+ 
+ // NB: It's very very important that these two classes have identical vtables
