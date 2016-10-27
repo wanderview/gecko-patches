@@ -1,0 +1,338 @@
+
+# HG changeset patch
+# User Michael Layzell <michael@thelayzells.com>
+# Date 1475788988 14400
+# Node ID fe339dd59a0188e201cf24498723a624f13f2146
+# Parent  3f15ff10cb267d4289655b2e3cf0a0dee48e7c0b
+Bug 1303196 - Part 1: Add the DocGroup and TabGroup Objects, r=billm
+
+MozReview-Commit-ID: ILXWUlPPeHM
+
+
+diff --git a/dom/base/DocGroup.cpp b/dom/base/DocGroup.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/base/DocGroup.cpp
+@@ -0,0 +1,125 @@
++#include "mozilla/dom/DocGroup.h"
++#include "mozilla/Telemetry.h"
++#include "nsIURI.h"
++#include "nsIEffectiveTLDService.h"
++#include "mozilla/StaticPtr.h"
++#include "mozilla/ClearOnShutdown.h"
++#include "nsIDocShell.h"
++
++namespace mozilla {
++namespace dom {
++
++/* static */ void
++DocGroup::GetKey(nsIPrincipal* aPrincipal, nsACString& aKey)
++{
++  aKey.Truncate();
++  nsCOMPtr<nsIURI> uri;
++  nsresult rv = aPrincipal->GetURI(getter_AddRefs(uri));
++  if (NS_SUCCEEDED(rv)) {
++    nsCOMPtr<nsIEffectiveTLDService> tldService =
++      do_GetService(NS_EFFECTIVETLDSERVICE_CONTRACTID);
++    if (tldService) {
++      rv = tldService->GetBaseDomain(uri, 0, aKey);
++      if (NS_FAILED(rv)) {
++        aKey.Truncate();
++      }
++    }
++  }
++}
++
++void
++DocGroup::RemoveDocument(nsIDocument* aDocument)
++{
++  MOZ_ASSERT(mDocuments.Contains(aDocument));
++  mDocuments.RemoveElement(aDocument);
++}
++
++DocGroup::DocGroup(TabGroup* aTabGroup, const nsACString& aKey)
++  : mKey(aKey), mTabGroup(aTabGroup)
++{
++  // This method does not add itself to mTabGroup->mDocGroups as the caller does it for us.
++}
++
++DocGroup::~DocGroup()
++{
++  MOZ_ASSERT(mDocuments.IsEmpty());
++  mTabGroup->mDocGroups.RemoveEntry(mKey);
++}
++
++NS_IMPL_ISUPPORTS(DocGroup, nsISupports)
++
++TabGroup::TabGroup()
++{}
++
++TabGroup::~TabGroup()
++{
++  MOZ_ASSERT(mDocGroups.IsEmpty());
++  MOZ_ASSERT(mWindows.IsEmpty());
++}
++
++static StaticRefPtr<TabGroup> sChromeTabGroup;
++
++TabGroup*
++TabGroup::GetChromeTabGroup()
++{
++  if (!sChromeTabGroup) {
++    sChromeTabGroup = new TabGroup();
++    ClearOnShutdown(&sChromeTabGroup);
++  }
++  return sChromeTabGroup;
++}
++
++already_AddRefed<DocGroup>
++TabGroup::GetDocGroup(const nsACString& aKey)
++{
++  RefPtr<DocGroup> docGroup(mDocGroups.GetEntry(aKey)->mDocGroup);
++  return docGroup.forget();
++}
++
++already_AddRefed<DocGroup>
++TabGroup::AddDocument(const nsACString& aKey, nsIDocument* aDocument)
++{
++  HashEntry* entry = mDocGroups.PutEntry(aKey);
++  RefPtr<DocGroup> docGroup;
++  if (entry->mDocGroup) {
++    docGroup = entry->mDocGroup;
++  } else {
++    docGroup = new DocGroup(this, aKey);
++    entry->mDocGroup = docGroup;
++  }
++
++  // Make sure that the hashtable was updated and now contains the correct value
++  MOZ_ASSERT(RefPtr<DocGroup>(GetDocGroup(aKey)) == docGroup);
++
++  docGroup->mDocuments.AppendElement(aDocument);
++
++  return docGroup.forget();
++}
++
++/* static */ already_AddRefed<TabGroup>
++TabGroup::Join(nsPIDOMWindowOuter* aWindow, TabGroup* aTabGroup)
++{
++  RefPtr<TabGroup> tabGroup = aTabGroup;
++  if (!tabGroup) {
++    tabGroup = new TabGroup();
++  }
++  MOZ_ASSERT(!tabGroup->mWindows.Contains(aWindow));
++  tabGroup->mWindows.AppendElement(aWindow);
++  return tabGroup.forget();
++}
++
++void
++TabGroup::Leave(nsPIDOMWindowOuter* aWindow)
++{
++  MOZ_ASSERT(mWindows.Contains(aWindow));
++  mWindows.RemoveElement(aWindow);
++}
++
++NS_IMPL_ISUPPORTS(TabGroup, nsISupports)
++
++TabGroup::HashEntry::HashEntry(const nsACString* aKey)
++  : nsCStringHashKey(aKey), mDocGroup(nullptr)
++{}
++
++}
++}
+diff --git a/dom/base/DocGroup.h b/dom/base/DocGroup.h
+new file mode 100644
+--- /dev/null
++++ b/dom/base/DocGroup.h
+@@ -0,0 +1,131 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
++ * You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef DocGroup_h
++#define DocGroup_h
++
++#include "nsISupports.h"
++#include "nsISupportsImpl.h"
++#include "nsIPrincipal.h"
++#include "nsTHashtable.h"
++#include "nsString.h"
++
++#include "mozilla/RefPtr.h"
++
++namespace mozilla {
++namespace dom {
++
++// Two browsing contexts are considered "related" if they are reachable from one
++// another through window.opener, window.parent, or window.frames. This is the
++// spec concept of a "unit of related browsing contexts"
++//
++// Two browsing contexts are considered "similar-origin" if they can be made to
++// have the same origin by setting document.domain. This is the spec concept of
++// a "unit of similar-origin related browsing contexts"
++//
++// A TabGroup is a set of browsing contexts which are all "related". Within a
++// TabGroup, browsing contexts are broken into "similar-origin" DocGroups. In
++// more detail, a DocGroup is actually a collection of documents, and a
++// TabGroup is a collection of DocGroups. A TabGroup typically will contain
++// (through its DocGroups) the documents from one or more tabs related by
++// window.opener. A DocGroup is a member of exactly one TabGroup.
++
++class TabGroup;
++
++class DocGroup final : public nsISupports
++{
++public:
++  typedef nsTArray<nsIDocument*>::iterator Iterator;
++  friend class TabGroup;
++
++  NS_DECL_THREADSAFE_ISUPPORTS
++
++  static void GetKey(nsIPrincipal* aPrincipal, nsACString& aString);
++  bool MatchesKey(const nsACString& aKey)
++  {
++    return aKey == mKey;
++  }
++  TabGroup* GetTabGroup()
++  {
++    return mTabGroup;
++  }
++  void RemoveDocument(nsIDocument* aWindow);
++
++  // Iterators for iterating over every document within the DocGroup
++  Iterator begin()
++  {
++    return mDocuments.begin();
++  }
++  Iterator end()
++  {
++    return mDocuments.end();
++  }
++
++private:
++  DocGroup(TabGroup* aTabGroup, const nsACString& aKey);
++  ~DocGroup();
++
++  nsCString mKey;
++  RefPtr<TabGroup> mTabGroup;
++  nsTArray<nsIDocument*> mDocuments;
++};
++
++
++class TabGroup final : public nsISupports
++{
++private:
++  class HashEntry : public nsCStringHashKey
++  {
++  public:
++    // NOTE: Weak reference. The DocGroup destructor removes itself from its
++    // owning TabGroup.
++    DocGroup* mDocGroup;
++    explicit HashEntry(const nsACString* aKey);
++  };
++
++  typedef nsTHashtable<HashEntry> DocGroupMap;
++public:
++  typedef DocGroupMap::Iterator Iterator;
++
++  friend class DocGroup;
++
++  NS_DECL_THREADSAFE_ISUPPORTS
++
++  static TabGroup*
++  GetChromeTabGroup();
++
++  TabGroup();
++
++  // Get the docgroup for the corresponding doc group key.
++  // Returns null if the given key hasn't been seen yet.
++  already_AddRefed<DocGroup>
++  GetDocGroup(const nsACString& aKey);
++
++  already_AddRefed<DocGroup>
++  AddDocument(const nsACString& aKey, nsIDocument* aDocument);
++
++  // Join the specified TabGroup, returning a reference to it. If aTabGroup is
++  // nullptr, create a new tabgroup to join.
++  static already_AddRefed<TabGroup>
++  Join(nsPIDOMWindowOuter* aWindow, TabGroup* aTabGroup);
++
++  void Leave(nsPIDOMWindowOuter* aWindow);
++
++  Iterator Iter()
++  {
++    return mDocGroups.Iter();
++  }
++
++private:
++  ~TabGroup();
++  DocGroupMap mDocGroups;
++  nsTArray<nsPIDOMWindowOuter*> mWindows;
++};
++
++} // namespace dom
++} // namespace mozilla
++
++#endif // defined(DocGroup_h)
+diff --git a/dom/base/FormData.cpp b/dom/base/FormData.cpp
+--- a/dom/base/FormData.cpp
++++ b/dom/base/FormData.cpp
+@@ -3,16 +3,17 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "FormData.h"
+ #include "nsIVariant.h"
+ #include "nsIInputStream.h"
+ #include "mozilla/dom/File.h"
++#include "mozilla/dom/Directory.h"
+ #include "mozilla/dom/HTMLFormElement.h"
+ 
+ #include "MultipartBlobImpl.h"
+ 
+ using namespace mozilla;
+ using namespace mozilla::dom;
+ 
+ FormData::FormData(nsISupports* aOwner)
+diff --git a/dom/base/moz.build b/dom/base/moz.build
+--- a/dom/base/moz.build
++++ b/dom/base/moz.build
+@@ -154,16 +154,17 @@ EXPORTS.mozilla.dom += [
+     'BodyUtil.h',
+     'BorrowedAttrInfo.h',
+     'ChildIterator.h',
+     'ChromeNodeList.h',
+     'ChromeUtils.h',
+     'Comment.h',
+     'CustomElementRegistry.h',
+     'DirectionalityUtils.h',
++    'DocGroup.h',
+     'DocumentFragment.h',
+     'DocumentType.h',
+     'DOMCursor.h',
+     'DOMError.h',
+     'DOMException.h',
+     'DOMImplementation.h',
+     'DOMIntersectionObserver.h',
+     'DOMMatrix.h',
+@@ -221,16 +222,17 @@ UNIFIED_SOURCES += [
+     'BorrowedAttrInfo.cpp',
+     'ChildIterator.cpp',
+     'ChromeNodeList.cpp',
+     'ChromeUtils.cpp',
+     'Comment.cpp',
+     'Crypto.cpp',
+     'CustomElementRegistry.cpp',
+     'DirectionalityUtils.cpp',
++    'DocGroup.cpp',
+     'DocumentFragment.cpp',
+     'DocumentType.cpp',
+     'DOMCursor.cpp',
+     'DOMError.cpp',
+     'DOMException.cpp',
+     'DOMImplementation.cpp',
+     'DOMMatrix.cpp',
+     'DOMParser.cpp',
+

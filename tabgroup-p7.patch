@@ -1,0 +1,688 @@
+
+# HG changeset patch
+# User Michael Layzell <michael@thelayzells.com>
+# Date 1477586264 14400
+# Node ID 74ef5b08ae25f39a81503cdcb86b12ea3d6312d2
+# Parent  fc29cabb300b077d2d83f138c2790366a2473650
+Bug 1303196 - Part 7: Updates to apply correctly after noopener changes, r=smaug
+
+MozReview-Commit-ID: 25Ew2PLpP5c
+
+
+diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
+--- a/browser/base/content/browser.js
++++ b/browser/base/content/browser.js
+@@ -4938,27 +4938,27 @@ nsBrowserAccess.prototype = {
+     let browser = win.gBrowser.getBrowserForTab(tab);
+ 
+     if (needToFocusWin || (!loadInBackground && aIsExternal))
+       win.focus();
+ 
+     return browser;
+   },
+ 
+-  openURI: function (aURI, aOpener, aWhere, aContext) {
++  openURI: function (aURI, aOpener, aWhere, aFlags) {
+     // This function should only ever be called if we're opening a URI
+     // from a non-remote browser window (via nsContentTreeOwner).
+     if (aOpener && Cu.isCrossProcessWrapper(aOpener)) {
+       Cu.reportError("nsBrowserAccess.openURI was passed a CPOW for aOpener. " +
+                      "openURI should only ever be called from non-remote browsers.");
+       throw Cr.NS_ERROR_FAILURE;
+     }
+ 
+     var newWindow = null;
+-    var isExternal = (aContext == Ci.nsIBrowserDOMWindow.OPEN_EXTERNAL);
++    var isExternal = !!(aFlags & Ci.nsIBrowserDOMWindow.OPEN_EXTERNAL);
+ 
+     if (aOpener && isExternal) {
+       Cu.reportError("nsBrowserAccess.openURI did not expect an opener to be " +
+                      "passed if the context is OPEN_EXTERNAL.");
+       throw Cr.NS_ERROR_FAILURE;
+     }
+ 
+     if (isExternal && aURI && aURI.schemeIs("chrome")) {
+@@ -5002,20 +5002,21 @@ nsBrowserAccess.prototype = {
+         // this means forcing the newly opened browser to be non-remote so that
+         // we can hand back the nsIDOMWindow. The XULBrowserWindow.shouldLoadURI
+         // will do the job of shuttling off the newly opened browser to run in
+         // the right process once it starts loading a URI.
+         let forceNotRemote = !!aOpener;
+         let userContextId = aOpener && aOpener.document
+                               ? aOpener.document.nodePrincipal.originAttributes.userContextId
+                               : Ci.nsIScriptSecurityManager.DEFAULT_USER_CONTEXT_ID;
++        let openerWindow = (aFlags & Ci.nsIBrowserDOMWindow.OPEN_NO_OPENER) ? null : aOpener;
+         let browser = this._openURIInNewTab(aURI, referrer, referrerPolicy,
+                                             isPrivate, isExternal,
+                                             forceNotRemote, userContextId,
+-                                            aOpener);
++                                            openerWindow);
+         if (browser)
+           newWindow = browser.contentWindow;
+         break;
+       default : // OPEN_CURRENTWINDOW or an illegal value
+         newWindow = content;
+         if (aURI) {
+           let loadflags = isExternal ?
+                             Ci.nsIWebNavigation.LOAD_FLAGS_FROM_EXTERNAL :
+@@ -5027,23 +5028,23 @@ nsBrowserAccess.prototype = {
+                                     });
+         }
+         if (!gPrefService.getBoolPref("browser.tabs.loadDivertedInBackground"))
+           window.focus();
+     }
+     return newWindow;
+   },
+ 
+-  openURIInFrame: function browser_openURIInFrame(aURI, aParams, aWhere, aContext) {
++  openURIInFrame: function browser_openURIInFrame(aURI, aParams, aWhere, aFlags) {
+     if (aWhere != Ci.nsIBrowserDOMWindow.OPEN_NEWTAB) {
+       dump("Error: openURIInFrame can only open in new tabs");
+       return null;
+     }
+ 
+-    var isExternal = (aContext == Ci.nsIBrowserDOMWindow.OPEN_EXTERNAL);
++    var isExternal = !!(aFlags & Ci.nsIBrowserDOMWindow.OPEN_EXTERNAL);
+ 
+     var userContextId = aParams.openerOriginAttributes &&
+                         ("userContextId" in aParams.openerOriginAttributes)
+                           ? aParams.openerOriginAttributes.userContextId
+                           : Ci.nsIScriptSecurityManager.DEFAULT_USER_CONTEXT_ID
+ 
+     let browser = this._openURIInNewTab(aURI, aParams.referrer,
+                                         aParams.referrerPolicy,
+diff --git a/devtools/client/responsive.html/browser/tunnel.js b/devtools/client/responsive.html/browser/tunnel.js
+--- a/devtools/client/responsive.html/browser/tunnel.js
++++ b/devtools/client/responsive.html/browser/tunnel.js
+@@ -226,18 +226,18 @@ function tunnelToInnerBrowser(outer, inn
+       let { detail } = event;
+       event.preventDefault();
+       let uri = Services.io.newURI(detail.url, null, null);
+       // This API is used mainly because it's near the path used for <a target/> with
+       // regular browser tabs (which calls `openURIInFrame`).  The more elaborate APIs
+       // that support openers, window features, etc. didn't seem callable from JS and / or
+       // this event doesn't give enough info to use them.
+       browserWindow.browserDOMWindow
+-                   .openURI(uri, null, Ci.nsIBrowserDOMWindow.OPEN_NEWTAB,
+-                            Ci.nsIBrowserDOMWindow.OPEN_NEWTAB);
++        .openURI(uri, null, Ci.nsIBrowserDOMWindow.OPEN_NEWTAB,
++                 Ci.nsIBrowserDOMWindow.OPEN_NEW);
+     },
+ 
+     stop() {
+       let tab = gBrowser.getTabForBrowser(outer);
+       let filteredProgressListener = gBrowser._tabFilters.get(tab);
+ 
+       // The browser's state has changed over time while the tunnel was active.  Push the
+       // the current state down to the inner browser, so that it follows the content in
+diff --git a/dom/base/nsHostObjectURI.cpp b/dom/base/nsHostObjectURI.cpp
+--- a/dom/base/nsHostObjectURI.cpp
++++ b/dom/base/nsHostObjectURI.cpp
+@@ -3,16 +3,17 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "nsHostObjectURI.h"
+ 
+ #include "nsIObjectInputStream.h"
+ #include "nsIObjectOutputStream.h"
++#include "nsHostObjectProtocolHandler.h"
+ 
+ #include "mozilla/ipc/BackgroundUtils.h"
+ #include "mozilla/ipc/URIUtils.h"
+ 
+ static NS_DEFINE_CID(kHOSTOBJECTURICID, NS_HOSTOBJECTURI_CID);
+ 
+ static NS_DEFINE_CID(kThisSimpleURIImplementationCID,
+                      NS_THIS_SIMPLEURI_IMPLEMENTATION_CID);
+diff --git a/dom/browser-element/BrowserElementParent.cpp b/dom/browser-element/BrowserElementParent.cpp
+--- a/dom/browser-element/BrowserElementParent.cpp
++++ b/dom/browser-element/BrowserElementParent.cpp
+@@ -251,16 +251,17 @@ BrowserElementParent::OpenWindowOOP(TabP
+ }
+ 
+ /* static */
+ BrowserElementParent::OpenWindowResult
+ BrowserElementParent::OpenWindowInProcess(nsPIDOMWindowOuter* aOpenerWindow,
+                                           nsIURI* aURI,
+                                           const nsAString& aName,
+                                           const nsACString& aFeatures,
++                                          bool aForceNoOpener,
+                                           mozIDOMWindowProxy** aReturnWindow)
+ {
+   *aReturnWindow = nullptr;
+ 
+   // If we call window.open from an <iframe> inside an <iframe mozbrowser>,
+   // it's as though the top-level document inside the <iframe mozbrowser>
+   // called window.open.  (Indeed, in the OOP case, the inner <iframe> lives
+   // out-of-process, so we couldn't touch it if we tried.)
+@@ -278,19 +279,21 @@ BrowserElementParent::OpenWindowInProces
+     CreateIframe(openerFrameElement, aName, /* aRemote = */ false);
+   NS_ENSURE_TRUE(popupFrameElement, BrowserElementParent::OPEN_WINDOW_IGNORED);
+ 
+   nsAutoCString spec;
+   if (aURI) {
+     aURI->GetSpec(spec);
+   }
+ 
+-  ErrorResult res;
+-  popupFrameElement->PresetOpenerWindow(aOpenerWindow, res);
+-  MOZ_ASSERT(!res.Failed());
++  if (!aForceNoOpener) {
++    ErrorResult res;
++    popupFrameElement->PresetOpenerWindow(aOpenerWindow, res);
++    MOZ_ASSERT(!res.Failed());
++  }
+ 
+   OpenWindowResult opened =
+     DispatchOpenWindowEvent(openerFrameElement, popupFrameElement,
+                             NS_ConvertUTF8toUTF16(spec),
+                             aName,
+                             NS_ConvertUTF8toUTF16(aFeatures));
+ 
+   if (opened != BrowserElementParent::OPEN_WINDOW_ADDED) {
+diff --git a/dom/browser-element/BrowserElementParent.h b/dom/browser-element/BrowserElementParent.h
+--- a/dom/browser-element/BrowserElementParent.h
++++ b/dom/browser-element/BrowserElementParent.h
+@@ -113,16 +113,17 @@ public:
+    *         frame to a document or whether they called preventDefault to prevent
+    *         the platform from handling the open request
+    */
+   static OpenWindowResult
+   OpenWindowInProcess(nsPIDOMWindowOuter* aOpenerWindow,
+                       nsIURI* aURI,
+                       const nsAString& aName,
+                       const nsACString& aFeatures,
++                      bool aForceNoOpener,
+                       mozIDOMWindowProxy** aReturnWindow);
+ 
+ private:
+   static OpenWindowResult
+   DispatchOpenWindowEvent(dom::Element* aOpenerFrameElement,
+                           dom::Element* aPopupFrameElement,
+                           const nsAString& aURL,
+                           const nsAString& aName,
+diff --git a/dom/interfaces/base/nsIBrowserDOMWindow.idl b/dom/interfaces/base/nsIBrowserDOMWindow.idl
+--- a/dom/interfaces/base/nsIBrowserDOMWindow.idl
++++ b/dom/interfaces/base/nsIBrowserDOMWindow.idl
+@@ -57,51 +57,64 @@ interface nsIBrowserDOMWindow : nsISuppo
+   const short OPEN_NEWTAB        = 3;
+   /**
+    * Open in an existing content tab based on the URI. If a match can't be
+    * found, revert to OPEN_NEWTAB behavior.
+    */
+   const short OPEN_SWITCHTAB     = 4;
+ 
+   /**
+-   * Values for openURI's aContext parameter.  These affect the behavior of
+-   * OPEN_DEFAULTWINDOW.
++   * Values for openURI's aFlags parameter. This is a bitflags field.
++   *
++   * The 0x1 bit decides the behavior of OPEN_DEFAULTWINDOW, and the 0x4 bit
++   * controls whether or not to set the window.opener property on the newly
++   * opened window.
++   *
++   * NOTE: The 0x2 bit is ignored for backwards compatibility with addons, as
++   * OPEN_NEW used to have the value 2. The values 0 and 2 are treated
++   * the same way internally.
+    */
+   /**
++   * internal open new window
++   */
++  const long OPEN_NEW           = 0x0;
++  /**
+    * external link (load request from another application, xremote, etc).
+    */
+-  const short OPEN_EXTERNAL      = 1;
++  const long OPEN_EXTERNAL      = 0x1;
++
+   /**
+-   * internal open new window
++   * Don't set the window.opener property on the window which is being opened
+    */
+-  const short OPEN_NEW           = 2; 
++  const long OPEN_NO_OPENER     = 0x4;
+ 
+   /**
+    * Load a URI
+ 
+    * @param aURI the URI to open. null is allowed.  If null is passed in, no
+    *             load will be done, though the window the load would have
+    *             happened in will be returned.
+    * @param aWhere see possible values described above.
+    * @param aOpener window requesting the open (can be null).
+-   * @param aContext the context in which the URI is being opened. This
+-   *                 is used only when aWhere == OPEN_DEFAULTWINDOW.
++   * @param aFlags flags which control the behavior of the load. The
++   *               OPEN_EXTERNAL/OPEN_NEW flag is only used when
++   *               aWhere == OPEN_DEFAULTWINDOW.
+    * @return the window into which the URI was opened.
+   */
+   mozIDOMWindowProxy
+   openURI(in nsIURI aURI, in mozIDOMWindowProxy aOpener,
+-          in short aWhere, in short aContext);
++          in short aWhere, in long aFlags);
+ 
+   /**
+    * As above, but return the nsIFrameLoaderOwner for the new window.
+    // XXXbz is this the right API?
+    // See bug 537428
+    */
+   nsIFrameLoaderOwner openURIInFrame(in nsIURI aURI, in nsIOpenURIInFrameParams params,
+-                                     in short aWhere, in short aContext);
++                                     in short aWhere, in long aFlags);
+ 
+   /**
+    * @param  aWindow the window to test.
+    * @return whether the window is the main content window for any
+    *         currently open tab in this toplevel browser window.
+    */
+   boolean isTabContentWindow(in nsIDOMWindow aWindow);
+ 
+diff --git a/dom/ipc/ContentChild.cpp b/dom/ipc/ContentChild.cpp
+--- a/dom/ipc/ContentChild.cpp
++++ b/dom/ipc/ContentChild.cpp
+@@ -657,36 +657,38 @@ NS_IMETHODIMP
+ ContentChild::ProvideWindow(mozIDOMWindowProxy* aParent,
+                             uint32_t aChromeFlags,
+                             bool aCalledFromJS,
+                             bool aPositionSpecified,
+                             bool aSizeSpecified,
+                             nsIURI* aURI,
+                             const nsAString& aName,
+                             const nsACString& aFeatures,
++                            bool aForceNoOpener,
+                             bool* aWindowIsNew,
+                             mozIDOMWindowProxy** aReturn)
+ {
+   return ProvideWindowCommon(nullptr, aParent, false, aChromeFlags,
+                              aCalledFromJS, aPositionSpecified,
+                              aSizeSpecified, aURI, aName, aFeatures,
+-                             aWindowIsNew, aReturn);
++                             aForceNoOpener, aWindowIsNew, aReturn);
+ }
+ 
+ nsresult
+ ContentChild::ProvideWindowCommon(TabChild* aTabOpener,
+                                   mozIDOMWindowProxy* aParent,
+                                   bool aIframeMoz,
+                                   uint32_t aChromeFlags,
+                                   bool aCalledFromJS,
+                                   bool aPositionSpecified,
+                                   bool aSizeSpecified,
+                                   nsIURI* aURI,
+                                   const nsAString& aName,
+                                   const nsACString& aFeatures,
++                                  bool aForceNoOpener,
+                                   bool* aWindowIsNew,
+                                   mozIDOMWindowProxy** aReturn)
+ {
+   *aReturn = nullptr;
+ 
+   nsAutoPtr<IPCTabContext> ipcContext;
+   TabId openerTabId = TabId(0);
+ 
+@@ -826,17 +828,17 @@ ContentChild::ProvideWindowCommon(TabChi
+                         aTabOpener->mDefaultScale);
+   }
+ 
+   // Set the opener window for this window before we start loading the document
+   // inside of it. We have to do this before loading the remote scripts, because
+   // they can poke at the document and cause the nsDocument to be created before
+   // the openerwindow
+   nsCOMPtr<mozIDOMWindowProxy> windowProxy = do_GetInterface(newChild->WebNavigation());
+-  if (windowProxy && aParent) {
++  if (!aForceNoOpener && windowProxy && aParent) {
+     nsPIDOMWindowOuter* outer = nsPIDOMWindowOuter::From(windowProxy);
+     nsPIDOMWindowOuter* parent = nsPIDOMWindowOuter::From(aParent);
+     outer->SetOpenerWindow(parent, *aWindowIsNew);
+   }
+ 
+   // Unfortunately we don't get a window unless we've shown the frame.  That's
+   // pretty bogus; see bug 763602.
+   newChild->DoFakeShow(textureFactoryIdentifier, layersId, renderFrame,
+diff --git a/dom/ipc/ContentChild.h b/dom/ipc/ContentChild.h
+--- a/dom/ipc/ContentChild.h
++++ b/dom/ipc/ContentChild.h
+@@ -83,16 +83,17 @@ public:
+                       bool aIframeMoz,
+                       uint32_t aChromeFlags,
+                       bool aCalledFromJS,
+                       bool aPositionSpecified,
+                       bool aSizeSpecified,
+                       nsIURI* aURI,
+                       const nsAString& aName,
+                       const nsACString& aFeatures,
++                      bool aForceNoOpener,
+                       bool* aWindowIsNew,
+                       mozIDOMWindowProxy** aReturn);
+ 
+   bool Init(MessageLoop* aIOLoop,
+             base::ProcessId aParentPid,
+             IPC::Channel* aChannel);
+ 
+   void InitProcessAttributes();
+diff --git a/dom/ipc/TabChild.cpp b/dom/ipc/TabChild.cpp
+--- a/dom/ipc/TabChild.cpp
++++ b/dom/ipc/TabChild.cpp
+@@ -1164,18 +1164,18 @@ TabChild::GetInterface(const nsIID & aII
+ }
+ 
+ NS_IMETHODIMP
+ TabChild::ProvideWindow(mozIDOMWindowProxy* aParent,
+                         uint32_t aChromeFlags,
+                         bool aCalledFromJS,
+                         bool aPositionSpecified, bool aSizeSpecified,
+                         nsIURI* aURI, const nsAString& aName,
+-                        const nsACString& aFeatures, bool* aWindowIsNew,
+-                        mozIDOMWindowProxy** aReturn)
++                        const nsACString& aFeatures, bool aForceNoOpener,
++                        bool* aWindowIsNew, mozIDOMWindowProxy** aReturn)
+ {
+     *aReturn = nullptr;
+ 
+     // If aParent is inside an <iframe mozbrowser> or <iframe mozapp> and this
+     // isn't a request to open a modal-type window, we're going to create a new
+     // <iframe mozbrowser/mozapp> and return its window here.
+     nsCOMPtr<nsIDocShell> docshell = do_GetInterface(aParent);
+     bool iframeMoz = (docshell && docshell->GetIsInMozBrowserOrApp() &&
+@@ -1207,16 +1207,17 @@ TabChild::ProvideWindow(mozIDOMWindowPro
+                                    iframeMoz,
+                                    aChromeFlags,
+                                    aCalledFromJS,
+                                    aPositionSpecified,
+                                    aSizeSpecified,
+                                    aURI,
+                                    aName,
+                                    aFeatures,
++                                   aForceNoOpener,
+                                    aWindowIsNew,
+                                    aReturn);
+ }
+ 
+ void
+ TabChild::DestroyWindow()
+ {
+     nsCOMPtr<nsIBaseWindow> baseWindow = do_QueryInterface(WebNavigation());
+diff --git a/embedding/components/windowwatcher/nsWindowWatcher.cpp b/embedding/components/windowwatcher/nsWindowWatcher.cpp
+--- a/embedding/components/windowwatcher/nsWindowWatcher.cpp
++++ b/embedding/components/windowwatcher/nsWindowWatcher.cpp
+@@ -878,18 +878,18 @@ nsWindowWatcher::OpenWindowInternal(mozI
+         provider = nsContentUtils::GetWindowProviderForContentProcess();
+       }
+ 
+       if (provider) {
+         nsCOMPtr<mozIDOMWindowProxy> newWindow;
+         rv = provider->ProvideWindow(aParent, chromeFlags, aCalledFromJS,
+                                      sizeSpec.PositionSpecified(),
+                                      sizeSpec.SizeSpecified(),
+-                                     uriToLoad, name, features, &windowIsNew,
+-                                     getter_AddRefs(newWindow));
++                                     uriToLoad, name, features, aForceNoOpener,
++                                     &windowIsNew, getter_AddRefs(newWindow));
+ 
+         if (NS_SUCCEEDED(rv)) {
+           GetWindowTreeItem(newWindow, getter_AddRefs(newDocShellItem));
+           if (windowIsNew && newDocShellItem) {
+             // Make sure to stop any loads happening in this window that the
+             // window provider might have started.  Otherwise if our caller
+             // manipulates the window it just opened and then the load
+             // completes their stuff will get blown away.
+@@ -993,31 +993,32 @@ nsWindowWatcher::OpenWindowInternal(mozI
+           popupConditions = !isCallerChrome;
+         }
+ 
+         if (popupConditions) {
+           contextFlags |=
+             nsIWindowCreator2::PARENT_IS_LOADING_OR_RUNNING_TIMEOUT;
+         }
+ 
++        mozIDOMWindowProxy* openerWindow = aForceNoOpener ? nullptr : aParent;
+         rv = CreateChromeWindow(features, parentChrome, chromeFlags, contextFlags,
+-                                nullptr, aParent, getter_AddRefs(newChrome));
++                                nullptr, openerWindow, getter_AddRefs(newChrome));
+ 
+       } else {
+         rv = mWindowCreator->CreateChromeWindow(parentChrome, chromeFlags,
+                                                 getter_AddRefs(newChrome));
+       }
+ 
+       if (newChrome) {
+         nsCOMPtr<nsIXULWindow> xulWin = do_GetInterface(newChrome);
+         if (xulWin) {
+           nsCOMPtr<nsIXULBrowserWindow> xulBrowserWin;
+           xulWin->GetXULBrowserWindow(getter_AddRefs(xulBrowserWin));
+           if (xulBrowserWin) {
+-            nsPIDOMWindowOuter* openerWindow = aForceNoOpener ? nullptr : parentWindow;
++            nsPIDOMWindowOuter* openerWindow = aForceNoOpener ? nullptr : parentWindow.get();
+             xulBrowserWin->ForceInitialBrowserNonRemote(openerWindow);
+           }
+         }
+         /* It might be a chrome nsXULWindow, in which case it won't have
+             an nsIDOMWindow (primary content shell). But in that case, it'll
+             be able to hand over an nsIDocShellTreeItem directly. */
+         nsCOMPtr<nsPIDOMWindowOuter> newWindow(do_GetInterface(newChrome));
+         if (newWindow) {
+@@ -2142,17 +2143,17 @@ nsWindowWatcher::ReadyOpenedDocShellItem
+ 
+   NS_ENSURE_ARG(aOpenedWindow);
+ 
+   *aOpenedWindow = 0;
+   nsCOMPtr<nsPIDOMWindowOuter> piOpenedWindow = aOpenedItem->GetWindow();
+   if (piOpenedWindow) {
+     if (!aForceNoOpener) {
+       piOpenedWindow->SetOpenerWindow(aParent, aWindowIsNew); // damnit
+-    } else if (aParent) {
++    } else if (aParent && aParent != piOpenedWindow) {
+       MOZ_ASSERT(nsGlobalWindow::Cast(piOpenedWindow)->TabGroup() !=
+                  nsGlobalWindow::Cast(aParent)->TabGroup(),
+                  "If we're forcing no opener, they should be in different tab groups");
+     }
+ 
+     if (aWindowIsNew) {
+ #ifdef DEBUG
+       // Assert that we're not loading things right now.  If we are, when
+diff --git a/embedding/nsIWindowProvider.idl b/embedding/nsIWindowProvider.idl
+--- a/embedding/nsIWindowProvider.idl
++++ b/embedding/nsIWindowProvider.idl
+@@ -93,10 +93,11 @@ interface nsIWindowProvider : nsISupport
+   mozIDOMWindowProxy provideWindow(in mozIDOMWindowProxy aParent,
+                                    in unsigned long aChromeFlags,
+                                    in boolean aCalledFromJS,
+                                    in boolean aPositionSpecified,
+                                    in boolean aSizeSpecified,
+                                    in nsIURI aURI,
+                                    in AString aName,
+                                    in AUTF8String aFeatures,
++                                   in boolean aForceNoOpener,
+                                    out boolean aWindowIsNew);
+ };
+diff --git a/mobile/android/chrome/content/browser.js b/mobile/android/chrome/content/browser.js
+--- a/mobile/android/chrome/content/browser.js
++++ b/mobile/android/chrome/content/browser.js
+@@ -3225,31 +3225,29 @@ var DesktopUserAgent = {
+ 
+ 
+ function nsBrowserAccess() {
+ }
+ 
+ nsBrowserAccess.prototype = {
+   QueryInterface: XPCOMUtils.generateQI([Ci.nsIBrowserDOMWindow]),
+ 
+-  _getBrowser: function _getBrowser(aURI, aOpener, aWhere, aContext) {
+-    let isExternal = (aContext == Ci.nsIBrowserDOMWindow.OPEN_EXTERNAL);
++  _getBrowser: function _getBrowser(aURI, aOpener, aWhere, aFlags) {
++    let isExternal = !!(aFlags & Ci.nsIBrowserDOMWindow.OPEN_EXTERNAL);
+     if (isExternal && aURI && aURI.schemeIs("chrome"))
+       return null;
+ 
+     let loadflags = isExternal ?
+                       Ci.nsIWebNavigation.LOAD_FLAGS_FROM_EXTERNAL :
+                       Ci.nsIWebNavigation.LOAD_FLAGS_NONE;
+     if (aWhere == Ci.nsIBrowserDOMWindow.OPEN_DEFAULTWINDOW) {
+-      switch (aContext) {
+-        case Ci.nsIBrowserDOMWindow.OPEN_EXTERNAL:
+-          aWhere = Services.prefs.getIntPref("browser.link.open_external");
+-          break;
+-        default: // OPEN_NEW or an illegal value
+-          aWhere = Services.prefs.getIntPref("browser.link.open_newwindow");
++      if (isExternal) {
++        aWhere = Services.prefs.getIntPref("browser.link.open_external");
++      } else {
++        aWhere = Services.prefs.getIntPref("browser.link.open_newwindow");
+       }
+     }
+ 
+     Services.io.offline = false;
+ 
+     let referrer;
+     if (aOpener) {
+       try {
+@@ -3287,45 +3285,46 @@ nsBrowserAccess.prototype = {
+       if (!isExternal && aOpener) {
+         let parent = BrowserApp.getTabForWindow(aOpener.top);
+         if (parent) {
+           parentId = parent.id;
+           isPrivate = PrivateBrowsingUtils.isBrowserPrivate(parent.browser);
+         }
+       }
+ 
++      let openerWindow = (aFlags & Ci.nsIBrowserDOMWindow.OPEN_NO_OPENER) ? null : aOpener;
+       // BrowserApp.addTab calls loadURIWithFlags with the appropriate params
+       let tab = BrowserApp.addTab(aURI ? aURI.spec : "about:blank", { flags: loadflags,
+                                                                       referrerURI: referrer,
+                                                                       external: isExternal,
+                                                                       parentId: parentId,
+-                                                                      opener: aOpener,
++                                                                      opener: openerWindow,
+                                                                       selected: true,
+                                                                       isPrivate: isPrivate,
+                                                                       pinned: pinned });
+ 
+       return tab.browser;
+     }
+ 
+     // OPEN_CURRENTWINDOW and illegal values
+     let browser = BrowserApp.selectedBrowser;
+     if (aURI && browser) {
+       browser.loadURIWithFlags(aURI.spec, loadflags, referrer, null, null);
+     }
+ 
+     return browser;
+   },
+ 
+-  openURI: function browser_openURI(aURI, aOpener, aWhere, aContext) {
+-    let browser = this._getBrowser(aURI, aOpener, aWhere, aContext);
++  openURI: function browser_openURI(aURI, aOpener, aWhere, aFlags) {
++    let browser = this._getBrowser(aURI, aOpener, aWhere, aFlags);
+     return browser ? browser.contentWindow : null;
+   },
+ 
+-  openURIInFrame: function browser_openURIInFrame(aURI, aParams, aWhere, aContext) {
+-    let browser = this._getBrowser(aURI, null, aWhere, aContext);
++  openURIInFrame: function browser_openURIInFrame(aURI, aParams, aWhere, aFlags) {
++    let browser = this._getBrowser(aURI, null, aWhere, aFlags);
+     return browser ? browser.QueryInterface(Ci.nsIFrameLoaderOwner) : null;
+   },
+ 
+   isTabContentWindow: function(aWindow) {
+     return BrowserApp.getBrowserForWindow(aWindow) != null;
+   },
+ 
+   canClose() {
+diff --git a/uriloader/exthandler/nsWebHandlerApp.js b/uriloader/exthandler/nsWebHandlerApp.js
+--- a/uriloader/exthandler/nsWebHandlerApp.js
++++ b/uriloader/exthandler/nsWebHandlerApp.js
+@@ -136,17 +136,17 @@ nsWebHandlerApp.prototype = {
+     //    command line handler.  
+     // c) something else went wrong 
+     //
+     // it's not clear how one would differentiate between the three cases
+     // above, so for now we don't catch the exception
+ 
+     // openURI
+     browserDOMWin.openURI(uriToSend,
+-                          null, // no window.opener 
++                          null, // no window.opener
+                           Ci.nsIBrowserDOMWindow.OPEN_DEFAULTWINDOW,
+                           Ci.nsIBrowserDOMWindow.OPEN_NEW);
+       
+     return;
+   },
+ 
+   //////////////////////////////////////////////////////////////////////////////
+   //// nsIWebHandlerApp
+diff --git a/xpfe/appshell/nsContentTreeOwner.cpp b/xpfe/appshell/nsContentTreeOwner.cpp
+--- a/xpfe/appshell/nsContentTreeOwner.cpp
++++ b/xpfe/appshell/nsContentTreeOwner.cpp
+@@ -776,16 +776,17 @@ NS_IMETHODIMP
+ nsContentTreeOwner::ProvideWindow(mozIDOMWindowProxy* aParent,
+                                   uint32_t aChromeFlags,
+                                   bool aCalledFromJS,
+                                   bool aPositionSpecified,
+                                   bool aSizeSpecified,
+                                   nsIURI* aURI,
+                                   const nsAString& aName,
+                                   const nsACString& aFeatures,
++                                  bool aForceNoOpener,
+                                   bool* aWindowIsNew,
+                                   mozIDOMWindowProxy** aReturn)
+ {
+   NS_ENSURE_ARG_POINTER(aParent);
+ 
+   auto* parent = nsPIDOMWindowOuter::From(aParent);
+   
+   *aReturn = nullptr;
+@@ -809,17 +810,17 @@ nsContentTreeOwner::ProvideWindow(mozIDO
+   nsCOMPtr<nsIDocShell> docshell = do_GetInterface(aParent);
+   if (docshell && docshell->GetIsInMozBrowserOrApp() &&
+       !(aChromeFlags & (nsIWebBrowserChrome::CHROME_MODAL |
+                         nsIWebBrowserChrome::CHROME_OPENAS_DIALOG |
+                         nsIWebBrowserChrome::CHROME_OPENAS_CHROME))) {
+ 
+     BrowserElementParent::OpenWindowResult opened =
+       BrowserElementParent::OpenWindowInProcess(parent, aURI, aName,
+-                                                aFeatures, aReturn);
++                                                aFeatures, aForceNoOpener, aReturn);
+ 
+     // If OpenWindowInProcess handled the open (by opening it or blocking the
+     // popup), tell our caller not to proceed trying to create a new window
+     // through other means.
+     if (opened != BrowserElementParent::OPEN_WINDOW_IGNORED) {
+       *aWindowIsNew = opened == BrowserElementParent::OPEN_WINDOW_ADDED;
+       return *aWindowIsNew ? NS_OK : NS_ERROR_ABORT;
+     }
+@@ -868,23 +869,29 @@ nsContentTreeOwner::ProvideWindow(mozIDO
+     return NS_OK;
+   }
+ 
+   *aWindowIsNew = (openLocation != nsIBrowserDOMWindow::OPEN_CURRENTWINDOW);
+ 
+   {
+     dom::AutoNoJSAPI nojsapi;
+ 
++    uint32_t flags = nsIBrowserDOMWindow::OPEN_NEW;
++    if (aForceNoOpener) {
++      flags |= nsIBrowserDOMWindow::OPEN_NO_OPENER;
++    }
++
+     // Get a new rendering area from the browserDOMWin.  We don't want
+     // to be starting any loads here, so get it with a null URI.
+     //
+     // This method handles setting the opener for us, so we don't need to set it
+     // ourselves.
+-    return browserDOMWin->OpenURI(nullptr, aParent, openLocation,
+-                                  nsIBrowserDOMWindow::OPEN_NEW, aReturn);
++    return browserDOMWin->OpenURI(nullptr, aParent,
++                                  openLocation,
++                                  flags, aReturn);
+   }
+ }
+ 
+ //*****************************************************************************
+ // nsContentTreeOwner: Accessors
+ //*****************************************************************************
+ 
+ #if defined(XP_MACOSX)
+
