@@ -1,0 +1,275 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  fb4f647e43ebe03b386c5f662ab76b7f20163e41
+Bug 1300659 P2 Expose a TaskQueue on that TabGroup. r=smaug
+
+diff --git a/dom/base/DocGroup.cpp b/dom/base/DocGroup.cpp
+--- a/dom/base/DocGroup.cpp
++++ b/dom/base/DocGroup.cpp
+@@ -1,14 +1,15 @@
+ #include "mozilla/dom/DocGroup.h"
+ #include "mozilla/Telemetry.h"
+ #include "nsIURI.h"
+ #include "nsIEffectiveTLDService.h"
+ #include "mozilla/StaticPtr.h"
+ #include "mozilla/ClearOnShutdown.h"
++#include "mozilla/SelfClosingTaskQueueTarget.h"
+ #include "nsIDocShell.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ /* static */ void
+ DocGroup::GetKey(nsIPrincipal* aPrincipal, nsACString& aKey)
+ {
+@@ -44,17 +45,25 @@ DocGroup::~DocGroup()
+ {
+   MOZ_ASSERT(mDocuments.IsEmpty());
+   mTabGroup->mDocGroups.RemoveEntry(mKey);
+ }
+ 
+ NS_IMPL_ISUPPORTS(DocGroup, nsISupports)
+ 
+ TabGroup::TabGroup()
+-{}
++{
++  nsCOMPtr<nsIThread> mainThread;
++  NS_GetMainThread(getter_AddRefs(mainThread));
++  MOZ_DIAGNOSTIC_ASSERT(mainThread);
++
++  // This may return nullptr during xpcom shutdown.  This is ok as we
++  // do not guarantee a task queue will be present.
++  mTaskQueue = SelfClosingTaskQueueTarget::Create(mainThread);
++}
+ 
+ TabGroup::~TabGroup()
+ {
+   MOZ_ASSERT(mDocGroups.IsEmpty());
+   MOZ_ASSERT(mWindows.IsEmpty());
+ }
+ 
+ static StaticRefPtr<TabGroup> sChromeTabGroup;
+@@ -152,16 +161,22 @@ TabGroup::FindItemWithName(const char16_
+         break;
+       }
+     }
+   }
+ 
+   return NS_OK;
+ }
+ 
++SelfClosingTaskQueueTarget*
++TabGroup::GetTaskQueue() const
++{
++  return mTaskQueue;
++}
++
+ NS_IMPL_ISUPPORTS(TabGroup, nsISupports)
+ 
+ TabGroup::HashEntry::HashEntry(const nsACString* aKey)
+   : nsCStringHashKey(aKey), mDocGroup(nullptr)
+ {}
+ 
+ }
+ }
+diff --git a/dom/base/DocGroup.h b/dom/base/DocGroup.h
+--- a/dom/base/DocGroup.h
++++ b/dom/base/DocGroup.h
+@@ -11,16 +11,17 @@
+ #include "nsISupportsImpl.h"
+ #include "nsIPrincipal.h"
+ #include "nsTHashtable.h"
+ #include "nsString.h"
+ 
+ #include "mozilla/RefPtr.h"
+ 
+ namespace mozilla {
++class SelfClosingTaskQueueTarget;
+ namespace dom {
+ 
+ // Two browsing contexts are considered "related" if they are reachable from one
+ // another through window.opener, window.parent, or window.frames. This is the
+ // spec concept of a "unit of related browsing contexts"
+ //
+ // Two browsing contexts are considered "similar-origin" if they can be made to
+ // have the same origin by setting document.domain. This is the spec concept of
+@@ -131,18 +132,24 @@ public:
+   // It is illegal to pass in the special case-insensitive names "_blank",
+   // "_self", "_parent" or "_top", as those should be handled elsewhere.
+   nsresult
+   FindItemWithName(const char16_t* aName,
+                    nsIDocShellTreeItem* aRequestor,
+                    nsIDocShellTreeItem* aOriginalRequestor,
+                    nsIDocShellTreeItem** aFoundItem);
+ 
++  // Get the task queue that associated windows can use to issue runnables to
++  // the main thread.  This may return nullptr during browser shutdown.
++  SelfClosingTaskQueueTarget*
++  GetTaskQueue() const;
++
+ private:
+   ~TabGroup();
+   DocGroupMap mDocGroups;
+   nsTArray<nsPIDOMWindowOuter*> mWindows;
++  RefPtr<SelfClosingTaskQueueTarget> mTaskQueue;
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // defined(DocGroup_h)
+diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
+--- a/dom/base/nsGlobalWindow.cpp
++++ b/dom/base/nsGlobalWindow.cpp
+@@ -72,16 +72,17 @@
+ #include "mozilla/dom/ToJSValue.h"
+ #include "nsJSPrincipals.h"
+ #include "mozilla/Attributes.h"
+ #include "mozilla/Debug.h"
+ #include "mozilla/EventListenerManager.h"
+ #include "mozilla/EventStates.h"
+ #include "mozilla/MouseEvents.h"
+ #include "mozilla/ProcessHangMonitor.h"
++#include "mozilla/SelfClosingTaskQueueTarget.h"
+ #include "AudioChannelService.h"
+ #include "nsAboutProtocolUtils.h"
+ #include "nsCharTraits.h" // NS_IS_HIGH/LOW_SURROGATE
+ #include "PostMessageEvent.h"
+ #include "DocGroup.h"
+ 
+ // Interfaces Needed
+ #include "nsIFrame.h"
+@@ -9444,16 +9445,34 @@ nsGlobalWindow::UpdateCommands(const nsA
+       nsContentUtils::AddScriptRunner(new CommandDispatcher(xulCommandDispatcher,
+                                                             anAction));
+     }
+   }
+ 
+   return NS_OK;
+ }
+ 
++SelfClosingTaskQueueTarget*
++nsGlobalWindow::GetTaskQueue()
++{
++  // Do not throttle runnables from chrome windows.  In theory we should
++  // not have abuse issues from these windows and many browser chrome
++  // tests have races that fail if we do throttle chrome runnables.
++  if (IsChromeWindow()) {
++    return nullptr;
++  }
++
++  nsGlobalWindow* outer = GetOuterWindowInternal();
++  if (!outer) {
++    return nullptr;
++  }
++
++  return TabGroup()->GetTaskQueue();
++}
++
+ Selection*
+ nsGlobalWindow::GetSelectionOuter()
+ {
+   MOZ_RELEASE_ASSERT(IsOuterWindow());
+ 
+   if (!mDocShell) {
+     return nullptr;
+   }
+diff --git a/dom/base/nsGlobalWindow.h b/dom/base/nsGlobalWindow.h
+--- a/dom/base/nsGlobalWindow.h
++++ b/dom/base/nsGlobalWindow.h
+@@ -96,16 +96,17 @@ class nsGlobalWindow;
+ class nsDOMWindowUtils;
+ class nsIIdleService;
+ struct nsRect;
+ 
+ class nsWindowSizes;
+ 
+ namespace mozilla {
+ class DOMEventTargetHelper;
++class SelfClosingTaskQueueTarget;
+ namespace dom {
+ class BarProp;
+ struct ChannelPixelLayout;
+ class Console;
+ class Crypto;
+ class CustomElementRegistry;
+ class DocGroup;
+ class External;
+@@ -1196,16 +1197,18 @@ public:
+              const mozilla::dom::Sequence<JS::Value>& aExtraArgument,
+              mozilla::ErrorResult& aError);
+   nsresult OpenDialog(const nsAString& aUrl, const nsAString& aName,
+                       const nsAString& aOptions,
+                       nsISupports* aExtraArgument,
+                       nsPIDOMWindowOuter** _retval) override;
+   nsresult UpdateCommands(const nsAString& anAction, nsISelection* aSel, int16_t aReason) override;
+ 
++  mozilla::SelfClosingTaskQueueTarget* GetTaskQueue() override;
++
+   already_AddRefed<nsPIDOMWindowOuter>
+     GetContentInternal(mozilla::ErrorResult& aError, bool aUnprivilegedCaller);
+   void GetContentOuter(JSContext* aCx,
+                        JS::MutableHandle<JSObject*> aRetval,
+                        mozilla::ErrorResult& aError);
+   void GetContent(JSContext* aCx,
+                   JS::MutableHandle<JSObject*> aRetval,
+                   mozilla::ErrorResult& aError);
+@@ -1921,16 +1924,18 @@ protected:
+   // responsible for unsuspending events on the document. If we don't (for
+   // example, if the outer window is closed before the LeaveModalState call),
+   // then the inner window whose mDoc is our mSuspendedDoc is responsible for
+   // unsuspending it.
+   nsCOMPtr<nsIDocument> mSuspendedDoc;
+ 
+   RefPtr<mozilla::dom::IDBFactory> mIndexedDB;
+ 
++  RefPtr<mozilla::SelfClosingTaskQueueTarget> mMainThreadTaskQueue;
++
+   // This counts the number of windows that have been opened in rapid succession
+   // (i.e. within dom.successive_dialog_time_limit of each other). It is reset
+   // to 0 once a dialog is opened after dom.successive_dialog_time_limit seconds
+   // have elapsed without any other dialogs.
+   uint32_t                      mDialogAbuseCount;
+ 
+   // This holds the time when the last modal dialog was shown. If more than
+   // MAX_DIALOG_LIMIT dialogs are shown within the time span defined by
+diff --git a/dom/base/nsPIDOMWindow.h b/dom/base/nsPIDOMWindow.h
+--- a/dom/base/nsPIDOMWindow.h
++++ b/dom/base/nsPIDOMWindow.h
+@@ -36,16 +36,17 @@ class nsPIDOMWindowInner;
+ class nsPIDOMWindowOuter;
+ class nsPIWindowRoot;
+ class nsXBLPrototypeHandler;
+ struct nsTimeout;
+ 
+ typedef uint32_t SuspendTypes;
+ 
+ namespace mozilla {
++class SelfClosingTaskQueueTarget;
+ namespace dom {
+ class AudioContext;
+ class Element;
+ class Performance;
+ class ServiceWorkerRegistration;
+ class CustomElementRegistry;
+ } // namespace dom
+ } // namespace mozilla
+@@ -570,16 +571,18 @@ public:
+   virtual nsresult SetFullScreen(bool aFullScreen) = 0;
+ 
+   virtual nsresult Focus() = 0;
+   virtual nsresult Close() = 0;
+ 
+   virtual nsresult MoveBy(int32_t aXDif, int32_t aYDif) = 0;
+   virtual nsresult UpdateCommands(const nsAString& anAction, nsISelection* aSel, int16_t aReason) = 0;
+ 
++  virtual mozilla::SelfClosingTaskQueueTarget* GetTaskQueue() = 0;
++
+ protected:
+   // The nsPIDOMWindow constructor. The aOuterWindow argument should
+   // be null if and only if the created window itself is an outer
+   // window. In all other cases aOuterWindow should be the outer
+   // window for the inner window that is being created.
+   explicit nsPIDOMWindow<T>(nsPIDOMWindowOuter *aOuterWindow);
+ 
+   ~nsPIDOMWindow<T>();
