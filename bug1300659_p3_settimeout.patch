@@ -1,23 +1,62 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  75a6ec9840e2c2d6308473e00000a0bba5725928
+# Parent  f4b71fbfe18cd102528d8538719a3cc2351a5ea1
 Bug 1300659 P3 Make setTimeout() and setInterval() use the TabGroup TaskQueue. r=smaug
 
-diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
---- a/dom/base/nsGlobalWindow.cpp
-+++ b/dom/base/nsGlobalWindow.cpp
-@@ -549,18 +549,32 @@ NS_IMPL_CYCLE_COLLECTION_UNLINK_0(nsTime
- NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsTimeout)
+diff --git a/dom/base/Timeout.cpp b/dom/base/Timeout.cpp
+--- a/dom/base/Timeout.cpp
++++ b/dom/base/Timeout.cpp
+@@ -50,37 +50,71 @@ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(
    NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mWindow)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mPrincipal)
    NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mScriptHandler)
  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
- NS_IMPL_CYCLE_COLLECTION_ROOT_NATIVE(nsTimeout, AddRef)
- NS_IMPL_CYCLE_COLLECTION_UNROOT_NATIVE(nsTimeout, Release)
  
- nsresult
--nsTimeout::InitTimer(uint32_t aDelay)
--{
-+nsTimeout::InitTimer(nsIEventTarget* aTarget, uint32_t aDelay)
+ NS_IMPL_CYCLE_COLLECTION_ROOT_NATIVE(Timeout, AddRef)
+ NS_IMPL_CYCLE_COLLECTION_UNROOT_NATIVE(Timeout, Release)
+ 
+-nsresult
+-Timeout::InitTimer(uint32_t aDelay)
++namespace {
++
++void
++TimerCallback(nsITimer*, void* aClosure)
+ {
+-  return mTimer->InitWithNameableFuncCallback(
+-    nsGlobalWindow::TimerCallback, this, aDelay,
+-    nsITimer::TYPE_ONE_SHOT, Timeout::TimerNameCallback);
++  RefPtr<Timeout> timeout = (Timeout*)aClosure;
++  timeout->mWindow->RunTimeout(timeout);
+ }
+ 
+-// static
+ void
+-Timeout::TimerNameCallback(nsITimer* aTimer, void* aClosure, char* aBuf,
+-                           size_t aLen)
++TimerTaskQueueCallback(nsITimer* aTimer, void* aClosure)
++{
++  RefPtr<Timeout> timeout = (Timeout*)aClosure;
++  nsCOMPtr<nsIRunnable> r = NS_NewRunnableFunction([timeout] {
++    TimerCallback(nullptr, timeout);
++  });
++  MOZ_ALWAYS_SUCCEEDS(NS_DispatchToMainThread(r.forget()));
++}
++
++void
++TimerNameCallback(nsITimer* aTimer, void* aClosure, char* aBuf, size_t aLen)
+ {
+   RefPtr<Timeout> timeout = (Timeout*)aClosure;
+ 
+   const char* filename;
+   uint32_t lineNum, column;
+   timeout->mScriptHandler->GetLocation(&filename, &lineNum, &column);
+   snprintf(aBuf, aLen, "[content] %s:%u:%u", filename, lineNum, column);
+ }
+ 
++} // anonymous namespace
++
++nsresult
++Timeout::InitTimer(nsIEventTarget* aTaskQueue, uint32_t aDelay)
 +{
 +  // If the given target does not match the timer's current target
 +  // then we need to override it before the Init.  Note that GetTarget()
@@ -25,23 +64,63 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 +  // So we need to special case the nullptr target comparison.
 +  nsCOMPtr<nsIEventTarget> currentTarget;
 +  MOZ_ALWAYS_SUCCEEDS(mTimer->GetTarget(getter_AddRefs(currentTarget)));
-+  if ((aTarget && currentTarget != aTarget) ||
-+      (!aTarget && currentTarget != NS_GetCurrentThread())) {
++  if ((aTaskQueue && currentTarget != aTaskQueue) ||
++      (!aTaskQueue && currentTarget != NS_GetCurrentThread())) {
 +    // Always call Cancel() in case we are re-using a timer.  Otherwise
 +    // the subsequent SetTarget() may fail.
 +    MOZ_ALWAYS_SUCCEEDS(mTimer->Cancel());
-+    MOZ_ALWAYS_SUCCEEDS(mTimer->SetTarget(aTarget));
++    MOZ_ALWAYS_SUCCEEDS(mTimer->SetTarget(aTaskQueue));
 +  }
 +
-   return mTimer->InitWithNameableFuncCallback(
-     nsGlobalWindow::TimerCallback, this, aDelay,
-     nsITimer::TYPE_ONE_SHOT, nsGlobalWindow::TimerNameCallback);
- }
++  nsTimerCallbackFunc callback =
++    aTaskQueue ? TimerTaskQueueCallback : TimerCallback;
++
++  return mTimer->InitWithNameableFuncCallback(
++    callback, this, aDelay, nsITimer::TYPE_ONE_SHOT, TimerNameCallback);
++}
  
  // Return true if this timeout has a refcount of 1. This is used to check
  // that dummy_timeout doesn't leak from nsGlobalWindow::RunTimeout.
+ #ifdef DEBUG
  bool
-@@ -11791,17 +11805,17 @@ nsGlobalWindow::Resume()
+ Timeout::HasRefCntOne() const
+ {
+   return mRefCnt.get() == 1;
+diff --git a/dom/base/Timeout.h b/dom/base/Timeout.h
+--- a/dom/base/Timeout.h
++++ b/dom/base/Timeout.h
+@@ -29,23 +29,23 @@ class Timeout final
+   : public LinkedListElement<Timeout>
+ {
+ public:
+   Timeout();
+ 
+   NS_DECL_CYCLE_COLLECTION_NATIVE_CLASS(Timeout)
+   NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(Timeout)
+ 
+-  nsresult InitTimer(uint32_t aDelay);
++  // The target may be specified to use a particular task queue for the
++  // resulting timer runnable.  A nullptr task queue will result in the
++  // default main thread being used.
++  nsresult InitTimer(nsIEventTarget* aTaskQueue, uint32_t aDelay);
+ 
+   enum class Reason { eTimeoutOrInterval, eIdleCallbackTimeout };
+ 
+-  static void TimerNameCallback(nsITimer* aTimer, void* aClosure, char* aBuf,
+-                                size_t aLen);
+-
+ #ifdef DEBUG
+   bool HasRefCntOne() const;
+ #endif // DEBUG
+ 
+   // Window for which this timeout fires
+   RefPtr<nsGlobalWindow> mWindow;
+ 
+   // The actual timer object
+diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
+--- a/dom/base/nsGlobalWindow.cpp
++++ b/dom/base/nsGlobalWindow.cpp
+@@ -11879,17 +11879,17 @@ nsGlobalWindow::Resume()
      uint32_t delay = std::max(remaining, DOMMinTimeoutValue());
  
      t->mTimer = do_CreateInstance("@mozilla.org/timer;1");
@@ -60,14 +139,14 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
  
      // Add a reference for the new timer's closure.
      t->AddRef();
-@@ -12497,17 +12511,17 @@ nsGlobalWindow::SetTimeoutOrInterval(nsI
+@@ -12598,17 +12598,17 @@ nsGlobalWindow::SetTimeoutOrInterval(nsI
      nsresult rv;
      timeout->mTimer = do_CreateInstance("@mozilla.org/timer;1", &rv);
      if (NS_FAILED(rv)) {
        return rv;
      }
  
-     RefPtr<nsTimeout> copy = timeout;
+     RefPtr<Timeout> copy = timeout;
  
 -    rv = timeout->InitTimer(realInterval);
 +    rv = timeout->InitTimer(GetTaskQueue(), realInterval);
@@ -79,7 +158,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
      Unused << copy.forget();
    }
  
-@@ -12761,17 +12775,18 @@ nsGlobalWindow::RescheduleTimeout(nsTime
+@@ -12871,17 +12871,18 @@ nsGlobalWindow::RescheduleTimeout(Timeou
      aTimeout->mTimeRemaining = delay;
      return true;
    }
@@ -99,7 +178,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
      // us no good here so we just cancel it (just in case) and
      // null out the pointer to the OS timer, this will release the
      // OS timer. As we continue executing the code below we'll end
-@@ -12820,31 +12835,63 @@ nsGlobalWindow::RunTimeout(nsTimeout *aT
+@@ -12931,31 +12932,63 @@ nsGlobalWindow::RunTimeout(Timeout* aTim
      // timers that *should* have fired before aTimeout *will* be fired
      // now.
  
@@ -123,7 +202,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
    last_expired_timeout = nullptr;
 +  uint32_t count = 0;
 +  bool foundTarget = false;
-   for (nsTimeout *timeout = mTimeouts.getFirst();
+   for (Timeout* timeout = mTimeouts.getFirst();
         timeout && timeout->mWhen <= deadline;
         timeout = timeout->getNext()) {
      if (timeout->mFiringDepth == 0) {
@@ -163,7 +242,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
    // eligible for execution yet. Go away.
    if (!last_expired_timeout) {
      return;
-@@ -13053,17 +13100,18 @@ nsresult nsGlobalWindow::ResetTimersForN
+@@ -13164,17 +13197,18 @@ nsresult nsGlobalWindow::ResetTimersForN
        timeout->remove();
        // InsertTimeoutIntoList will addref |timeout| and reset
        // mFiringDepth.  Make sure to undo that after calling it.
@@ -183,28 +262,50 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
  
        timeout = nextTimeout;
      } else {
+@@ -13253,25 +13287,16 @@ nsGlobalWindow::InsertTimeoutIntoList(Ti
+ 
+   aTimeout->mFiringDepth = 0;
+ 
+   // Increment the timeout's reference count since it's now held on to
+   // by the list
+   aTimeout->AddRef();
+ }
+ 
+-// static
+-void
+-nsGlobalWindow::TimerCallback(nsITimer *aTimer, void *aClosure)
+-{
+-  RefPtr<Timeout> timeout = (Timeout*)aClosure;
+-
+-  timeout->mWindow->RunTimeout(timeout);
+-}
+-
+ //*****************************************************************************
+ // nsGlobalWindow: Helper Functions
+ //*****************************************************************************
+ 
+ already_AddRefed<nsIDocShellTreeOwner>
+ nsGlobalWindow::GetTreeOwner()
+ {
+   FORWARD_TO_OUTER(GetTreeOwner, (), nullptr);
 diff --git a/dom/base/nsGlobalWindow.h b/dom/base/nsGlobalWindow.h
 --- a/dom/base/nsGlobalWindow.h
 +++ b/dom/base/nsGlobalWindow.h
-@@ -164,17 +164,20 @@ private:
-   ~nsTimeout();
+@@ -1488,17 +1488,16 @@ public:
+   // Return true if |aTimeout| needs to be reinserted into the timeout list.
+   bool RescheduleTimeout(mozilla::dom::Timeout* aTimeout, const TimeStamp& now,
+                          bool aRunningPendingTimeouts);
  
- public:
-   nsTimeout();
+   void ClearAllTimeouts();
+   // Insert aTimeout into the list, before all timeouts that would
+   // fire after it, but no earlier than mTimeoutInsertionPoint, if any.
+   void InsertTimeoutIntoList(mozilla::dom::Timeout* aTimeout);
+-  static void TimerCallback(nsITimer *aTimer, void *aClosure);
+   uint32_t GetTimeoutId(mozilla::dom::Timeout::Reason aReason);
  
-   NS_DECL_CYCLE_COLLECTION_NATIVE_CLASS(nsTimeout)
-   NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(nsTimeout)
- 
--  nsresult InitTimer(uint32_t aDelay);
-+  // The callback target may be specified to use a particular task queue
-+  // for the resulting timer runnable.  A nullptr callback target will result
-+  // in the default main thread being used.
-+  nsresult InitTimer(nsIEventTarget* aCallbackTarget, uint32_t aDelay);
- 
-   bool HasRefCntOne();
- 
-   // Window for which this timeout fires
-   RefPtr<nsGlobalWindow> mWindow;
- 
-   // The actual timer object
-   nsCOMPtr<nsITimer> mTimer;
+   // Helper Functions
+   already_AddRefed<nsIDocShellTreeOwner> GetTreeOwner();
+   already_AddRefed<nsIBaseWindow> GetTreeOwnerWindow();
+   already_AddRefed<nsIWebBrowserChrome> GetWebBrowserChrome();
+   nsresult SecurityCheckURL(const char *aURL);
+   bool IsPrivateBrowsing();
