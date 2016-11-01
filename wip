@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  cb8753b01b4d98b2cbb311e0a2024fca29a5ea76
+# Parent  a3351d320887142e1cc3fce0e09e44ee96b04564
 
 diff --git a/xpcom/threads/SelfClosingTaskQueueTarget.cpp b/xpcom/threads/SelfClosingTaskQueueTarget.cpp
 deleted file mode 100644
@@ -365,7 +365,7 @@ diff --git a/xpcom/threads/ThrottledEventQueue.cpp b/xpcom/threads/ThrottledEven
 new file mode 100644
 --- /dev/null
 +++ b/xpcom/threads/ThrottledEventQueue.cpp
-@@ -0,0 +1,372 @@
+@@ -0,0 +1,394 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -478,6 +478,7 @@ new file mode 100644
 +  {
 +    // Any thread
 +    nsCOMPtr<nsIRunnable> event;
++    bool shouldShutdown = false;
 +
 +#ifdef DEBUG
 +    bool currentThread = false;
@@ -488,26 +489,44 @@ new file mode 100644
 +    {
 +      MutexAutoLock lock(mMutex);
 +
-+      if (!mEventQueue.GetPendingEvent(getter_AddRefs(event), lock)) {
-+        if (mShutdownStarted) {
-+          NS_DispatchToMainThread(NewRunnableMethod(this, &Inner::ShutdownComplete));
-+        }
-+        // Note, this breaks a ref cycle.
-+        mExecutor = nullptr;
-+        return;
++      // We only dispatch an executor runnable when we know there is something
++      // in the queue, so this should never fail.
++      MOZ_ALWAYS_TRUE(mEventQueue.GetPendingEvent(getter_AddRefs(event), lock));
++
++      // If there are more events in the queue, then dispatch the next
++      // executor.  We do this now, before running the event, because
++      // the event might spin the event loop and we don't want to stall
++      // the queue.
++      if (mEventQueue.HasPendingEvent(lock)) {
++        // Dispatch the next base target runnable to attempt to execute
++        // the next throttled event.  We must do this before executing
++        // the event in case the event spins the event loop.
++        MOZ_ALWAYS_SUCCEEDS(
++          mBaseTarget->Dispatch(mExecutor, NS_DISPATCH_NORMAL));
 +      }
 +
-+      // Dispatch the next base target runnable to attempt to execute
-+      // the next throttled event.  We must do this before executing
-+      // the event in case the event spins the event loop.
-+      MOZ_ALWAYS_SUCCEEDS(
-+        mBaseTarget->Dispatch(mExecutor, NS_DISPATCH_NORMAL));
++      // Otherwise the queue is empty and we can stop dispatching the
++      // executor.  We might also need to shutdown after running the
++      // last event.
++      else {
++        shouldShutdown = mShutdownStarted;
++        // Note, this breaks a ref cycle.
++        mExecutor = nullptr;
++      }
 +    }
 +
 +    // Execute the event now that we have unlocked.
 +    ++mExecutionDepth;
 +    Unused << event->Run();
 +    --mExecutionDepth;
++
++    // If shutdown was started and the queue is now empty we can now
++    // finalize the shutdown.  This is performed separate at the end
++    // of the method in order to wait for the event to finish running.
++    if (shouldShutdown) {
++      MOZ_ASSERT(IsEmpty());
++      NS_DispatchToMainThread(NewRunnableMethod(this, &Inner::ShutdownComplete));
++    }
 +  }
 +
 +  void
@@ -616,13 +635,16 @@ new file mode 100644
 +  nsresult
 +  Dispatch(already_AddRefed<nsIRunnable> aEvent, uint32_t aFlags)
 +  {
++    nsCOMPtr<nsIRunnable> event = aEvent;
 +    // Any thread
 +    MutexAutoLock lock(mMutex);
++
++    MOZ_ASSERT(aFlags == NS_DISPATCH_NORMAL);
 +
 +    // If we are shutting down, just fall back to our base target
 +    // directly.
 +    if (mShutdownStarted) {
-+      return mBaseTarget->Dispatch(Move(aEvent), aFlags);
++      return mBaseTarget->Dispatch(event.forget(), aFlags);
 +    }
 +
 +    // We are not currently processing events, so we must start
@@ -634,7 +656,7 @@ new file mode 100644
 +      // until the queue is drained.
 +      mExecutor = new Executor(this);
 +      nsresult rv = mBaseTarget->Dispatch(mExecutor, NS_DISPATCH_NORMAL);
-+      if (NS_FAILED(rv)) {
++      if (NS_WARN_IF(NS_FAILED(rv))) {
 +        mExecutor = nullptr;
 +        return rv;
 +      }
@@ -642,7 +664,7 @@ new file mode 100644
 +
 +    // Only add the event to the underlying queue if are able to
 +    // dispatch to our base target.
-+    mEventQueue.PutEvent(Move(aEvent), lock);
++    mEventQueue.PutEvent(event.forget(), lock);
 +    return NS_OK;
 +  }
 +
