@@ -1,11 +1,39 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  c2e8a05876634b321a02c945e0db70383faa35c0
+# Parent  5a8673596c857dd799a60a7a48de40b9b44d04f8
 
 diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 --- a/dom/base/nsGlobalWindow.cpp
 +++ b/dom/base/nsGlobalWindow.cpp
-@@ -3658,25 +3658,40 @@ nsGlobalWindow::MaybeApplyBackPressure()
+@@ -3638,16 +3638,27 @@ nsGlobalWindow::DefineArgumentsProperty(
+   return ctx->SetProperty(obj, "arguments", aArguments);
+ }
+ 
+ void
+ nsGlobalWindow::MaybeApplyBackPressure()
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+ 
++  if (IsOuterWindow()) {
++    nsGlobalWindow* inner = GetCurrentInnerWindowInternal();
++    if (!inner) {
++      return;
++    }
++    inner->MaybeApplyBackPressure();
++    return;
++  }
++
++  MOZ_ASSERT(IsInnerWindow());
++
+   // If we are already suspended, then we don't need to apply back
+   // pressure for ThrottledEventQueue reasons.  This also avoids repeatedly
+   // calling SuspendTimeout() if this routine is executed many times
+   // before dropping below the backpressure threshold.
+   if (IsSuspended()) {
+     return;
+   }
+ 
+@@ -3658,25 +3669,40 @@ nsGlobalWindow::MaybeApplyBackPressure()
  
    static const uint32_t kThrottledEventQueueBackPressure = 5000;
    if (taskQueue->Length() < kThrottledEventQueueBackPressure) {
@@ -48,7 +76,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
  
  nsIPrincipal*
  nsGlobalWindow::GetPrincipal()
-@@ -8553,16 +8568,23 @@ nsGlobalWindow::PostMessageMozOuter(JSCo
+@@ -8553,16 +8579,23 @@ nsGlobalWindow::PostMessageMozOuter(JSCo
    JS::Rooted<JS::Value> message(aCx, aMessage);
    JS::Rooted<JS::Value> transfer(aCx, aTransfer);
  
@@ -95,3 +123,141 @@ diff --git a/dom/base/nsGlobalWindow.h b/dom/base/nsGlobalWindow.h
    // you never set any of these on an inner object!
    bool                          mFullScreen : 1;
    bool                          mFullscreenMode : 1;
+diff --git a/dom/broadcastchannel/BroadcastChannel.cpp b/dom/broadcastchannel/BroadcastChannel.cpp
+--- a/dom/broadcastchannel/BroadcastChannel.cpp
++++ b/dom/broadcastchannel/BroadcastChannel.cpp
+@@ -8,16 +8,17 @@
+ #include "BroadcastChannelChild.h"
+ #include "mozilla/dom/BroadcastChannelBinding.h"
+ #include "mozilla/dom/Navigator.h"
+ #include "mozilla/dom/File.h"
+ #include "mozilla/dom/StructuredCloneHolder.h"
+ #include "mozilla/ipc/BackgroundChild.h"
+ #include "mozilla/ipc/BackgroundUtils.h"
+ #include "mozilla/ipc/PBackgroundChild.h"
++#include "mozilla/ThrottledEventQueue.h"
+ #include "nsContentUtils.h"
+ #include "WorkerPrivate.h"
+ #include "WorkerRunnable.h"
+ 
+ #include "nsIBFCacheEntry.h"
+ #include "nsIDocument.h"
+ #include "nsISupportsPrimitives.h"
+ 
+@@ -437,20 +438,20 @@ BroadcastChannel::PostMessageInternal(JS
+ }
+ 
+ void
+ BroadcastChannel::PostMessageData(BroadcastChannelMessage* aData)
+ {
+   RemoveDocFromBFCache();
+ 
+   if (mActor) {
+-    RefPtr<BCPostMessageRunnable> runnable =
++    nsCOMPtr<nsIRunnable> runnable =
+       new BCPostMessageRunnable(mActor, aData);
+ 
+-    if (NS_FAILED(NS_DispatchToCurrentThread(runnable))) {
++    if (NS_FAILED(DispatchToCurrentThread(runnable.forget()))) {
+       NS_WARNING("Failed to dispatch to the current thread!");
+     }
+ 
+     return;
+   }
+ 
+   mPendingMessages.AppendElement(aData);
+ }
+@@ -463,19 +464,19 @@ BroadcastChannel::Close()
+   }
+ 
+   if (mPendingMessages.IsEmpty()) {
+     // We cannot call Shutdown() immediatelly because we could have some
+     // postMessage runnable already dispatched. Instead, we change the state to
+     // StateClosed and we shutdown the actor asynchrounsly.
+ 
+     mState = StateClosed;
+-    RefPtr<CloseRunnable> runnable = new CloseRunnable(this);
++    nsCOMPtr<nsIRunnable> runnable = new CloseRunnable(this);
+ 
+-    if (NS_FAILED(NS_DispatchToCurrentThread(runnable))) {
++    if (NS_FAILED(DispatchToCurrentThread(runnable.forget()))) {
+       NS_WARNING("Failed to dispatch to the current thread!");
+     }
+   } else {
+     MOZ_ASSERT(!mActor);
+     mState = StateClosing;
+   }
+ }
+ 
+@@ -520,18 +521,18 @@ BroadcastChannel::Shutdown()
+   mState = StateClosed;
+ 
+   // The DTOR of this WorkerHolder will release the worker for us.
+   mWorkerHolder = nullptr;
+ 
+   if (mActor) {
+     mActor->SetParent(nullptr);
+ 
+-    RefPtr<TeardownRunnable> runnable = new TeardownRunnable(mActor);
+-    NS_DispatchToCurrentThread(runnable);
++    nsCOMPtr<nsIRunnable> runnable = new TeardownRunnable(mActor);
++    DispatchToCurrentThread(runnable.forget());
+ 
+     mActor = nullptr;
+   }
+ 
+   // If shutdown() is called we have to release the reference if we still keep
+   // it.
+   if (mIsKeptAlive) {
+     mIsKeptAlive = false;
+@@ -657,16 +658,27 @@ BroadcastChannel::RemoveDocFromBFCache()
+   nsCOMPtr<nsIBFCacheEntry> bfCacheEntry = doc->GetBFCacheEntry();
+   if (!bfCacheEntry) {
+     return;
+   }
+ 
+   bfCacheEntry->RemoveFromBFCacheSync();
+ }
+ 
++nsresult
++BroadcastChannel::DispatchToCurrentThread(already_AddRefed<nsIRunnable> aEvent)
++{
++  if (!NS_IsMainThread() || !GetOwner() || !GetOwner()->GetThrottledEventQueue()) {
++    return NS_DispatchToCurrentThread(Move(aEvent));
++  }
++
++  nsCOMPtr<nsIEventTarget> target = GetOwner()->GetThrottledEventQueue();
++  return target->Dispatch(Move(aEvent), NS_DISPATCH_NORMAL);
++}
++
+ NS_IMPL_CYCLE_COLLECTION_CLASS(BroadcastChannel)
+ 
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(BroadcastChannel,
+                                                   DOMEventTargetHelper)
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+ 
+ NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(BroadcastChannel,
+                                                 DOMEventTargetHelper)
+diff --git a/dom/broadcastchannel/BroadcastChannel.h b/dom/broadcastchannel/BroadcastChannel.h
+--- a/dom/broadcastchannel/BroadcastChannel.h
++++ b/dom/broadcastchannel/BroadcastChannel.h
+@@ -102,16 +102,19 @@ private:
+ 
+   bool IsCertainlyAliveForCC() const override
+   {
+     return mIsKeptAlive;
+   }
+ 
+   void RemoveDocFromBFCache();
+ 
++  nsresult
++  DispatchToCurrentThread(already_AddRefed<nsIRunnable> aEvent);
++
+   RefPtr<BroadcastChannelChild> mActor;
+   nsTArray<RefPtr<BroadcastChannelMessage>> mPendingMessages;
+ 
+   nsAutoPtr<workers::WorkerHolder> mWorkerHolder;
+ 
+   nsAutoPtr<PrincipalInfo> mPrincipalInfo;
+ 
+   nsCString mOrigin;
