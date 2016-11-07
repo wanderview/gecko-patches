@@ -1,13 +1,13 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  3bfde35a0d18a643485ffd5073f3bc6a79e0ae48
+# Parent  060f80b690b8aaa5d927e03578673a3eff3b4c64
 Bug 1300659 P1 Add the ThrottledEventQueue class. r=froydnj
 
 diff --git a/xpcom/threads/ThrottledEventQueue.cpp b/xpcom/threads/ThrottledEventQueue.cpp
 new file mode 100644
 --- /dev/null
 +++ b/xpcom/threads/ThrottledEventQueue.cpp
-@@ -0,0 +1,446 @@
+@@ -0,0 +1,443 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -28,7 +28,7 @@ new file mode 100644
 +
 +namespace {
 +
-+static const char* kShutdownTopic = "xpcom-shutdown";
++static const char kShutdownTopic[] = "xpcom-shutdown";
 +
 +} // anonymous namespace
 +
@@ -169,7 +169,7 @@ new file mode 100644
 +    --mExecutionDepth;
 +
 +    // If shutdown was started and the queue is now empty we can now
-+    // finalize the shutdown.  This is performed separate at the end
++    // finalize the shutdown.  This is performed separately at the end
 +    // of the method in order to wait for the event to finish running.
 +    if (shouldShutdown) {
 +      MOZ_ASSERT(IsEmpty());
@@ -182,10 +182,7 @@ new file mode 100644
 +  {
 +    MOZ_ASSERT(NS_IsMainThread());
 +    MOZ_ASSERT(IsEmpty());
-+
 +    nsCOMPtr<nsIObserverService> obs = GetObserverService();
-+
-+    // This may cause immediate destruction of `this`.
 +    obs->RemoveObserver(this, kShutdownTopic);
 +  }
 +
@@ -276,7 +273,7 @@ new file mode 100644
 +  AwaitIdle() const
 +  {
 +    // Any thread, except the main thread or our base target.  Blocking the
-+    // main thread is forbidden and block the base target is guaranteed to
++    // main thread is forbidden.  Blocking the base target is guaranteed to
 +    // produce a deadlock.
 +    MOZ_ASSERT(!NS_IsMainThread());
 +#ifdef DEBUG
@@ -387,6 +384,12 @@ new file mode 100644
 +  mInner->MaybeStartShutdown();
 +}
 +
++void
++ThrottledEventQueue::MaybeStartShutdown()
++{
++  return mInner->MaybeStartShutdown();
++}
++
 +already_AddRefed<ThrottledEventQueue>
 +ThrottledEventQueue::Create(nsIEventTarget* aBaseTarget)
 +{
@@ -421,12 +424,6 @@ new file mode 100644
 +  return mInner->AwaitIdle();
 +}
 +
-+void
-+ThrottledEventQueue::MaybeStartShutdown()
-+{
-+  return mInner->MaybeStartShutdown();
-+}
-+
 +NS_IMETHODIMP
 +ThrottledEventQueue::DispatchFromScript(nsIRunnable* aEvent, uint32_t aFlags)
 +{
@@ -458,12 +455,14 @@ diff --git a/xpcom/threads/ThrottledEventQueue.h b/xpcom/threads/ThrottledEventQ
 new file mode 100644
 --- /dev/null
 +++ b/xpcom/threads/ThrottledEventQueue.h
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,94 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++// nsIEventTarget wrapper for throttling event dispatch.
 +
 +#ifndef mozilla_ThrottledEventQueue_h
 +#define mozilla_ThrottledEventQueue_h
@@ -476,6 +475,21 @@ new file mode 100644
 +// events being dispatched to another base target.  It maintains its
 +// own queue of events and only dispatches one at a time to the wrapped
 +// target.  This can be used to avoid flooding the base target.
++//
++// Flooding is avoided via a very simply principal.  Runnables dispatched
++// to the ThrottledEventQueue are only dispatched to the base target
++// one at a time.  Only once that runnable has executed will we dispatch
++// the next runnable to the base target.  This in effect makes all
++// runnables passing through the ThrottledEventQueue yield to other work
++// on the base target.
++//
++// ThrottledEventQueue keeps runnables waiting to be dispatched to the
++// base in its own internal queue.  Code can query the length of this
++// queue using IsEmpty() and Length().  Further, code implement back
++// pressure by checking the depth of the queue and deciding to stop
++// issuing runnables if they see the ThrottledEventQueue is backed up.
++// Code running on other threads could even use AwaitIdle() to block
++// all operation until the ThrottledEventQueue drains.
 +//
 +// Note, this class is similar to TaskQueue, but also differs in a few
 +// ways.  First, it is a very simple nsIEventTarget implementation.  It
@@ -494,8 +508,7 @@ new file mode 100644
 +//
 +// ThrottledEventQueue also implements an automatic shutdown mechanism.
 +// De-referencing the queue or browser shutdown will automatically begin
-+// shutdown.  You can also manually shutdown the queue using the
-+// MaybeStartShutdown() method.
++// shutdown.
 +//
 +// Once shutdown begins all events will bypass the queue and be dispatched
 +// straight to the underlying base target.
@@ -507,6 +520,13 @@ new file mode 100644
 +  explicit ThrottledEventQueue(already_AddRefed<Inner> aInner);
 +  ~ThrottledEventQueue();
 +
++  // Begin shutdown of the event queue.  This has no effect if shutdown
++  // is already in process.  After this is called nsIEventTarget methods
++  // will bypass the queue and operate directly on the base target.
++  // Note, this could be made public if code needs to explicitly shutdown
++  // for some reason.
++  void MaybeStartShutdown();
++
 +public:
 +  // Attempt to create a ThrottledEventQueue for the given target.  This
 +  // may return nullptr if the browser is already shutting down.
@@ -514,27 +534,14 @@ new file mode 100644
 +  Create(nsIEventTarget* aBaseTarget);
 +
 +  // Determine if there are any events pending in the queue.
-+  bool
-+  IsEmpty() const;
++  bool IsEmpty() const;
 +
 +  // Determine how many events are pending in the queue.
-+  uint32_t
-+  Length() const;
++  uint32_t Length() const;
 +
 +  // Block the current thread until the queue is empty.  This may not
 +  // be called on the main thread or the base target.
-+  void
-+  AwaitIdle() const;
-+
-+  // Begin shutdown of the event queue.  This has no effect if shutdown
-+  // is already in process.  After this is called nsIEventTarget methods
-+  // will bypass the queue and operate directly on the base target.
-+  //
-+  // In order to determine when shutdown completes you can either dispatch
-+  // a runnable before calling MaybeStartShutdown() or you can block
-+  // until the queue is empty using AwaitIdle().
-+  void
-+  MaybeStartShutdown();
++  void AwaitIdle() const;
 +
 +  NS_DECL_THREADSAFE_ISUPPORTS
 +  NS_DECL_NSIEVENTTARGET
