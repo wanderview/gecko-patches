@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  05e5b12f41df270b31955ff7e6d09245c1f83a7a
+# Parent  a103e1713a2eda3b4e88d71df82d140487c8db87
 Bug 1318084 Make nsGlobalWindow back pressure increase timer delays instead of calling Suspend(). r=smaug
 
 diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
@@ -50,7 +50,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
      mSetOpenerWindowCalled(false),
  #endif
  #ifdef MOZ_B2G
-@@ -3637,55 +3640,165 @@ nsGlobalWindow::DefineArgumentsProperty(
+@@ -3638,55 +3641,121 @@ nsGlobalWindow::DefineArgumentsProperty(
  
    nsIScriptContext *ctx = GetOuterWindowInternal()->mContext;
    NS_ENSURE_TRUE(aArguments && ctx, NS_ERROR_NOT_INITIALIZED);
@@ -59,47 +59,11 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
    return ctx->SetProperty(obj, "arguments", aArguments);
  }
  
-+class nsGlobalWindow::MaybeRemoveBackPressureCallback final : public nsITimeoutHandler
-+{
-+  RefPtr<nsGlobalWindow> mWindow;
-+
-+  ~MaybeRemoveBackPressureCallback()
-+  {
-+  }
-+
-+public:
-+  explicit MaybeRemoveBackPressureCallback(nsGlobalWindow* aWindow)
-+    : mWindow(aWindow)
-+  {
-+    MOZ_ASSERT(mWindow);
-+  }
-+
-+  nsresult
-+  Call() override
-+  {
-+    mWindow->MaybeRemoveBackPressure(nullptr);
-+    return NS_OK;
-+  }
-+
-+  void
-+  GetLocation(const char**, uint32_t*, uint32_t*) override
-+  { }
-+
-+  void
-+  MarkForCC() override
-+  { }
-+
-+  NS_DECL_ISUPPORTS
-+};
-+
-+NS_IMPL_ISUPPORTS(nsGlobalWindow::MaybeRemoveBackPressureCallback, nsITimeoutHandler);
-+
 +namespace {
 +
 +// The number of queued runnables within the TabGroup ThrottledEventQueue
 +// at which to begin applying back pressure to the window.
 +const uint32_t kThrottledEventQueueBackPressure = 5000;
-+
 +
 +// The amount of delay to apply to timers when back pressure is triggered.
 +// As the length of the ThrottledEventQueue grows delay is increased.  The
@@ -136,55 +100,54 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 -  // calling SuspendTimeout() if this routine is executed many times
 -  // before dropping below the backpressure threshold.
 -  if (IsSuspended()) {
+-    return;
+-  }
+-
+-  RefPtr<ThrottledEventQueue> taskQueue = TabGroup()->GetThrottledEventQueue();
+-  if (!taskQueue) {
+-    return;
+-  }
+-
+-  // Only stop the window if it has greatly fallen behind the main thread.
+-  // This is a somewhat arbitrary threshold chosen such that it should
 +  // If we are already in back pressure then we don't need to apply back
 +  // pressure again.  We also shouldn't need to apply back pressure while
 +  // the window is suspended.
 +  if (mBackPressureDelayMS > 0 || IsSuspended()) {
-     return;
-   }
- 
-   RefPtr<ThrottledEventQueue> taskQueue = TabGroup()->GetThrottledEventQueue();
-   if (!taskQueue) {
-     return;
-   }
- 
--  // Only stop the window if it has greatly fallen behind the main thread.
--  // This is a somewhat arbitrary threshold chosen such that it should
++    return;
++  }
++
++  RefPtr<ThrottledEventQueue> queue = TabGroup()->GetThrottledEventQueue();
++  if (!queue) {
++    return;
++  }
++
 +  // Only begin back pressure if the window has greatly fallen behind the main
 +  // thread.  This is a somewhat arbitrary threshold chosen such that it should
    // rarely fire under normaly circumstances.  Its low enough, though,
 -  // that we should avoid hitting an OOM from the backed up runnables in
 -  // the queue.
 -  static const uint32_t kThrottledEventQueueBackPressure = 5000;
-+  // that we should have time to slow new runnables from being added before an
-+  // OOM occurs.
-   if (taskQueue->Length() < kThrottledEventQueueBackPressure) {
-     return;
-   }
- 
+-  if (taskQueue->Length() < kThrottledEventQueueBackPressure) {
+-    return;
+-  }
+-
 -  // First attempt to queue a runnable to resume running timeouts.  We do
 -  // this first in order to verify we can dispatch successfully.
 -  nsCOMPtr<nsIRunnable> r = NewRunnableMethod(this, &nsGlobalWindow::Resume);
 -  nsresult rv = taskQueue->Dispatch(r.forget(), NS_DISPATCH_NORMAL);
-+  // Calculate the amount of delay we will begin applying to timers due to
-+  // back pressure.
-+  int32_t newBackPressureDelayMS =
-+    CalculateNewBackPressureDelayMS(taskQueue->Length());
++  // that we should have time to slow new runnables from being added before an
++  // OOM occurs.
++  if (queue->Length() < kThrottledEventQueueBackPressure) {
++    return;
++  }
 +
-+  // First attempt to schedule a timer to possibly remove back pressure.  We do
-+  // this first in order to verify we can dispatch successfully before
++  // First attempt to dispatch a runnable to update our back pressure state.  We
++  // do this first in order to verify we can dispatch successfully before
 +  // entering the back pressure state.
-+  //
-+  // Note, a timer is used here instead of a Runnable because we want to be
-+  // sure that ordering is preserved.  By checking from a timer delayed by our
-+  // new back pressure delay period we can ensure that any timers scheduled
-+  // during back pressure will still run before timers scheduled after potentially
-+  // removing back pressure.
-+  nsCOMPtr<nsITimeoutHandler> t = new MaybeRemoveBackPressureCallback(this);
-+  int32_t dummy = 0;
-+  nsresult rv = SetTimeoutOrInterval(t, newBackPressureDelayMS, false,
-+                                     Timeout::Reason::eTimeoutOrInterval,
-+                                     &dummy);
++  nsCOMPtr<nsIRunnable> r =
++    NewRunnableMethod(this, &nsGlobalWindow::CancelOrUpdateBackPressure);
++  nsresult rv = queue->Dispatch(r.forget(), NS_DISPATCH_NORMAL);
    NS_ENSURE_SUCCESS_VOID(rv);
  
 -  // Since the resume is dispatched we can go ahead and suspend the window
@@ -194,18 +157,21 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 -  Suspend();
 +  // Since the callback was scheduled successfully we can now persist the
 +  // backpressure value.
-+  mBackPressureDelayMS = newBackPressureDelayMS;
++  mBackPressureDelayMS = CalculateNewBackPressureDelayMS(queue->Length());
 +}
 +
 +void
-+nsGlobalWindow::MaybeRemoveBackPressure(nsIDocument* aSuppressedDoc)
++nsGlobalWindow::CancelOrUpdateBackPressure()
 +{
++  MOZ_ASSERT(NS_IsMainThread());
++  MOZ_ASSERT(mBackPressureDelayMS > 0);
++
 +  // First, check to see if we are still in back pressure.  If we've dropped
 +  // below the threshold we can simply drop our back pressure delay.  We
 +  // must also reset timers to remove the old back pressure delay in order to
 +  // avoid out-of-order timer execution.
-+  RefPtr<ThrottledEventQueue> taskQueue = TabGroup()->GetThrottledEventQueue();
-+  if (!taskQueue || taskQueue->Length() < kThrottledEventQueueBackPressure) {
++  RefPtr<ThrottledEventQueue> queue = TabGroup()->GetThrottledEventQueue();
++  if (!queue || queue->Length() < kThrottledEventQueueBackPressure) {
 +    int32_t oldBackPressureDelayMS = mBackPressureDelayMS;
 +    mBackPressureDelayMS = 0;
 +    ResetTimersForThrottleReduction(oldBackPressureDelayMS);
@@ -214,19 +180,21 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 +
 +  // Otherwise we are still in back pressure mode.
 +
-+  // Re-calculate the back pressure delay.  We only update our actual delay
-+  // value, however, if it increases.  We cannot decrease the delay without
-+  // risking out of order timers or expensive rescheduling operations.
-+  int32_t newBackPressureDelayMS = CalculateNewBackPressureDelayMS(taskQueue->Length());
-+  if (newBackPressureDelayMS > mBackPressureDelayMS) {
-+    mBackPressureDelayMS = newBackPressureDelayMS;
++  // Re-calculate the back pressure delay.
++  int32_t oldBackPressureDelayMS = mBackPressureDelayMS;
++  mBackPressureDelayMS = CalculateNewBackPressureDelayMS(queue->Length());
++
++  // If the back pressure delay has gone down we must reset any existing
++  // timers to use the new value.  Otherwise we run the risk of executing
++  // timer callbacks out-of-order.
++  if (mBackPressureDelayMS < oldBackPressureDelayMS) {
++    ResetTimersForThrottleReduction(oldBackPressureDelayMS);
 +  }
 +
-+  nsCOMPtr<nsITimeoutHandler> t = new MaybeRemoveBackPressureCallback(this);
-+  int32_t dummy = 0;
-+  Unused << SetTimeoutOrInterval(t, mBackPressureDelayMS, false,
-+                                 Timeout::Reason::eTimeoutOrInterval,
-+                                 &dummy);
++  // Dispatch another runnable to update the back pressure state again.
++  nsCOMPtr<nsIRunnable> r =
++    NewRunnableMethod(this, &nsGlobalWindow::CancelOrUpdateBackPressure);
++  MOZ_ALWAYS_SUCCEEDS(queue->Dispatch(r.forget(), NS_DISPATCH_NORMAL));
  }
  
  //*****************************************************************************
@@ -235,7 +203,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
  
  nsIPrincipal*
  nsGlobalWindow::GetPrincipal()
-@@ -10064,17 +10177,17 @@ nsGlobalWindow::IsTopLevelWindowActive()
+@@ -10065,17 +10134,17 @@ nsGlobalWindow::IsTopLevelWindowActive()
  
  void nsGlobalWindow::SetIsBackground(bool aIsBackground)
  {
@@ -254,7 +222,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
        inner->UnthrottleIdleCallbackRequests();
      }
    }
-@@ -12661,17 +12774,18 @@ nsGlobalWindow::SetTimeoutOrInterval(nsI
+@@ -12655,17 +12724,18 @@ nsGlobalWindow::SetTimeoutOrInterval(nsI
    timeout->mIsInterval = aIsInterval;
    timeout->mInterval = interval;
    timeout->mScriptHandler = aHandler;
@@ -274,7 +242,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
    TimeDuration delta = TimeDuration::FromMilliseconds(realInterval);
  
    if (IsFrozen()) {
-@@ -13087,17 +13201,17 @@ nsGlobalWindow::RunTimeout(Timeout* aTim
+@@ -13081,17 +13151,17 @@ nsGlobalWindow::RunTimeout(Timeout* aTim
    RefPtr<Timeout> dummy_timeout = new Timeout();
    dummy_timeout->mFiringDepth = firingDepth;
    dummy_timeout->mWhen = now;
@@ -293,7 +261,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
      nextTimeout = timeout->getNext();
  
      if (timeout->mFiringDepth != firingDepth) {
-@@ -13200,20 +13314,21 @@ nsGlobalWindow::ClearTimeoutOrInterval(i
+@@ -13194,20 +13264,21 @@ nsGlobalWindow::ClearTimeoutOrInterval(i
          }
          timeout->Release();
        }
@@ -318,7 +286,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
    TimeStamp now = TimeStamp::Now();
  
    // If mTimeoutInsertionPoint is non-null, we're in the middle of firing
-@@ -13230,24 +13345,24 @@ nsresult nsGlobalWindow::ResetTimersForN
+@@ -13224,24 +13295,24 @@ nsresult nsGlobalWindow::ResetTimersForN
      // taking std::max with |now| won't make a quantity equal to
      // timeout->mWhen below.
      if (timeout->mWhen <= now) {
@@ -368,22 +336,26 @@ diff --git a/dom/base/nsGlobalWindow.h b/dom/base/nsGlobalWindow.h
    // Return true if |aTimeout| needs to be reinserted into the timeout list.
    bool RescheduleTimeout(mozilla::dom::Timeout* aTimeout, const TimeStamp& now,
                           bool aRunningPendingTimeouts);
-@@ -1706,19 +1703,29 @@ private:
+@@ -1704,21 +1701,31 @@ private:
+   bool ComputeIsSecureContext(nsIDocument* aDocument);
+ 
    // nsPIDOMWindow<T> should be able to see these helper methods.
    friend class nsPIDOMWindow<mozIDOMWindowProxy>;
    friend class nsPIDOMWindow<mozIDOMWindow>;
    friend class nsPIDOMWindow<nsISupports>;
  
    // Apply back pressure to the window if the TabGroup ThrottledEventQueue
-   // exists and has too many runnables waiting to run.  For example, suspend
-   // timers until we have a chance to catch up, etc.
-+  class MaybeRemoveBackPressureCallback;
-+
+-  // exists and has too many runnables waiting to run.  For example, suspend
+-  // timers until we have a chance to catch up, etc.
++  // exists and has too many runnables waiting to run.  For example, increase
++  // the minimum timer delay, etc.
    void
    MaybeApplyBackPressure();
  
++  // Check the current ThrottledEventQueue depth and update the back pressure
++  // state.  If the queue has drained back pressure may be canceled.
 +  void
-+  MaybeRemoveBackPressure(nsIDocument* aSuppressedDoc);
++  CancelOrUpdateBackPressure();
 +
 +  // When timers are being throttled and we reduce the thottle delay we must
 +  // reschedule.  The amount of the old throttle delay must be provided in
@@ -393,12 +365,12 @@ diff --git a/dom/base/nsGlobalWindow.h b/dom/base/nsGlobalWindow.h
    mozilla::dom::TabGroup* TabGroupInner();
    mozilla::dom::TabGroup* TabGroupOuter();
  
- protected:
-   // These members are only used on outer window objects. Make sure
-   // you never set any of these on an inner object!
-   bool                          mFullScreen : 1;
-   bool                          mFullscreenMode : 1;
-@@ -1837,33 +1844,35 @@ protected:
+ public:
+   // Dispatch a runnable related to the global.
+   virtual nsresult Dispatch(const char* aName,
+                             mozilla::dom::TaskCategory aCategory,
+                             already_AddRefed<nsIRunnable>&& aRunnable) override;
+@@ -1846,33 +1853,35 @@ protected:
    RefPtr<mozilla::EventListenerManager> mListenerManager;
    // mTimeouts is generally sorted by mWhen, unless mTimeoutInsertionPoint is
    // non-null.  In that case, the dummy timeout pointed to by
