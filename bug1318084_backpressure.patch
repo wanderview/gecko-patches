@@ -1,0 +1,437 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  05e5b12f41df270b31955ff7e6d09245c1f83a7a
+Bug 1318084 Make nsGlobalWindow back pressure increase timer delays instead of calling Suspend(). r=smaug
+
+diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
+--- a/dom/base/nsGlobalWindow.cpp
++++ b/dom/base/nsGlobalWindow.cpp
+@@ -310,22 +310,24 @@ int32_t gTimeoutCnt                     
+ 
+ // The default shortest interval/timeout we permit
+ #define DEFAULT_MIN_TIMEOUT_VALUE 4 // 4ms
+ #define DEFAULT_MIN_BACKGROUND_TIMEOUT_VALUE 1000 // 1000ms
+ static int32_t gMinTimeoutValue;
+ static int32_t gMinBackgroundTimeoutValue;
+ inline int32_t
+ nsGlobalWindow::DOMMinTimeoutValue() const {
++  // First apply any back pressure delay that might be in effect.
++  int32_t value = std::max(mBackPressureDelayMS, 0);
+   // Don't use the background timeout value when there are audio contexts
+   // present, so that baackground audio can keep running smoothly. (bug 1181073)
+   bool isBackground = mAudioContexts.IsEmpty() &&
+     (!mOuterWindow || mOuterWindow->IsBackground());
+   return
+-    std::max(isBackground ? gMinBackgroundTimeoutValue : gMinTimeoutValue, 0);
++    std::max(isBackground ? gMinBackgroundTimeoutValue : gMinTimeoutValue, value);
+ }
+ 
+ // The number of nested timeouts before we start clamping. HTML5 says 1, WebKit
+ // uses 5.
+ #define DOM_CLAMP_TIMEOUT_NESTING_LEVEL 5
+ 
+ // The longest interval (as PRIntervalTime) we permit, or that our
+ // timer code can handle, really. See DELAY_INTERVAL_LIMIT in
+@@ -1260,16 +1262,17 @@ nsGlobalWindow::nsGlobalWindow(nsGlobalW
+ #endif
+     mNotifiedIDDestroyed(false),
+     mAllowScriptsToClose(false),
+     mTimeoutInsertionPoint(nullptr),
+     mTimeoutIdCounter(1),
+     mTimeoutFiringDepth(0),
+     mSuspendDepth(0),
+     mFreezeDepth(0),
++    mBackPressureDelayMS(0),
+     mFocusMethod(0),
+     mSerial(0),
+     mIdleCallbackTimeoutCounter(1),
+     mIdleRequestCallbackCounter(1),
+ #ifdef DEBUG
+     mSetOpenerWindowCalled(false),
+ #endif
+ #ifdef MOZ_B2G
+@@ -3637,55 +3640,165 @@ nsGlobalWindow::DefineArgumentsProperty(
+ 
+   nsIScriptContext *ctx = GetOuterWindowInternal()->mContext;
+   NS_ENSURE_TRUE(aArguments && ctx, NS_ERROR_NOT_INITIALIZED);
+ 
+   JS::Rooted<JSObject*> obj(RootingCx(), GetWrapperPreserveColor());
+   return ctx->SetProperty(obj, "arguments", aArguments);
+ }
+ 
++class nsGlobalWindow::MaybeRemoveBackPressureCallback final : public nsITimeoutHandler
++{
++  RefPtr<nsGlobalWindow> mWindow;
++
++  ~MaybeRemoveBackPressureCallback()
++  {
++  }
++
++public:
++  explicit MaybeRemoveBackPressureCallback(nsGlobalWindow* aWindow)
++    : mWindow(aWindow)
++  {
++    MOZ_ASSERT(mWindow);
++  }
++
++  nsresult
++  Call() override
++  {
++    mWindow->MaybeRemoveBackPressure(nullptr);
++    return NS_OK;
++  }
++
++  void
++  GetLocation(const char**, uint32_t*, uint32_t*) override
++  { }
++
++  void
++  MarkForCC() override
++  { }
++
++  NS_DECL_ISUPPORTS
++};
++
++NS_IMPL_ISUPPORTS(nsGlobalWindow::MaybeRemoveBackPressureCallback, nsITimeoutHandler);
++
++namespace {
++
++// The number of queued runnables within the TabGroup ThrottledEventQueue
++// at which to begin applying back pressure to the window.
++const uint32_t kThrottledEventQueueBackPressure = 5000;
++
++
++// The amount of delay to apply to timers when back pressure is triggered.
++// As the length of the ThrottledEventQueue grows delay is increased.  The
++// delay is scaled such that every kThrottledEventQueueBackPressure runnables
++// in the queue equates to an additional kBackPressureDelayMS.
++const double kBackPressureDelayMS = 500;
++
++// Convert a ThrottledEventQueue length to a timer delay in milliseconds.
++// This will return a value between kBackPressureDelayMS and INT32_MAX.
++int32_t
++CalculateNewBackPressureDelayMS(uint32_t aBacklogDepth)
++{
++  // The calculations here assume we are only operating while in back
++  // pressure conditions.
++  MOZ_ASSERT(aBacklogDepth >= kThrottledEventQueueBackPressure);
++  double multiplier = static_cast<double>(aBacklogDepth) /
++                      static_cast<double>(kThrottledEventQueueBackPressure);
++  double value = kBackPressureDelayMS * multiplier;
++  if (value > INT32_MAX) {
++    value = INT32_MAX;
++  }
++  return static_cast<int32_t>(value);
++}
++
++} // anonymous namespace
++
+ void
+ nsGlobalWindow::MaybeApplyBackPressure()
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+ 
+-  // If we are already suspended, then we don't need to apply back
+-  // pressure for ThrottledEventQueue reasons.  This also avoids repeatedly
+-  // calling SuspendTimeout() if this routine is executed many times
+-  // before dropping below the backpressure threshold.
+-  if (IsSuspended()) {
++  // If we are already in back pressure then we don't need to apply back
++  // pressure again.  We also shouldn't need to apply back pressure while
++  // the window is suspended.
++  if (mBackPressureDelayMS > 0 || IsSuspended()) {
+     return;
+   }
+ 
+   RefPtr<ThrottledEventQueue> taskQueue = TabGroup()->GetThrottledEventQueue();
+   if (!taskQueue) {
+     return;
+   }
+ 
+-  // Only stop the window if it has greatly fallen behind the main thread.
+-  // This is a somewhat arbitrary threshold chosen such that it should
++  // Only begin back pressure if the window has greatly fallen behind the main
++  // thread.  This is a somewhat arbitrary threshold chosen such that it should
+   // rarely fire under normaly circumstances.  Its low enough, though,
+-  // that we should avoid hitting an OOM from the backed up runnables in
+-  // the queue.
+-  static const uint32_t kThrottledEventQueueBackPressure = 5000;
++  // that we should have time to slow new runnables from being added before an
++  // OOM occurs.
+   if (taskQueue->Length() < kThrottledEventQueueBackPressure) {
+     return;
+   }
+ 
+-  // First attempt to queue a runnable to resume running timeouts.  We do
+-  // this first in order to verify we can dispatch successfully.
+-  nsCOMPtr<nsIRunnable> r = NewRunnableMethod(this, &nsGlobalWindow::Resume);
+-  nsresult rv = taskQueue->Dispatch(r.forget(), NS_DISPATCH_NORMAL);
++  // Calculate the amount of delay we will begin applying to timers due to
++  // back pressure.
++  int32_t newBackPressureDelayMS =
++    CalculateNewBackPressureDelayMS(taskQueue->Length());
++
++  // First attempt to schedule a timer to possibly remove back pressure.  We do
++  // this first in order to verify we can dispatch successfully before
++  // entering the back pressure state.
++  //
++  // Note, a timer is used here instead of a Runnable because we want to be
++  // sure that ordering is preserved.  By checking from a timer delayed by our
++  // new back pressure delay period we can ensure that any timers scheduled
++  // during back pressure will still run before timers scheduled after potentially
++  // removing back pressure.
++  nsCOMPtr<nsITimeoutHandler> t = new MaybeRemoveBackPressureCallback(this);
++  int32_t dummy = 0;
++  nsresult rv = SetTimeoutOrInterval(t, newBackPressureDelayMS, false,
++                                     Timeout::Reason::eTimeoutOrInterval,
++                                     &dummy);
+   NS_ENSURE_SUCCESS_VOID(rv);
+ 
+-  // Since the resume is dispatched we can go ahead and suspend the window
+-  // now.  Once the task queue drains the resume will automatically get
+-  // executed balancing this suspend.
+-  // TODO: Consider suppressing event handling as well.
+-  Suspend();
++  // Since the callback was scheduled successfully we can now persist the
++  // backpressure value.
++  mBackPressureDelayMS = newBackPressureDelayMS;
++}
++
++void
++nsGlobalWindow::MaybeRemoveBackPressure(nsIDocument* aSuppressedDoc)
++{
++  // First, check to see if we are still in back pressure.  If we've dropped
++  // below the threshold we can simply drop our back pressure delay.  We
++  // must also reset timers to remove the old back pressure delay in order to
++  // avoid out-of-order timer execution.
++  RefPtr<ThrottledEventQueue> taskQueue = TabGroup()->GetThrottledEventQueue();
++  if (!taskQueue || taskQueue->Length() < kThrottledEventQueueBackPressure) {
++    int32_t oldBackPressureDelayMS = mBackPressureDelayMS;
++    mBackPressureDelayMS = 0;
++    ResetTimersForThrottleReduction(oldBackPressureDelayMS);
++    return;
++  }
++
++  // Otherwise we are still in back pressure mode.
++
++  // Re-calculate the back pressure delay.  We only update our actual delay
++  // value, however, if it increases.  We cannot decrease the delay without
++  // risking out of order timers or expensive rescheduling operations.
++  int32_t newBackPressureDelayMS = CalculateNewBackPressureDelayMS(taskQueue->Length());
++  if (newBackPressureDelayMS > mBackPressureDelayMS) {
++    mBackPressureDelayMS = newBackPressureDelayMS;
++  }
++
++  nsCOMPtr<nsITimeoutHandler> t = new MaybeRemoveBackPressureCallback(this);
++  int32_t dummy = 0;
++  Unused << SetTimeoutOrInterval(t, mBackPressureDelayMS, false,
++                                 Timeout::Reason::eTimeoutOrInterval,
++                                 &dummy);
+ }
+ 
+ //*****************************************************************************
+ // nsGlobalWindow::nsIScriptObjectPrincipal
+ //*****************************************************************************
+ 
+ nsIPrincipal*
+ nsGlobalWindow::GetPrincipal()
+@@ -10064,17 +10177,17 @@ nsGlobalWindow::IsTopLevelWindowActive()
+ 
+ void nsGlobalWindow::SetIsBackground(bool aIsBackground)
+ {
+   MOZ_ASSERT(IsOuterWindow());
+ 
+   bool resetTimers = (!aIsBackground && AsOuter()->IsBackground());
+   nsPIDOMWindow::SetIsBackground(aIsBackground);
+   if (resetTimers) {
+-    ResetTimersForNonBackgroundWindow();
++    ResetTimersForThrottleReduction(gMinBackgroundTimeoutValue);
+   }
+ 
+   if (!aIsBackground) {
+     nsGlobalWindow* inner = GetCurrentInnerWindowInternal();
+     if (inner) {
+       inner->UnthrottleIdleCallbackRequests();
+     }
+   }
+@@ -12661,17 +12774,18 @@ nsGlobalWindow::SetTimeoutOrInterval(nsI
+   timeout->mIsInterval = aIsInterval;
+   timeout->mInterval = interval;
+   timeout->mScriptHandler = aHandler;
+   timeout->mReason = aReason;
+ 
+   // Now clamp the actual interval we will use for the timer based on
+   uint32_t nestingLevel = sNestingLevel + 1;
+   uint32_t realInterval = interval;
+-  if (aIsInterval || nestingLevel >= DOM_CLAMP_TIMEOUT_NESTING_LEVEL) {
++  if (aIsInterval || nestingLevel >= DOM_CLAMP_TIMEOUT_NESTING_LEVEL ||
++      mBackPressureDelayMS > 0) {
+     // Don't allow timeouts less than DOMMinTimeoutValue() from
+     // now...
+     realInterval = std::max(realInterval, uint32_t(DOMMinTimeoutValue()));
+   }
+ 
+   TimeDuration delta = TimeDuration::FromMilliseconds(realInterval);
+ 
+   if (IsFrozen()) {
+@@ -13087,17 +13201,17 @@ nsGlobalWindow::RunTimeout(Timeout* aTim
+   RefPtr<Timeout> dummy_timeout = new Timeout();
+   dummy_timeout->mFiringDepth = firingDepth;
+   dummy_timeout->mWhen = now;
+   last_expired_timeout->setNext(dummy_timeout);
+   RefPtr<Timeout> timeoutExtraRef(dummy_timeout);
+ 
+   last_insertion_point = mTimeoutInsertionPoint;
+   // If we ever start setting mTimeoutInsertionPoint to a non-dummy timeout,
+-  // the logic in ResetTimersForNonBackgroundWindow will need to change.
++  // the logic in ResetTimersForThrottleReduction will need to change.
+   mTimeoutInsertionPoint = dummy_timeout;
+ 
+   for (Timeout* timeout = mTimeouts.getFirst();
+        timeout != dummy_timeout && !IsFrozen();
+        timeout = nextTimeout) {
+     nextTimeout = timeout->getNext();
+ 
+     if (timeout->mFiringDepth != firingDepth) {
+@@ -13200,20 +13314,21 @@ nsGlobalWindow::ClearTimeoutOrInterval(i
+         }
+         timeout->Release();
+       }
+       break;
+     }
+   }
+ }
+ 
+-nsresult nsGlobalWindow::ResetTimersForNonBackgroundWindow()
+-{
+-  FORWARD_TO_INNER(ResetTimersForNonBackgroundWindow, (),
++nsresult nsGlobalWindow::ResetTimersForThrottleReduction(int32_t aPreviousThrottleDelayMS)
++{
++  FORWARD_TO_INNER(ResetTimersForThrottleReduction, (aPreviousThrottleDelayMS),
+                    NS_ERROR_NOT_INITIALIZED);
++  MOZ_ASSERT(aPreviousThrottleDelayMS > 0);
+ 
+   if (IsFrozen() || IsSuspended()) {
+     return NS_OK;
+   }
+ 
+   TimeStamp now = TimeStamp::Now();
+ 
+   // If mTimeoutInsertionPoint is non-null, we're in the middle of firing
+@@ -13230,24 +13345,24 @@ nsresult nsGlobalWindow::ResetTimersForN
+     // taking std::max with |now| won't make a quantity equal to
+     // timeout->mWhen below.
+     if (timeout->mWhen <= now) {
+       timeout = timeout->getNext();
+       continue;
+     }
+ 
+     if (timeout->mWhen - now >
+-        TimeDuration::FromMilliseconds(gMinBackgroundTimeoutValue)) {
++        TimeDuration::FromMilliseconds(aPreviousThrottleDelayMS)) {
+       // No need to loop further.  Timeouts are sorted in mWhen order
+       // and the ones after this point were all set up for at least
+       // gMinBackgroundTimeoutValue ms and hence were not clamped.
+       break;
+     }
+ 
+-    /* We switched from background. Re-init the timer appropriately */
++    // We reduced our throttled delay. Re-init the timer appropriately.
+     // Compute the interval the timer should have had if it had not been set in a
+     // background window
+     TimeDuration interval =
+       TimeDuration::FromMilliseconds(std::max(timeout->mInterval,
+                                             uint32_t(DOMMinTimeoutValue())));
+     uint32_t oldIntervalMillisecs = 0;
+     timeout->mTimer->GetDelay(&oldIntervalMillisecs);
+     TimeDuration oldInterval = TimeDuration::FromMilliseconds(oldIntervalMillisecs);
+diff --git a/dom/base/nsGlobalWindow.h b/dom/base/nsGlobalWindow.h
+--- a/dom/base/nsGlobalWindow.h
++++ b/dom/base/nsGlobalWindow.h
+@@ -1477,19 +1477,16 @@ public:
+                                const mozilla::dom::Sequence<JS::Value>& aArguments,
+                                bool aIsInterval, mozilla::ErrorResult& aError);
+   int32_t SetTimeoutOrInterval(JSContext* aCx, const nsAString& aHandler,
+                                int32_t aTimeout, bool aIsInterval,
+                                mozilla::ErrorResult& aError);
+   void ClearTimeoutOrInterval(int32_t aTimerId,
+                               mozilla::dom::Timeout::Reason aReason);
+ 
+-  // JS specific timeout functions (JS args grabbed from context).
+-  nsresult ResetTimersForNonBackgroundWindow();
+-
+   // The timeout implementation functions.
+   void RunTimeout(mozilla::dom::Timeout* aTimeout);
+   void RunTimeout() { RunTimeout(nullptr); }
+   // Return true if |aTimeout| was cleared while its handler ran.
+   bool RunTimeoutHandler(mozilla::dom::Timeout* aTimeout, nsIScriptContext* aScx);
+   // Return true if |aTimeout| needs to be reinserted into the timeout list.
+   bool RescheduleTimeout(mozilla::dom::Timeout* aTimeout, const TimeStamp& now,
+                          bool aRunningPendingTimeouts);
+@@ -1706,19 +1703,29 @@ private:
+   // nsPIDOMWindow<T> should be able to see these helper methods.
+   friend class nsPIDOMWindow<mozIDOMWindowProxy>;
+   friend class nsPIDOMWindow<mozIDOMWindow>;
+   friend class nsPIDOMWindow<nsISupports>;
+ 
+   // Apply back pressure to the window if the TabGroup ThrottledEventQueue
+   // exists and has too many runnables waiting to run.  For example, suspend
+   // timers until we have a chance to catch up, etc.
++  class MaybeRemoveBackPressureCallback;
++
+   void
+   MaybeApplyBackPressure();
+ 
++  void
++  MaybeRemoveBackPressure(nsIDocument* aSuppressedDoc);
++
++  // When timers are being throttled and we reduce the thottle delay we must
++  // reschedule.  The amount of the old throttle delay must be provided in
++  // order to bound how many timers must be examined.
++  nsresult ResetTimersForThrottleReduction(int32_t aPreviousThrottleDelayMS);
++
+   mozilla::dom::TabGroup* TabGroupInner();
+   mozilla::dom::TabGroup* TabGroupOuter();
+ 
+ protected:
+   // These members are only used on outer window objects. Make sure
+   // you never set any of these on an inner object!
+   bool                          mFullScreen : 1;
+   bool                          mFullscreenMode : 1;
+@@ -1837,33 +1844,35 @@ protected:
+   RefPtr<mozilla::EventListenerManager> mListenerManager;
+   // mTimeouts is generally sorted by mWhen, unless mTimeoutInsertionPoint is
+   // non-null.  In that case, the dummy timeout pointed to by
+   // mTimeoutInsertionPoint may have a later mWhen than some of the timeouts
+   // that come after it.
+   mozilla::LinkedList<mozilla::dom::Timeout> mTimeouts;
+   // If mTimeoutInsertionPoint is non-null, insertions should happen after it.
+   // This is a dummy timeout at the moment; if that ever changes, the logic in
+-  // ResetTimersForNonBackgroundWindow needs to change.
++  // ResetTimersForThrottleReduction needs to change.
+   mozilla::dom::Timeout*      mTimeoutInsertionPoint;
+   uint32_t                    mTimeoutIdCounter;
+   uint32_t                    mTimeoutFiringDepth;
+   RefPtr<mozilla::dom::Location> mLocation;
+   RefPtr<nsHistory>           mHistory;
+   RefPtr<mozilla::dom::CustomElementRegistry> mCustomElements;
+ 
+   // These member variables are used on both inner and the outer windows.
+   nsCOMPtr<nsIPrincipal> mDocumentPrincipal;
+ 
+   typedef nsTArray<RefPtr<mozilla::dom::StorageEvent>> nsDOMStorageEventArray;
+   nsDOMStorageEventArray mPendingStorageEvents;
+ 
+   uint32_t mSuspendDepth;
+   uint32_t mFreezeDepth;
+ 
++  int32_t mBackPressureDelayMS;
++
+   // the method that was used to focus mFocusedNode
+   uint32_t mFocusMethod;
+ 
+   uint32_t mSerial;
+ 
+   void DisableIdleCallbackRequests();
+   void UnthrottleIdleCallbackRequests();
+ 
