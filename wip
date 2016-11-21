@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  a103e1713a2eda3b4e88d71df82d140487c8db87
+# Parent  0534254e9a40b4bade2577c631fe4cfa0b5db41d
 
 diff --git a/dom/clients/ClientHandleChild.cpp b/dom/clients/ClientHandleChild.cpp
 new file mode 100644
@@ -157,11 +157,232 @@ new file mode 100644
 +
 +} // namespace dom
 +} // namespace mozilla
+diff --git a/dom/clients/ClientManager.cpp b/dom/clients/ClientManager.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/clients/ClientManager.cpp
+@@ -0,0 +1,163 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "ClientManager.h"
++
++#include "ClientManagerChild.h"
++#include "mozilla/ipc/BackgroundChild.h"
++#include "mozilla/ipc/PBackgroundChild.h"
++#include "nsIIPCBackgroundChildCreateCallback.h"
++#include "prthread.h"
++
++namespace mozilla {
++namespace dom {
++
++using mozilla::ipc::BackgroundChild;
++using mozilla::ipc::PBackgroundChild;
++
++namespace {
++
++uint32_t kBadThreadLocalIndex = -1;
++uint32_t sClientManagerThreadLocalIndex = kBadThreadLocalIndex;
++
++} // anonymous namespace
++
++class ClientManager::PBackgroundCreateCallback final : public nsIIPCBackgroundChildCreateCallback
++{
++  RefPtr<ClientManager> mManager;
++
++  ~PBackgroundCreateCallback()
++  {
++  }
++
++public:
++  explicit PBackgroundCreateCallback(ClientManager* aManager)
++    : mManager(aManager)
++  {
++    MOZ_ASSERT(mManager);
++  }
++
++  void
++  ActorCreated(PBackgroundChild* aActor) override
++  {
++    mManager->PBackgroundActorCreated(aActor);
++    mManager = nullptr;
++  }
++
++  void
++  ActorFailed() override
++  {
++    mManager->Shutdown();
++    mManager = nullptr;
++  }
++
++  NS_DECL_ISUPPORTS
++};
++
++NS_IMPL_ISUPPORTS(ClientManager::PBackgroundCreateCallback,
++                  nsIIPCBackgroundChildCreateCallback);
++
++ClientManager::ClientManager()
++  : mActor(nullptr)
++{
++  // TODO: worker holder
++
++  PBackgroundChild* actor = BackgroundChild::GetForCurrentThread();
++  if (actor) {
++    PBackgroundActorCreated(actor);
++    return;
++  }
++
++  MOZ_ASSERT(NS_IsMainThread());
++  RefPtr<PBackgroundCreateCallback> cb = new PBackgroundCreateCallback(this);
++  bool ok = BackgroundChild::GetOrCreateForCurrentThread(cb);
++  if (NS_WARN_IF(!ok)) {
++    Shutdown();
++  }
++}
++
++ClientManager::~ClientManager()
++{
++  NS_ASSERT_OWNINGTHREAD(ClientManager);
++
++  Shutdown();
++
++  MOZ_DIAGNOSTIC_ASSERT(this == PR_GetThreadPrivate(sClientManagerThreadLocalIndex));
++  PRStatus status =
++    PR_SetThreadPrivate(sClientManagerThreadLocalIndex, nullptr);
++  MOZ_DIAGNOSTIC_ASSERT(status == PR_SUCCESS);
++}
++
++void
++ClientManager::Shutdown()
++{
++  NS_ASSERT_OWNINGTHREAD(ClientManager);
++
++  if (!mActor) {
++    return;
++  }
++
++  mActor->RevokeManager(this);
++  mActor->SendTeardown();
++  mActor = nullptr;
++}
++
++void
++ClientManager::RevokeActor(ClientManagerChild* aActor)
++{
++  NS_ASSERT_OWNINGTHREAD(ClientManager);
++  MOZ_ASSERT(mActor);
++  MOZ_ASSERT(mActor == aActor);
++  mActor->RevokeManager(this);
++  mActor = nullptr;
++}
++
++void
++ClientManager::PBackgroundActorCreated(PBackgroundChild* aActor)
++{
++  NS_ASSERT_OWNINGTHREAD(ClientManager);
++  MOZ_ASSERT(aActor);
++
++  ClientManagerChild* actor = new ClientManagerChild(this);
++  PClientManagerChild *sentActor = aActor->SendPClientManagerConstructor(actor);
++  if (NS_WARN_IF(!sentActor)) {
++    Shutdown();
++    return;
++  }
++  MOZ_ASSERT(sentActor == actor);
++
++  mActor = static_cast<ClientManagerChild*>(actor);
++}
++
++// static
++already_AddRefed<ClientManager>
++ClientManager::GetOrCreateCurrentThreadInstance()
++{
++  if (sClientManagerThreadLocalIndex == kBadThreadLocalIndex) {
++    MOZ_ASSERT(NS_IsMainThread());
++    PRStatus status =
++      PR_NewThreadPrivateIndex(&sClientManagerThreadLocalIndex, nullptr);
++    MOZ_DIAGNOSTIC_ASSERT(status == PR_SUCCESS);
++  }
++
++  MOZ_ASSERT(sClientManagerThreadLocalIndex != kBadThreadLocalIndex);
++  RefPtr<ClientManager> cm =
++    static_cast<ClientManager*>(PR_GetThreadPrivate(sClientManagerThreadLocalIndex));
++
++  if (!cm) {
++    cm = new ClientManager();
++
++    PRStatus status =
++      PR_SetThreadPrivate(sClientManagerThreadLocalIndex, cm.get());
++    MOZ_DIAGNOSTIC_ASSERT(status == PR_SUCCESS);
++  }
++
++  MOZ_ASSERT(cm);
++  return cm.forget();
++}
++
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/clients/ClientManager.h b/dom/clients/ClientManager.h
+new file mode 100644
+--- /dev/null
++++ b/dom/clients/ClientManager.h
+@@ -0,0 +1,48 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++#ifndef _mozilla_dom_ClientManager_h
++#define _mozilla_dom_ClientManager_h
++
++#include "mozilla/dom/PClientManager.h"
++
++namespace mozilla {
++namespace ipc {
++class PBackgroundChild;
++} // namespace ipc
++namespace dom {
++
++class ClientManagerChild;
++
++class ClientManager final
++{
++  friend class ClientManagerChild;
++  class PBackgroundCreateCallback;
++
++  ClientManagerChild* mActor;
++
++  ClientManager();
++  ~ClientManager();
++
++  void
++  Shutdown();
++
++  void
++  PBackgroundActorCreated(mozilla::ipc::PBackgroundChild* aActor);
++
++  void
++  RevokeActor(ClientManagerChild* aActor);
++
++public:
++  static already_AddRefed<ClientManager>
++  GetOrCreateCurrentThreadInstance();
++
++  NS_INLINE_DECL_REFCOUNTING(mozilla::dom::ClientManager)
++};
++
++} // namespace dom
++} // namespace mozilla
++
++#endif // _mozilla_dom_ClientManager_h
 diff --git a/dom/clients/ClientManagerActors.cpp b/dom/clients/ClientManagerActors.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/ClientManagerActors.cpp
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,41 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -177,7 +398,8 @@ new file mode 100644
 +PClientManagerChild*
 +AllocClientManagerChild()
 +{
-+  return new ClientManagerChild();
++  MOZ_ASSERT_UNREACHABLE("Default ClientManagerChild allocator should not be invoked");
++  return nullptr;
 +}
 +
 +bool
@@ -242,7 +464,7 @@ diff --git a/dom/clients/ClientManagerChild.cpp b/dom/clients/ClientManagerChild
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/ClientManagerChild.cpp
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,67 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -252,10 +474,21 @@ new file mode 100644
 +#include "ClientManagerChild.h"
 +
 +#include "ClientHandleChild.h"
++#include "ClientManager.h"
 +#include "ClientSourceChild.h"
 +
 +namespace mozilla {
 +namespace dom {
++
++void
++ClientManagerChild::ActorDestroy(ActorDestroyReason aReason)
++{
++  if (!mManager) {
++    return;
++  }
++
++  mManager->RevokeActor(this);
++}
 +
 +PClientHandleChild*
 +ClientManagerChild::AllocPClientHandleChild(const ClientHandleConstructorArgs& aArgs)
@@ -283,13 +516,27 @@ new file mode 100644
 +  return true;
 +}
 +
++ClientManagerChild::ClientManagerChild(ClientManager* aManager)
++  : mManager(aManager)
++{
++  MOZ_ASSERT(mManager);
++}
++
++void
++ClientManagerChild::RevokeManager(ClientManager* aManager)
++{
++  MOZ_ASSERT(mManager);
++  MOZ_ASSERT(mManager == aManager);
++  mManager = nullptr;
++}
++
 +} // namespace dom
 +} // namespace mozilla
 diff --git a/dom/clients/ClientManagerChild.h b/dom/clients/ClientManagerChild.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/ClientManagerChild.h
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,49 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -305,8 +552,14 @@ new file mode 100644
 +
 +class ClientManagerChild final : public PClientManagerChild
 +{
-+private:
++  // Weak reference.  The ClientManager will call RevokeManager() when
++  // it is destroyed.
++  ClientManager* mManager;
++
 +  // PClientManagerChild interface
++  void
++  ActorDestroy(ActorDestroyReason aReason) override;
++
 +  PClientHandleChild*
 +  AllocPClientHandleChild(const ClientHandleConstructorArgs& aArgs) override;
 +
@@ -318,6 +571,15 @@ new file mode 100644
 +
 +  bool
 +  DeallocPClientSourceChild(PClientSourceChild* aActor) override;
++
++public:
++  explicit ClientManagerChild(ClientManager* aManager);
++
++  void
++  RevokeManager(ClientManager* aManager);
++
++  void
++  StartTeardown();
 +};
 +
 +} // namespace dom
@@ -693,7 +955,7 @@ diff --git a/dom/clients/moz.build b/dom/clients/moz.build
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/moz.build
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,46 @@
 +# -*- Mode: python; indent-tabs-mode: nil; tab-width: 40 -*-
 +# vim: set filetype=python:
 +# This Source Code Form is subject to the terms of the Mozilla Public
@@ -701,6 +963,7 @@ new file mode 100644
 +# file, You can obtain one at http://mozilla.org/MPL/2.0/.
 +
 +EXPORTS.mozilla.dom += [
++  'ClientManager.h',
 +  'ClientManagerActors.h',
 +  'ClientType.h',
 +]
@@ -708,6 +971,7 @@ new file mode 100644
 +UNIFIED_SOURCES += [
 +  'ClientHandleChild.cpp',
 +  'ClientHandleParent.cpp',
++  'ClientManager.cpp',
 +  'ClientManagerActors.cpp',
 +  'ClientManagerChild.cpp',
 +  'ClientManagerParent.cpp',
@@ -741,8 +1005,8 @@ new file mode 100644
 diff --git a/dom/moz.build b/dom/moz.build
 --- a/dom/moz.build
 +++ b/dom/moz.build
-@@ -39,16 +39,17 @@ DIRS += [
-     'apps',
+@@ -38,16 +38,17 @@ DIRS += [
+     'animation',
      'base',
      'archivereader',
      'bindings',
