@@ -1,7 +1,126 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  0534254e9a40b4bade2577c631fe4cfa0b5db41d
+# Parent  1a3194836cb4c3da6ba3a9742a2d25cf26669b55
 
+diff --git a/dom/clients/ClientActorChild.cpp b/dom/clients/ClientActorChild.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/clients/ClientActorChild.cpp
+@@ -0,0 +1,64 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "ClientActorChild.h"
++
++#include "ClientWorkerHolder.h"
++#include "nsThreadUtils.h"
++
++namespace mozilla {
++namespace dom {
++
++void
++ClientActorChild::SetWorkerHolder(ClientWorkerHolder* aWorkerHolder)
++{
++  // Some of the Client actors can have multiple DOM objects associated with
++  // them.  In this case the workerHolder will be added multiple times.  This is
++  // permitted, but the workerHolder should be the same each time.
++  if (mWorkerHolder) {
++    MOZ_ASSERT(mWorkerHolder == aWorkerHolder);
++    return;
++  }
++
++  mWorkerHolder = aWorkerHolder;
++  if (mWorkerHolder) {
++    mWorkerHolder->AddActor(this);
++  }
++}
++
++void
++ClientActorChild::RemoveWorkerHolder()
++{
++  MOZ_ASSERT_IF(!NS_IsMainThread(), mWorkerHolder);
++  if (mWorkerHolder) {
++    mWorkerHolder->RemoveActor(this);
++    mWorkerHolder = nullptr;
++  }
++}
++
++ClientWorkerHolder*
++ClientActorChild::GetWorkerHolder() const
++{
++  return mWorkerHolder;
++}
++
++bool
++ClientActorChild::WorkerHolderNotified() const
++{
++  return mWorkerHolder && mWorkerHolder->Notified();
++}
++
++ClientActorChild::ClientActorChild()
++{
++}
++
++ClientActorChild::~ClientActorChild()
++{
++  MOZ_ASSERT(!mWorkerHolder);
++}
++
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/clients/ClientActorChild.h b/dom/clients/ClientActorChild.h
+new file mode 100644
+--- /dev/null
++++ b/dom/clients/ClientActorChild.h
+@@ -0,0 +1,45 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_clients_ClientActorChild_h
++#define mozilla_dom_clients_ClientActorChild_h
++
++#include "mozilla/RefPtr.h"
++
++namespace mozilla {
++namespace dom {
++
++class ClientWorkerHolder;
++
++class ClientActorChild
++{
++  RefPtr<ClientWorkerHolder> mWorkerHolder;
++
++protected:
++  ClientActorChild();
++  ~ClientActorChild();
++
++public:
++  virtual void
++  StartDestroy() = 0;
++
++  void
++  SetWorkerHolder(ClientWorkerHolder* aWorkerHolder);
++
++  void
++  RemoveWorkerHolder();
++
++  ClientWorkerHolder*
++  GetWorkerHolder() const;
++
++  bool
++  WorkerHolderNotified() const;
++};
++
++} // namespace dom
++} // namespace mozilla
++
++#endif // mozilla_dom_clients_ActioChild_h
 diff --git a/dom/clients/ClientHandleChild.cpp b/dom/clients/ClientHandleChild.cpp
 new file mode 100644
 --- /dev/null
@@ -861,6 +980,169 @@ new file mode 100644
 +} // namespace IPC
 +
 +#endif // _mozilla_dom_ClientType_h
+diff --git a/dom/clients/ClientWorkerHolder.cpp b/dom/clients/ClientWorkerHolder.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/clients/ClientWorkerHolder.cpp
+@@ -0,0 +1,103 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "ClientWorkerHolder.h"
++
++#include "ClientActorChild.h"
++#include "WorkerPrivate.h"
++
++namespace mozilla {
++namespace dom {
++
++using mozilla::dom::workers::Terminating;
++using mozilla::dom::workers::Status;
++using mozilla::dom::workers::WorkerPrivate;
++
++// static
++already_AddRefed<ClientWorkerHolder>
++ClientWorkerHolder::Create(WorkerPrivate* aWorkerPrivate)
++{
++  MOZ_ASSERT(aWorkerPrivate);
++
++  RefPtr<ClientWorkerHolder> workerHolder = new ClientWorkerHolder();
++  if (NS_WARN_IF(!workerHolder->HoldWorker(aWorkerPrivate, Terminating))) {
++    return nullptr;
++  }
++
++  return workerHolder.forget();
++}
++
++void
++ClientWorkerHolder::AddActor(ClientActorChild* aActor)
++{
++  NS_ASSERT_OWNINGTHREAD(ClientWorkerHolder);
++  MOZ_ASSERT(aActor);
++  MOZ_ASSERT(!mActorList.Contains(aActor));
++
++  mActorList.AppendElement(aActor);
++
++  // Allow an actor to be added after we've entered the Notifying case.  We
++  // can't stop the actor creation from racing with out destruction of the
++  // other actors and we need to wait for this extra one to close as well.
++  // Signal it should destroy itself right away.
++  if (mNotified) {
++    aActor->StartDestroy();
++  }
++}
++
++void
++ClientWorkerHolder::RemoveActor(ClientActorChild* aActor)
++{
++  NS_ASSERT_OWNINGTHREAD(ClientWorkerHolder);
++  MOZ_ASSERT(aActor);
++
++  DebugOnly<bool> removed = mActorList.RemoveElement(aActor);
++
++  MOZ_ASSERT(removed);
++  MOZ_ASSERT(!mActorList.Contains(aActor));
++}
++
++bool
++ClientWorkerHolder::Notified() const
++{
++  return mNotified;
++}
++
++bool
++ClientWorkerHolder::Notify(Status aStatus)
++{
++  NS_ASSERT_OWNINGTHREAD(ClientWorkerHolder);
++
++  // When the service worker thread is stopped we will get Terminating,
++  // but nothing higher than that.  We must shut things down at Terminating.
++  if (aStatus < Terminating || mNotified) {
++    return true;
++  }
++
++  mNotified = true;
++
++  // Start the asynchronous destruction of our actors.  These will call back
++  // into RemoveActor() once the actor is destroyed.
++  for (uint32_t i = 0; i < mActorList.Length(); ++i) {
++    mActorList[i]->StartDestroy();
++  }
++
++  return true;
++}
++
++ClientWorkerHolder::ClientWorkerHolder()
++  : mNotified(false)
++{
++}
++
++ClientWorkerHolder::~ClientWorkerHolder()
++{
++  NS_ASSERT_OWNINGTHREAD(ClientWorkerHolder);
++  MOZ_ASSERT(mActorList.IsEmpty());
++}
++
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/clients/ClientWorkerHolder.h b/dom/clients/ClientWorkerHolder.h
+new file mode 100644
+--- /dev/null
++++ b/dom/clients/ClientWorkerHolder.h
+@@ -0,0 +1,50 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_clients_ClientWorkerHolder_h
++#define mozilla_dom_clients_ClientWorkerHolder_h
++
++#include "nsISupportsImpl.h"
++#include "nsTArray.h"
++#include "WorkerHolder.h"
++
++namespace mozilla {
++
++namespace workers {
++class WorkerPrivate;
++} // namespace workers
++
++namespace dom {
++
++class ClientActorChild;
++
++class ClientWorkerHolder final : public workers::WorkerHolder
++{
++  nsTArray<ClientActorChild*> mActorList;
++  bool mNotified;
++
++  ClientWorkerHolder();
++  ~ClientWorkerHolder();
++
++public:
++  static already_AddRefed<ClientWorkerHolder>
++  Create(workers::WorkerPrivate* aWorkerPrivate);
++
++  void AddActor(ClientActorChild* aActor);
++  void RemoveActor(ClientActorChild* aActor);
++
++  bool Notified() const;
++
++  // WorkerHolder methods
++  virtual bool Notify(workers::Status aStatus) override;
++
++  NS_INLINE_DECL_REFCOUNTING(ClientWorkerHolder)
++};
++
++} // namespace dom
++} // namespace mozilla
++
++#endif // mozilla_dom_clients_ClientWorkerHolder_h
 diff --git a/dom/clients/PClientHandle.ipdl b/dom/clients/PClientHandle.ipdl
 new file mode 100644
 --- /dev/null
@@ -955,7 +1237,7 @@ diff --git a/dom/clients/moz.build b/dom/clients/moz.build
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/moz.build
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,48 @@
 +# -*- Mode: python; indent-tabs-mode: nil; tab-width: 40 -*-
 +# vim: set filetype=python:
 +# This Source Code Form is subject to the terms of the Mozilla Public
@@ -969,6 +1251,7 @@ new file mode 100644
 +]
 +
 +UNIFIED_SOURCES += [
++  'ClientActorChild.cpp',
 +  'ClientHandleChild.cpp',
 +  'ClientHandleParent.cpp',
 +  'ClientManager.cpp',
@@ -977,6 +1260,7 @@ new file mode 100644
 +  'ClientManagerParent.cpp',
 +  'ClientSourceChild.cpp',
 +  'ClientSourceParent.cpp',
++  'ClientWorkerHolder.cpp',
 +]
 +
 +IPDL_SOURCES += [
