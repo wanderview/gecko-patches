@@ -1,115 +1,45 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  8d8846f63b74eb930e48b410730ae088e9bdbee8
+# Parent  db1793403bf6e41f2d9a25441d21cca95d584873
 Bug 1134372 P2 Verify that cloned pipe streams can be read at different rates. r=froydnj
 
 diff --git a/xpcom/tests/gtest/TestPipes.cpp b/xpcom/tests/gtest/TestPipes.cpp
 --- a/xpcom/tests/gtest/TestPipes.cpp
 +++ b/xpcom/tests/gtest/TestPipes.cpp
-@@ -733,21 +733,19 @@ TEST(Pipes, Write_AsyncWait_Clone)
+@@ -720,34 +720,73 @@ TEST(Pipes, Write_AsyncWait_Clone)
  
-   rv = writer->AsyncWait(cb, 0, 0, nullptr);
+   nsTArray<char> inputData;
+   testing::CreateData(segmentSize, inputData);
+ 
+   uint32_t numWritten = 0;
+   rv = writer->Write(inputData.Elements(), inputData.Length(), &numWritten);
    ASSERT_TRUE(NS_SUCCEEDED(rv));
  
-   ASSERT_FALSE(cb->Called());
- 
-   testing::ConsumeAndValidateStream(reader, inputData);
- 
--  ASSERT_FALSE(cb->Called());
-+  ASSERT_TRUE(cb->Called());
- 
-   testing::ConsumeAndValidateStream(clone, inputData);
--
--  ASSERT_TRUE(cb->Called());
- }
- 
- TEST(Pipes, Write_AsyncWait_Clone_CloseOriginal)
- {
-   nsCOMPtr<nsIAsyncInputStream> reader;
-   nsCOMPtr<nsIAsyncOutputStream> writer;
- 
-   const uint32_t segmentSize = 1024;
-@@ -777,21 +775,19 @@ TEST(Pipes, Write_AsyncWait_Clone_CloseO
- 
-   rv = writer->AsyncWait(cb, 0, 0, nullptr);
-   ASSERT_TRUE(NS_SUCCEEDED(rv));
- 
-   ASSERT_FALSE(cb->Called());
- 
-   testing::ConsumeAndValidateStream(clone, inputData);
- 
--  ASSERT_FALSE(cb->Called());
-+  ASSERT_TRUE(cb->Called());
- 
-   reader->Close();
--
--  ASSERT_TRUE(cb->Called());
- }
- 
- TEST(Pipes, Read_AsyncWait)
- {
-   nsCOMPtr<nsIAsyncInputStream> reader;
-   nsCOMPtr<nsIAsyncOutputStream> writer;
- 
-   const uint32_t segmentSize = 1024;
-@@ -866,16 +862,85 @@ TEST(Pipes, Read_AsyncWait_Clone)
-   ASSERT_TRUE(NS_SUCCEEDED(rv));
- 
-   ASSERT_TRUE(cb->Called());
-   ASSERT_TRUE(cb2->Called());
- 
-   testing::ConsumeAndValidateStream(reader, inputData);
- }
- 
-+// This test validates that we properly handle cloned pipes that
-+// are read at wildly different rates.  Historically we have stalled
-+// the pipe until the slower side of the cloned reader streams was
-+// within the pipe size limit of the faster reader side.  This is
-+// a problem when a clone occurs, but one side if not read at all.  It
-+// can deadlock forever.  We also don't want to just increase the pipe
-+// size since that prevents us from limiting a single reader/writer
-+// from using excess memory.  Instead, we verify here that we allow
-+// the fastest reader to buffer up to our limit ahead, but that we
-+// do not stall writes for a slow clone.  In practice we end up buffering
-+// up to [size_limit + (fastest_position - slowest_position)].
-+TEST(Pipes, Read_Divergent_Clone)
-+{
-+  nsCOMPtr<nsIAsyncInputStream> reader;
-+  nsCOMPtr<nsIAsyncOutputStream> writer;
-+
-+  const uint32_t segmentSize = 1024;
-+  const uint32_t numSegments = 1;
-+
-+  nsresult rv = NS_NewPipe2(getter_AddRefs(reader), getter_AddRefs(writer),
-+                            true, true,  // non-blocking - reader, writer
-+                            segmentSize, numSegments);
-+  ASSERT_TRUE(NS_SUCCEEDED(rv));
-+
-+  nsCOMPtr<nsIInputStream> clone;
-+  rv = NS_CloneInputStream(reader, getter_AddRefs(clone));
-+  ASSERT_TRUE(NS_SUCCEEDED(rv));
-+
-+  nsCOMPtr<nsIAsyncInputStream> asyncClone = do_QueryInterface(clone);
-+  ASSERT_TRUE(asyncClone);
-+
-+  nsTArray<char> inputData;
-+  testing::CreateData(segmentSize, inputData);
-+
-+  uint32_t numWritten = 0;
-+  rv = writer->Write(inputData.Elements(), inputData.Length(), &numWritten);
-+  ASSERT_TRUE(NS_SUCCEEDED(rv));
-+
 +  // This attempts to write data beyond the original pipe size limit.  It
 +  // should fail since neither side of the clone has been read yet.
-+  rv = writer->Write(inputData.Elements(), inputData.Length(), &numWritten);
-+  ASSERT_TRUE(NS_FAILED(rv));
-+
+   rv = writer->Write(inputData.Elements(), inputData.Length(), &numWritten);
+   ASSERT_EQ(NS_BASE_STREAM_WOULD_BLOCK, rv);
+ 
+   RefPtr<testing::OutputStreamCallback> cb =
+     new testing::OutputStreamCallback();
+ 
+   rv = writer->AsyncWait(cb, 0, 0, nullptr);
+   ASSERT_TRUE(NS_SUCCEEDED(rv));
+ 
+   ASSERT_FALSE(cb->Called());
+ 
 +  // Consume data on the original stream, but the clone still has not been read.
-+  testing::ConsumeAndValidateStream(reader, inputData);
+   testing::ConsumeAndValidateStream(reader, inputData);
+ 
++  // A clone that is not being read should not stall the other input stream
++  // reader.  Therefore the writer callback should trigger when the fastest
++  // reader drains the other input stream.
++  ASSERT_TRUE(cb->Called());
 +
-+  // Attempt to write data beyond the original pipe size limit.  This must
-+  // work in order to avoid stalling the original reader stream until the clone
-+  // is read.
++  // Attempt to write data.  This will buffer data beyond the pipe size limit in
++  // order for the clone stream to still work.  This is allowed because the
++  // other input stream has drained its buffered segments and is ready for more
++  // data.
 +  rv = writer->Write(inputData.Elements(), inputData.Length(), &numWritten);
 +  ASSERT_TRUE(NS_SUCCEEDED(rv));
 +
@@ -119,7 +49,108 @@ diff --git a/xpcom/tests/gtest/TestPipes.cpp b/xpcom/tests/gtest/TestPipes.cpp
 +  rv = writer->Write(inputData.Elements(), inputData.Length(), &numWritten);
 +  ASSERT_TRUE(NS_FAILED(rv));
 +
++  cb = new testing::OutputStreamCallback();
++  rv = writer->AsyncWait(cb, 0, 0, nullptr);
++  ASSERT_TRUE(NS_SUCCEEDED(rv));
++
++  // The write should again be blocked since we have written data and the
++  // main reader is at its maximum advance buffer.
+   ASSERT_FALSE(cb->Called());
+ 
+-  testing::ConsumeAndValidateStream(clone, inputData);
++  nsTArray<char> expectedCloneData;
++  expectedCloneData.AppendElements(inputData);
++  expectedCloneData.AppendElements(inputData);
+ 
++  // We should now be able to consume the entire backlog of buffered data on
++  // the cloned stream.
++  testing::ConsumeAndValidateStream(clone, expectedCloneData);
++
++  // Draining the clone side should also trigger the AsyncWait() writer
++  // callback
+   ASSERT_TRUE(cb->Called());
++
++  // Finally, we should be able to consume the remaining data on the original
++  // reader.
 +  testing::ConsumeAndValidateStream(reader, inputData);
+ }
+ 
+ TEST(Pipes, Write_AsyncWait_Clone_CloseOriginal)
+ {
+   nsCOMPtr<nsIAsyncInputStream> reader;
+   nsCOMPtr<nsIAsyncOutputStream> writer;
+ 
+   const uint32_t segmentSize = 1024;
+@@ -764,33 +803,114 @@ TEST(Pipes, Write_AsyncWait_Clone_CloseO
+ 
+   nsTArray<char> inputData;
+   testing::CreateData(segmentSize, inputData);
+ 
+   uint32_t numWritten = 0;
+   rv = writer->Write(inputData.Elements(), inputData.Length(), &numWritten);
+   ASSERT_TRUE(NS_SUCCEEDED(rv));
+ 
++  // This attempts to write data beyond the original pipe size limit.  It
++  // should fail since neither side of the clone has been read yet.
+   rv = writer->Write(inputData.Elements(), inputData.Length(), &numWritten);
+   ASSERT_EQ(NS_BASE_STREAM_WOULD_BLOCK, rv);
+ 
+   RefPtr<testing::OutputStreamCallback> cb =
+     new testing::OutputStreamCallback();
+ 
+   rv = writer->AsyncWait(cb, 0, 0, nullptr);
+   ASSERT_TRUE(NS_SUCCEEDED(rv));
+ 
+   ASSERT_FALSE(cb->Called());
+ 
+-  testing::ConsumeAndValidateStream(clone, inputData);
++  // Consume data on the original stream, but the clone still has not been read.
++  testing::ConsumeAndValidateStream(reader, inputData);
+ 
++  // A clone that is not being read should not stall the other input stream
++  // reader.  Therefore the writer callback should trigger when the fastest
++  // reader drains the other input stream.
++  ASSERT_TRUE(cb->Called());
++
++  // Attempt to write data.  This will buffer data beyond the pipe size limit in
++  // order for the clone stream to still work.  This is allowed because the
++  // other input stream has drained its buffered segments and is ready for more
++  // data.
++  rv = writer->Write(inputData.Elements(), inputData.Length(), &numWritten);
++  ASSERT_TRUE(NS_SUCCEEDED(rv));
++
++  // Again, this should fail since the origin stream has not been read again.
++  // The pipe size should still restrict how far ahead we can buffer even
++  // when there is a cloned stream not being read.
++  rv = writer->Write(inputData.Elements(), inputData.Length(), &numWritten);
++  ASSERT_TRUE(NS_FAILED(rv));
++
++  cb = new testing::OutputStreamCallback();
++  rv = writer->AsyncWait(cb, 0, 0, nullptr);
++  ASSERT_TRUE(NS_SUCCEEDED(rv));
++
++  // The write should again be blocked since we have written data and the
++  // main reader is at its maximum advance buffer.
+   ASSERT_FALSE(cb->Called());
+ 
++  // Close the original reader input stream.  This was the fastest reader,
++  // so we should have a single stream that is buffered beyond our nominal
++  // limit.
+   reader->Close();
+ 
++  // Because the clone stream is still buffered the writable callback should
++  // not be fired.
++  ASSERT_FALSE(cb->Called());
++
++  // And we should not be able to perform a write.
++  rv = writer->Write(inputData.Elements(), inputData.Length(), &numWritten);
++  ASSERT_TRUE(NS_FAILED(rv));
++
++  // Create another clone stream.  Now we have two streams that exceed our
++  // maximum size limit
++  nsCOMPtr<nsIInputStream> clone2;
++  rv = NS_CloneInputStream(clone, getter_AddRefs(clone2));
++  ASSERT_TRUE(NS_SUCCEEDED(rv));
 +
 +  nsTArray<char> expectedCloneData;
 +  expectedCloneData.AppendElements(inputData);
@@ -128,13 +159,41 @@ diff --git a/xpcom/tests/gtest/TestPipes.cpp b/xpcom/tests/gtest/TestPipes.cpp
 +  // We should now be able to consume the entire backlog of buffered data on
 +  // the cloned stream.
 +  testing::ConsumeAndValidateStream(clone, expectedCloneData);
-+}
 +
- namespace {
++  // The pipe should now be writable because we have two open streams, one of which
++  // is completely drained.
++  ASSERT_TRUE(cb->Called());
++
++  // Write again to reach our limit again.
++  rv = writer->Write(inputData.Elements(), inputData.Length(), &numWritten);
++  ASSERT_TRUE(NS_SUCCEEDED(rv));
++
++  // The stream is again non-writeable.
++  cb = new testing::OutputStreamCallback();
++  rv = writer->AsyncWait(cb, 0, 0, nullptr);
++  ASSERT_TRUE(NS_SUCCEEDED(rv));
++  ASSERT_FALSE(cb->Called());
++
++  // Close the empty stream.  This is different from our previous close since
++  // before we were closing a stream with some data still buffered.
++  clone->Close();
++
++  // The pipe should not be writable.  The second clone is still fully buffered
++  // over our limit.
++  ASSERT_FALSE(cb->Called());
++  rv = writer->Write(inputData.Elements(), inputData.Length(), &numWritten);
++  ASSERT_TRUE(NS_FAILED(rv));
++
++  // Finally consume all of the buffered data on the second clone.
++  expectedCloneData.AppendElements(inputData);
++  testing::ConsumeAndValidateStream(clone2, expectedCloneData);
++
++  // Draining the final clone should make the pipe writable again.
+   ASSERT_TRUE(cb->Called());
+ }
  
- nsresult
- CloseDuringReadFunc(nsIInputStream *aReader,
-                     void* aClosure,
-                     const char* aFromSegment,
-                     uint32_t aToOffset,
-                     uint32_t aCount,
+ TEST(Pipes, Read_AsyncWait)
+ {
+   nsCOMPtr<nsIAsyncInputStream> reader;
+   nsCOMPtr<nsIAsyncOutputStream> writer;
+ 

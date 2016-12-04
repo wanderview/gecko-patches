@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  efb6205c1df67d41a1ddc82a46c81918dbb13016
+# Parent  f65ad27efe839ce9df0283840a1a40b4bbc9ead0
 Bug 1134372 P1 Allow pipe cloned streams to be read at different rates. r=froydnj
 
 diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
@@ -25,17 +25,43 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  
  // this class is used to delay notifications until the end of a particular
  // scope.  it helps avoid the complexity of issuing callbacks while inside
-@@ -324,16 +324,18 @@ private:
+@@ -304,36 +304,41 @@ public:
+ 
+   // nsPipe methods:
+   nsPipe();
+ 
+ private:
+   ~nsPipe();
+ 
+   //
+-  // methods below may only be called while inside the pipe's monitor
++  // Methods below may only be called while inside the pipe's monitor.  Some
++  // of these methods require passing a ReentrantMonitorAutoEnter to prove the
++  // monitor is held.
+   //
+ 
+   void PeekSegment(const nsPipeReadState& aReadState, uint32_t aIndex,
+                    char*& aCursor, char*& aLimit);
+-  SegmentChangeResult AdvanceReadSegment(nsPipeReadState& aReadState);
++  SegmentChangeResult AdvanceReadSegment(nsPipeReadState& aReadState,
++                                         const ReentrantMonitorAutoEnter &ev);
+   bool ReadSegmentBeingWritten(nsPipeReadState& aReadState);
+   uint32_t CountSegmentReferences(int32_t aSegment);
+   void SetAllNullReadCursors();
+   bool AllReadCursorsMatchWriteCursor();
+   void RollBackAllReadCursors(char* aWriteCursor);
+   void UpdateAllReadCursors(char* aWriteCursor);
    void ValidateAllReadCursors();
++  uint32_t GetBufferSegmentCount(const nsPipeReadState& aReadState,
++                                 const ReentrantMonitorAutoEnter& ev) const;
++  bool IsAdvanceBufferFull(const ReentrantMonitorAutoEnter& ev) const;
  
    //
    // methods below may be called while outside the pipe's monitor
    //
  
    void     DrainInputStream(nsPipeReadState& aReadState, nsPipeEvents& aEvents);
- 
-+  uint32_t GetBufferSegmentCount(const nsPipeReadState& aReadState);
-+  bool     IsAdvanceBufferFull();
+-
    nsresult GetWriteSegment(char*& aSegment, uint32_t& aSegmentLen);
    void     AdvanceWriteCursor(uint32_t aCount);
  
@@ -44,7 +70,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  
    nsresult CloneInputStream(nsPipeInputStream* aOriginal,
                              nsIInputStream** aCloneOut);
-@@ -360,16 +362,17 @@ private:
+@@ -360,16 +365,21 @@ private:
    // compatibility we need to be able to consistently return this same
    // object from GetInputStream().  Note, mOriginalInput is also stored
    // in mInputList as a weak ref.
@@ -53,7 +79,11 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
    ReentrantMonitor    mReentrantMonitor;
    nsSegmentedBuffer   mBuffer;
  
++  // The maximum number of segments to allow to be buffered in advance
++  // of the fastest reader.  This is collection of segments is called
++  // the "advance buffer".
 +  uint32_t            mMaxAdvanceBufferSegmentCount;
++
    int32_t             mWriteSegment;
    char*               mWriteCursor;
    char*               mWriteLimit;
@@ -62,7 +92,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
    nsresult            mStatus;
    bool                mInited;
  };
-@@ -489,31 +492,39 @@ private:
+@@ -489,31 +499,39 @@ private:
  //
  // (shaded region contains data)
  //
@@ -71,7 +101,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  //       mReadLimit values in play.  The pipe cannot discard old data until
  //       all mReadCursors have moved beyond that point in the stream.
  //
-+//       Likewise, each input stream reader will have its own amount of
++//       Likewise, each input stream reader will have it's own amount of
 +//       buffered data.  The pipe size threshold, however, is only applied
 +//       to the input stream that is being read fastest.  We call this
 +//       the "advance buffer" in that its in advance of all readers.  We
@@ -102,7 +132,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  {
    mInputList.AppendElement(mOriginalInput);
  }
-@@ -561,21 +572,27 @@ nsPipe::Init(bool aNonBlockingIn,
+@@ -561,21 +579,27 @@ nsPipe::Init(bool aNonBlockingIn,
    }
  
    // protect against overflow
@@ -131,7 +161,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  
  NS_IMETHODIMP
  nsPipe::GetInputStream(nsIAsyncInputStream** aInputStream)
-@@ -685,40 +702,41 @@ nsPipe::AdvanceReadCursor(nsPipeReadStat
+@@ -685,40 +709,40 @@ nsPipe::AdvanceReadCursor(nsPipeReadStat
      aReadState.mAvailable -= aBytesRead;
  
      // Check to see if we're at the end of the available read data.  If we
@@ -145,7 +175,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 -      if (AdvanceReadSegment(aReadState) == SegmentDeleted &&
 +      // Advance the segment position.  If we have read any segments from the
 +      // advance buffer then we can potentially notify blocked writers.
-+      if (AdvanceReadSegment(aReadState) == SegmentAdvanceBufferRead &&
++      if (AdvanceReadSegment(aReadState, mon) == SegmentAdvanceBufferRead &&
            mOutput.OnOutputWritable(events) == NotifyMonitor) {
          mon.NotifyAll();
        }
@@ -156,13 +186,14 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  }
  
  SegmentChangeResult
- nsPipe::AdvanceReadSegment(nsPipeReadState& aReadState)
+-nsPipe::AdvanceReadSegment(nsPipeReadState& aReadState)
++nsPipe::AdvanceReadSegment(nsPipeReadState& aReadState,
++                           const ReentrantMonitorAutoEnter &ev)
  {
-   mReentrantMonitor.AssertCurrentThreadIn();
- 
+-  mReentrantMonitor.AssertCurrentThreadIn();
 +  // Calculate how many segments are buffered for this stream to start.
-+  uint32_t startBufferSegments = GetBufferSegmentCount(aReadState);
-+
++  uint32_t startBufferSegments = GetBufferSegmentCount(aReadState, ev);
+ 
    int32_t currentSegment = aReadState.mSegment;
  
    // Move to the next segment to read
@@ -178,7 +209,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  
      // Directly modify the current read state.  If the associated input
      // stream is closed simultaneous with reading, then it may not be
-@@ -732,18 +750,16 @@ nsPipe::AdvanceReadSegment(nsPipeReadSta
+@@ -732,18 +756,16 @@ nsPipe::AdvanceReadSegment(nsPipeReadSta
          continue;
        }
        mInputList[i]->ReadState().mSegment -= 1;
@@ -197,7 +228,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
      aReadState.mReadCursor = nullptr;
      aReadState.mReadLimit = nullptr;
      // also, the buffer is completely empty, so reset the write cursor
-@@ -756,17 +772,29 @@ nsPipe::AdvanceReadSegment(nsPipeReadSta
+@@ -756,17 +778,29 @@ nsPipe::AdvanceReadSegment(nsPipeReadSta
      aReadState.mReadCursor = mBuffer.GetSegment(aReadState.mSegment);
      if (mWriteSegment == aReadState.mSegment) {
        aReadState.mReadLimit = mWriteCursor;
@@ -209,7 +240,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 -  return result;
 +  // Calculate how many segments are buffered for the stream after
 +  // reading.
-+  uint32_t endBufferSegments = GetBufferSegmentCount(aReadState);
++  uint32_t endBufferSegments = GetBufferSegmentCount(aReadState, ev);
 +
 +  // If the stream has read a segment out of the set of advanced buffer
 +  // segments, then the writer may advance.
@@ -228,7 +259,16 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
    ReentrantMonitorAutoEnter mon(mReentrantMonitor);
  
    // If a segment is actively being read in ReadSegments() for this input
-@@ -786,56 +814,105 @@ nsPipe::DrainInputStream(nsPipeReadState
+@@ -777,33 +811,33 @@ nsPipe::DrainInputStream(nsPipeReadState
+   if (aReadState.mActiveRead) {
+     MOZ_ASSERT(!aReadState.mNeedDrain);
+     aReadState.mNeedDrain = true;
+     return;
+   }
+ 
+   aReadState.mAvailable = 0;
+ 
+-  SegmentChangeResult result = SegmentNotChanged;
    while(mWriteSegment >= aReadState.mSegment) {
  
      // If the last segment to free is still being written to, we're done
@@ -239,9 +279,11 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  
 -    if (AdvanceReadSegment(aReadState) == SegmentDeleted) {
 -      result = SegmentDeleted;
-+    if (AdvanceReadSegment(aReadState) == SegmentAdvanceBufferRead) {
-+      result = SegmentAdvanceBufferRead;
-     }
+-    }
++    // Don't bother checking if this results in an advance buffer segment
++    // read.  Since we are draining the entire stream we will read an
++    // advance buffer segment no matter what.
++    AdvanceReadSegment(aReadState, mon);
    }
  
 -  // if we've free'd up a segment, notify output stream that pipe has
@@ -249,7 +291,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 -  if (result == SegmentDeleted &&
 +  // If we have read any segments from the advance buffer then we can
 +  // potentially notify blocked writers.
-+  if (result == SegmentAdvanceBufferRead &&
++  if (!IsAdvanceBufferFull(mon) &&
        mOutput.OnOutputWritable(aEvents) == NotifyMonitor) {
      mon.NotifyAll();
    }
@@ -258,60 +300,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  bool
  nsPipe::ReadSegmentBeingWritten(nsPipeReadState& aReadState)
  {
-   mReentrantMonitor.AssertCurrentThreadIn();
-   bool beingWritten = mWriteSegment == aReadState.mSegment &&
-                       mWriteLimit > mWriteCursor;
-   NS_ASSERTION(!beingWritten || aReadState.mReadLimit == mWriteCursor,
-                "unexpected state");
-   return beingWritten;
- }
- 
-+uint32_t
-+nsPipe::GetBufferSegmentCount(const nsPipeReadState& aReadState)
-+{
-+  mReentrantMonitor.AssertCurrentThreadIn();
-+  int32_t value =
-+    mWriteSegment < aReadState.mSegment ? 0 : 1 + mWriteSegment - aReadState.mSegment;
-+  MOZ_DIAGNOSTIC_ASSERT(value >= 0);
-+  return value;
-+}
-+
-+bool
-+nsPipe::IsAdvanceBufferFull()
-+{
-+  mReentrantMonitor.AssertCurrentThreadIn();
-+
-+  // If we have fewer total segments than the limit we can
-+  // immediately determine we are not full.
-+  if (mWriteSegment < 0 ||
-+      static_cast<uint32_t>(mWriteSegment + 1) < mMaxAdvanceBufferSegmentCount) {
-+    return false;
-+  }
-+
-+  // Otherwise we must inspect all of our reader streams.  We need
-+  // to determine the buffer depth of the fastest reader.
-+  uint32_t minBufferSegments = UINT32_MAX;
-+  for (uint32_t i = 0; i < mInputList.Length(); ++i) {
-+    const nsPipeReadState& state = mInputList[i]->ReadState();
-+    uint32_t bufferSegments = GetBufferSegmentCount(state);
-+    minBufferSegments = std::min(minBufferSegments, bufferSegments);
-+    // We only care if any reader has fewer segments buffered than
-+    // our threshold.  We can stop once we hit that threshold.
-+    if (minBufferSegments < mMaxAdvanceBufferSegmentCount) {
-+      return false;
-+    }
-+  }
-+
-+  // We must never allow our fastest reader to get ahead of our advance
-+  // buffer threshold.
-+  MOZ_DIAGNOSTIC_ASSERT(minBufferSegments == mMaxAdvanceBufferSegmentCount);
-+
-+  return true;
-+}
-+
- nsresult
- nsPipe::GetWriteSegment(char*& aSegment, uint32_t& aSegmentLen)
- {
+@@ -821,21 +855,28 @@ nsPipe::GetWriteSegment(char*& aSegment,
    ReentrantMonitorAutoEnter mon(mReentrantMonitor);
  
    if (NS_FAILED(mStatus)) {
@@ -323,9 +312,10 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 -    char* seg = mBuffer.AppendNewSegment();
 -    // pipe is full
 -    if (!seg) {
-+    // If we have hit our limit on advance data buffering for the fastest
-+    // reader we must consider the pipe full.
-+    if (IsAdvanceBufferFull()) {
++    // The pipe is full if we have hit our limit on advance data buffering.
++    // This means the fastest reader is still reading slower than data is
++    // being written into the pipe.
++    if (IsAdvanceBufferFull(mon)) {
        return NS_BASE_STREAM_WOULD_BLOCK;
      }
 +
@@ -342,7 +332,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
  
    // make sure read cursor is initialized
    SetAllNullReadCursors();
-@@ -872,19 +949,17 @@ nsPipe::AdvanceWriteCursor(uint32_t aByt
+@@ -872,19 +913,17 @@ nsPipe::AdvanceWriteCursor(uint32_t aByt
      UpdateAllReadCursors(newWriteCursor);
  
      mWriteCursor = newWriteCursor;
@@ -354,7 +344,7 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
 -      if (mBuffer.GetSize() >= mBuffer.GetMaxSize()) {
 -        mOutput.SetWritable(false);
 -      }
-+      mOutput.SetWritable(!IsAdvanceBufferFull());
++      mOutput.SetWritable(!IsAdvanceBufferFull(mon));
      }
  
      // notify input stream that pipe now contains additional data
@@ -363,3 +353,82 @@ diff --git a/xpcom/io/nsPipe3.cpp b/xpcom/io/nsPipe3.cpp
        if (mInputList[i]->OnInputReadable(aBytesWritten, events, mon)
            == NotifyMonitor) {
          needNotify = true;
+@@ -1096,16 +1135,78 @@ nsPipe::ValidateAllReadCursors()
+     NS_ASSERTION(state.mReadCursor != mWriteCursor ||
+                  (mBuffer.GetSegment(state.mSegment) == state.mReadCursor &&
+                   mWriteCursor == mWriteLimit),
+                  "read cursor is bad");
+   }
+ #endif
+ }
+ 
++uint32_t
++nsPipe::GetBufferSegmentCount(const nsPipeReadState& aReadState,
++                              const ReentrantMonitorAutoEnter& ev) const
++{
++  // The write segment can be smaller than the current reader position
++  // in some cases.  For example, when the first write segment has not
++  // been allocated yet mWriteSegment is negative.  In these cases
++  // the stream is effectively using zero segments.
++  if (mWriteSegment < aReadState.mSegment) {
++    return 0;
++  }
++
++  MOZ_ASSERT(mWriteSegment >= 0);
++  MOZ_ASSERT(aReadState.mSegment >= 0);
++
++  // Otherwise at least one segment is being used.  We add one here
++  // since a single segment is being used when the write and read
++  // segment indices are the same.
++  return 1 + mWriteSegment - aReadState.mSegment;
++}
++
++bool
++nsPipe::IsAdvanceBufferFull(const ReentrantMonitorAutoEnter& ev) const
++{
++  // If we have fewer total segments than the limit we can immediately
++  // determine we are not full.  Note, we must add one to mWriteSegment
++  // to convert from a index to a count.
++  MOZ_DIAGNOSTIC_ASSERT(mWriteSegment >= -1);
++  MOZ_DIAGNOSTIC_ASSERT(mWriteSegment < INT32_MAX);
++  uint32_t totalWriteSegments = mWriteSegment + 1;
++  if (totalWriteSegments < mMaxAdvanceBufferSegmentCount) {
++    return false;
++  }
++
++  // Otherwise we must inspect all of our reader streams.  We need
++  // to determine the buffer depth of the fastest reader.
++  uint32_t minBufferSegments = UINT32_MAX;
++  for (uint32_t i = 0; i < mInputList.Length(); ++i) {
++    // Only count buffer segments from input streams that are open.
++    if (NS_FAILED(mInputList[i]->Status(ev))) {
++      continue;
++    }
++    const nsPipeReadState& state = mInputList[i]->ReadState();
++    uint32_t bufferSegments = GetBufferSegmentCount(state, ev);
++    minBufferSegments = std::min(minBufferSegments, bufferSegments);
++    // We only care if any reader has fewer segments buffered than
++    // our threshold.  We can stop once we hit that threshold.
++    if (minBufferSegments < mMaxAdvanceBufferSegmentCount) {
++      return false;
++    }
++  }
++
++  // Note, its possible for minBufferSegments to exceed our
++  // mMaxAdvanceBufferSegmentCount here.  This happens when a cloned
++  // reader gets far behind, but then the fastest reader stream is
++  // closed.  This leaves us with a single stream that is buffered
++  // beyond our max.  Naturally we continue to indicate the pipe
++  // is full at this point.
++
++  return true;
++}
++
+ //-----------------------------------------------------------------------------
+ // nsPipeEvents methods:
+ //-----------------------------------------------------------------------------
+ 
+ nsPipeEvents::~nsPipeEvents()
+ {
+   // dispatch any pending events
+ 
