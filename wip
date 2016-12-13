@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  0ddfec7126ec503b54df9c4b7c3b988906f6c882
+# Parent  f46f85dcfbc2b3098ea758825d18be6fab33cbc6
 
 diff --git a/dom/clients/ClientHandleChild.cpp b/dom/clients/ClientHandleChild.cpp
 new file mode 100644
@@ -161,7 +161,7 @@ diff --git a/dom/clients/ClientManager.cpp b/dom/clients/ClientManager.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/ClientManager.cpp
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,179 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -171,6 +171,8 @@ new file mode 100644
 +#include "ClientManager.h"
 +
 +#include "ClientManagerChild.h"
++#include "mozilla/dom/WorkerPrivate.h"
++#include "mozilla/dom/workers/bindings/WorkerHolderToken.h"
 +#include "mozilla/ipc/BackgroundChild.h"
 +#include "mozilla/ipc/PBackgroundChild.h"
 +#include "nsIIPCBackgroundChildCreateCallback.h"
@@ -181,6 +183,9 @@ new file mode 100644
 +
 +using mozilla::ipc::BackgroundChild;
 +using mozilla::ipc::PBackgroundChild;
++using mozilla::dom::workers::GetCurrentThreadWorkerPrivate;
++using mozilla::dom::workers::Terminating;
++using mozilla::dom::workers::WorkerHolderToken;
 +
 +namespace {
 +
@@ -227,8 +232,6 @@ new file mode 100644
 +ClientManager::ClientManager()
 +  : mActor(nullptr)
 +{
-+  // TODO: worker holder
-+
 +  PBackgroundChild* actor = BackgroundChild::GetForCurrentThread();
 +  if (actor) {
 +    PBackgroundActorCreated(actor);
@@ -261,11 +264,12 @@ new file mode 100644
 +  NS_ASSERT_OWNINGTHREAD(ClientManager);
 +
 +  if (!mActor) {
++    // TODO: Terminate pending source/handle actor creation
 +    return;
 +  }
 +
 +  mActor->RevokeManager(this);
-+  mActor->SendTeardown();
++  mActor->MaybeStartTeardown();
 +  mActor = nullptr;
 +}
 +
@@ -285,7 +289,17 @@ new file mode 100644
 +  NS_ASSERT_OWNINGTHREAD(ClientManager);
 +  MOZ_ASSERT(aActor);
 +
-+  ClientManagerChild* actor = new ClientManagerChild(this);
++  RefPtr<WorkerHolderToken> workerHolderToken;
++  if (!NS_IsMainThread()) {
++    workerHolderToken =
++      WorkerHolderToken::Create(GetCurrentThreadWorkerPrivate(), Terminating);
++    if (NS_WARN_IF(!workerHolderToken)) {
++      Shutdown();
++      return;
++    }
++  }
++
++  ClientManagerChild* actor = new ClientManagerChild(this, workerHolderToken);
 +  PClientManagerChild *sentActor = aActor->SendPClientManagerConstructor(actor);
 +  if (NS_WARN_IF(!sentActor)) {
 +    Shutdown();
@@ -294,6 +308,8 @@ new file mode 100644
 +  MOZ_ASSERT(sentActor == actor);
 +
 +  mActor = static_cast<ClientManagerChild*>(actor);
++
++  // TODO: complete pending source/handle actor creation
 +}
 +
 +// static
@@ -464,7 +480,7 @@ diff --git a/dom/clients/ClientManagerChild.cpp b/dom/clients/ClientManagerChild
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/ClientManagerChild.cpp
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,96 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -480,14 +496,21 @@ new file mode 100644
 +namespace mozilla {
 +namespace dom {
 +
++using mozilla::dom::workers::WorkerHolderToken;
++
 +void
 +ClientManagerChild::ActorDestroy(ActorDestroyReason aReason)
 +{
-+  if (!mManager) {
-+    return;
++  if (mWorkerHolderToken) {
++    mWorkerHolderToken->RemoveListener(this);
++    mWorkerHolderToken = nullptr;
++
 +  }
 +
-+  mManager->RevokeActor(this);
++  if (mManager) {
++    mManager->RevokeActor(this);
++    MOZ_ASSERT(!mManager);
++  }
 +}
 +
 +PClientHandleChild*
@@ -516,10 +539,24 @@ new file mode 100644
 +  return true;
 +}
 +
-+ClientManagerChild::ClientManagerChild(ClientManager* aManager)
++void
++ClientManagerChild::WorkerShuttingDown()
++{
++  MaybeStartTeardown();
++}
++
++ClientManagerChild::ClientManagerChild(ClientManager* aManager,
++                                       WorkerHolderToken* aWorkerHolderToken)
 +  : mManager(aManager)
++  , mWorkerHolderToken(aWorkerHolderToken)
++  , mTeardownStarted(false)
 +{
 +  MOZ_ASSERT(mManager);
++  MOZ_ASSERT_IF(!NS_IsMainThread(), mWorkerHolderToken);
++
++  if (mWorkerHolderToken) {
++    mWorkerHolderToken->AddListener(this);
++  }
 +}
 +
 +void
@@ -530,13 +567,21 @@ new file mode 100644
 +  mManager = nullptr;
 +}
 +
++void
++ClientManagerChild::MaybeStartTeardown()
++{
++  MOZ_ASSERT(!mTeardownStarted);
++  mTeardownStarted = true;
++  SendTeardown();
++}
++
 +} // namespace dom
 +} // namespace mozilla
 diff --git a/dom/clients/ClientManagerChild.h b/dom/clients/ClientManagerChild.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/ClientManagerChild.h
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,59 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -546,15 +591,20 @@ new file mode 100644
 +#define _mozilla_dom_ClientManagerChild_h
 +
 +#include "mozilla/dom/PClientManagerChild.h"
++#include "mozilla/dom/workers/bindings/WorkerHolderToken.h"
 +
 +namespace mozilla {
 +namespace dom {
 +
 +class ClientManagerChild final : public PClientManagerChild
++                               , public mozilla::dom::workers::WorkerHolderToken::Listener
 +{
 +  // Weak reference.  The ClientManager will call RevokeManager() when
 +  // it is destroyed.
 +  ClientManager* mManager;
++
++  RefPtr<mozilla::dom::workers::WorkerHolderToken> mWorkerHolderToken;
++  bool mTeardownStarted;
 +
 +  // PClientManagerChild interface
 +  void
@@ -572,14 +622,19 @@ new file mode 100644
 +  bool
 +  DeallocPClientSourceChild(PClientSourceChild* aActor) override;
 +
++  // WorkerHolderToken::Listener interface
++  void
++  WorkerShuttingDown() override;
++
 +public:
-+  explicit ClientManagerChild(ClientManager* aManager);
++  ClientManagerChild(ClientManager* aManager,
++                     mozilla::dom::workers::WorkerHolderToken* aWorkerHolderToken);
 +
 +  void
 +  RevokeManager(ClientManager* aManager);
 +
 +  void
-+  StartTeardown();
++  MaybeStartTeardown();
 +};
 +
 +} // namespace dom
@@ -1020,9 +1075,9 @@ diff --git a/dom/moz.build b/dom/moz.build
      'encoding',
      'events',
      'fetch',
+     'file',
      'filehandle',
      'filesystem',
-     'flyweb',
 diff --git a/dom/workers/WorkerHolderToken.cpp b/dom/workers/WorkerHolderToken.cpp
 new file mode 100644
 --- /dev/null
@@ -1327,7 +1382,7 @@ diff --git a/ipc/glue/BackgroundParentImpl.cpp b/ipc/glue/BackgroundParentImpl.c
  #include "mozilla/dom/GamepadTestChannelParent.h"
  #endif
  #include "mozilla/dom/PBlobParent.h"
-@@ -952,16 +953,28 @@ BackgroundParentImpl::DeallocPGamepadTes
+@@ -946,16 +947,28 @@ BackgroundParentImpl::DeallocPGamepadTes
  #ifdef MOZ_GAMEPAD
    MOZ_ASSERT(aActor);
    RefPtr<dom::GamepadTestChannelParent> parent =
