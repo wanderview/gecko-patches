@@ -161,7 +161,7 @@ diff --git a/dom/clients/ClientManager.cpp b/dom/clients/ClientManager.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/ClientManager.cpp
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,210 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -171,6 +171,7 @@ new file mode 100644
 +#include "ClientManager.h"
 +
 +#include "ClientManagerChild.h"
++#include "ClientSource.h"
 +#include "mozilla/dom/WorkerPrivate.h"
 +#include "mozilla/dom/workers/bindings/WorkerHolderToken.h"
 +#include "mozilla/ipc/BackgroundChild.h"
@@ -231,6 +232,7 @@ new file mode 100644
 +
 +ClientManager::ClientManager()
 +  : mActor(nullptr)
++  , mShutdown(false)
 +{
 +  PBackgroundChild* actor = BackgroundChild::GetForCurrentThread();
 +  if (actor) {
@@ -263,11 +265,16 @@ new file mode 100644
 +{
 +  NS_ASSERT_OWNINGTHREAD(ClientManager);
 +
-+  if (!mActor) {
-+    // TODO: Terminate pending source/handle actor creation
++  if (mShutdown) {
 +    return;
 +  }
++  mShutdown = true;
 +
++  // TODO: Terminate pending source/handle actor creation
++
++  if (!mActor) {
++    return;
++  }
 +  mActor->RevokeManager(this);
 +  mActor->MaybeStartTeardown();
 +  mActor = nullptr;
@@ -288,6 +295,10 @@ new file mode 100644
 +{
 +  NS_ASSERT_OWNINGTHREAD(ClientManager);
 +  MOZ_ASSERT(aActor);
++
++  if (mShutdown) {
++    return;
++  }
 +
 +  RefPtr<WorkerHolderToken> workerHolderToken;
 +  if (!NS_IsMainThread()) {
@@ -339,13 +350,33 @@ new file mode 100644
 +  return cm.forget();
 +}
 +
++UniquePtr<ClientSource>
++ClientManager::CreateSource()
++{
++  NS_ASSERT_OWNINGTHREAD(ClientManager);
++
++  if (mShutdown) {
++    return nullptr;
++  }
++
++  UniquePtr<ClientSource> source = ClientSource::Create();
++
++  if (mActor) {
++    source->Activate(mActor);
++  } else {
++    // TODO: track pending actor
++  }
++
++  return Move(source);
++}
++
 +} // namespace dom
 +} // namespace mozilla
 diff --git a/dom/clients/ClientManager.h b/dom/clients/ClientManager.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/ClientManager.h
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,54 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -363,6 +394,7 @@ new file mode 100644
 +namespace dom {
 +
 +class ClientManagerChild;
++class ClientSource;
 +
 +class ClientManager final
 +{
@@ -370,6 +402,7 @@ new file mode 100644
 +  class PBackgroundCreateCallback;
 +
 +  ClientManagerChild* mActor;
++  bool mShutdown;
 +
 +  ClientManager();
 +  ~ClientManager();
@@ -380,12 +413,16 @@ new file mode 100644
 +  void
 +  PBackgroundActorCreated(mozilla::ipc::PBackgroundChild* aActor);
 +
++  // Private methods called by ClientManagerChild
 +  void
 +  RevokeActor(ClientManagerChild* aActor);
 +
 +public:
 +  static already_AddRefed<ClientManager>
 +  GetOrCreateCurrentThreadInstance();
++
++  UniquePtr<ClientSource>
++  CreateSource();
 +
 +  NS_INLINE_DECL_REFCOUNTING(mozilla::dom::ClientManager)
 +};
@@ -480,7 +517,7 @@ diff --git a/dom/clients/ClientManagerChild.cpp b/dom/clients/ClientManagerChild
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/ClientManagerChild.cpp
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,98 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -529,7 +566,7 @@ new file mode 100644
 +PClientSourceChild*
 +ClientManagerChild::AllocPClientSourceChild(const ClientSourceConstructorArgs& aArgs)
 +{
-+  return new ClientSourceChild(aArgs);
++  return new ClientSourceChild(aArgs, mWorkerHolderToken);
 +}
 +
 +bool
@@ -570,7 +607,9 @@ new file mode 100644
 +void
 +ClientManagerChild::MaybeStartTeardown()
 +{
-+  MOZ_ASSERT(!mTeardownStarted);
++  if (mTeardownStarted) {
++    return;
++  }
 +  mTeardownStarted = true;
 +  SendTeardown();
 +}
@@ -748,11 +787,124 @@ new file mode 100644
 +} // namespace mozilla
 +
 +#endif // _mozilla_dom_ClientManagerParent_h
+diff --git a/dom/clients/ClientSource.cpp b/dom/clients/ClientSource.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/clients/ClientSource.cpp
+@@ -0,0 +1,59 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "ClientSource.h"
++
++namespace mozilla {
++namespace dom {
++
++ClientSource::ClientSource()
++  : mActor(nullptr)
++{
++}
++
++// static
++UniquePtr<ClientSource>
++ClientSource::Create()
++{
++  return MakeUnique<ClientSource>();
++}
++
++void
++ClientSource::Activate(PClientManagerChild* aActor)
++{
++  NS_ASSERT_OWNINGTHREAD(ClientSource);
++  MOZ_ASSERT(!mActor);
++
++  // TODO
++  ClientSourceConstructorArgs args;
++
++  PClientSourceChild* actor = aActor->SendPClientSourceConstructor(args);
++  if (!actor) {
++    // TODO: shutdown
++    return;
++  }
++
++  mActor = static_cast<ClientSourceChild*>(actor);
++  mActor->SetSource(this);
++
++  // TODO: complete any pending operations
++}
++
++void
++ClientSource::RevokeActor(ClientSourceChild* aActor)
++{
++  NS_ASSERT_OWNINGTHREAD(ClientSource);
++  MOZ_ASSERT(mActor);
++  mActor->RevokeSource(this);
++  mActor = nullptr;
++}
++
++ClientSource::~ClientSource()
++{
++}
++
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/clients/ClientSource.h b/dom/clients/ClientSource.h
+new file mode 100644
+--- /dev/null
++++ b/dom/clients/ClientSource.h
+@@ -0,0 +1,44 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++#ifndef _mozilla_dom_ClientSource_h
++#define _mozilla_dom_ClientSource_h
++
++namespace mozilla {
++namespace dom {
++
++class ClientSourceChild;
++class PClientManagerChild;
++
++class ClientSource final
++{
++  friend class ClientManager;
++  friend class ClientSourceChild;
++
++  NS_DECL_OWNINGTHREAD
++
++  ClientSourceChild* mActor;
++
++  ClientSource();
++
++  // Private methods called by ClientManager
++  static UniquePtr<ClientSource>
++  Create();
++
++  void
++  Activate(PClientManagerChild* aActor);
++
++  // Private methods called by ClientSourceChild
++  void
++  RevokeActor(ClientSourceChild* aActor);
++
++public:
++  ~ClientSource();
++};
++
++} // namespace dom
++} // namespace mozilla
++
++#endif // _mozilla_dom_ClientSource_h
 diff --git a/dom/clients/ClientSourceChild.cpp b/dom/clients/ClientSourceChild.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/ClientSourceChild.cpp
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,76 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -766,9 +918,65 @@ new file mode 100644
 +namespace mozilla {
 +namespace dom {
 +
-+ClientSourceChild::ClientSourceChild(const ClientSourceConstructorArgs& aArgs)
++using mozilla::dom::workers::WorkerHolderToken;
++
++void
++ClientSourceChild::ActorDestroy(ActorDestroyReason aReason)
 +{
-+  // TODO
++  if (mWorkerHolderToken) {
++    mWorkerHolderToken->RemoveListener(this);
++    mWorkerHolderToken = nullptr;
++  }
++
++  if (mSource) {
++    mSource->RevokeActor(this);
++    MOZ_ASSERT(!mSource);
++  }
++}
++
++void
++ClientSourceChild::WorkerShuttingDown()
++{
++  MaybeStartTeardown();
++}
++
++ClientSourceChild::ClientSourceChild(const ClientSourceConstructorArgs& aArgs,
++                                     WorkerHolderToken* aWorkerHolderToken)
++  : mWorkerHolderToken(aWorkerHolderToken)
++  , mSource(nullptr)
++  , mTeardownStarted(false)
++{
++  MOZ_ASSERT_IF(!NS_IsMainThread(), mWorkerHolderToken);
++
++  if (mWorkerHolderToken) {
++    mWorkerHolderToken->AddListener(this);
++  }
++}
++
++void
++ClientSourceChild::SetSource(ClientSource* aSource)
++{
++  MOZ_ASSERT(!mSource);
++  mSource = aSource;
++  MOZ_ASSERT(mSource);
++}
++
++void
++ClientSourceChild::RevokeSource(ClientSource* aSource)
++{
++  MOZ_ASSERT(mSource);
++  MOZ_ASSERT(mSource == aSource);
++  mSource = nullptr;
++}
++
++void
++ClientSourceChild::MaybeStartTeardown()
++{
++  if (mTeardownStarted) {
++    return;
++  }
++  mTeardownStarted = true;
++  SendTeardown();
 +}
 +
 +} // namespace dom
@@ -777,7 +985,7 @@ diff --git a/dom/clients/ClientSourceChild.h b/dom/clients/ClientSourceChild.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/ClientSourceChild.h
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,50 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -787,16 +995,41 @@ new file mode 100644
 +#define _mozilla_dom_ClientSourceChild_h
 +
 +#include "mozilla/dom/PClientSourceChild.h"
++#include "mozilla/dom/workers/bindings/WorkerHolderToken.h"
 +
 +namespace mozilla {
 +namespace dom {
 +
++class ClientSource;
 +class ClientSourceConstructorArgs;
 +
 +class ClientSourceChild final : public PClientSourceChild
++                              , public mozilla::dom::workers::WorkerHolderToken::Listener
 +{
++  RefPtr<mozilla::dom::workers::WorkerHolderToken> mWorkerHolderToken;
++  ClientSource* mSource;
++  bool mTeardownStarted;
++
++  // PClientSourceChild interface
++  void
++  ActorDestroy(ActorDestroyReason aReason) override;
++
++  // WorkerHolderToken::Listener interface
++  void
++  WorkerShuttingDown() override;
++
 +public:
-+  explicit ClientSourceChild(const ClientSourceConstructorArgs& aArgs);
++  ClientSourceChild(const ClientSourceConstructorArgs& aArgs,
++                    mozilla::dom::workers::WorkerHolderToken* aWorkerHolderToken);
++
++  void
++  SetSource(ClientSource* aSource);
++
++  void
++  RevokeSource(ClientSource* aSource);
++
++  void
++  MaybeStartTeardown();
 +};
 +
 +} // namespace dom
@@ -1010,7 +1243,7 @@ diff --git a/dom/clients/moz.build b/dom/clients/moz.build
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/moz.build
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,48 @@
 +# -*- Mode: python; indent-tabs-mode: nil; tab-width: 40 -*-
 +# vim: set filetype=python:
 +# This Source Code Form is subject to the terms of the Mozilla Public
@@ -1020,6 +1253,7 @@ new file mode 100644
 +EXPORTS.mozilla.dom += [
 +  'ClientManager.h',
 +  'ClientManagerActors.h',
++  'ClientSource.h',
 +  'ClientType.h',
 +]
 +
@@ -1030,6 +1264,7 @@ new file mode 100644
 +  'ClientManagerActors.cpp',
 +  'ClientManagerChild.cpp',
 +  'ClientManagerParent.cpp',
++  'ClientSource.cpp',
 +  'ClientSourceChild.cpp',
 +  'ClientSourceParent.cpp',
 +]
