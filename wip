@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  f46f85dcfbc2b3098ea758825d18be6fab33cbc6
+# Parent  18b5a7a5d833f09b1f1e5cc45f4c0ff6235a1d5e
 
 diff --git a/dom/clients/ClientHandleChild.cpp b/dom/clients/ClientHandleChild.cpp
 new file mode 100644
@@ -161,7 +161,7 @@ diff --git a/dom/clients/ClientManager.cpp b/dom/clients/ClientManager.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/ClientManager.cpp
-@@ -0,0 +1,212 @@
+@@ -0,0 +1,226 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -251,6 +251,7 @@ new file mode 100644
 +ClientManager::~ClientManager()
 +{
 +  NS_ASSERT_OWNINGTHREAD(ClientManager);
++  MOZ_ASSERT(mPendingSourceList.IsEmpty());
 +
 +  Shutdown();
 +
@@ -270,7 +271,11 @@ new file mode 100644
 +  }
 +  mShutdown = true;
 +
-+  // TODO: Terminate pending source/handle actor creation
++  nsTArray<ClientSource*> pendingSourceList;
++  mPendingSourceList.SwapElements(pendingSourceList);
++  for (ClientSource* source : pendingSourceList) {
++    source->Shutdown();
++  }
 +
 +  if (!mActor) {
 +    return;
@@ -288,6 +293,13 @@ new file mode 100644
 +  MOZ_ASSERT(mActor == aActor);
 +  mActor->RevokeManager(this);
 +  mActor = nullptr;
++}
++
++void
++ClientManager::ForgetSource(ClientSource* aSource)
++{
++  NS_ASSERT_OWNINGTHREAD(ClientManager);
++  mPendingSourceList.RemoveElement(aSource);
 +}
 +
 +void
@@ -320,7 +332,11 @@ new file mode 100644
 +
 +  mActor = static_cast<ClientManagerChild*>(actor);
 +
-+  // TODO: complete pending source/handle actor creation
++  nsTArray<ClientSource*> pendingSourceList;
++  mPendingSourceList.SwapElements(pendingSourceList);
++  for (ClientSource* source : pendingSourceList) {
++    source->Activate(mActor);
++  }
 +}
 +
 +// static
@@ -359,14 +375,12 @@ new file mode 100644
 +    return nullptr;
 +  }
 +
-+  // Note, MakeUnique does not work with private constructors.
-+  UniquePtr<ClientSource> source;
-+  source.reset(new ClientSource());
++  UniquePtr<ClientSource> source(new ClientSource(this));
 +
 +  if (mActor) {
 +    source->Activate(mActor);
 +  } else {
-+    // TODO: track pending actor
++    mPendingSourceList.AppendElement(source.get());
 +  }
 +
 +  return Move(source);
@@ -378,7 +392,7 @@ diff --git a/dom/clients/ClientManager.h b/dom/clients/ClientManager.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/ClientManager.h
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,61 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -388,6 +402,7 @@ new file mode 100644
 +#define _mozilla_dom_ClientManager_h
 +
 +#include "mozilla/dom/PClientManager.h"
++#include "nsTArray.h"
 +
 +namespace mozilla {
 +namespace ipc {
@@ -401,9 +416,11 @@ new file mode 100644
 +class ClientManager final
 +{
 +  friend class ClientManagerChild;
++  friend class ClientSource;
 +  class PBackgroundCreateCallback;
 +
 +  ClientManagerChild* mActor;
++  nsTArray<ClientSource*> mPendingSourceList;
 +  bool mShutdown;
 +
 +  ClientManager();
@@ -418,6 +435,10 @@ new file mode 100644
 +  // Private methods called by ClientManagerChild
 +  void
 +  RevokeActor(ClientManagerChild* aActor);
++
++  // Private methods called by ClientSource
++  void
++  ForgetSource(ClientSource* aSource);
 +
 +public:
 +  static already_AddRefed<ClientManager>
@@ -793,7 +814,7 @@ diff --git a/dom/clients/ClientSource.cpp b/dom/clients/ClientSource.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/ClientSource.cpp
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,73 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -805,9 +826,25 @@ new file mode 100644
 +namespace mozilla {
 +namespace dom {
 +
-+ClientSource::ClientSource()
-+  : mActor(nullptr)
++void
++ClientSource::Shutdown()
 +{
++  NS_ASSERT_OWNINGTHREAD(ClientSource);
++  if (mShutdown) {
++    return;
++  }
++  mShutdown = true;
++
++  if (mActor) {
++    mActor->MaybeStartTeardown();
++  }
++}
++
++ClientSource::ClientSource(ClientManager* aManager)
++  : mManager(aManager)
++  , mActor(nullptr)
++{
++  MOZ_ASSERT(mManager);
 +}
 +
 +void
@@ -816,12 +853,16 @@ new file mode 100644
 +  NS_ASSERT_OWNINGTHREAD(ClientSource);
 +  MOZ_ASSERT(!mActor);
 +
++  if (mShutdown) {
++    return;
++  }
++
 +  // TODO
 +  ClientSourceConstructorArgs args;
 +
 +  PClientSourceChild* actor = aActor->SendPClientSourceConstructor(args);
 +  if (!actor) {
-+    // TODO: shutdown
++    Shutdown();
 +    return;
 +  }
 +
@@ -842,6 +883,7 @@ new file mode 100644
 +
 +ClientSource::~ClientSource()
 +{
++  mManager->ForgetSource(this);
 +}
 +
 +} // namespace dom
@@ -850,7 +892,7 @@ diff --git a/dom/clients/ClientSource.h b/dom/clients/ClientSource.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/ClientSource.h
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,47 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -862,6 +904,7 @@ new file mode 100644
 +namespace mozilla {
 +namespace dom {
 +
++class ClientManager;
 +class ClientSourceChild;
 +class PClientManagerChild;
 +
@@ -872,10 +915,15 @@ new file mode 100644
 +
 +  NS_DECL_OWNINGTHREAD
 +
++  RefPtr<ClientManager> mManager;
 +  ClientSourceChild* mActor;
++  bool mShutdown;
++
++  void
++  Shutdown();
 +
 +  // Private methods called by ClientManager
-+  ClientSource();
++  explicit ClientSource(ClientManager* aManager);
 +
 +  void
 +  Activate(PClientManagerChild* aActor);
