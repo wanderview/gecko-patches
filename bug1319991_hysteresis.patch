@@ -1,12 +1,12 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  f65ad27efe839ce9df0283840a1a40b4bbc9ead0
+# Parent  18b5a7a5d833f09b1f1e5cc45f4c0ff6235a1d5e
 Bug 1319991 Introduce hysteresis into window timer back pressure calculations. r=smaug
 
-diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
---- a/dom/base/nsGlobalWindow.cpp
-+++ b/dom/base/nsGlobalWindow.cpp
-@@ -3659,30 +3659,46 @@ namespace {
+diff --git a/dom/base/TimeoutManager.cpp b/dom/base/TimeoutManager.cpp
+--- a/dom/base/TimeoutManager.cpp
++++ b/dom/base/TimeoutManager.cpp
+@@ -50,30 +50,46 @@ namespace {
  const uint32_t kThrottledEventQueueBackPressure = 5000;
  
  // The amount of delay to apply to timers when back pressure is triggered.
@@ -54,16 +54,16 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
  
  } // anonymous namespace
  
- void
- nsGlobalWindow::MaybeApplyBackPressure()
- {
-@@ -3723,42 +3739,58 @@ nsGlobalWindow::MaybeApplyBackPressure()
- }
+ TimeoutManager::TimeoutManager(nsGlobalWindow& aWindow)
+   : mWindow(aWindow),
+     mTimeoutIdCounter(1),
+@@ -463,42 +479,60 @@ TimeoutManager::MaybeApplyBackPressure()
  
  void
- nsGlobalWindow::CancelOrUpdateBackPressure()
+ TimeoutManager::CancelOrUpdateBackPressure(nsGlobalWindow* aWindow)
  {
    MOZ_ASSERT(NS_IsMainThread());
+   MOZ_ASSERT(aWindow == &mWindow);
    MOZ_ASSERT(mBackPressureDelayMS > 0);
  
 -  // First, check to see if we are still in back pressure.  If we've dropped
@@ -71,13 +71,15 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 -  // must also reset timers to remove the old back pressure delay in order to
 -  // avoid out-of-order timer execution.
 +  // First, re-calculate the back pressure delay.
-   RefPtr<ThrottledEventQueue> queue = TabGroup()->GetThrottledEventQueue();
+   RefPtr<ThrottledEventQueue> queue = mWindow.TabGroup()->GetThrottledEventQueue();
 -  if (!queue || queue->Length() < kThrottledEventQueueBackPressure) {
 +  int32_t newBackPressureDelayMS =
 +    CalculateNewBackPressureDelayMS(queue ? queue->Length() : 0);
 +
 +  // If the delay has increased, then simply apply it.  Increasing the delay
-+  // does not risk re-ordering timers.
++  // does not risk re-ordering timers with similar parameters.  We want to
++  // extra careful not to re-order sequential calls to setTimeout(func, 0),
++  // for example.
 +  if (newBackPressureDelayMS > mBackPressureDelayMS) {
 +    mBackPressureDelayMS = newBackPressureDelayMS;
 +  }
@@ -99,9 +101,15 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 +    // timers to use the new value.  Otherwise we run the risk of executing
 +    // timer callbacks out-of-order.
      ResetTimersForThrottleReduction(oldBackPressureDelayMS);
--    return;
--  }
--
++  }
++
++  // If all of the back pressure delay has been removed then we no longer need
++  // to check back pressure updates.  We can simply return without scheduling
++  // another update runnable.
++  if (!mBackPressureDelayMS) {
+     return;
+   }
+ 
 -  // Otherwise we are still in back pressure mode.
 -
 -  // Re-calculate the back pressure delay.
@@ -116,15 +124,6 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 -  }
 -
 -  // Dispatch another runnable to update the back pressure state again.
-+  }
-+
-+  // If all of the back pressure delay has been removed then we no longer need
-+  // to check back pressure updates.  We can simply return without scheduling
-+  // another update runnable.
-+  if (!mBackPressureDelayMS) {
-+    return;
-+  }
-+
 +  // Otherwise, if there is a back pressure delay still in effect we need
 +  // queue a runnable to check if it can be reduced in the future.  Note
 +  // that this runnable is dispatched to the ThrottledEventQueue.  This
@@ -132,10 +131,10 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 +  // has been processed.  The next update will only keep back pressure if
 +  // more runnables continue to be dispatched to the queue.
    nsCOMPtr<nsIRunnable> r =
-     NewRunnableMethod(this, &nsGlobalWindow::CancelOrUpdateBackPressure);
+     NewNonOwningRunnableMethod<StorensRefPtrPassByPtr<nsGlobalWindow>>(this,
+       &TimeoutManager::CancelOrUpdateBackPressure, &mWindow);
    MOZ_ALWAYS_SUCCEEDS(queue->Dispatch(r.forget(), NS_DISPATCH_NORMAL));
  }
  
- //*****************************************************************************
- // nsGlobalWindow::nsIScriptObjectPrincipal
- //*****************************************************************************
+ bool
+ TimeoutManager::RescheduleTimeout(Timeout* aTimeout, const TimeStamp& now,
