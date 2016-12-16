@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  6dbc6e9f62a705d5f523cc750811bd01c8275ec6
+# Parent  5a536a16e33798fe7b16de35c968d5bc0cbf8448
 
 diff --git a/dom/base/nsDocument.cpp b/dom/base/nsDocument.cpp
 --- a/dom/base/nsDocument.cpp
@@ -24,7 +24,7 @@ diff --git a/dom/base/nsDocument.cpp b/dom/base/nsDocument.cpp
  #include "nsISpeculativeConnect.h"
  
  #include "mozilla/MediaManager.h"
-@@ -4493,29 +4495,31 @@ nsDocument::SetScriptGlobalObject(nsIScr
+@@ -4493,29 +4495,33 @@ nsDocument::SetScriptGlobalObject(nsIScr
      // Remove ourself from the list of clients.  We only register
      // content principal documents in this list.
      if (!nsContentUtils::IsSystemPrincipal(GetPrincipal()) &&
@@ -47,7 +47,9 @@ diff --git a/dom/base/nsDocument.cpp b/dom/base/nsDocument.cpp
      if (os) {
        os->AddObserver(this, "service-worker-get-client", /* ownsWeak */ false);
      }
-+    mClientSource = ClientManager::CreateSource();
++    mClientSource = ClientManager::CreateSource(ClientType::Window,
++                                                GetPrincipal(),
++                                                GetOriginalURI());
    }
  
    mScriptGlobalObject = aScriptGlobalObject;
@@ -229,11 +231,12 @@ diff --git a/dom/clients/manager/ClientIPCTypes.ipdlh b/dom/clients/manager/Clie
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientIPCTypes.ipdlh
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,24 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 +
++include PBackgroundSharedTypes;
 +using ClientType from "mozilla/dom/ClientType.h";
 +
 +namespace mozilla {
@@ -247,6 +250,8 @@ new file mode 100644
 +struct ClientSourceConstructorArgs
 +{
 +  ClientType type;
++  PrincipalInfo principal;
++  nsCString creationURL;
 +};
 +
 +} // namespace dom
@@ -255,7 +260,7 @@ diff --git a/dom/clients/manager/ClientManager.cpp b/dom/clients/manager/ClientM
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientManager.cpp
-@@ -0,0 +1,234 @@
+@@ -0,0 +1,264 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -278,6 +283,7 @@ new file mode 100644
 +
 +using mozilla::ipc::BackgroundChild;
 +using mozilla::ipc::PBackgroundChild;
++using mozilla::ipc::PrincipalInfo;
 +using mozilla::dom::workers::GetCurrentThreadWorkerPrivate;
 +using mozilla::dom::workers::Terminating;
 +using mozilla::dom::workers::WorkerHolderToken;
@@ -380,7 +386,9 @@ new file mode 100644
 +}
 +
 +UniquePtr<ClientSource>
-+ClientManager::CreateSourceInternal()
++ClientManager::CreateSourceInternal(ClientType aType,
++                                    const PrincipalInfo& aPrincipal,
++                                    const nsACString& aCreationURL)
 +{
 +  NS_ASSERT_OWNINGTHREAD(ClientManager);
 +
@@ -388,7 +396,8 @@ new file mode 100644
 +    return nullptr;
 +  }
 +
-+  UniquePtr<ClientSource> source(new ClientSource(this));
++  ClientSourceConstructorArgs args(aType, aPrincipal, nsCString(aCreationURL));
++  UniquePtr<ClientSource> source(new ClientSource(this, args));
 +
 +  if (mActor) {
 +    source->Activate(mActor);
@@ -482,10 +491,36 @@ new file mode 100644
 +
 +// static
 +UniquePtr<ClientSource>
-+ClientManager::CreateSource()
++ClientManager::CreateSource(ClientType aType, nsIPrincipal* aPrincipal,
++                            nsIURI* aCreationURL)
++{
++  MOZ_ASSERT(NS_IsMainThread());
++  MOZ_ASSERT(aPrincipal);
++  MOZ_ASSERT(aCreationURL);
++
++  PrincipalInfo principalInfo;
++  nsresult rv = PrincipalToPrincipalInfo(aPrincipal, &principalInfo);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return nullptr;
++  }
++
++  nsCString spec;
++  rv = aCreationURL->GetSpec(spec);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return nullptr;
++  }
++
++  RefPtr<ClientManager> mgr = GetOrCreateForCurrentThread();
++  return mgr->CreateSourceInternal(aType, principalInfo, spec);
++}
++
++// static
++UniquePtr<ClientSource>
++ClientManager::CreateSource(ClientType aType, const PrincipalInfo& aPrincipal,
++                            const nsACString& aCreationURL)
 +{
 +  RefPtr<ClientManager> mgr = GetOrCreateForCurrentThread();
-+  return mgr->CreateSourceInternal();
++  return mgr->CreateSourceInternal(aType, aPrincipal, aCreationURL);
 +}
 +
 +} // namespace dom
@@ -494,7 +529,7 @@ diff --git a/dom/clients/manager/ClientManager.h b/dom/clients/manager/ClientMan
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientManager.h
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,76 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -503,12 +538,17 @@ new file mode 100644
 +#ifndef _mozilla_dom_ClientManager_h
 +#define _mozilla_dom_ClientManager_h
 +
++#include "mozilla/dom/ClientType.h"
 +#include "mozilla/dom/PClientManager.h"
 +#include "nsTArray.h"
++
++class nsIPrincipal;
++class nsIURI;
 +
 +namespace mozilla {
 +namespace ipc {
 +class PBackgroundChild;
++class PrincipalInfo;
 +} // namespace ipc
 +namespace dom {
 +
@@ -532,7 +572,9 @@ new file mode 100644
 +  Shutdown();
 +
 +  UniquePtr<ClientSource>
-+  CreateSourceInternal();
++  CreateSourceInternal(ClientType aType,
++                       const mozilla::ipc::PrincipalInfo& aPrincipal,
++                       const nsACString& aCreationURL);
 +
 +  void
 +  PBackgroundActorCreated(mozilla::ipc::PBackgroundChild* aActor);
@@ -550,7 +592,12 @@ new file mode 100644
 +  GetOrCreateForCurrentThread();
 +
 +  static UniquePtr<ClientSource>
-+  CreateSource();
++  CreateSource(ClientType aType, nsIPrincipal* aPrincipal,
++               nsIURI* aCreationURL);
++
++  static UniquePtr<ClientSource>
++  CreateSource(ClientType aType, const mozilla::ipc::PrincipalInfo& aPrincipal,
++               const nsACString& aCreationURL);
 +
 +  NS_INLINE_DECL_REFCOUNTING(mozilla::dom::ClientManager)
 +};
@@ -936,7 +983,7 @@ diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientManagerService.cpp
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,78 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -996,8 +1043,9 @@ new file mode 100644
 +  AssertIsOnBackgroundThread();
 +  MOZ_ASSERT(aSource);
 +  MOZ_ASSERT(!mSourceList.Contains(aSource));
-+  printf_stderr("### ### [%p] ClientManagerService::AddSource(%p) list %lu to %lu\n",
-+                this, aSource, mSourceList.Length(), (mSourceList.Length() + 1));
++  printf_stderr("### ### [%p] ClientManagerService::AddSource(%p) list %lu to %lu - %s\n",
++                this, aSource, mSourceList.Length(), (mSourceList.Length() + 1),
++                aSource->CreationURL().get());
 +  mSourceList.AppendElement(aSource);
 +}
 +
@@ -1006,8 +1054,9 @@ new file mode 100644
 +{
 +  AssertIsOnBackgroundThread();
 +  MOZ_ASSERT(aSource);
-+  printf_stderr("### ### [%p] ClientManagerService::RemoveSource(%p) list %lu to %lu\n",
-+                this, aSource, mSourceList.Length(), (mSourceList.Length() - 1));
++  printf_stderr("### ### [%p] ClientManagerService::RemoveSource(%p) list %lu to %lu - %s\n",
++                this, aSource, mSourceList.Length(), (mSourceList.Length() - 1),
++                aSource->CreationURL().get());
 +  MOZ_ALWAYS_TRUE(mSourceList.RemoveElement(aSource));
 +}
 +
@@ -1063,7 +1112,7 @@ diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSo
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientSource.cpp
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,78 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1094,8 +1143,10 @@ new file mode 100644
 +  mManager = nullptr;
 +}
 +
-+ClientSource::ClientSource(ClientManager* aManager)
++ClientSource::ClientSource(ClientManager* aManager,
++                           const ClientSourceConstructorArgs& aArgs)
 +  : mManager(aManager)
++  , mArgs(aArgs)
 +  , mActor(nullptr)
 +  , mShutdown(false)
 +{
@@ -1112,10 +1163,7 @@ new file mode 100644
 +    return;
 +  }
 +
-+  // TODO
-+  ClientSourceConstructorArgs args;
-+
-+  PClientSourceChild* actor = aActor->SendPClientSourceConstructor(args);
++  PClientSourceChild* actor = aActor->SendPClientSourceConstructor(mArgs);
 +  if (!actor) {
 +    Shutdown();
 +    return;
@@ -1147,7 +1195,7 @@ diff --git a/dom/clients/manager/ClientSource.h b/dom/clients/manager/ClientSour
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientSource.h
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,50 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1161,6 +1209,7 @@ new file mode 100644
 +
 +class ClientManager;
 +class ClientSourceChild;
++class ClientSourceConstructorArgs;
 +class PClientManagerChild;
 +
 +class ClientSource final
@@ -1171,6 +1220,7 @@ new file mode 100644
 +  NS_DECL_OWNINGTHREAD
 +
 +  RefPtr<ClientManager> mManager;
++  const ClientSourceConstructorArgs mArgs;
 +  ClientSourceChild* mActor;
 +  bool mShutdown;
 +
@@ -1178,7 +1228,8 @@ new file mode 100644
 +  Shutdown();
 +
 +  // Private methods called by ClientManager
-+  explicit ClientSource(ClientManager* aManager);
++  ClientSource(ClientManager* aManager,
++               const ClientSourceConstructorArgs& aArgs);
 +
 +  void
 +  Activate(PClientManagerChild* aActor);
@@ -1307,7 +1358,7 @@ diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/Cl
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientSourceParent.cpp
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,53 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1336,7 +1387,8 @@ new file mode 100644
 +}
 +
 +ClientSourceParent::ClientSourceParent(const ClientSourceConstructorArgs& aArgs)
-+  : mService(ClientManagerService::GetOrCreateInstance())
++  : mArgs(aArgs)
++  , mService(ClientManagerService::GetOrCreateInstance())
 +{
 +  mService->AddSource(this);
 +}
@@ -1346,13 +1398,25 @@ new file mode 100644
 +  mService->RemoveSource(this);
 +}
 +
++ClientType
++ClientSourceParent::Type() const
++{
++  return mArgs.type();
++}
++
++const nsCString&
++ClientSourceParent::CreationURL() const
++{
++  return mArgs.creationURL();
++}
++
 +} // namespace dom
 +} // namespace mozilla
 diff --git a/dom/clients/manager/ClientSourceParent.h b/dom/clients/manager/ClientSourceParent.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientSourceParent.h
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,43 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1371,6 +1435,7 @@ new file mode 100644
 +
 +class ClientSourceParent final : public PClientSourceParent
 +{
++  const ClientSourceConstructorArgs mArgs;
 +  RefPtr<ClientManagerService> mService;
 +
 +  // PClientSourceParent
@@ -1383,6 +1448,12 @@ new file mode 100644
 +public:
 +  explicit ClientSourceParent(const ClientSourceConstructorArgs& aArgs);
 +  ~ClientSourceParent();
++
++  ClientType
++  Type() const;
++
++  const nsCString&
++  CreationURL() const;
 +};
 +
 +} // namespace dom
@@ -1393,7 +1464,7 @@ diff --git a/dom/clients/manager/ClientType.h b/dom/clients/manager/ClientType.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientType.h
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,21 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1404,8 +1475,6 @@ new file mode 100644
 +
 +#include "ipc/IPCMessageUtils.h"
 +#include "mozilla/dom/ClientsBinding.h"
-+
-+// TODO: fix the header name here
 +
 +namespace IPC {
 +  template<>
@@ -1786,7 +1855,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
  #include "mozilla/dom/FunctionBinding.h"
  #include "mozilla/dom/IndexedDatabaseManager.h"
  #include "mozilla/dom/MessageEvent.h"
-@@ -4553,16 +4555,19 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
+@@ -4539,16 +4541,23 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
    MOZ_ASSERT(jsapi.cx() == aCx);
  
    EnableMemoryReporter();
@@ -1796,7 +1865,11 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
    Maybe<JSAutoCompartment> workerCompartment;
  
 +  MOZ_ASSERT(!mClientSource);
-+  mClientSource = ClientManager::CreateSource();
++  // TODO: fix specific worker type
++  // TODO: fix late principal/url setting
++  mClientSource = ClientManager::CreateSource(ClientType::Worker,
++                                              GetPrincipalInfo(),
++                                              NS_ConvertUTF16toUTF8(ScriptURL()));
 +
    for (;;) {
      Status currentStatus, previousStatus;
@@ -1806,7 +1879,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
      {
        MutexAutoLock lock(mMutex);
        previousStatus = mStatus;
-@@ -4606,16 +4611,18 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
+@@ -4592,16 +4601,18 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
        }
  
        // If we're supposed to die then we should exit the loop.
@@ -1825,7 +1898,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
            MutexAutoLock lock(mMutex);
  
            mStatus = Dead;
-@@ -5106,16 +5113,19 @@ WorkerPrivate::ClearDebuggerEventQueue()
+@@ -5092,16 +5103,19 @@ WorkerPrivate::ClearDebuggerEventQueue()
  
  bool
  WorkerPrivate::FreezeInternal()
@@ -1845,7 +1918,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
  
    return true;
  }
-@@ -5127,16 +5137,20 @@ WorkerPrivate::ThawInternal()
+@@ -5113,16 +5127,24 @@ WorkerPrivate::ThawInternal()
  
    NS_ASSERTION(mFrozen, "Not yet frozen!");
  
@@ -1856,7 +1929,11 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
    mFrozen = false;
 +
 +  MOZ_ASSERT(!mClientSource);
-+  mClientSource = ClientManager::CreateSource();
++  // TODO: fix worker type
++  // TODO: make sure to re-use original client ID or re-use same ClientSource object
++  mClientSource = ClientManager::CreateSource(ClientType::Worker,
++                                              GetPrincipalInfo(),
++                                              NS_ConvertUTF16toUTF8(ScriptURL()));
 +
    return true;
  }
@@ -1887,7 +1964,7 @@ diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
  class WorkerDebuggerGlobalScope;
  class WorkerGlobalScope;
  } // namespace dom
-@@ -965,16 +966,17 @@ class WorkerPrivate : public WorkerPriva
+@@ -960,16 +961,17 @@ class WorkerPrivate : public WorkerPriva
    // fired on the main thread if the worker script fails to load
    nsCOMPtr<nsIRunnable> mLoadFailedRunnable;
  
