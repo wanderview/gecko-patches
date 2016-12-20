@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  d4b3146a5567a7ddbcdfa5244945db55616cb8d1
+# Parent  567894f026558e6dada617a3998f29aed06ac7d8
 
 diff --git a/dom/base/nsDocument.cpp b/dom/base/nsDocument.cpp
 --- a/dom/base/nsDocument.cpp
@@ -1100,7 +1100,7 @@ diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSo
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientSource.cpp
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,187 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1111,6 +1111,15 @@ new file mode 100644
 +
 +namespace mozilla {
 +namespace dom {
++
++class ClientSource::Op
++{
++public:
++  virtual ~Op() { }
++
++  virtual void
++  Execute(PClientSourceChild* aActor) = 0;
++};
 +
 +void
 +ClientSource::Shutdown()
@@ -1129,6 +1138,20 @@ new file mode 100644
 +
 +  mManager->ForgetSource(this);
 +  mManager = nullptr;
++}
++
++void
++ClientSource::MaybeExecuteOpList()
++{
++  NS_ASSERT_OWNINGTHREAD(ClientSource);
++  if (mShutdown || !mActor) {
++    return;
++  }
++  nsTArray<UniquePtr<Op>> opList;
++  mOpList.SwapElements(opList);
++  for (UniquePtr<Op>& o : opList) {
++    o->Execute(mActor);
++  }
 +}
 +
 +ClientSource::ClientSource(ClientManager* aManager,
@@ -1160,7 +1183,7 @@ new file mode 100644
 +  mActor = static_cast<ClientSourceChild*>(actor);
 +  mActor->SetSource(this);
 +
-+  // TODO: complete any pending operations
++  MaybeExecuteOpList();
 +}
 +
 +void
@@ -1177,13 +1200,99 @@ new file mode 100644
 +  Shutdown();
 +}
 +
++class ClientSource::ExecutionReadyOp final : public ClientSource::Op
++{
++  const nsCString mCreationURL;
++
++public:
++  explicit ExecutionReadyOp(const nsACString& aCreationURL)
++    : mCreationURL(aCreationURL)
++  { }
++
++  void
++  Execute(PClientSourceChild* aActor) override
++  {
++    MOZ_DIAGNOSTIC_ASSERT(aActor);
++    aActor->SendExecutionReady(mCreationURL);
++  }
++};
++
++void
++ClientSource::ExecutionReady(const nsACString& aCreationURL)
++{
++  NS_ASSERT_OWNINGTHREAD(ClientSource);
++  if (mShutdown) {
++    return;
++  }
++  mOpList.AppendElement(new ExecutionReadyOp(aCreationURL));
++  MaybeExecuteOpList();
++}
++
++template<typename Callable>
++class ClientSource::OpImpl final : public ClientSource::Op
++{
++  Callable mCallable;
++
++  explicit OpImpl(Callable aCallable)
++    : mCallable(aCallable)
++  { }
++
++public:
++  template<typename C>
++  static UniquePtr<OpImpl<C>>
++  Create(C aCallable)
++  {
++    return UniquePtr<OpImpl<C>>(new OpImpl<C>(aCallable));
++  }
++
++  void
++  Execute(PClientSourceChild* aActor) override
++  {
++    MOZ_DIAGNOSTIC_ASSERT(aActor);
++    mCallable(aActor);
++  }
++};
++
++template<typename Callable>
++struct ClientSource::Foo final
++{
++  Callable mCallable;
++
++public:
++  explicit Foo(Callable aCallable)
++    : mCallable(aCallable)
++  {
++    MOZ_ASSERT(mCallable);
++  }
++
++  void
++  Execute(PClientSourceChild* aActor)
++  {
++    MOZ_DIAGNOSTIC_ASSERT(aActor);
++    mCallable(aActor);
++  }
++};
++
++void
++ClientSource::Freeze()
++{
++  NS_ASSERT_OWNINGTHREAD(ClientSource);
++  OpImpl::Create([](PClientSourceChild* aActor) {
++  });
++}
++
++void
++ClientSource::Thaw()
++{
++}
++
 +} // namespace dom
 +} // namespace mozilla
 diff --git a/dom/clients/manager/ClientSource.h b/dom/clients/manager/ClientSource.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientSource.h
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,67 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1202,6 +1311,10 @@ new file mode 100644
 +
 +class ClientSource final
 +{
++  class Op;
++  template<typename Callable> struct Foo;
++  template<typename Callable> class OpImpl;
++  class ExecutionReadyOp;
 +  friend class ClientManager;
 +  friend class ClientSourceChild;
 +
@@ -1209,11 +1322,15 @@ new file mode 100644
 +
 +  RefPtr<ClientManager> mManager;
 +  const ClientSourceConstructorArgs mArgs;
++  nsTArray<UniquePtr<Op>> mOpList;
 +  ClientSourceChild* mActor;
 +  bool mShutdown;
 +
 +  void
 +  Shutdown();
++
++  void
++  MaybeExecuteOpList();
 +
 +  // Private methods called by ClientManager
 +  ClientSource(ClientManager* aManager,
@@ -1228,6 +1345,15 @@ new file mode 100644
 +
 +public:
 +  ~ClientSource();
++
++  void
++  ExecutionReady(const nsACString& aCreationURL);
++
++  void
++  Freeze();
++
++  void
++  Thaw();
 +};
 +
 +} // namespace dom
@@ -1346,7 +1472,7 @@ diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/Cl
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientSourceParent.cpp
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,85 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1380,6 +1506,20 @@ new file mode 100644
 +  mCreationURL = aCreationURL;
 +  return IPC_OK();
 +};
++
++IPCResult
++ClientSourceParent::RecvFreeze()
++{
++  // TODO: impl freeze
++  return IPC_OK();
++}
++
++IPCResult
++ClientSourceParent::RecvThaw()
++{
++  // TODO: impl thaw
++  return IPC_OK();
++}
 +
 +void
 +ClientSourceParent::ActorDestroy(ActorDestroyReason aReason)
@@ -1422,7 +1562,7 @@ diff --git a/dom/clients/manager/ClientSourceParent.h b/dom/clients/manager/Clie
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientSourceParent.h
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,56 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1451,6 +1591,12 @@ new file mode 100644
 +
 +  mozilla::ipc::IPCResult
 +  RecvExecutionReady(const nsCString& aCreationURL) override;
++
++  mozilla::ipc::IPCResult
++  RecvFreeze() override;
++
++  mozilla::ipc::IPCResult
++  RecvThaw() override;
 +
 +  void
 +  ActorDestroy(ActorDestroyReason aReason) override;
@@ -1566,7 +1712,7 @@ diff --git a/dom/clients/manager/PClientSource.ipdl b/dom/clients/manager/PClien
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/PClientSource.ipdl
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,25 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this file,
 + * You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -1583,6 +1729,8 @@ new file mode 100644
 +parent:
 +  async Teardown();
 +  async ExecutionReady(nsCString aCreationURL);
++  async Freeze();
++  async Thaw();
 +
 +child:
 +  async __delete__();
@@ -1907,7 +2055,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
                                   DebuggerScript, rv);
      rv.WouldReportJSException();
      // Explicitly ignore NS_BINDING_ABORTED on rv.  Or more precisely, still
-@@ -4539,16 +4545,18 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
+@@ -4540,16 +4546,18 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
    MOZ_ASSERT(jsapi.cx() == aCx);
  
    EnableMemoryReporter();
@@ -1926,7 +2074,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
      {
        MutexAutoLock lock(mMutex);
        previousStatus = mStatus;
-@@ -4592,16 +4600,18 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
+@@ -4593,16 +4601,18 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
        }
  
        // If we're supposed to die then we should exit the loop.
@@ -1945,7 +2093,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
            MutexAutoLock lock(mMutex);
  
            mStatus = Dead;
-@@ -4742,16 +4752,25 @@ WorkerPrivate::DispatchToMainThread(nsIR
+@@ -4743,16 +4753,25 @@ WorkerPrivate::DispatchToMainThread(nsIR
  nsresult
  WorkerPrivate::DispatchToMainThread(already_AddRefed<nsIRunnable> aRunnable,
                                      uint32_t aFlags)
@@ -1971,7 +2119,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
    // periodically (PERIODIC_GC_TIMER_DELAY_SEC) while the worker is running.
    // Once the worker goes idle we set a short (IDLE_GC_TIMER_DELAY_SEC) timer to
    // run a shrinking GC. If the worker receives more messages then the short
-@@ -5092,16 +5111,18 @@ WorkerPrivate::ClearDebuggerEventQueue()
+@@ -5093,16 +5112,18 @@ WorkerPrivate::ClearDebuggerEventQueue()
  
  bool
  WorkerPrivate::FreezeInternal()
@@ -1990,7 +2138,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
  
    return true;
  }
-@@ -5113,16 +5134,19 @@ WorkerPrivate::ThawInternal()
+@@ -5114,16 +5135,19 @@ WorkerPrivate::ThawInternal()
  
    NS_ASSERTION(mFrozen, "Not yet frozen!");
  
@@ -2049,7 +2197,7 @@ diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
    bool mPeriodicGCTimerRunning;
    bool mIdleGCTimerRunning;
    bool mWorkerScriptExecutedSuccessfully;
-@@ -1362,16 +1364,19 @@ public:
+@@ -1379,16 +1381,19 @@ public:
    nsresult
    DispatchToMainThread(nsIRunnable* aRunnable,
                         uint32_t aFlags = NS_DISPATCH_NORMAL);
