@@ -1,0 +1,141 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  63ad56438630b389efdb01632e153143cf3008ec
+Bug 1330432 Expose worker GC timer values as prefs and tune them for fennec. r=baku
+
+diff --git a/dom/workers/WorkerPrefs.h b/dom/workers/WorkerPrefs.h
+--- a/dom/workers/WorkerPrefs.h
++++ b/dom/workers/WorkerPrefs.h
+@@ -35,16 +35,18 @@ WORKER_SIMPLE_PREF("dom.serviceWorkers.e
+ WORKER_SIMPLE_PREF("dom.serviceWorkers.testing.enabled", ServiceWorkersTestingEnabled, SERVICEWORKERS_TESTING_ENABLED)
+ WORKER_SIMPLE_PREF("dom.serviceWorkers.openWindow.enabled", OpenWindowEnabled, OPEN_WINDOW_ENABLED)
+ WORKER_SIMPLE_PREF("dom.storageManager.enabled", StorageManagerEnabled, STORAGEMANAGER_ENABLED)
+ WORKER_SIMPLE_PREF("dom.push.enabled", PushEnabled, PUSH_ENABLED)
+ WORKER_SIMPLE_PREF("dom.requestcontext.enabled", RequestContextEnabled, REQUESTCONTEXT_ENABLED)
+ WORKER_SIMPLE_PREF("gfx.offscreencanvas.enabled", OffscreenCanvasEnabled, OFFSCREENCANVAS_ENABLED)
+ WORKER_SIMPLE_PREF("dom.webkitBlink.dirPicker.enabled", WebkitBlinkDirectoryPickerEnabled, DOM_WEBKITBLINK_DIRPICKER_WEBKITBLINK)
+ WORKER_SIMPLE_PREF("dom.netinfo.enabled", NetworkInformationEnabled, NETWORKINFORMATION_ENABLED)
++WORKER_SIMPLE_PREF("dom.worker.gc.interval", GCInterval, GC_INTERVAL)
++WORKER_SIMPLE_PREF("dom.worker.idle.gc.delay", IdleGCDelay, IDLE_GC_DELAY)
+ WORKER_PREF("dom.workers.latestJSVersion", JSVersionChanged)
+ WORKER_PREF("intl.accept_languages", PrefLanguagesChanged)
+ WORKER_PREF("general.appname.override", AppNameOverrideChanged)
+ WORKER_PREF("general.appversion.override", AppVersionOverrideChanged)
+ WORKER_PREF("general.platform.override", PlatformOverrideChanged)
+ #ifdef JS_GC_ZEAL
+ WORKER_PREF("dom.workers.options.gcZeal", LoadGCZealOptions)
+ #endif
+diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
+--- a/dom/workers/WorkerPrivate.cpp
++++ b/dom/workers/WorkerPrivate.cpp
+@@ -108,22 +108,16 @@
+ #include "SharedWorker.h"
+ #include "WorkerDebuggerManager.h"
+ #include "WorkerHolder.h"
+ #include "WorkerNavigator.h"
+ #include "WorkerRunnable.h"
+ #include "WorkerScope.h"
+ #include "WorkerThread.h"
+ 
+-// JS_MaybeGC will run once every second during normal execution.
+-#define PERIODIC_GC_TIMER_DELAY_SEC 1
+-
+-// A shrinking GC will run five seconds after the last event is processed.
+-#define IDLE_GC_TIMER_DELAY_SEC 5
+-
+ #define PREF_WORKERS_ENABLED "dom.workers.enabled"
+ 
+ static mozilla::LazyLogModule sWorkerPrivateLog("WorkerPrivate");
+ static mozilla::LazyLogModule sWorkerTimeoutsLog("WorkerTimeouts");
+ 
+ mozilla::LogModule*
+ WorkerLog()
+ {
+@@ -4750,18 +4744,18 @@ WorkerPrivate::DispatchToMainThread(alre
+ }
+ 
+ void
+ WorkerPrivate::InitializeGCTimers()
+ {
+   AssertIsOnWorkerThread();
+ 
+   // We need a timer for GC. The basic plan is to run a non-shrinking GC
+-  // periodically (PERIODIC_GC_TIMER_DELAY_SEC) while the worker is running.
+-  // Once the worker goes idle we set a short (IDLE_GC_TIMER_DELAY_SEC) timer to
++  // periodically (dom.workers.gc.interval) while the worker is running.
++  // Once the worker goes idle we set a short (dom.workers.idle.gc.delay) timer to
+   // run a shrinking GC. If the worker receives more messages then the short
+   // timer is canceled and the periodic timer resumes.
+   mGCTimer = do_CreateInstance(NS_TIMER_CONTRACTID);
+   MOZ_ASSERT(mGCTimer);
+ 
+   RefPtr<GarbageCollectRunnable> runnable =
+     new GarbageCollectRunnable(this, false, false);
+   mPeriodicGCTimerTarget = new TimerThreadEventTarget(this, runnable);
+@@ -4803,22 +4797,22 @@ WorkerPrivate::SetGCTimerMode(GCTimerMod
+   MOZ_ASSERT(aMode == PeriodicTimer || aMode == IdleTimer);
+ 
+   nsIEventTarget* target;
+   uint32_t delay;
+   int16_t type;
+ 
+   if (aMode == PeriodicTimer) {
+     target = mPeriodicGCTimerTarget;
+-    delay = PERIODIC_GC_TIMER_DELAY_SEC * 1000;
++    delay = GCInterval() ? GCInterval() : 1000;
+     type = nsITimer::TYPE_REPEATING_SLACK;
+   }
+   else {
+     target = mIdleGCTimerTarget;
+-    delay = IDLE_GC_TIMER_DELAY_SEC * 1000;
++    delay = IdleGCDelay() ? IdleGCDelay() : 5000;
+     type = nsITimer::TYPE_ONE_SHOT;
+   }
+ 
+   MOZ_ALWAYS_SUCCEEDS(mGCTimer->SetTarget(target));
+   MOZ_ALWAYS_SUCCEEDS(
+     mGCTimer->InitWithNamedFuncCallback(DummyCallback, nullptr, delay, type,
+                                         "dom::workers::DummyCallback(2)"));
+ 
+diff --git a/mobile/android/app/mobile.js b/mobile/android/app/mobile.js
+--- a/mobile/android/app/mobile.js
++++ b/mobile/android/app/mobile.js
+@@ -924,8 +924,11 @@ pref("dom.presentation.receiver.enabled"
+ pref("dom.audiochannel.audioCompeting", true);
+ pref("dom.audiochannel.mediaControl", true);
+ 
+ // Space separated list of URLS that are allowed to send objects (instead of
+ // only strings) through webchannels. This list is duplicated in browser/app/profile/firefox.js
+ pref("webchannel.allowObject.urlWhitelist", "https://accounts.firefox.com https://content.cdn.mozilla.net https://input.mozilla.org https://support.mozilla.org https://install.mozilla.org");
+ 
+ pref("media.openUnsupportedTypeWithExternalApp", true);
++
++// How often to perform a non-shrinking GC during normal worker operation.
++pref("dom.workers.gc.interval", 2500);
+diff --git a/modules/libpref/init/all.js b/modules/libpref/init/all.js
+--- a/modules/libpref/init/all.js
++++ b/modules/libpref/init/all.js
+@@ -144,16 +144,23 @@ pref("dom.select_events.enabled", true);
+ pref("dom.select_events.textcontrols.enabled", true);
+ #else
+ pref("dom.select_events.textcontrols.enabled", false);
+ #endif
+ 
+ // Whether or not Web Workers are enabled.
+ pref("dom.workers.enabled", true);
+ 
++// How often to perform a non-shrinking GC during normal worker operation.
++pref("dom.workers.gc.interval", 1000);
++
++// How long to wait in ms after the last worker event before triggering a
++// shrinking GC.
++pref("dom.workers.idle.gc.delay", 5000);
++
+ // The number of workers per domain allowed to run concurrently.
+ // We're going for effectively infinite, while preventing abuse.
+ pref("dom.workers.maxPerDomain", 512);
+ 
+ pref("dom.serviceWorkers.enabled", false);
+ 
+ // The amount of time (milliseconds) service workers keep running after each event.
+ pref("dom.serviceWorkers.idle_timeout", 30000);

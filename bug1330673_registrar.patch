@@ -1,0 +1,169 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  9a8ae1d5075576f165616f03c6e113c3047aba61
+Bug 1330673 Gracefully handle ServiceWorkerRegistrar not being active. r=baku
+
+diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
+--- a/dom/workers/ServiceWorkerManager.cpp
++++ b/dom/workers/ServiceWorkerManager.cpp
+@@ -241,31 +241,30 @@ ServiceWorkerManager::ServiceWorkerManag
+ ServiceWorkerManager::~ServiceWorkerManager()
+ {
+   // The map will assert if it is not empty when destroyed.
+   mRegistrationInfos.Clear();
+   MOZ_ASSERT(!mActor);
+ }
+ 
+ void
+-ServiceWorkerManager::Init()
++ServiceWorkerManager::Init(ServiceWorkerRegistrar* aRegistrar)
+ {
+   nsCOMPtr<nsIObserverService> obs = mozilla::services::GetObserverService();
+   if (obs) {
+     DebugOnly<nsresult> rv;
+     rv = obs->AddObserver(this, NS_XPCOM_SHUTDOWN_OBSERVER_ID, false /* ownsWeak */);
+     MOZ_ASSERT(NS_SUCCEEDED(rv));
+   }
+ 
+   if (XRE_IsParentProcess()) {
+-    RefPtr<ServiceWorkerRegistrar> swr = ServiceWorkerRegistrar::Get();
+-    MOZ_ASSERT(swr);
++    MOZ_DIAGNOSTIC_ASSERT(aRegistrar);
+ 
+     nsTArray<ServiceWorkerRegistrationData> data;
+-    swr->GetRegistrations(data);
++    aRegistrar->GetRegistrations(data);
+     LoadRegistrations(data);
+ 
+     if (obs) {
+       DebugOnly<nsresult> rv;
+       rv = obs->AddObserver(this, PURGE_SESSION_HISTORY, false /* ownsWeak */);
+       MOZ_ASSERT(NS_SUCCEEDED(rv));
+       rv = obs->AddObserver(this, PURGE_DOMAIN_DATA, false /* ownsWeak */);
+       MOZ_ASSERT(NS_SUCCEEDED(rv));
+@@ -1340,22 +1339,33 @@ ServiceWorkerManager::GetOrCreateJobQueu
+ /* static */
+ already_AddRefed<ServiceWorkerManager>
+ ServiceWorkerManager::GetInstance()
+ {
+   // Note: We don't simply check gInstance for null-ness here, since otherwise
+   // this can resurrect the ServiceWorkerManager pretty late during shutdown.
+   static bool firstTime = true;
+   if (firstTime) {
++    RefPtr<ServiceWorkerRegistrar> swr;
++
++    // Don't create the ServiceWorkerManager until the ServiceWorkerRegistrar is
++    // initialized.
++    if (XRE_IsParentProcess()) {
++      swr = ServiceWorkerRegistrar::Get();
++      if (!swr) {
++        return nullptr;
++      }
++    }
++
+     firstTime = false;
+ 
+     AssertIsOnMainThread();
+ 
+     gInstance = new ServiceWorkerManager();
+-    gInstance->Init();
++    gInstance->Init(swr);
+     ClearOnShutdown(&gInstance);
+   }
+   RefPtr<ServiceWorkerManager> copy = gInstance.get();
+   return copy.forget();
+ }
+ 
+ void
+ ServiceWorkerManager::FinishFetch(ServiceWorkerRegistrationInfo* aRegistration)
+diff --git a/dom/workers/ServiceWorkerManager.h b/dom/workers/ServiceWorkerManager.h
+--- a/dom/workers/ServiceWorkerManager.h
++++ b/dom/workers/ServiceWorkerManager.h
+@@ -36,16 +36,17 @@
+ class nsIConsoleReportCollector;
+ 
+ namespace mozilla {
+ 
+ class PrincipalOriginAttributes;
+ 
+ namespace dom {
+ 
++class ServiceWorkerRegistrar;
+ class ServiceWorkerRegistrationListener;
+ 
+ namespace workers {
+ 
+ class ServiceWorkerClientInfo;
+ class ServiceWorkerInfo;
+ class ServiceWorkerJobQueue;
+ class ServiceWorkerManagerChild;
+@@ -323,17 +324,17 @@ public:
+   void
+   WorkerIsIdle(ServiceWorkerInfo* aWorker);
+ 
+ private:
+   ServiceWorkerManager();
+   ~ServiceWorkerManager();
+ 
+   void
+-  Init();
++  Init(ServiceWorkerRegistrar* aRegistrar);
+ 
+   already_AddRefed<ServiceWorkerJobQueue>
+   GetOrCreateJobQueue(const nsACString& aOriginSuffix,
+                       const nsACString& aScope);
+ 
+   void
+   MaybeRemoveRegistrationInfo(const nsACString& aScopeKey);
+ 
+diff --git a/dom/workers/ServiceWorkerManagerParent.cpp b/dom/workers/ServiceWorkerManagerParent.cpp
+--- a/dom/workers/ServiceWorkerManagerParent.cpp
++++ b/dom/workers/ServiceWorkerManagerParent.cpp
+@@ -39,17 +39,22 @@ public:
+   NS_IMETHOD
+   Run() override
+   {
+     AssertIsInMainProcess();
+     AssertIsOnBackgroundThread();
+ 
+     RefPtr<dom::ServiceWorkerRegistrar> service =
+       dom::ServiceWorkerRegistrar::Get();
+-    MOZ_ASSERT(service);
++
++    // Shutdown during the process of trying to update the registrar.  Give
++    // up on this modification.
++    if (!service) {
++      return NS_OK;
++    }
+ 
+     service->RegisterServiceWorker(mData);
+ 
+     RefPtr<ServiceWorkerManagerService> managerService =
+       ServiceWorkerManagerService::Get();
+     if (managerService) {
+       managerService->PropagateRegistration(mParentID, mData);
+     }
+@@ -79,17 +84,22 @@ public:
+   NS_IMETHOD
+   Run() override
+   {
+     AssertIsInMainProcess();
+     AssertIsOnBackgroundThread();
+ 
+     RefPtr<dom::ServiceWorkerRegistrar> service =
+       dom::ServiceWorkerRegistrar::Get();
+-    MOZ_ASSERT(service);
++
++    // Shutdown during the process of trying to update the registrar.  Give
++    // up on this modification.
++    if (!service) {
++      return NS_OK;
++    }
+ 
+     service->UnregisterServiceWorker(mPrincipalInfo,
+                                      NS_ConvertUTF16toUTF8(mScope));
+ 
+     RefPtr<ServiceWorkerManagerService> managerService =
+       ServiceWorkerManagerService::Get();
+     if (managerService) {
+       managerService->PropagateUnregister(mParentID, mPrincipalInfo,

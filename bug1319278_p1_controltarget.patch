@@ -1,0 +1,188 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  f80dc9fc34680105b714a49b4704bb843f5f7004
+Bug 1319278 P1 Add a WorkerControlEventTarget that executes runnables as WorkerControlRunnables. r=baku
+
+diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
+--- a/dom/workers/WorkerPrivate.cpp
++++ b/dom/workers/WorkerPrivate.cpp
+@@ -1604,16 +1604,158 @@ TimerThreadEventTarget::IsOnCurrentThrea
+     return rv;
+   }
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMPL_ISUPPORTS(TimerThreadEventTarget, nsIEventTarget)
+ 
++BEGIN_WORKERS_NAMESPACE
++
++class WorkerControlEventTarget final : public nsIEventTarget
++{
++  mozilla::Mutex mMutex;
++  WorkerPrivate* mWorkerPrivate;
++
++  ~WorkerControlEventTarget();
++
++public:
++  explicit WorkerControlEventTarget(WorkerPrivate* aWorkerPrivate);
++
++  void
++  ForgetWorkerPrivate(WorkerPrivate* aWorkerPrivate);
++
++  NS_DECL_THREADSAFE_ISUPPORTS
++  NS_DECL_NSIEVENTTARGET
++};
++
++NS_IMPL_ISUPPORTS(WorkerControlEventTarget, nsIEventTarget)
++
++WorkerControlEventTarget::~WorkerControlEventTarget()
++{
++}
++
++WorkerControlEventTarget::WorkerControlEventTarget(WorkerPrivate* aWorkerPrivate)
++  : mMutex("WorkerControlEventTarget")
++  , mWorkerPrivate(aWorkerPrivate)
++{
++  MOZ_DIAGNOSTIC_ASSERT(mWorkerPrivate);
++}
++
++void
++WorkerControlEventTarget::ForgetWorkerPrivate(WorkerPrivate* aWorkerPrivate)
++{
++  MutexAutoLock lock(mMutex);
++  MOZ_DIAGNOSTIC_ASSERT(mWorkerPrivate == aWorkerPrivate);
++  mWorkerPrivate = nullptr;
++}
++
++NS_IMETHODIMP
++WorkerControlEventTarget::DispatchFromScript(nsIRunnable* aRunnable, uint32_t aFlags)
++{
++  nsCOMPtr<nsIRunnable> runnable(aRunnable);
++  return Dispatch(runnable.forget(), aFlags);
++}
++
++END_WORKERS_NAMESPACE
++
++namespace {
++
++class WrappedControlRunnable final : public WorkerControlRunnable
++{
++  nsCOMPtr<nsIRunnable> mInner;
++
++  ~WrappedControlRunnable()
++  {
++  }
++
++public:
++  WrappedControlRunnable(WorkerPrivate* aWorkerPrivate,
++                         already_AddRefed<nsIRunnable>&& aInner)
++    : WorkerControlRunnable(aWorkerPrivate, WorkerThreadUnchangedBusyCount)
++    , mInner(aInner)
++  {
++  }
++
++  virtual bool
++  PreDispatch(WorkerPrivate* aWorkerPrivate) override
++  {
++    // Silence bad assertions, this can be dispatched from any thread.
++    return true;
++  }
++
++  virtual void
++  PostDispatch(WorkerPrivate* aWorkerPrivate, bool aDispatchResult) override
++  {
++    // Silence bad assertions, this can be dispatched from any thread.
++  }
++
++  bool
++  WorkerRun(JSContext* aCx, WorkerPrivate* aWorkerPrivate) override
++  {
++    mInner->Run();
++    return true;
++  }
++
++  nsresult
++  Cancel() override
++  {
++    // First run the default cancelation code
++    WorkerControlRunnable::Cancel();
++
++    // Attempt to cancel the inner runnable as well
++    nsCOMPtr<nsICancelableRunnable> cr = do_QueryInterface(mInner);
++    if (cr) {
++      return cr->Cancel();
++    }
++    return NS_OK;
++  }
++};
++
++} // anonymous namespace
++
++NS_IMETHODIMP
++WorkerControlEventTarget::Dispatch(already_AddRefed<nsIRunnable> aRunnable, uint32_t aFlags)
++{
++  MutexAutoLock lock(mMutex);
++
++  if (!mWorkerPrivate) {
++    return NS_ERROR_FAILURE;
++  }
++
++  RefPtr<WorkerControlRunnable> r = new WrappedControlRunnable(mWorkerPrivate,
++                                                               Move(aRunnable));
++  if (!r->Dispatch()) {
++    return NS_ERROR_FAILURE;
++  }
++
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++WorkerControlEventTarget::DelayedDispatch(already_AddRefed<nsIRunnable>, uint32_t)
++{
++  return NS_ERROR_NOT_IMPLEMENTED;
++}
++
++NS_IMETHODIMP
++WorkerControlEventTarget::IsOnCurrentThread(bool* aIsOnCurrentThread)
++{
++  MOZ_ASSERT(aIsOnCurrentThread);
++  MutexAutoLock lock(mMutex);
++
++  if (!mWorkerPrivate) {
++    *aIsOnCurrentThread = false;
++    return NS_OK;
++  }
++
++  return mWorkerPrivate->IsOnCurrentThread(aIsOnCurrentThread);
++}
++
+ WorkerLoadInfo::WorkerLoadInfo()
+   : mLoadFlags(nsIRequest::LOAD_NORMAL)
+   , mWindowID(UINT64_MAX)
+   , mServiceWorkerID(0)
+   , mReferrerPolicy(net::RP_Unset)
+   , mFromWindow(false)
+   , mEvalAllowed(false)
+   , mReportCSPViolations(false)
+diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
+--- a/dom/workers/WorkerPrivate.h
++++ b/dom/workers/WorkerPrivate.h
+@@ -80,16 +80,17 @@ struct PRThread;
+ class ReportDebuggerErrorRunnable;
+ class PostDebuggerMessageRunnable;
+ 
+ BEGIN_WORKERS_NAMESPACE
+ 
+ class AutoSyncLoopHolder;
+ class SharedWorker;
+ class ServiceWorkerClientInfo;
++class WorkerControlEventTarget;
+ class WorkerControlRunnable;
+ class WorkerDebugger;
+ class WorkerPrivate;
+ class WorkerRunnable;
+ class WorkerThread;
+ 
+ // SharedMutex is a small wrapper around an (internal) reference-counted Mutex
+ // object. It exists to avoid changing a lot of code to use Mutex* instead of
