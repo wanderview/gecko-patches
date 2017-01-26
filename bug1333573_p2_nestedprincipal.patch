@@ -1,0 +1,159 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  49c6e8d5895417188d891adc3b35f0feb349820e
+Bug 1333573 P2 Give nested workers an initial principal based on parent. r=baku
+
+diff --git a/dom/workers/ScriptLoader.cpp b/dom/workers/ScriptLoader.cpp
+--- a/dom/workers/ScriptLoader.cpp
++++ b/dom/workers/ScriptLoader.cpp
+@@ -870,24 +870,24 @@ private:
+     AssertIsOnMainThread();
+     MOZ_ASSERT(aIndex < mLoadInfos.Length());
+ 
+     WorkerPrivate* parentWorker = mWorkerPrivate->GetParent();
+ 
+     // Figure out which principal to use.
+     nsIPrincipal* principal = mWorkerPrivate->GetPrincipal();
+     nsCOMPtr<nsILoadGroup> loadGroup = mWorkerPrivate->GetLoadGroup();
+-    if (!principal) {
+-      NS_ASSERTION(parentWorker, "Must have a principal!");
+-      NS_ASSERTION(mIsMainScript, "Must have a principal for importScripts!");
++    if (!loadGroup) {
++      MOZ_DIAGNOSTIC_ASSERT(parentWorker);
++      MOZ_DIAGNOSTIC_ASSERT(mIsMainScript);
+ 
+-      principal = parentWorker->GetPrincipal();
+       loadGroup = parentWorker->GetLoadGroup();
+     }
+-    NS_ASSERTION(principal, "This should never be null here!");
++    MOZ_DIAGNOSTIC_ASSERT(principal);
++    MOZ_DIAGNOSTIC_ASSERT(loadGroup);
+     MOZ_ASSERT(NS_LoadGroupMatchesPrincipal(loadGroup, principal));
+ 
+     // Figure out our base URI.
+     nsCOMPtr<nsIURI> baseURI = GetBaseURI(mIsMainScript, mWorkerPrivate);
+ 
+     // May be null.
+     nsCOMPtr<nsIDocument> parentDoc = mWorkerPrivate->GetDocument();
+ 
+diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
+--- a/dom/workers/WorkerPrivate.cpp
++++ b/dom/workers/WorkerPrivate.cpp
+@@ -1679,16 +1679,25 @@ WorkerLoadInfo::StealFrom(WorkerLoadInfo
+   mXHRParamsAllowed = aOther.mXHRParamsAllowed;
+   mPrincipalIsSystem = aOther.mPrincipalIsSystem;
+   mStorageAllowed = aOther.mStorageAllowed;
+   mServiceWorkersTestingInWindow = aOther.mServiceWorkersTestingInWindow;
+   mOriginAttributes = aOther.mOriginAttributes;
+ }
+ 
+ void
++WorkerLoadInfo::CopyPrincipalFrom(const WorkerLoadInfo& aOther)
++{
++  // any thread
++  mPrincipal = aOther.mPrincipal;
++  mPrincipalIsSystem = aOther.mPrincipalIsSystem;
++  mOriginAttributes = aOther.mOriginAttributes;
++}
++
++void
+ WorkerLoadInfo::SetPrincipalOnMainThread(nsIPrincipal* aPrincipal,
+                                          const OriginAttributes& aAttributes)
+ {
+   AssertIsOnMainThread();
+   MOZ_DIAGNOSTIC_ASSERT(aPrincipal);
+ 
+   mPrincipal = new nsMainThreadPtrHolder<nsIPrincipal>(aPrincipal);
+   mPrincipalIsSystem = mPrincipal->GetIsSystemPrincipal();
+@@ -2359,16 +2368,23 @@ WorkerPrivateParent<Derived>::WorkerPriv
+ 
+ template <class Derived>
+ WorkerPrivateParent<Derived>::~WorkerPrivateParent()
+ {
+   DropJSObjects(this);
+ }
+ 
+ template <class Derived>
++void
++WorkerPrivateParent<Derived>::CopyPrincipalTo(WorkerLoadInfo& aLoadInfo) const
++{
++  aLoadInfo.CopyPrincipalFrom(mLoadInfo);
++}
++
++template <class Derived>
+ JSObject*
+ WorkerPrivateParent<Derived>::WrapObject(JSContext* aCx, JS::Handle<JSObject*> aGivenProto)
+ {
+   MOZ_ASSERT(!IsSharedWorker(),
+              "We should never wrap a WorkerPrivate for a SharedWorker");
+ 
+   AssertIsOnParentThread();
+ 
+@@ -4305,21 +4321,22 @@ WorkerPrivate::GetLoadInfo(JSContext* aC
+       parentStatus = aParent->mStatus;
+     }
+ 
+     if (parentStatus > Running) {
+       NS_ReleaseOnMainThread(loadInfo.mChannel.forget());
+       return NS_ERROR_FAILURE;
+     }
+ 
++    aParent->CopyPrincipalTo(loadInfo);
++
+     loadInfo.mDomain = aParent->Domain();
+     loadInfo.mFromWindow = aParent->IsFromWindow();
+     loadInfo.mWindowID = aParent->WindowID();
+     loadInfo.mStorageAllowed = aParent->IsStorageAllowed();
+-    loadInfo.mOriginAttributes = aParent->GetOriginAttributes();
+     loadInfo.mServiceWorkersTestingInWindow =
+       aParent->ServiceWorkersTestingInWindow();
+   } else {
+     AssertIsOnMainThread();
+ 
+     // Make sure that the IndexedDatabaseManager is set up
+     Unused << NS_WARN_IF(!IndexedDatabaseManager::GetOrCreate());
+ 
+diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
+--- a/dom/workers/WorkerPrivate.h
++++ b/dom/workers/WorkerPrivate.h
+@@ -226,16 +226,19 @@ protected:
+   WorkerPrivateParent(WorkerPrivate* aParent,
+                       const nsAString& aScriptURL, bool aIsChromeWorker,
+                       WorkerType aWorkerType,
+                       const nsACString& aSharedWorkerName,
+                       WorkerLoadInfo& aLoadInfo);
+ 
+   ~WorkerPrivateParent();
+ 
++  void
++  CopyPrincipalTo(WorkerLoadInfo& aLoadInfo) const;
++
+ private:
+   Derived*
+   ParentAsWorkerPrivate() const
+   {
+     return static_cast<Derived*>(const_cast<WorkerPrivateParent*>(this));
+   }
+ 
+   bool
+diff --git a/dom/workers/Workers.h b/dom/workers/Workers.h
+--- a/dom/workers/Workers.h
++++ b/dom/workers/Workers.h
+@@ -273,16 +273,17 @@ struct WorkerLoadInfo
+   bool mStorageAllowed;
+   bool mServiceWorkersTestingInWindow;
+   OriginAttributes mOriginAttributes;
+ 
+   WorkerLoadInfo();
+   ~WorkerLoadInfo();
+ 
+   void StealFrom(WorkerLoadInfo& aOther);
++  void CopyPrincipalFrom(const WorkerLoadInfo& aOther);
+   void SetPrincipalOnMainThread(nsIPrincipal* aPrincipal,
+                                 const OriginAttributes& aAttributes);
+ };
+ 
+ // All of these are implemented in RuntimeService.cpp
+ 
+ void
+ CancelWorkersForWindow(nsPIDOMWindowInner* aWindow);

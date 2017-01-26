@@ -1,29 +1,281 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  8ff550409e1d1f8b54f6f7f115545dbef857be0b
+# Parent  c989c7b352279925edf138373e4ca3f1540dbd5f
 Bug 1333573 P1 Make WorkerPrivate use an nsMainThreadPtrHandle for its nsIPrincipal. r=baku
 
+diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPrivate.cpp
+--- a/dom/workers/ServiceWorkerPrivate.cpp
++++ b/dom/workers/ServiceWorkerPrivate.cpp
+@@ -1826,22 +1826,22 @@ ServiceWorkerPrivate::SpawnWorkerIfNeede
+   info.mLoadFlags = mInfo->GetLoadFlags() |
+                     nsIChannel::LOAD_BYPASS_SERVICE_WORKER;
+ 
+   rv = info.mBaseURI->GetHost(info.mDomain);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return rv;
+   }
+ 
+-  info.mPrincipal = mInfo->GetPrincipal();
++  info.SetPrincipalOnMainThread(mInfo->GetPrincipal(),
++                                mInfo->GetOriginAttributes());
+ 
+   nsContentUtils::StorageAccess access =
+     nsContentUtils::StorageAllowedForPrincipal(info.mPrincipal);
+   info.mStorageAllowed = access > nsContentUtils::StorageAccess::ePrivateBrowsing;
+-  info.mOriginAttributes = mInfo->GetOriginAttributes();
+ 
+   nsCOMPtr<nsIContentSecurityPolicy> csp;
+   rv = info.mPrincipal->GetCsp(getter_AddRefs(csp));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return rv;
+   }
+ 
+   info.mCSP = csp;
+diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
+--- a/dom/workers/WorkerPrivate.cpp
++++ b/dom/workers/WorkerPrivate.cpp
+@@ -1635,17 +1635,18 @@ WorkerLoadInfo::StealFrom(WorkerLoadInfo
+ {
+   MOZ_ASSERT(!mBaseURI);
+   aOther.mBaseURI.swap(mBaseURI);
+ 
+   MOZ_ASSERT(!mResolvedScriptURI);
+   aOther.mResolvedScriptURI.swap(mResolvedScriptURI);
+ 
+   MOZ_ASSERT(!mPrincipal);
+-  aOther.mPrincipal.swap(mPrincipal);
++  mPrincipal = aOther.mPrincipal;
++  aOther.mPrincipal = nullptr;
+ 
+   MOZ_ASSERT(!mScriptContext);
+   aOther.mScriptContext.swap(mScriptContext);
+ 
+   MOZ_ASSERT(!mWindow);
+   aOther.mWindow.swap(mWindow);
+ 
+   MOZ_ASSERT(!mCSP);
+@@ -1677,16 +1678,28 @@ WorkerLoadInfo::StealFrom(WorkerLoadInfo
+   mReportCSPViolations = aOther.mReportCSPViolations;
+   mXHRParamsAllowed = aOther.mXHRParamsAllowed;
+   mPrincipalIsSystem = aOther.mPrincipalIsSystem;
+   mStorageAllowed = aOther.mStorageAllowed;
+   mServiceWorkersTestingInWindow = aOther.mServiceWorkersTestingInWindow;
+   mOriginAttributes = aOther.mOriginAttributes;
+ }
+ 
++void
++WorkerLoadInfo::SetPrincipalOnMainThread(nsIPrincipal* aPrincipal,
++                                         const OriginAttributes& aAttributes)
++{
++  AssertIsOnMainThread();
++  MOZ_DIAGNOSTIC_ASSERT(aPrincipal);
++
++  mPrincipal = new nsMainThreadPtrHolder<nsIPrincipal>(aPrincipal);
++  mPrincipalIsSystem = mPrincipal->GetIsSystemPrincipal();
++  mOriginAttributes = aAttributes;
++}
++
+ template <class Derived>
+ class WorkerPrivateParent<Derived>::EventTarget final
+   : public nsIEventTarget
+ {
+   // This mutex protects mWorkerPrivate and must be acquired *before* the
+   // WorkerPrivate's mutex whenever they must both be held.
+   mozilla::Mutex mMutex;
+   WorkerPrivate* mWorkerPrivate;
+@@ -2880,25 +2893,30 @@ WorkerPrivateParent<Derived>::ForgetOver
+ template <class Derived>
+ void
+ WorkerPrivateParent<Derived>::ForgetMainThreadObjects(
+                                       nsTArray<nsCOMPtr<nsISupports> >& aDoomed)
+ {
+   AssertIsOnParentThread();
+   MOZ_ASSERT(!mMainThreadObjectsForgotten);
+ 
+-  static const uint32_t kDoomedCount = 10;
++  // Clear nsMainThreadPtrHandle objects explicitly...  This is slightly
++  // less efficient since these require more main thread runnables.
++  mLoadInfo.mPrincipal = nullptr;
++
++  // Release the remaining objects in a shared array to minimize the
++  // number of main thread runnables.
++  static const uint32_t kDoomedCount = 9;
+ 
+   aDoomed.SetCapacity(kDoomedCount);
+ 
+   SwapToISupportsArray(mLoadInfo.mWindow, aDoomed);
+   SwapToISupportsArray(mLoadInfo.mScriptContext, aDoomed);
+   SwapToISupportsArray(mLoadInfo.mBaseURI, aDoomed);
+   SwapToISupportsArray(mLoadInfo.mResolvedScriptURI, aDoomed);
+-  SwapToISupportsArray(mLoadInfo.mPrincipal, aDoomed);
+   SwapToISupportsArray(mLoadInfo.mChannel, aDoomed);
+   SwapToISupportsArray(mLoadInfo.mCSP, aDoomed);
+   SwapToISupportsArray(mLoadInfo.mLoadGroup, aDoomed);
+   SwapToISupportsArray(mLoadInfo.mLoadFailedAsyncRunnable, aDoomed);
+   SwapToISupportsArray(mLoadInfo.mInterfaceRequestor, aDoomed);
+   // Before adding anything here update kDoomedCount above!
+ 
+   MOZ_ASSERT(aDoomed.Length() == kDoomedCount);
+@@ -3489,18 +3507,18 @@ template <class Derived>
+ void
+ WorkerPrivateParent<Derived>::SetPrincipal(nsIPrincipal* aPrincipal,
+                                            nsILoadGroup* aLoadGroup)
+ {
+   AssertIsOnMainThread();
+   MOZ_ASSERT(NS_LoadGroupMatchesPrincipal(aLoadGroup, aPrincipal));
+   MOZ_ASSERT(!mLoadInfo.mPrincipalInfo);
+ 
+-  mLoadInfo.mPrincipal = aPrincipal;
+-  mLoadInfo.mPrincipalIsSystem = nsContentUtils::IsSystemPrincipal(aPrincipal);
++  mLoadInfo.SetPrincipalOnMainThread(aPrincipal,
++                                     nsContentUtils::GetOriginAttributes(aLoadGroup));
+ 
+   aPrincipal->GetCsp(getter_AddRefs(mLoadInfo.mCSP));
+ 
+   if (mLoadInfo.mCSP) {
+     mLoadInfo.mCSP->GetAllowsEval(&mLoadInfo.mReportCSPViolations,
+                                   &mLoadInfo.mEvalAllowed);
+     // Set ReferrerPolicy
+     bool hasReferrerPolicy = false;
+@@ -3515,18 +3533,16 @@ WorkerPrivateParent<Derived>::SetPrincip
+   } else {
+     mLoadInfo.mEvalAllowed = true;
+     mLoadInfo.mReportCSPViolations = false;
+   }
+ 
+   mLoadInfo.mLoadGroup = aLoadGroup;
+ 
+   mLoadInfo.mPrincipalInfo = new PrincipalInfo();
+-  mLoadInfo.mOriginAttributes = nsContentUtils::GetOriginAttributes(aLoadGroup);
+-
+   MOZ_ALWAYS_SUCCEEDS(
+     PrincipalToPrincipalInfo(aPrincipal, mLoadInfo.mPrincipalInfo));
+ }
+ 
+ template <class Derived>
+ void
+ WorkerPrivateParent<Derived>::UpdateOverridenLoadGroup(nsILoadGroup* aBaseLoadGroup)
+ {
+@@ -4318,20 +4334,22 @@ WorkerPrivate::GetLoadInfo(JSContext* aC
+       return NS_ERROR_DOM_SECURITY_ERR;
+     }
+ 
+     // Chrome callers (whether creating a ChromeWorker or Worker) always get the
+     // system principal here as they're allowed to load anything. The script
+     // loader will refuse to run any script that does not also have the system
+     // principal.
+     if (isChrome) {
+-      rv = ssm->GetSystemPrincipal(getter_AddRefs(loadInfo.mPrincipal));
++      nsCOMPtr<nsIPrincipal> systemPrincipal;
++      rv = ssm->GetSystemPrincipal(getter_AddRefs(systemPrincipal));
+       NS_ENSURE_SUCCESS(rv, rv);
+ 
+-      loadInfo.mPrincipalIsSystem = true;
++      loadInfo.SetPrincipalOnMainThread(systemPrincipal, OriginAttributes());
++      MOZ_DIAGNOSTIC_ASSERT(loadInfo.mPrincipalIsSystem);
+     }
+ 
+     // See if we're being called from a window.
+     nsCOMPtr<nsPIDOMWindowInner> globalWindow = aWindow;
+     if (!globalWindow) {
+       nsCOMPtr<nsIScriptGlobalObject> scriptGlobal =
+         nsJSUtils::GetStaticScriptGlobal(JS::CurrentGlobalOrNull(aCx));
+       if (scriptGlobal) {
+@@ -4370,17 +4388,18 @@ WorkerPrivate::GetLoadInfo(JSContext* aC
+       NS_ENSURE_TRUE(document, NS_ERROR_FAILURE);
+ 
+       loadInfo.mBaseURI = document->GetDocBaseURI();
+       loadInfo.mLoadGroup = document->GetDocumentLoadGroup();
+ 
+       // Use the document's NodePrincipal as our principal if we're not being
+       // called from chrome.
+       if (!loadInfo.mPrincipal) {
+-        loadInfo.mPrincipal = document->NodePrincipal();
++        loadInfo.SetPrincipalOnMainThread(document->NodePrincipal(),
++                                          nsContentUtils::GetOriginAttributes(document));
+         NS_ENSURE_TRUE(loadInfo.mPrincipal, NS_ERROR_FAILURE);
+ 
+         // We use the document's base domain to limit the number of workers
+         // each domain can create. For sandboxed documents, we use the domain
+         // of their first non-sandboxed document, walking up until we find
+         // one. If we can't find one, we fall back to using the GUID of the
+         // null principal as the base domain.
+         if (document->GetSandboxFlags() & SANDBOXED_ORIGIN) {
+@@ -4417,17 +4436,16 @@ WorkerPrivate::GetLoadInfo(JSContext* aC
+ 
+       loadInfo.mXHRParamsAllowed = perm == nsIPermissionManager::ALLOW_ACTION;
+ 
+       loadInfo.mFromWindow = true;
+       loadInfo.mWindowID = globalWindow->WindowID();
+       nsContentUtils::StorageAccess access =
+         nsContentUtils::StorageAllowedForWindow(globalWindow);
+       loadInfo.mStorageAllowed = access > nsContentUtils::StorageAccess::eDeny;
+-      loadInfo.mOriginAttributes = nsContentUtils::GetOriginAttributes(document);
+     } else {
+       // Not a window
+       MOZ_ASSERT(isChrome);
+ 
+       // We're being created outside of a window. Need to figure out the script
+       // that is creating us in order for us to use relative URIs later on.
+       JS::AutoFilename fileName;
+       if (JS::DescribeScriptedCaller(aCx, &fileName)) {
+@@ -4459,17 +4477,17 @@ WorkerPrivate::GetLoadInfo(JSContext* aC
+         if (NS_FAILED(rv)) {
+           return rv;
+         }
+       }
+       loadInfo.mXHRParamsAllowed = true;
+       loadInfo.mFromWindow = false;
+       loadInfo.mWindowID = UINT64_MAX;
+       loadInfo.mStorageAllowed = true;
+-      loadInfo.mOriginAttributes = OriginAttributes();
++      // principal and origin attributes set above
+     }
+ 
+     MOZ_ASSERT(loadInfo.mPrincipal);
+     MOZ_ASSERT(isChrome || !loadInfo.mDomain.IsEmpty());
+ 
+     if (!loadInfo.mLoadGroup || aLoadGroupBehavior == OverrideLoadGroup) {
+       OverrideLoadInfoLoadGroup(loadInfo);
+     }
 diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
 --- a/dom/workers/WorkerPrivate.h
 +++ b/dom/workers/WorkerPrivate.h
-@@ -581,17 +581,17 @@ public:
-   DOMHighResTimeStamp TimeStampToDOMHighRes(const TimeStamp& aTimeStamp) const
-   {
-     MOZ_ASSERT(!aTimeStamp.IsNull());
+@@ -584,33 +584,33 @@ public:
      TimeDuration duration = aTimeStamp - mCreationTimeStamp;
      return duration.ToMilliseconds();
    }
  
    nsIPrincipal*
--  GetPrincipal() const
-+  GetPrincipal()
+   GetPrincipal() const
    {
      AssertIsOnMainThread();
-     return mLoadInfo.mPrincipal;
+-    return mLoadInfo.mPrincipal;
++    return GetPrincipalDontAssertMainThread();
    }
  
    nsILoadGroup*
    GetLoadGroup() const
+   {
+     AssertIsOnMainThread();
+     return mLoadInfo.mLoadGroup;
+   }
+ 
+   // This method allows the principal to be retrieved off the main thread.
+   // Principals are main-thread objects so the caller must ensure that all
+   // access occurs on the main thread.
+   nsIPrincipal*
+   GetPrincipalDontAssertMainThread() const
+   {
+-      return mLoadInfo.mPrincipal;
++      return const_cast<nsIPrincipal*>(mLoadInfo.mPrincipal.get());
+   }
+ 
+   void
+   SetPrincipal(nsIPrincipal* aPrincipal, nsILoadGroup* aLoadGroup);
+ 
+   bool
+   UsesSystemPrincipal() const
    {
 diff --git a/dom/workers/Workers.h b/dom/workers/Workers.h
 --- a/dom/workers/Workers.h
@@ -65,3 +317,22 @@ diff --git a/dom/workers/Workers.h b/dom/workers/Workers.h
  
    // mLoadFailedAsyncRunnable will execute on main thread if script loading
    // fails during script loading.  If script loading is never started due to
+@@ -272,16 +273,18 @@ struct WorkerLoadInfo
+   bool mStorageAllowed;
+   bool mServiceWorkersTestingInWindow;
+   OriginAttributes mOriginAttributes;
+ 
+   WorkerLoadInfo();
+   ~WorkerLoadInfo();
+ 
+   void StealFrom(WorkerLoadInfo& aOther);
++  void SetPrincipalOnMainThread(nsIPrincipal* aPrincipal,
++                                const OriginAttributes& aAttributes);
+ };
+ 
+ // All of these are implemented in RuntimeService.cpp
+ 
+ void
+ CancelWorkersForWindow(nsPIDOMWindowInner* aWindow);
+ 
+ void
