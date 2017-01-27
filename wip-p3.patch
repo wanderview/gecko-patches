@@ -1,0 +1,163 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  5fa0df7806324df9574dff2f174c53618ec6a822
+Bug 1333573 P3 MOZ_DIAGNOSTIC_ASSERT that the final worker script principal has not changed. r=baku
+
+diff --git a/dom/workers/ScriptLoader.cpp b/dom/workers/ScriptLoader.cpp
+--- a/dom/workers/ScriptLoader.cpp
++++ b/dom/workers/ScriptLoader.cpp
+@@ -99,21 +99,26 @@ GetBaseURI(bool aIsMainScript, WorkerPri
+     baseURI = aWorkerPrivate->GetBaseURI();
+     NS_ASSERTION(baseURI, "Should have been set already!");
+   }
+ 
+   return baseURI;
+ }
+ 
+ nsresult
+-SetPrincipalFromChannel(WorkerPrivate* aWorkerPrivate, nsIChannel* aChannel)
++GetPrincipalAndLoadGroupFromChannel(WorkerPrivate* aWorkerPrivate,
++                                    nsIChannel* aChannel,
++                                    nsIPrincipal** aPrincipalOut,
++                                    nsILoadGroup** aLoadGroupOut)
+ {
+   AssertIsOnMainThread();
+   MOZ_DIAGNOSTIC_ASSERT(aWorkerPrivate);
+   MOZ_DIAGNOSTIC_ASSERT(aChannel);
++  MOZ_DIAGNOSTIC_ASSERT(aPrincipalOut);
++  MOZ_DIAGNOSTIC_ASSERT(aLoadGroupOut);
+ 
+   WorkerPrivate* parent = aWorkerPrivate->GetParent();
+ 
+   MOZ_DIAGNOSTIC_ASSERT(aWorkerPrivate->GetPrincipal() || parent);
+   nsCOMPtr<nsIPrincipal> loadPrincipal = aWorkerPrivate->GetPrincipal() ?
+                                          aWorkerPrivate->GetPrincipal() :
+                                          parent->GetPrincipal();
+   MOZ_DIAGNOSTIC_ASSERT(loadPrincipal);
+@@ -161,22 +166,84 @@ SetPrincipalFromChannel(WorkerPrivate* a
+       }
+     }
+   }
+ 
+   // The principal can change, but it should still match the original
+   // load group's appId and browser element flag.
+   MOZ_ASSERT(NS_LoadGroupMatchesPrincipal(channelLoadGroup, channelPrincipal));
+ 
+-  aWorkerPrivate->SetPrincipal(channelPrincipal, channelLoadGroup);
++  channelPrincipal.forget(aPrincipalOut);
++  channelLoadGroup.forget(aLoadGroupOut);
+ 
+   return NS_OK;
+ }
+ 
+ nsresult
++SetPrincipalFromChannel(WorkerPrivate* aWorkerPrivate, nsIChannel* aChannel)
++{
++  AssertIsOnMainThread();
++  MOZ_DIAGNOSTIC_ASSERT(aWorkerPrivate);
++  MOZ_DIAGNOSTIC_ASSERT(aChannel);
++
++  nsCOMPtr<nsIPrincipal> principal;
++  nsCOMPtr<nsILoadGroup> loadGroup;
++
++  nsresult rv = GetPrincipalAndLoadGroupFromChannel(aWorkerPrivate,
++                                                    aChannel,
++                                                    getter_AddRefs(principal),
++                                                    getter_AddRefs(loadGroup));
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  aWorkerPrivate->SetPrincipal(principal, loadGroup);
++
++  return NS_OK;
++}
++
++#if defined(DEBUG) || !defined(RELEASE_OR_BETA)
++// Verify that the final principal calculated from the loaded channel
++// matches what we set before the load.  Cross origin redirects should
++// not be possible do to our AsyncOpen2() security policies.  Even
++// HSTS upgrades should be blocked because AsyncOpen2() same origin checks
++// take place before the upgrade.
++bool
++ValidFinalPrincipal(WorkerPrivate* aWorkerPrivate, nsIChannel* aChannel)
++{
++  AssertIsOnMainThread();
++  MOZ_DIAGNOSTIC_ASSERT(aWorkerPrivate);
++  MOZ_DIAGNOSTIC_ASSERT(aChannel);
++
++  nsCOMPtr<nsIPrincipal> principal;
++  nsCOMPtr<nsILoadGroup> loadGroup;
++
++  nsresult rv = GetPrincipalAndLoadGroupFromChannel(aWorkerPrivate,
++                                                    aChannel,
++                                                    getter_AddRefs(principal),
++                                                    getter_AddRefs(loadGroup));
++  NS_ENSURE_SUCCESS(rv, false);
++
++  // Verify that the channel is still a null principal.  We don't care
++  // if these are the exact same null principal object, though.  From
++  // the worker's perspective its the same effect.
++  if (principal->GetIsNullPrincipal() &&
++      aWorkerPrivate->GetPrincipal()->GetIsNullPrincipal()) {
++    return true;
++  }
++
++  // Otherwise we require exact equality.  Redirects can happen, but they
++  // are not allowed to change our principal.
++  if (principal->Equals(aWorkerPrivate->GetPrincipal())) {
++    return true;
++  }
++
++  return false;
++}
++#endif // defined(DEBUG) || !defined(RELEASE_OR_BETA)
++
++nsresult
+ ChannelFromScriptURL(nsIPrincipal* principal,
+                      nsIURI* baseURI,
+                      nsIDocument* parentDoc,
+                      nsILoadGroup* loadGroup,
+                      nsIIOService* ios,
+                      nsIScriptSecurityManager* secMan,
+                      const nsAString& aScriptURL,
+                      bool aIsMainScript,
+@@ -1007,16 +1074,21 @@ private:
+                                 mWorkerPrivate->ContentPolicyType(), loadFlags,
+                                 useDefaultEncoding,
+                                 getter_AddRefs(channel));
+       if (NS_WARN_IF(NS_FAILED(rv))) {
+         return rv;
+       }
+     }
+ 
++    // If this is the main worker script then update our worker principal
++    // immediately.  Due to our AsyncOpen2() security policy cross-origin
++    // redirects cannot take place.  Therefore the current channel principal
++    // should not change between now and the end of load.  We will assert
++    // that it does not change later with ValidFinalPrincipal().
+     if (IsMainWorkerScript()) {
+       rv = SetPrincipalFromChannel(mWorkerPrivate, channel);
+       NS_ENSURE_SUCCESS(rv, rv);
+     }
+ 
+     // We need to know which index we're on in OnStreamComplete so we know
+     // where to put the result.
+     RefPtr<LoaderListener> listener = new LoaderListener(this, aIndex);
+@@ -1205,16 +1277,18 @@ private:
+     // worker's primary script.
+     if (IsMainWorkerScript()) {
+       // Take care of the base URI first.
+       mWorkerPrivate->SetBaseURI(finalURI);
+ 
+       // Store the channel info if needed.
+       mWorkerPrivate->InitChannelInfo(channel);
+ 
++      MOZ_DIAGNOSTIC_ASSERT(ValidFinalPrincipal(mWorkerPrivate, channel));
++
+       // We did inherit CSP in bug 1223647. If we do not already have a CSP, we
+       // should get it from the HTTP headers on the worker script.
+       if (!mWorkerPrivate->GetCSP() && CSPService::sCSPEnabled) {
+         NS_ConvertASCIItoUTF16 cspHeaderValue(tCspHeaderValue);
+         NS_ConvertASCIItoUTF16 cspROHeaderValue(tCspROHeaderValue);
+ 
+         nsIPrincipal* principal = mWorkerPrivate->GetPrincipal();
+         MOZ_ASSERT(principal, "Should not be null");
