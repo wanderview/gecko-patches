@@ -1,0 +1,231 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  df90f441ed8a9f4cd4e746594efc58ee67c6cb8f
+Bug 1325254 P3 Sort TimerThread list as a binary heap. r=froydnj
+
+diff --git a/xpcom/threads/TimerThread.cpp b/xpcom/threads/TimerThread.cpp
+--- a/xpcom/threads/TimerThread.cpp
++++ b/xpcom/threads/TimerThread.cpp
+@@ -461,32 +461,32 @@ TimerThread::Run()
+       waitFor = PR_MillisecondsToInterval(milliseconds);
+     } else {
+       waitFor = PR_INTERVAL_NO_TIMEOUT;
+       TimeStamp now = TimeStamp::Now();
+       nsTimerImpl* timer = nullptr;
+ 
+       // skip any canceled timers
+       while(!mTimers.IsEmpty() && !mTimers[0].mTimerImpl) {
+-        mTimers.RemoveElementAt(0);
++        RemoveFirstTimerInternal();
+       }
+ 
+       if (!mTimers.IsEmpty()) {
+         timer = mTimers[0].mTimerImpl;
+ 
+         if (now >= timer->mTimeout || forceRunThisTimer) {
+     next:
+           // NB: AddRef before the Release under RemoveTimerInternal to avoid
+           // mRefCnt passing through zero, in case all other refs than the one
+           // from mTimers have gone away (the last non-mTimers[i]-ref's Release
+           // must be racing with us, blocked in gThread->RemoveTimer waiting
+           // for TimerThread::mMonitor, under nsTimerImpl::Release.
+ 
+           RefPtr<nsTimerImpl> timerRef(timer);
+-          mTimers.RemoveElementAt(0);
++          RemoveFirstTimerInternal();
+           timer = nullptr;
+ 
+           MOZ_LOG(GetTimerLog(), LogLevel::Debug,
+                  ("Timer thread woke up %fms from when it was supposed to\n",
+                   fabs((now - timerRef->mTimeout).ToMilliseconds())));
+ 
+           // We are going to let the call to PostTimerEvent here handle the
+           // release of the timer so that we don't end up releasing the timer
+@@ -521,17 +521,17 @@ TimerThread::Run()
+           // Update now, as PostTimerEvent plus the locking may have taken a
+           // tick or two, and we may goto next below.
+           now = TimeStamp::Now();
+         }
+       }
+ 
+       // skip any canceled timers
+       while(!mTimers.IsEmpty() && !mTimers[0].mTimerImpl) {
+-        mTimers.RemoveElementAt(0);
++        RemoveFirstTimerInternal();
+       }
+ 
+       if (!mTimers.IsEmpty()) {
+         timer = mTimers[0].mTimerImpl;
+ 
+         TimeStamp timeout = timer->mTimeout;
+ 
+         // Don't wait at all (even for PR_INTERVAL_NO_WAIT) if the next timer
+@@ -593,23 +593,22 @@ TimerThread::AddTimer(nsTimerImpl* aTime
+ {
+   MonitorAutoLock lock(mMonitor);
+ 
+   if (!aTimer->mEventTarget) {
+     return NS_ERROR_NOT_INITIALIZED;
+   }
+ 
+   // Add the timer to our list.
+-  int32_t i = AddTimerInternal(aTimer);
+-  if (i < 0) {
++  if(!AddTimerInternal(aTimer)) {
+     return NS_ERROR_OUT_OF_MEMORY;
+   }
+ 
+   // Awaken the timer thread.
+-  if (mWaiting && i == 0) {
++  if (mWaiting && mTimers[0].mTimerImpl == aTimer) {
+     mNotified = true;
+     mMonitor.Notify();
+   }
+ 
+   return NS_OK;
+ }
+ 
+ nsresult
+@@ -633,55 +632,64 @@ TimerThread::RemoveTimer(nsTimerImpl* aT
+     mNotified = true;
+     mMonitor.Notify();
+   }
+ 
+   return NS_OK;
+ }
+ 
+ // This function must be called from within a lock
+-int32_t
++bool
+ TimerThread::AddTimerInternal(nsTimerImpl* aTimer)
+ {
+   mMonitor.AssertCurrentThreadOwns();
+   if (mShutdown) {
+-    return -1;
++    return false;
+   }
+ 
+   TimeStamp now = TimeStamp::Now();
+-
+-  Entry* insertSlot = mTimers.InsertElementSorted(
+-    Entry(now, aTimer->mTimeout, aTimer));
++  Entry* entry = mTimers.AppendElement(Entry(now, aTimer->mTimeout, aTimer),
++                                       mozilla::fallible);
++  if (!entry) {
++    return false;
++  }
+ 
+-  if (!insertSlot) {
+-    return -1;
+-  }
++  std::push_heap(mTimers.begin(), mTimers.end());
+ 
+ #ifdef MOZ_TASK_TRACER
+   // Caller of AddTimer is the parent task of its timer event, so we store the
+   // TraceInfo here for later used.
+   aTimer->GetTLSTraceInfo();
+ #endif
+ 
+-  return insertSlot - mTimers.Elements();
++  return true;
+ }
+ 
+ bool
+ TimerThread::RemoveTimerInternal(nsTimerImpl* aTimer)
+ {
+   mMonitor.AssertCurrentThreadOwns();
+   for (uint32_t i = 0; i < mTimers.Length(); ++i) {
+     if (mTimers[i].mTimerImpl == aTimer) {
+       mTimers[i].mTimerImpl = nullptr;
+       return true;
+     }
+   }
+   return false;
+ }
+ 
++void
++TimerThread::RemoveFirstTimerInternal()
++{
++  mMonitor.AssertCurrentThreadOwns();
++  MOZ_ASSERT(!mTimers.IsEmpty());
++  std::pop_heap(mTimers.begin(), mTimers.end());
++  mTimers.RemoveElementAt(mTimers.Length() - 1);
++}
++
+ already_AddRefed<nsTimerImpl>
+ TimerThread::PostTimerEvent(already_AddRefed<nsTimerImpl> aTimerRef)
+ {
+   mMonitor.AssertCurrentThreadOwns();
+ 
+   RefPtr<nsTimerImpl> timer(aTimerRef);
+   if (!timer->mEventTarget) {
+     NS_ERROR("Attempt to post timer event to NULL event target");
+diff --git a/xpcom/threads/TimerThread.h b/xpcom/threads/TimerThread.h
+--- a/xpcom/threads/TimerThread.h
++++ b/xpcom/threads/TimerThread.h
+@@ -58,46 +58,59 @@ public:
+ 
+ private:
+   ~TimerThread();
+ 
+   mozilla::Atomic<bool> mInitInProgress;
+   bool    mInitialized;
+ 
+   // These two internal helper methods must be called while mMonitor is held.
+-  // AddTimerInternal returns the position where the timer was added in the
+-  // list, or -1 if it failed.
+-  int32_t AddTimerInternal(nsTimerImpl* aTimer);
++  // AddTimerInternal returns false if the insertion failed.
++  bool    AddTimerInternal(nsTimerImpl* aTimer);
+   bool    RemoveTimerInternal(nsTimerImpl* aTimer);
+-  void    ReleaseTimerInternal(nsTimerImpl* aTimer);
++  void    RemoveFirstTimerInternal();
+ 
+   already_AddRefed<nsTimerImpl> PostTimerEvent(already_AddRefed<nsTimerImpl> aTimerRef);
+ 
+   nsCOMPtr<nsIThread> mThread;
+   Monitor mMonitor;
+ 
+   bool mShutdown;
+   bool mWaiting;
+   bool mNotified;
+   bool mSleeping;
+ 
+   struct Entry
+   {
+-    const TimeStamp mTimeout;
++    TimeStamp mTimeout;
+     RefPtr<nsTimerImpl> mTimerImpl;
+ 
+     Entry(const TimeStamp& aMinTimeout, const TimeStamp& aTimeout,
+           nsTimerImpl* aTimerImpl)
+       : mTimeout(std::max(aMinTimeout, aTimeout)),
+       mTimerImpl(aTimerImpl)
+     { }
+ 
++    Entry(Entry&& aOther)
++      : mTimeout(aOther.mTimeout)
++      , mTimerImpl(mozilla::Move(aOther.mTimerImpl))
++    { }
++
++    Entry& operator=(Entry&& aOther)
++    {
++      mTimeout = aOther.mTimeout;
++      mTimerImpl = mozilla::Move(aOther.mTimerImpl);
++      return *this;
++    }
++
+     bool operator<(const Entry& aRight) const
+     {
+-      return mTimeout < aRight.mTimeout;
++      // Reverse logic since we are inserting into a max heap
++      // that sorts the "largest" value to index 0.
++      return mTimeout > aRight.mTimeout;
+     }
+ 
+     bool operator==(const Entry& aRight) const
+     {
+       return mTimeout == aRight.mTimeout;
+     }
+   };
+ 
