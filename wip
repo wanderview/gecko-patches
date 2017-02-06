@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  78c206b025d2d805a7268194a42dcf775681deef
+# Parent  e929c83465216ac34dd7782e8c4ad7ed5e1708a0
 
 diff --git a/dom/base/nsDocument.cpp b/dom/base/nsDocument.cpp
 --- a/dom/base/nsDocument.cpp
@@ -1780,7 +1780,7 @@ diff --git a/dom/clients/manager/ReservedClientHelper.cpp b/dom/clients/manager/
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ReservedClientHelper.cpp
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,134 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1789,7 +1789,9 @@ new file mode 100644
 +
 +#include "ReservedClientHelper.h"
 +
++#include "nsIAsyncVerifyRedirectCallback.h"
 +#include "nsIInterfaceRequestor.h"
++#include "nsIInterfaceRequestorUtils.h"
 +#include "nsIChannelEventSink.h"
 +
 +namespace mozilla {
@@ -1800,14 +1802,26 @@ new file mode 100644
 +class ReserveClientHelper final : public nsIInterfaceRequestor
 +                                , public nsIChannelEventSink
 +{
++  nsCOMPtr<nsIInterfaceRequestor> mOuter;
++
 +  ~ReserveClientHelper()
 +  {
 +  }
 +
 +  NS_IMETHOD
-+  GetInterface(const nsIID & aUUID, void **aResultOut) override
++  GetInterface(const nsIID & aIID, void **aResultOut) override
 +  {
-+    return NS_OK;
++    if (aIID.Equals(NS_GET_IID(nsIChannelEventSink))) {
++      *aResultOut = static_cast<nsIChannelEventSink*>(this);
++      NS_ADDREF_THIS();
++      return NS_OK;
++    }
++
++    if (mOuter) {
++      return mOuter->GetInterface(aIID, aResultOut);
++    }
++
++    return NS_ERROR_NO_INTERFACE;
 +  }
 +
 +  NS_IMETHOD
@@ -1816,10 +1830,28 @@ new file mode 100644
 +                         uint32_t aFlags,
 +                         nsIAsyncVerifyRedirectCallback *aCallback) override
 +  {
++    // TODO: use nsIPrincipal::CheckMayLoad()
++    // If cross-origin
++      // reserve new client
++    // else same-origin
++      // move existing reserved client
++
++    nsCOMPtr<nsIChannelEventSink> outerSink = do_GetInterface(mOuter);
++    if (outerSink) {
++      return outerSink->AsyncOnChannelRedirect(aOldChannel, aNewChannel, aFlags,
++                                               aCallback);
++    }
++
++    aCallback->OnRedirectVerifyCallback(NS_OK);
 +    return NS_OK;
 +  }
 +
 +public:
++  explicit ReserveClientHelper(nsIInterfaceRequestor* aOuter)
++    : mOuter(aOuter)
++  {
++  }
++
 +  NS_DECL_ISUPPORTS
 +};
 +
@@ -1832,6 +1864,51 @@ new file mode 100644
 +ReserveClientForChannel(nsIChannel* aChannel)
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
++
++  nsCOMPtr<nsIInterfaceRequestor> outer;
++  nsresult rv = aChannel->GetNotificationCallbacks(getter_AddRefs(outer));
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return rv;
++  }
++
++  nsIScriptSecurityManager* ssm = nsContentUtils::GetSecurityManager();
++  if (!ssm) {
++    return NS_ERROR_FAILURE;
++  }
++
++  nsCOMPtr<nsIPrincipal> principal;
++  rv = ssm->GetChannelResultPrincipal(aChannel, getter_AddRefs(principal));
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return rv;
++  }
++
++  nsCOMPtr<nsILoadInfo> loadInfo;
++  rv = aChannel->GetLoadInfo(getter_AddRefs(loadInfo));
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return rv;
++  }
++
++  // Wait to reserve the client until we are reasonably sure this method
++  // will succeed.
++  UniquePtr<ClientSource> reservedClient =
++    ClientManager::CreateSource(ClientType::Window, principal);
++  if (!reservedClient) {
++    return NS_ERROR_FAILURE;
++  }
++
++  RefPtr<ReserveClientHelper> helper =
++    new ReserveClientHelper(outer);
++
++  // Only set the callbacks helper if we are able to reserve the client
++  // successfully.
++  rv = aChannel->SetNotificationCallbacks(helper);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return rv;
++  }
++
++  // Finally preserve the reserved client on the nsILoadInfo once the
++  // redirect helper has been added to the channel.
++  loadInfo->GiveReservedClient(Move(reservedClient));
 +
 +  return NS_OK;
 +}
@@ -2247,7 +2324,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
  #include "mozilla/dom/FunctionBinding.h"
  #include "mozilla/dom/IndexedDatabaseManager.h"
  #include "mozilla/dom/MessageEvent.h"
-@@ -586,16 +588,18 @@ private:
+@@ -570,16 +572,18 @@ private:
    // run we have not yet done our load so don't know things like our final
    // principal and whatnot.
  
@@ -2266,7 +2343,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
      // case, but don't throw anything on aCx.  The idea is to not dispatch error
      // events if our load is canceled with that error code.
      if (rv.ErrorCodeIs(NS_BINDING_ABORTED)) {
-@@ -656,16 +660,18 @@ private:
+@@ -640,16 +644,18 @@ private:
  
      WorkerDebuggerGlobalScope* globalScope =
        aWorkerPrivate->CreateDebuggerGlobalScope(aCx);
@@ -2285,7 +2362,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
                                   DebuggerScript, rv);
      rv.WouldReportJSException();
      // Explicitly ignore NS_BINDING_ABORTED on rv.  Or more precisely, still
-@@ -4491,30 +4497,35 @@ WorkerPrivate::Constructor(JSContext* aC
+@@ -4468,30 +4474,35 @@ WorkerPrivate::Constructor(JSContext* aC
    }
  
    // Only service and shared workers can have names.
@@ -2321,7 +2398,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
    RuntimeService* runtimeService;
  
    if (!parent) {
-@@ -4883,16 +4894,18 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
+@@ -4850,16 +4861,18 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
    MOZ_ASSERT(jsapi.cx() == aCx);
  
    EnableMemoryReporter();
@@ -2340,7 +2417,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
      {
        MutexAutoLock lock(mMutex);
        previousStatus = mStatus;
-@@ -4936,16 +4949,18 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
+@@ -4903,16 +4916,18 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
        }
  
        // If we're supposed to die then we should exit the loop.
@@ -2359,7 +2436,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
            MutexAutoLock lock(mMutex);
  
            mStatus = Dead;
-@@ -5096,16 +5111,32 @@ WorkerPrivate::DispatchToMainThread(alre
+@@ -5063,16 +5078,32 @@ WorkerPrivate::DispatchToMainThread(alre
  
  nsIEventTarget*
  WorkerPrivate::ControlEventTarget()
@@ -2392,7 +2469,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
    // periodically (PERIODIC_GC_TIMER_DELAY_SEC) while the worker is running.
    // Once the worker goes idle we set a short (IDLE_GC_TIMER_DELAY_SEC) timer to
    // run a shrinking GC. If the worker receives more messages then the short
-@@ -5437,16 +5468,18 @@ WorkerPrivate::ClearDebuggerEventQueue()
+@@ -5404,16 +5435,18 @@ WorkerPrivate::ClearDebuggerEventQueue()
  
  bool
  WorkerPrivate::FreezeInternal()
@@ -2411,7 +2488,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
  
    return true;
  }
-@@ -5458,16 +5491,19 @@ WorkerPrivate::ThawInternal()
+@@ -5425,16 +5458,19 @@ WorkerPrivate::ThawInternal()
  
    NS_ASSERTION(mFrozen, "Not yet frozen!");
  
@@ -2452,7 +2529,7 @@ diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
  class WorkerDebuggerGlobalScope;
  class WorkerGlobalScope;
  } // namespace dom
-@@ -975,16 +976,17 @@ class WorkerPrivate : public WorkerPriva
+@@ -972,16 +973,17 @@ class WorkerPrivate : public WorkerPriva
    // fired on the main thread if the worker script fails to load
    nsCOMPtr<nsIRunnable> mLoadFailedRunnable;
  
@@ -2470,7 +2547,7 @@ diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
    bool mPeriodicGCTimerRunning;
    bool mIdleGCTimerRunning;
    bool mWorkerScriptExecutedSuccessfully;
-@@ -1400,16 +1402,22 @@ public:
+@@ -1396,16 +1398,22 @@ public:
                         uint32_t aFlags = NS_DISPATCH_NORMAL);
  
    // Get an event target that will dispatch runnables as control runnables on
