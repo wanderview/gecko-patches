@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  b7957583523aa55a026b3da330810149c6b5a34d
+# Parent  acc4eb8dbce2eb47c111ed9cc3b9f3753d997e8e
 
 diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
 --- a/docshell/base/nsDocShell.cpp
@@ -23,7 +23,7 @@ diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
  #include "mozilla/StartupTimeline.h"
  #include "mozilla/Telemetry.h"
  #include "mozilla/Unused.h"
-@@ -11466,16 +11467,20 @@ nsDocShell::DoChannelLoad(nsIChannel* aC
+@@ -11493,16 +11494,20 @@ nsDocShell::DoChannelLoad(nsIChannel* aC
  
    uint32_t openFlags = 0;
    if (mLoadType == LOAD_LINK) {
@@ -66,38 +66,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
  #include "mozilla/dom/TimeoutHandler.h"
  #include "mozilla/dom/TimeoutManager.h"
  #include "mozilla/IntegerPrintfMacros.h"
-@@ -2967,16 +2969,30 @@ nsGlobalWindow::SetNewDocument(nsIDocume
-                    "Failed to get script global");
-       newInnerWindow->mIsSecureContextIfOpenerIgnored =
-         ComputeIsSecureContext(aDocument, SecureContextFlags::eIgnoreOpener);
- 
-       mCreatingInnerWindow = false;
-       createdInnerWindow = true;
- 
-       NS_ENSURE_SUCCESS(rv, rv);
-+
-+      nsCOMPtr<nsIChannel> channel = aDocument->GetChannel();
-+      if (channel) {
-+        nsCOMPtr<nsILoadInfo> loadInfo;
-+        rv = channel->GetLoadInfo(getter_AddRefs(loadInfo));
-+        if (NS_SUCCEEDED(rv) && loadInfo) {
-+          mClientSource = loadInfo->TakeReservedClient();
-+        }
-+      }
-+
-+      if (!mClientSource) {
-+        mClientSource = ClientManager::CreateSource(ClientType::Window,
-+                                                    aDocument->NodePrincipal());
-+      }
-     }
- 
-     if (currentInner && currentInner->GetWrapperPreserveColor()) {
-       if (oldDoc == aDocument) {
-         // Move the navigator from the old inner window to the new one since
-         // this is a document.write. This is safe from a same-origin point of
-         // view because document.write can only be used by the same origin.
-         newInnerWindow->mNavigator = currentInner->mNavigator;
-@@ -3124,16 +3140,18 @@ nsGlobalWindow::SetNewDocument(nsIDocume
+@@ -3141,16 +3143,19 @@ nsGlobalWindow::SetNewDocument(nsIDocume
        }
      } else {
        newInnerWindow->InnerSetNewDocument(cx, aDocument);
@@ -107,7 +76,8 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
        rv = kungFuDeathGrip->InitClasses(obj);
        NS_ENSURE_SUCCESS(rv, rv);
 +
-+      // TODO: mark mClientSource execution ready
++      rv = newInnerWindow->InnerExecutionReady();
++      NS_ENSURE_SUCCESS(rv, rv);
      }
  
      // If the document comes from a JAR, check if the channel was determined
@@ -116,6 +86,69 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
      nsCOMPtr<nsIJARChannel> jarChannel = do_QueryInterface(aDocument->GetChannel());
      if (jarChannel && jarChannel->GetIsUnsafe()) {
        xpc::Scriptability::Get(newInnerGlobal).Block();
+@@ -3304,16 +3309,62 @@ nsGlobalWindow::InnerSetNewDocument(JSCo
+ 
+   Telemetry::Accumulate(Telemetry::INNERWINDOWS_WITH_MUTATION_LISTENERS,
+                         mMutationBits ? 1 : 0);
+ 
+   // Clear our mutation bitfield.
+   mMutationBits = 0;
+ }
+ 
++nsresult
++nsGlobalWindow::EnsureClientSource()
++{
++  MOZ_DIAGNOSTIC_ASSERT(IsInnerWindow());
++  MOZ_DIAGNOSTIC_ASSERT(mDoc);
++  MOZ_DIAGNOSTIC_ASSERT(!mClientSource);
++
++  // Try to get the reserved client from the loading document
++  nsCOMPtr<nsIChannel> channel = mDoc->GetChannel();
++  if (channel) {
++    nsCOMPtr<nsILoadInfo> loadInfo;
++    nsresult rv = channel->GetLoadInfo(getter_AddRefs(loadInfo));
++    if (NS_SUCCEEDED(rv) && loadInfo) {
++      mClientSource = loadInfo->TakeReservedClient();
++    }
++  }
++
++  // We got a reserved client, so there is nothing left to do
++  if (mClientSource) {
++    return NS_OK;
++  }
++
++  // We need to create a reserved client now
++  mClientSource = ClientManager::CreateSource(ClientType::Window,
++                                              mDoc->NodePrincipal());
++  if (!mClientSource) {
++    return NS_ERROR_FAILURE;
++  }
++
++  return NS_OK;
++}
++
++nsresult
++nsGlobalWindow::InnerExecutionReady()
++{
++  MOZ_DIAGNOSTIC_ASSERT(IsInnerWindow());
++
++  nsresult rv = EnsureClientSource();
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  rv = mClientSource->WindowExecutionReady(AsInner());
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  return NS_OK;
++}
++
+ void
+ nsGlobalWindow::SetDocShell(nsIDocShell* aDocShell)
+ {
+   NS_ASSERTION(IsOuterWindow(), "Uh, SetDocShell() called on inner window!");
+   MOZ_ASSERT(aDocShell);
+ 
+   if (aDocShell == mDocShell) {
+     return;
 diff --git a/dom/base/nsGlobalWindow.h b/dom/base/nsGlobalWindow.h
 --- a/dom/base/nsGlobalWindow.h
 +++ b/dom/base/nsGlobalWindow.h
@@ -137,7 +170,30 @@ diff --git a/dom/base/nsGlobalWindow.h b/dom/base/nsGlobalWindow.h
  class Function;
  class Gamepad;
  enum class ImageBitmapFormat : uint8_t;
-@@ -2017,16 +2018,19 @@ protected:
+@@ -1442,16 +1443,22 @@ protected:
+ 
+   void FreeInnerObjects();
+   nsGlobalWindow *CallerInnerWindow();
+ 
+   // Only to be called on an inner window.
+   // aDocument must not be null.
+   void InnerSetNewDocument(JSContext* aCx, nsIDocument* aDocument);
+ 
++  // inner window only
++  nsresult EnsureClientSource();
++
++  // inner window only
++  nsresult InnerExecutionReady();
++
+   // Inner windows only.
+   nsresult DefineArgumentsProperty(nsIArray *aArguments);
+ 
+   // Get the parent, returns null if this is a toplevel window
+   nsPIDOMWindowOuter* GetParentInternal();
+ 
+ public:
+   // popup tracking
+@@ -2024,16 +2031,19 @@ protected:
    // This is the CC generation the last time we called CanSkip.
    uint32_t mCanSkipCCGeneration;
  
@@ -290,13 +346,15 @@ diff --git a/dom/clients/manager/ClientIPCTypes.ipdlh b/dom/clients/manager/Clie
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientIPCTypes.ipdlh
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,50 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 +
 +include PBackgroundSharedTypes;
-+using ClientType from "mozilla/dom/ClientType.h";
++using ClientType from "mozilla/dom/ClientIPCUtils.h";
++using FrameType from "mozilla/dom/ClientIPCUtils.h";
++using VisibilityState from "mozilla/dom/ClientIPCUtils.h";
 +using struct nsID from "nsID.h";
 +
 +namespace mozilla {
@@ -314,9 +372,27 @@ new file mode 100644
 +  PrincipalInfo principal;
 +};
 +
++struct ClientWindowState
++{
++  bool focused;
++  VisibilityState visibilityState;
++};
++
++struct ClientWorkerState
++{
++};
++
++union ClientState
++{
++  ClientWindowState;
++  ClientWorkerState;
++};
++
 +struct ClientSourceExecutionReadyArgs
 +{
 +  nsCString url;
++  FrameType frameType;
++  ClientState state;
 +};
 +
 +} // namespace dom
@@ -325,7 +401,7 @@ diff --git a/dom/clients/manager/ClientIPCUtils.h b/dom/clients/manager/ClientIP
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientIPCUtils.h
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,37 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -335,7 +411,9 @@ new file mode 100644
 +#define _mozilla_dom_ClientIPCUtils_h
 +
 +#include "ipc/IPCMessageUtils.h"
++#include "mozilla/dom/ClientBinding.h"
 +#include "mozilla/dom/ClientsBinding.h"
++#include "mozilla/dom/DocumentBinding.h"
 +
 +namespace IPC {
 +  template<>
@@ -343,6 +421,20 @@ new file mode 100644
 +    public ContiguousEnumSerializer<mozilla::dom::ClientType,
 +                                    mozilla::dom::ClientType::Window,
 +                                    mozilla::dom::ClientType::EndGuard_>
++  {};
++
++  template<>
++  struct ParamTraits<mozilla::dom::FrameType> :
++    public ContiguousEnumSerializer<mozilla::dom::FrameType,
++                                    mozilla::dom::FrameType::Auxiliary,
++                                    mozilla::dom::FrameType::EndGuard_>
++  {};
++
++  template<>
++  struct ParamTraits<mozilla::dom::VisibilityState> :
++    public ContiguousEnumSerializer<mozilla::dom::VisibilityState,
++                                    mozilla::dom::VisibilityState::Hidden,
++                                    mozilla::dom::VisibilityState::EndGuard_>
 +  {};
 +} // namespace IPC
 +
@@ -637,7 +729,6 @@ new file mode 100644
 +#ifndef _mozilla_dom_ClientManager_h
 +#define _mozilla_dom_ClientManager_h
 +
-+#include "mozilla/dom/ClientType.h"
 +#include "mozilla/dom/PClientManager.h"
 +#include "nsTArray.h"
 +
@@ -653,6 +744,7 @@ new file mode 100644
 +
 +class ClientManagerChild;
 +class ClientSource;
++enum class ClientType : uint8_t;
 +
 +class ClientManager final
 +{
@@ -1082,7 +1174,7 @@ diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientManagerService.cpp
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,90 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1142,13 +1234,15 @@ new file mode 100644
 +  AssertIsOnBackgroundThread();
 +  MOZ_ASSERT(aSource);
 +  MOZ_ASSERT(!mSourceList.Contains(aSource));
++  nsCString type(ClientTypeValues::strings[(uint8_t)aSource->Type()].value,
++                 ClientTypeValues::strings[(uint8_t)aSource->Type()].length);
 +  nsCString spec;
 +  if (aSource->GetPrincipalInfo().type() == PrincipalInfo::TContentPrincipalInfo) {
 +    spec = aSource->GetPrincipalInfo().get_ContentPrincipalInfo().spec();
 +  }
-+  printf_stderr("### ### [%p] ClientManagerService::AddSource(%p) list %lu to %lu - %s\n",
++  printf_stderr("### ### [%p] ClientManagerService::AddSource(%p) list %lu to %lu - type:%s origin:%s\n",
 +                this, aSource, mSourceList.Length(), (mSourceList.Length() + 1),
-+                spec.get());
++                type.get(), spec.get());
 +  mSourceList.AppendElement(aSource);
 +}
 +
@@ -1157,13 +1251,15 @@ new file mode 100644
 +{
 +  AssertIsOnBackgroundThread();
 +  MOZ_ASSERT(aSource);
++  nsCString type(ClientTypeValues::strings[(uint8_t)aSource->Type()].value,
++                 ClientTypeValues::strings[(uint8_t)aSource->Type()].length);
 +  nsCString spec;
 +  if (aSource->GetPrincipalInfo().type() == PrincipalInfo::TContentPrincipalInfo) {
 +    spec = aSource->GetPrincipalInfo().get_ContentPrincipalInfo().spec();
 +  }
-+  printf_stderr("### ### [%p] ClientManagerService::RemoveSource(%p) list %lu to %lu - %s\n",
++  printf_stderr("### ### [%p] ClientManagerService::RemoveSource(%p) list %lu to %lu - type:%s origin:%s\n",
 +                this, aSource, mSourceList.Length(), (mSourceList.Length() - 1),
-+                spec.get());
++                type.get(), spec.get());
 +  MOZ_ALWAYS_TRUE(mSourceList.RemoveElement(aSource));
 +}
 +
@@ -1219,7 +1315,7 @@ diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSo
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientSource.cpp
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,252 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1228,8 +1324,13 @@ new file mode 100644
 +
 +#include "ClientSource.h"
 +
++#include "mozilla/dom/ClientIPCTypes.h"
++#include "mozilla/dom/WorkerPrivate.h"
++
 +namespace mozilla {
 +namespace dom {
++
++using mozilla::dom::workers::WorkerPrivate;
 +
 +class ClientSource::Op
 +{
@@ -1305,6 +1406,40 @@ new file mode 100644
 +  }
 +}
 +
++void
++ClientSource::ExecutionReady(const ClientSourceExecutionReadyArgs& aArgs)
++{
++  MaybeExecute([aArgs](PClientSourceChild* aActor) {
++    aActor->SendExecutionReady(aArgs);
++  });
++}
++
++nsresult
++ClientSource::SnapshotWindowState(nsPIDOMWindowInner* aInnerWindow,
++                                  ClientWindowState* aStateOut)
++{
++  MOZ_ASSERT(NS_IsMainThread());
++  MOZ_DIAGNOSTIC_ASSERT(aInnerWindow);
++  MOZ_DIAGNOSTIC_ASSERT(aInnerWindow->IsCurrentInnerWindow());
++  MOZ_DIAGNOSTIC_ASSERT(aInnerWindow->HasActiveDocument());
++
++  nsIDocument* doc = aInnerWindow->GetExtantDoc();
++  if (NS_WARN_IF(!doc)) {
++    return NS_ERROR_UNEXPECTED;
++  }
++
++  ErrorResult rv;
++  aStateOut->focused() = doc->HasFocus(rv);
++  if (NS_WARN_IF(rv.Failed())) {
++    rv.SuppressException();
++    return rv.StealNSResult();
++  }
++
++  aStateOut->visibilityState() = doc->VisibilityState();
++
++  return NS_OK;
++}
++
 +ClientSource::ClientSource(ClientManager* aManager,
 +                           const ClientSourceConstructorArgs& aArgs)
 +  : mManager(aManager)
@@ -1351,13 +1486,68 @@ new file mode 100644
 +  Shutdown();
 +}
 +
-+void
-+ClientSource::ExecutionReady()
++nsresult
++ClientSource::WorkerExecutionReady(WorkerPrivate* aWorkerPrivate)
 +{
-+  MaybeExecute([](PClientSourceChild* aActor) {
-+    ClientSourceExecutionReadyArgs args;
-+    aActor->SendExecutionReady(args);
-+  });
++  MOZ_DIAGNOSTIC_ASSERT(aWorkerPrivate);
++  aWorkerPrivate->AssertIsOnWorkerThread();
++
++  ClientSourceExecutionReadyArgs args(
++    NS_ConvertUTF16toUTF8(aWorkerPrivate->ScriptURL()),
++    FrameType::None,
++    ClientWorkerState());
++
++  ExecutionReady(args);
++
++  return NS_OK;
++}
++
++nsresult
++ClientSource::WindowExecutionReady(nsPIDOMWindowInner* aInnerWindow)
++{
++  MOZ_ASSERT(NS_IsMainThread());
++  MOZ_DIAGNOSTIC_ASSERT(aInnerWindow);
++  MOZ_DIAGNOSTIC_ASSERT(aInnerWindow->IsCurrentInnerWindow());
++  MOZ_DIAGNOSTIC_ASSERT(aInnerWindow->HasActiveDocument());
++
++  nsIDocument* doc = aInnerWindow->GetExtantDoc();
++  if (NS_WARN_IF(!doc)) {
++    return NS_ERROR_UNEXPECTED;
++  }
++
++  nsIURI* uri = doc->GetOriginalURI();
++  if (NS_WARN_IF(!uri)) {
++    return NS_ERROR_UNEXPECTED;
++  }
++
++  nsCString spec;
++  nsresult rv = uri->GetSpec(spec);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return rv;
++  }
++
++  nsPIDOMWindowOuter* outer = aInnerWindow->GetOuterWindow();
++  if (NS_WARN_IF(!outer)) {
++    return NS_ERROR_UNEXPECTED;
++  }
++
++  FrameType frameType = FrameType::Top_level;
++  if (!outer->IsTopLevelWindow()) {
++    frameType = FrameType::Nested;
++  } else if(outer->HadOriginalOpener()) {
++    frameType = FrameType::Auxiliary;
++  }
++
++  ClientWindowState state;
++  rv = SnapshotWindowState(aInnerWindow, &state);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return rv;
++  }
++
++  ClientSourceExecutionReadyArgs args(spec, frameType, state);
++  ExecutionReady(args);
++
++  return NS_OK;
 +}
 +
 +void
@@ -1382,7 +1572,7 @@ diff --git a/dom/clients/manager/ClientSource.h b/dom/clients/manager/ClientSour
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientSource.h
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,85 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1398,7 +1588,12 @@ new file mode 100644
 +
 +class ClientManager;
 +class ClientSourceChild;
++class ClientSourceExecutionReadyArgs;
 +class PClientManagerChild;
++
++namespace workers {
++class WorkerPrivate;
++} // workers namespace
 +
 +class ClientSource final
 +{
@@ -1425,6 +1620,13 @@ new file mode 100644
 +  void
 +  MaybeExecuteOpList();
 +
++  void
++  ExecutionReady(const ClientSourceExecutionReadyArgs& aArgs);
++
++  nsresult
++  SnapshotWindowState(nsPIDOMWindowInner* aInnerWindow,
++                      ClientWindowState* aStateOut);
++
 +  // Private methods called by ClientManager
 +  ClientSource(ClientManager* aManager,
 +               const ClientSourceConstructorArgs& aArgs);
@@ -1439,8 +1641,11 @@ new file mode 100644
 +public:
 +  ~ClientSource();
 +
-+  void
-+  ExecutionReady();
++  nsresult
++  WorkerExecutionReady(mozilla::dom::workers::WorkerPrivate* aWorkerPrivate);
++
++  nsresult
++  WindowExecutionReady(nsPIDOMWindowInner* aInnerWindow);
 +
 +  void
 +  Freeze();
@@ -1565,7 +1770,7 @@ diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/Cl
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientSourceParent.cpp
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,88 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1605,6 +1810,7 @@ new file mode 100644
 +{
 +  // TODO: Validate this against nsIURI and nsIPrincipal
 +  // TODO: mark execution ready
++  printf_stderr("### ### ExecutionReady() %s\n", aArgs.url().get());
 +  return IPC_OK();
 +};
 +
@@ -1715,32 +1921,6 @@ new file mode 100644
 +} // namespace mozilla
 +
 +#endif // _mozilla_dom_ClientSourceParent_h
-diff --git a/dom/clients/manager/ClientType.h b/dom/clients/manager/ClientType.h
-new file mode 100644
---- /dev/null
-+++ b/dom/clients/manager/ClientType.h
-@@ -0,0 +1,21 @@
-+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
-+/* vim: set ts=8 sts=2 et sw=2 tw=80: */
-+/* This Source Code Form is subject to the terms of the Mozilla Public
-+ * License, v. 2.0. If a copy of the MPL was not distributed with this
-+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
-+#ifndef _mozilla_dom_ClientType_h
-+#define _mozilla_dom_ClientType_h
-+
-+#include "ipc/IPCMessageUtils.h"
-+#include "mozilla/dom/ClientsBinding.h"
-+
-+namespace IPC {
-+  template<>
-+  struct ParamTraits<mozilla::dom::ClientType> :
-+    public ContiguousEnumSerializer<mozilla::dom::ClientType,
-+                                    mozilla::dom::ClientType::Window,
-+                                    mozilla::dom::ClientType::EndGuard_>
-+  {};
-+} // namespace IPC
-+
-+#endif // _mozilla_dom_ClientType_h
 diff --git a/dom/clients/manager/PClientHandle.ipdl b/dom/clients/manager/PClientHandle.ipdl
 new file mode 100644
 --- /dev/null
@@ -2052,10 +2232,10 @@ new file mode 100644
 +# file, You can obtain one at http://mozilla.org/MPL/2.0/.
 +
 +EXPORTS.mozilla.dom += [
++  'ClientIPCUtils.h',
 +  'ClientManager.h',
 +  'ClientManagerActors.h',
 +  'ClientSource.h',
-+  'ClientType.h',
 +  'ReservedClientHelper.h',
 +]
 +
@@ -2130,8 +2310,8 @@ diff --git a/dom/ipc/ContentChild.cpp b/dom/ipc/ContentChild.cpp
  #include "mozilla/dom/DataTransfer.h"
  #include "mozilla/dom/DocGroup.h"
  #include "mozilla/dom/ExternalHelperAppChild.h"
- #include "mozilla/dom/FlyWebPublishedServerIPC.h"
-@@ -951,16 +952,19 @@ void
+ #include "mozilla/dom/FileCreatorHelper.h"
+@@ -957,16 +958,19 @@ void
  ContentChild::InitXPCOM(const XPCOMInitData& aXPCOMInit,
                          const mozilla::dom::ipc::StructuredCloneData& aInitialData)
  {
@@ -2167,12 +2347,12 @@ diff --git a/dom/ipc/ContentParent.cpp b/dom/ipc/ContentParent.cpp
  #include "mozilla/dom/DataTransfer.h"
  #include "mozilla/dom/Element.h"
  #include "mozilla/dom/File.h"
+ #include "mozilla/dom/FileCreatorHelper.h"
  #include "mozilla/dom/ExternalHelperAppParent.h"
  #include "mozilla/dom/GetFilesHelper.h"
  #include "mozilla/dom/GeolocationBinding.h"
  #include "mozilla/dom/MemoryReportRequest.h"
- #include "mozilla/dom/Notification.h"
-@@ -522,16 +523,17 @@ ContentParent::StartUp()
+@@ -524,16 +525,17 @@ ContentParent::StartUp()
  
    // Note: This reporter measures all ContentParents.
    RegisterStrongMemoryReporter(new ContentParentsMemoryReporter());
@@ -2211,10 +2391,27 @@ diff --git a/dom/moz.build b/dom/moz.build
      'fetch',
      'file',
      'filehandle',
+diff --git a/dom/webidl/Clients.webidl b/dom/webidl/Clients.webidl
+--- a/dom/webidl/Clients.webidl
++++ b/dom/webidl/Clients.webidl
+@@ -26,11 +26,13 @@ dictionary ClientQueryOptions {
+   boolean includeUncontrolled = false;
+   ClientType type = "window";
+ };
+ 
+ enum ClientType {
+   "window",
+   "worker",
+   "sharedworker",
++  // https://github.com/w3c/ServiceWorker/issues/1036
++  "serviceworker",
+   "all"
+ };
+ 
 diff --git a/dom/workers/ScriptLoader.cpp b/dom/workers/ScriptLoader.cpp
 --- a/dom/workers/ScriptLoader.cpp
 +++ b/dom/workers/ScriptLoader.cpp
-@@ -943,16 +943,20 @@ private:
+@@ -951,16 +951,20 @@ private:
      // We don't care about progress so just use the simple stream loader for
      // OnStreamComplete notification only.
      nsCOMPtr<nsIStreamLoader> loader;
@@ -2425,7 +2622,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
  #include "mozilla/dom/FunctionBinding.h"
  #include "mozilla/dom/IndexedDatabaseManager.h"
  #include "mozilla/dom/MessageEvent.h"
-@@ -570,16 +572,18 @@ private:
+@@ -576,16 +578,18 @@ private:
    // run we have not yet done our load so don't know things like our final
    // principal and whatnot.
  
@@ -2444,7 +2641,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
      // case, but don't throw anything on aCx.  The idea is to not dispatch error
      // events if our load is canceled with that error code.
      if (rv.ErrorCodeIs(NS_BINDING_ABORTED)) {
-@@ -640,16 +644,18 @@ private:
+@@ -646,16 +650,18 @@ private:
  
      WorkerDebuggerGlobalScope* globalScope =
        aWorkerPrivate->CreateDebuggerGlobalScope(aCx);
@@ -2463,7 +2660,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
                                   DebuggerScript, rv);
      rv.WouldReportJSException();
      // Explicitly ignore NS_BINDING_ABORTED on rv.  Or more precisely, still
-@@ -4469,30 +4475,35 @@ WorkerPrivate::Constructor(JSContext* aC
+@@ -4525,30 +4531,35 @@ WorkerPrivate::Constructor(JSContext* aC
    }
  
    // Only service and shared workers can have names.
@@ -2499,7 +2696,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
    RuntimeService* runtimeService;
  
    if (!parent) {
-@@ -4851,16 +4862,18 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
+@@ -4911,16 +4922,18 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
    MOZ_ASSERT(jsapi.cx() == aCx);
  
    EnableMemoryReporter();
@@ -2518,7 +2715,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
      {
        MutexAutoLock lock(mMutex);
        previousStatus = mStatus;
-@@ -4904,16 +4917,18 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
+@@ -4964,16 +4977,18 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
        }
  
        // If we're supposed to die then we should exit the loop.
@@ -2537,7 +2734,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
            MutexAutoLock lock(mMutex);
  
            mStatus = Dead;
-@@ -5064,16 +5079,32 @@ WorkerPrivate::DispatchToMainThread(alre
+@@ -5124,16 +5139,48 @@ WorkerPrivate::DispatchToMainThread(alre
  
  nsIEventTarget*
  WorkerPrivate::ControlEventTarget()
@@ -2550,7 +2747,23 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
 +{
 +  AssertIsOnWorkerThread();
 +  MOZ_ASSERT(!mClientSource);
-+  mClientSource = ClientManager::CreateSource(ClientType::Worker,
++
++  ClientType type;
++  switch(Type()) {
++    case WorkerTypeDedicated:
++      type = ClientType::Worker;
++      break;
++    case WorkerTypeShared:
++      type = ClientType::Sharedworker;
++      break;
++    case WorkerTypeService:
++      type = ClientType::Serviceworker;
++      break;
++    default:
++      MOZ_CRASH("unknown worker type!");
++  }
++
++  mClientSource = ClientManager::CreateSource(type,
 +                                              GetPrincipalInfo());
 +}
 +
@@ -2570,7 +2783,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
    // periodically (PERIODIC_GC_TIMER_DELAY_SEC) while the worker is running.
    // Once the worker goes idle we set a short (IDLE_GC_TIMER_DELAY_SEC) timer to
    // run a shrinking GC. If the worker receives more messages then the short
-@@ -5405,16 +5436,18 @@ WorkerPrivate::ClearDebuggerEventQueue()
+@@ -5465,16 +5512,18 @@ WorkerPrivate::ClearDebuggerEventQueue()
  
  bool
  WorkerPrivate::FreezeInternal()
@@ -2589,7 +2802,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
  
    return true;
  }
-@@ -5426,16 +5459,19 @@ WorkerPrivate::ThawInternal()
+@@ -5486,16 +5535,19 @@ WorkerPrivate::ThawInternal()
  
    NS_ASSERTION(mFrozen, "Not yet frozen!");
  
@@ -2630,7 +2843,7 @@ diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
  class WorkerDebuggerGlobalScope;
  class WorkerGlobalScope;
  } // namespace dom
-@@ -972,16 +973,17 @@ class WorkerPrivate : public WorkerPriva
+@@ -1020,16 +1021,17 @@ class WorkerPrivate : public WorkerPriva
    // fired on the main thread if the worker script fails to load
    nsCOMPtr<nsIRunnable> mLoadFailedRunnable;
  
@@ -2648,7 +2861,7 @@ diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
    bool mPeriodicGCTimerRunning;
    bool mIdleGCTimerRunning;
    bool mWorkerScriptExecutedSuccessfully;
-@@ -1396,16 +1398,22 @@ public:
+@@ -1444,16 +1446,22 @@ public:
                         uint32_t aFlags = NS_DISPATCH_NORMAL);
  
    // Get an event target that will dispatch runnables as control runnables on
@@ -2957,7 +3170,7 @@ diff --git a/netwerk/base/LoadInfo.cpp b/netwerk/base/LoadInfo.cpp
    , mVerifySignedContent(rhs.mVerifySignedContent)
    , mEnforceSRI(rhs.mEnforceSRI)
    , mForceInheritPrincipalDropped(rhs.mForceInheritPrincipalDropped)
-@@ -889,16 +891,29 @@ LoadInfo::SetIsPreflight()
+@@ -888,16 +890,29 @@ LoadInfo::SetIsPreflight()
  }
  
  void
