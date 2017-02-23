@@ -1,0 +1,176 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  18cd1f81025c1a2aa6d24683baf64cb4948aeb97
+Bug 1266747 P3 Sort output of Clients.matchAll(). r=smaug
+
+diff --git a/dom/workers/ServiceWorkerClient.cpp b/dom/workers/ServiceWorkerClient.cpp
+--- a/dom/workers/ServiceWorkerClient.cpp
++++ b/dom/workers/ServiceWorkerClient.cpp
+@@ -28,18 +28,19 @@ NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(Se
+ NS_IMPL_CYCLE_COLLECTING_ADDREF(ServiceWorkerClient)
+ NS_IMPL_CYCLE_COLLECTING_RELEASE(ServiceWorkerClient)
+ 
+ NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ServiceWorkerClient)
+   NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+   NS_INTERFACE_MAP_ENTRY(nsISupports)
+ NS_INTERFACE_MAP_END
+ 
+-ServiceWorkerClientInfo::ServiceWorkerClientInfo(nsIDocument* aDoc)
++ServiceWorkerClientInfo::ServiceWorkerClientInfo(nsIDocument* aDoc, uint32_t aOrdinal)
+   : mType(ClientType::Window)
++  , mOrdinal(aOrdinal)
+   , mWindowId(0)
+   , mFrameType(FrameType::None)
+ {
+   MOZ_ASSERT(aDoc);
+   nsresult rv = aDoc->GetOrCreateId(mClientId);
+   if (NS_FAILED(rv)) {
+     NS_WARNING("Failed to get the UUID of the document.");
+   }
+@@ -77,16 +78,46 @@ ServiceWorkerClientInfo::ServiceWorkerCl
+     mFrameType = FrameType::Nested;
+   } else if (outerWindow->HadOriginalOpener()) {
+     mFrameType = FrameType::Auxiliary;
+   } else {
+     mFrameType = FrameType::Top_level;
+   }
+ }
+ 
++bool
++ServiceWorkerClientInfo::operator<(const ServiceWorkerClientInfo& aRight) const
++{
++  // Note: the mLastFocusTime comparisons are reversed because we need to
++  // put most recently focused values first.  The mOrdinal comparison is
++  // normal, though, because otherwise we want normal creation order.
++
++  if (mLastFocusTime.IsNull() && !aRight.mLastFocusTime.IsNull()) {
++    return false;
++  }
++
++  if (!mLastFocusTime.IsNull() && aRight.mLastFocusTime.IsNull()) {
++    return true;
++  }
++
++  if (mLastFocusTime.IsNull() && aRight.mLastFocusTime.IsNull()) {
++    return mOrdinal < aRight.mOrdinal;
++  }
++
++  return mLastFocusTime > aRight.mLastFocusTime;
++}
++
++bool
++ServiceWorkerClientInfo::operator==(const ServiceWorkerClientInfo& aRight) const
++{
++  return mLastFocusTime == aRight.mLastFocusTime &&
++         mOrdinal == aRight.mOrdinal &&
++         mClientId == aRight.mClientId;
++}
++
+ JSObject*
+ ServiceWorkerClient::WrapObject(JSContext* aCx, JS::Handle<JSObject*> aGivenProto)
+ {
+   return ClientBinding::Wrap(aCx, this, aGivenProto);
+ }
+ 
+ ClientType
+ ServiceWorkerClient::Type() const
+diff --git a/dom/workers/ServiceWorkerClient.h b/dom/workers/ServiceWorkerClient.h
+--- a/dom/workers/ServiceWorkerClient.h
++++ b/dom/workers/ServiceWorkerClient.h
+@@ -26,25 +26,29 @@ class ServiceWorkerWindowClient;
+ // Used as a container object for information needed to create
+ // client objects.
+ class ServiceWorkerClientInfo final
+ {
+   friend class ServiceWorkerClient;
+   friend class ServiceWorkerWindowClient;
+ 
+ public:
+-  explicit ServiceWorkerClientInfo(nsIDocument* aDoc);
++  explicit ServiceWorkerClientInfo(nsIDocument* aDoc, uint32_t aOrdinal = 0);
+ 
+   const nsString& ClientId() const
+   {
+     return mClientId;
+   }
+ 
++  bool operator<(const ServiceWorkerClientInfo& aRight) const;
++  bool operator==(const ServiceWorkerClientInfo& aRight) const;
++
+ private:
+   const mozilla::dom::ClientType mType;
++  const uint32_t mOrdinal;
+   nsString mClientId;
+   uint64_t mWindowId;
+   nsString mUrl;
+ 
+   // Window Clients
+   VisibilityState mVisibilityState;
+   FrameType mFrameType;
+   TimeStamp mLastFocusTime;
+diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
+--- a/dom/workers/ServiceWorkerManager.cpp
++++ b/dom/workers/ServiceWorkerManager.cpp
+@@ -2969,17 +2969,20 @@ ServiceWorkerManager::GetAllClients(nsIP
+ 
+   nsCOMPtr<nsISimpleEnumerator> enumerator;
+   nsresult rv = obs->EnumerateObservers("service-worker-get-client",
+                                         getter_AddRefs(enumerator));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return;
+   }
+ 
+-  auto ProcessDocument = [&aDocuments](nsIPrincipal* aPrincipal, nsIDocument* aDoc) {
++  uint32_t ordinal = 0;
++
++  auto ProcessDocument = [&aDocuments, &ordinal](nsIPrincipal* aPrincipal,
++                                                 nsIDocument* aDoc) {
+     if (!aDoc || !aDoc->GetWindow()) {
+       return;
+     }
+ 
+     bool equals = false;
+     aPrincipal->Equals(aDoc->NodePrincipal(), &equals);
+     if (!equals) {
+       return;
+@@ -2988,18 +2991,19 @@ ServiceWorkerManager::GetAllClients(nsIP
+     // Treat http windows with devtools opened as secure if the correct devtools
+     // setting is enabled.
+     if (!aDoc->GetWindow()->GetServiceWorkersTestingEnabled() &&
+         !Preferences::GetBool("dom.serviceWorkers.testing.enabled") &&
+         !IsFromAuthenticatedOrigin(aDoc)) {
+       return;
+     }
+ 
+-    ServiceWorkerClientInfo clientInfo(aDoc);
+-    aDocuments.AppendElement(aDoc);
++    aDocuments.AppendElement(ServiceWorkerClientInfo(aDoc, ordinal));
++
++    ordinal += 1;
+   };
+ 
+   // Since it's not simple to check whether a document is in
+   // mControlledDocuments, we take different code paths depending on whether we
+   // need to look at all documents.  The common parts of the two loops are
+   // factored out into the ProcessDocument lambda.
+   if (aIncludeUncontrolled) {
+     bool loop = true;
+@@ -3024,16 +3028,18 @@ ServiceWorkerManager::GetAllClients(nsIP
+       nsCOMPtr<nsIDocument> doc = do_QueryInterface(iter.Key());
+ 
+       // All controlled documents must have an outer window.
+       MOZ_ASSERT(doc->GetWindow());
+ 
+       ProcessDocument(aPrincipal, doc);
+     }
+   }
++
++  aDocuments.Sort();
+ }
+ 
+ void
+ ServiceWorkerManager::MaybeClaimClient(nsIDocument* aDocument,
+                                        ServiceWorkerRegistrationInfo* aWorkerRegistration)
+ {
+   MOZ_ASSERT(aWorkerRegistration);
+   MOZ_ASSERT(aWorkerRegistration->GetActive());
