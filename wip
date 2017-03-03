@@ -3045,7 +3045,43 @@ diff --git a/dom/webidl/Clients.webidl b/dom/webidl/Clients.webidl
 diff --git a/dom/workers/ScriptLoader.cpp b/dom/workers/ScriptLoader.cpp
 --- a/dom/workers/ScriptLoader.cpp
 +++ b/dom/workers/ScriptLoader.cpp
-@@ -956,16 +956,20 @@ private:
+@@ -46,16 +46,17 @@
+ #include "mozilla/LoadContext.h"
+ #include "mozilla/Maybe.h"
+ #include "mozilla/ipc/BackgroundUtils.h"
+ #include "mozilla/dom/CacheBinding.h"
+ #include "mozilla/dom/cache/CacheTypes.h"
+ #include "mozilla/dom/cache/Cache.h"
+ #include "mozilla/dom/cache/CacheStorage.h"
+ #include "mozilla/dom/ChannelInfo.h"
++#include "mozilla/dom/ClientIPCTypes.h"
+ #include "mozilla/dom/Exceptions.h"
+ #include "mozilla/dom/InternalResponse.h"
+ #include "mozilla/dom/nsCSPService.h"
+ #include "mozilla/dom/nsCSPUtils.h"
+ #include "mozilla/dom/Promise.h"
+ #include "mozilla/dom/PromiseNativeHandler.h"
+ #include "mozilla/dom/Response.h"
+ #include "mozilla/dom/ScriptSettings.h"
+@@ -260,16 +261,17 @@ struct ScriptLoadInfo
+   // resolution.
+   RefPtr<Promise> mCachePromise;
+ 
+   // The reader stream the cache entry should be filled from, for those cases
+   // when we're going to have an mCachePromise.
+   nsCOMPtr<nsIInputStream> mCacheReadStream;
+ 
+   nsCOMPtr<nsIChannel> mChannel;
++  Maybe<ClientInfo> mReservedClientInfo;
+   char16_t* mScriptTextBuf;
+   size_t mScriptTextLength;
+ 
+   nsresult mLoadResult;
+   bool mLoadingFinished;
+   bool mExecutionScheduled;
+   bool mExecutionResult;
+ 
+@@ -956,16 +958,22 @@ private:
      // We don't care about progress so just use the simple stream loader for
      // OnStreamComplete notification only.
      nsCOMPtr<nsIStreamLoader> loader;
@@ -3055,7 +3091,9 @@ diff --git a/dom/workers/ScriptLoader.cpp b/dom/workers/ScriptLoader.cpp
      }
  
 +    if (IsMainWorkerScript()) {
-+      MOZ_DIAGNOSTIC_ASSERT(mWorkerPrivate->IsClientReserved());
++      MOZ_DIAGNOSTIC_ASSERT(loadInfo.mReservedClientInfo.isSome());
++      nsCOMPtr<nsILoadInfo> chanLoadInfo = channel->GetLoadInfo();
++      chanLoadInfo->SetReservedClientInfo(loadInfo.mReservedClientInfo.ref());
 +    }
 +
      if (loadInfo.mCacheStatus != ScriptLoadInfo::ToBeCached) {
@@ -3066,6 +3104,27 @@ diff --git a/dom/workers/ScriptLoader.cpp b/dom/workers/ScriptLoader.cpp
      } else {
        nsCOMPtr<nsIOutputStream> writer;
  
+@@ -2216,16 +2224,20 @@ LoadMainScript(WorkerPrivate* aWorkerPri
+                ErrorResult& aRv)
+ {
+   nsTArray<ScriptLoadInfo> loadInfos;
+ 
+   ScriptLoadInfo* info = loadInfos.AppendElement();
+   info->mURL = aScriptURL;
+   info->mLoadFlags = aWorkerPrivate->GetLoadFlags();
+ 
++  // We are loading the main script, so the worker's Client must be
++  // reserved.
++  info->mReservedClientInfo.emplace(aWorkerPrivate->GetClientInfo());
++
+   LoadAllScripts(aWorkerPrivate, loadInfos, true, aWorkerScriptType, aRv);
+ }
+ 
+ void
+ Load(WorkerPrivate* aWorkerPrivate,
+      const nsTArray<nsString>& aScriptURLs, WorkerScriptType aWorkerScriptType,
+      ErrorResult& aRv)
+ {
 diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
 --- a/dom/workers/ServiceWorkerManager.cpp
 +++ b/dom/workers/ServiceWorkerManager.cpp
@@ -3110,7 +3169,7 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
  {
    aRegistration->StopControllingADocument();
    if (aRegistration->IsControllingDocuments() || !aRegistration->IsIdle()) {
-@@ -2507,16 +2514,30 @@ ServiceWorkerManager::DispatchFetchEvent
+@@ -2507,16 +2514,33 @@ ServiceWorkerManager::DispatchFetchEvent
      // before we get to this point.  Therefore we must handle a nullptr
      // active worker here.
      serviceWorker = registration->GetActive();
@@ -3128,7 +3187,10 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
 +        RefPtr<ClientHandle> clientHandle =
 +          ClientManager::CreateHandle(clientInfo.ref());
 +        if (clientHandle) {
-+          // TODO call controlled method on handle
++          printf_stderr("### ### Calling ClientHandle::SetControlled() scope:%s id:%lu\n",
++                        serviceWorker->Scope().get(), serviceWorker->ID());
++          clientHandle->SetControlled(serviceWorker->Scope(),
++                                      serviceWorker->ID());
 +        }
 +      }
 +    }
@@ -3443,7 +3505,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
            MutexAutoLock lock(mMutex);
  
            mStatus = Dead;
-@@ -5203,16 +5218,48 @@ WorkerPrivate::DispatchToMainThread(alre
+@@ -5203,16 +5218,51 @@ WorkerPrivate::DispatchToMainThread(alre
  
  nsIEventTarget*
  WorkerPrivate::ControlEventTarget()
@@ -3472,15 +3534,18 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
 +      MOZ_CRASH("unknown worker type!");
 +  }
 +
++  printf_stderr("### ### WorkerPrivate::ReserveClient()\n");
++
 +  mClientSource = ClientManager::CreateSource(type,
 +                                              GetPrincipalInfo());
 +}
 +
-+bool
-+WorkerPrivate::IsClientReserved()
++const ClientInfo&
++WorkerPrivate::GetClientInfo() const
 +{
-+  // TODO: this is for testing... remove it as its unsafe cross-thread
-+  return mClientSource.get();
++  AssertIsOnWorkerThread();
++  MOZ_DIAGNOSTIC_ASSERT(mClientSource);
++  return mClientSource->Info();
 +}
 +
 +void
@@ -3492,7 +3557,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
    // periodically (PERIODIC_GC_TIMER_DELAY_SEC) while the worker is running.
    // Once the worker goes idle we set a short (IDLE_GC_TIMER_DELAY_SEC) timer to
    // run a shrinking GC. If the worker receives more messages then the short
-@@ -5544,16 +5591,18 @@ WorkerPrivate::ClearDebuggerEventQueue()
+@@ -5544,16 +5594,18 @@ WorkerPrivate::ClearDebuggerEventQueue()
  
  bool
  WorkerPrivate::FreezeInternal()
@@ -3511,7 +3576,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
  
    return true;
  }
-@@ -5565,16 +5614,19 @@ WorkerPrivate::ThawInternal()
+@@ -5565,16 +5617,19 @@ WorkerPrivate::ThawInternal()
  
    NS_ASSERTION(mFrozen, "Not yet frozen!");
  
@@ -3582,8 +3647,8 @@ diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
 +  void
 +  ReserveClient();
 +
-+  bool
-+  IsClientReserved();
++  const ClientInfo&
++  GetClientInfo() const;
 +
  private:
    WorkerPrivate(WorkerPrivate* aParent,
