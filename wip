@@ -542,24 +542,24 @@ new file mode 100644
 +  });
 +}
 +
-+already_AddRefed<ClientHandle::ControlPromise>
++already_AddRefed<GenericPromise>
 +ClientHandle::Control(const nsACString& aScope, uint64_t aServiceWorkerID)
 +{
 +  ClientControlledArgs args(nsCString(aScope), aServiceWorkerID);
-+  RefPtr<ControlPromise::Private> outerPromise =
-+    new ControlPromise::Private(__func__);
++  RefPtr<GenericPromise::Private> outerPromise =
++    new GenericPromise::Private(__func__);
 +
 +  RefPtr<ClientOpPromise> innerPromise =
 +    StartOp(ClientControlledArgs(nsCString(aScope), aServiceWorkerID));
 +
 +  innerPromise->Then(AbstractThread::GetCurrent(), __func__,
 +    [outerPromise](const ClientOpResult& aResult) {
-+      outerPromise->Resolve(NS_OK, __func__);
++      outerPromise->Resolve(true, __func__);
 +    }, [outerPromise](const ClientOpResult& aResult) {
 +      outerPromise->Reject(aResult.get_nsresult(), __func__);
 +    });
 +
-+  RefPtr<ControlPromise> ref = outerPromise.get();
++  RefPtr<GenericPromise> ref = outerPromise.get();
 +  return ref.forget();
 +}
 +
@@ -569,7 +569,7 @@ diff --git a/dom/clients/manager/ClientHandle.h b/dom/clients/manager/ClientHand
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientHandle.h
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,76 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -636,9 +636,7 @@ new file mode 100644
 +  void
 +  SetControlled(const nsACString& aScope, uint64_t aServiceWorkerID);
 +
-+  typedef MozPromise<nsresult, nsresult, true> ControlPromise;
-+
-+  already_AddRefed<ControlPromise>
++  already_AddRefed<GenericPromise>
 +  Control(const nsACString& aScope, uint64_t aServiceWorkerID);
 +
 +  NS_INLINE_DECL_REFCOUNTING(ClientHandle);
@@ -652,7 +650,7 @@ diff --git a/dom/clients/manager/ClientHandleChild.cpp b/dom/clients/manager/Cli
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientHandleChild.cpp
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,74 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -720,6 +718,7 @@ new file mode 100644
 +  if (mTeardownStarted) {
 +    return;
 +  }
++  printf_stderr("### ### ClientHandleChild::MaybeStartTeardown()\n");
 +  mTeardownStarted = true;
 +  Unused << SendTeardown();
 +}
@@ -783,7 +782,7 @@ diff --git a/dom/clients/manager/ClientHandleOpChild.cpp b/dom/clients/manager/C
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientHandleOpChild.cpp
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,49 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -799,6 +798,7 @@ new file mode 100644
 +ClientHandleOpChild::ActorDestroy(ActorDestroyReason aReason)
 +{
 +  if (mPromise) {
++    printf_stderr("### ### ClientHandleOpChild::ActorDestroy()\n");
 +    mPromise->Reject(NS_ERROR_ABORT, __func__);
 +    mPromise = nullptr;
 +  }
@@ -879,7 +879,7 @@ diff --git a/dom/clients/manager/ClientHandleOpParent.cpp b/dom/clients/manager/
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientHandleOpParent.cpp
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,55 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -889,6 +889,7 @@ new file mode 100644
 +#include "ClientHandleOpParent.h"
 +
 +#include "ClientHandleParent.h"
++#include "ClientSourceParent.h"
 +
 +namespace mozilla {
 +namespace dom {
@@ -903,6 +904,7 @@ new file mode 100644
 +void
 +ClientHandleOpParent::ActorDestroy(ActorDestroyReason aReason)
 +{
++  mPromiseRequestHolder.DisconnectIfExists();
 +}
 +
 +void
@@ -914,7 +916,21 @@ new file mode 100644
 +    return;
 +  }
 +
-+  // TODO
++  RefPtr<ClientOpPromise> p =
++    source->StartOp(aArgs);
++
++  RefPtr<AbstractThread> target =
++    AbstractThread::CreateXPCOMThreadWrapper(NS_GetCurrentThread(), false);
++
++  // Capturing `this` is safe here because we disconnect the promise in
++  // ActorDestroy() which ensures neither lambda is called if the actor
++  // is destroyed before the source operation completes.
++  p->Then(target, __func__,
++      [this] (const ClientOpResult& aResult) {
++        Unused << PClientHandleOpParent::Send__delete__(this, aResult);
++      }, [this] (const ClientOpResult& aResult) {
++        Unused << PClientHandleOpParent::Send__delete__(this, aResult);
++    })->Track(mPromiseRequestHolder);
 +}
 +
 +} // namespace dom
@@ -923,7 +939,7 @@ diff --git a/dom/clients/manager/ClientHandleOpParent.h b/dom/clients/manager/Cl
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientHandleOpParent.h
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,40 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -934,6 +950,8 @@ new file mode 100644
 +
 +#include "mozilla/dom/PClientHandleOpParent.h"
 +
++#include "mozilla/MozPromise.h"
++
 +namespace mozilla {
 +namespace dom {
 +
@@ -941,6 +959,8 @@ new file mode 100644
 +
 +class ClientHandleOpParent final : public PClientHandleOpParent
 +{
++  MozPromiseRequestHolder<ClientOpPromise> mPromiseRequestHolder;
++
 +  ClientSourceParent*
 +  GetSource() const;
 +
@@ -3996,6 +4016,125 @@ diff --git a/dom/workers/ScriptLoader.cpp b/dom/workers/ScriptLoader.cpp
       const nsTArray<nsString>& aScriptURLs, WorkerScriptType aWorkerScriptType,
       ErrorResult& aRv)
  {
+diff --git a/dom/workers/ServiceWorkerClients.cpp b/dom/workers/ServiceWorkerClients.cpp
+--- a/dom/workers/ServiceWorkerClients.cpp
++++ b/dom/workers/ServiceWorkerClients.cpp
+@@ -28,16 +28,18 @@
+ #include "nsIWebProgressListener.h"
+ #include "nsIWindowMediator.h"
+ #include "nsIWindowWatcher.h"
+ #include "nsNetUtil.h"
+ #include "nsPIWindowWatcher.h"
+ #include "nsWindowWatcher.h"
+ #include "nsWeakReference.h"
+ 
++#include "mozilla/ErrorNames.h"
++
+ #ifdef MOZ_WIDGET_ANDROID
+ #include "AndroidBridge.h"
+ #endif
+ 
+ using namespace mozilla;
+ using namespace mozilla::dom;
+ using namespace mozilla::dom::workers;
+ 
+@@ -237,37 +239,45 @@ public:
+ 
+ class ResolveClaimRunnable final : public WorkerRunnable
+ {
+   RefPtr<PromiseWorkerProxy> mPromiseProxy;
+   nsresult mResult;
+ 
+ public:
+   ResolveClaimRunnable(WorkerPrivate* aWorkerPrivate,
+-                       PromiseWorkerProxy* aPromiseProxy,
+-                       nsresult aResult)
++                       PromiseWorkerProxy* aPromiseProxy)
+     : WorkerRunnable(aWorkerPrivate)
+     , mPromiseProxy(aPromiseProxy)
+-    , mResult(aResult)
++    , mResult(NS_OK)
+   {
+     AssertIsOnMainThread();
+   }
+ 
++  void
++  SetResult(nsresult aResult)
++  {
++    mResult = aResult;
++  }
++
+   bool
+   WorkerRun(JSContext* aCx, WorkerPrivate* aWorkerPrivate) override
+   {
+     MOZ_ASSERT(aWorkerPrivate);
+     aWorkerPrivate->AssertIsOnWorkerThread();
+ 
+     RefPtr<Promise> promise = mPromiseProxy->WorkerPromise();
+     MOZ_ASSERT(promise);
+ 
+     if (NS_SUCCEEDED(mResult)) {
+       promise->MaybeResolveWithUndefined();
+     } else {
++      nsAutoCString name;
++      GetErrorName(mResult, name);
++      printf_stderr("### ### %s\n", name.get());
+       promise->MaybeReject(NS_ERROR_DOM_INVALID_STATE_ERR);
+     }
+ 
+     mPromiseProxy->CleanUp();
+     return true;
+   }
+ };
+ 
+@@ -294,30 +304,39 @@ public:
+     MutexAutoLock lock(mPromiseProxy->Lock());
+     if (mPromiseProxy->CleanedUp()) {
+       return NS_OK;
+     }
+ 
+     WorkerPrivate* workerPrivate = mPromiseProxy->GetWorkerPrivate();
+     MOZ_ASSERT(workerPrivate);
+ 
+-    nsresult rv = NS_OK;
++    RefPtr<ResolveClaimRunnable> resolveRunnable =
++      new ResolveClaimRunnable(workerPrivate, mPromiseProxy);
++
+     RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+     if (!swm) {
+       // browser shutdown
+-      rv = NS_ERROR_FAILURE;
+-    } else {
+-      rv = swm->ClaimClients(workerPrivate->GetPrincipal(), mScope,
+-                             mServiceWorkerID);
++      resolveRunnable->SetResult(NS_ERROR_FAILURE);
++      resolveRunnable->Dispatch();
++      return NS_OK;
+     }
+ 
+-    RefPtr<ResolveClaimRunnable> r =
+-      new ResolveClaimRunnable(workerPrivate, mPromiseProxy, rv);
++    RefPtr<GenericPromise::AllPromiseType> p =
++      swm->ClaimClients(workerPrivate->GetPrincipal(), mScope,
++                        mServiceWorkerID);
++    p->Then(AbstractThread::GetCurrent(), __func__,
++      [resolveRunnable](const nsTArray<bool>& aResultList) {
++        resolveRunnable->SetResult(NS_OK);
++        resolveRunnable->Dispatch();
++      }, [resolveRunnable](nsresult aRv) {
++        resolveRunnable->SetResult(aRv);
++        resolveRunnable->Dispatch();
++      });
+ 
+-    r->Dispatch();
+     return NS_OK;
+   }
+ };
+ 
+ class ResolveOpenWindowRunnable final : public WorkerRunnable
+ {
+ public:
+   ResolveOpenWindowRunnable(PromiseWorkerProxy* aPromiseProxy,
 diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
 --- a/dom/workers/ServiceWorkerManager.cpp
 +++ b/dom/workers/ServiceWorkerManager.cpp
@@ -4018,10 +4157,46 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
  #include "mozilla/dom/InternalHeaders.h"
  #include "mozilla/dom/Navigator.h"
  #include "mozilla/dom/NotificationEvent.h"
-@@ -2200,16 +2202,30 @@ ServiceWorkerManager::StartControllingAD
+@@ -2147,17 +2149,18 @@ ServiceWorkerManager::MaybeStartControll
+                                             const nsAString& aDocumentId)
+ {
+   AssertIsOnMainThread();
+   MOZ_ASSERT(aDoc);
+   RefPtr<ServiceWorkerRegistrationInfo> registration =
+     GetServiceWorkerRegistrationInfo(aDoc);
+   if (registration) {
+     MOZ_ASSERT(!mControlledDocuments.Contains(aDoc));
+-    StartControllingADocument(registration, aDoc, aDocumentId);
++    RefPtr<GenericPromise> p =
++      StartControllingADocument(registration, aDoc, aDocumentId);
+   }
+ }
+ 
+ void
+ ServiceWorkerManager::MaybeStopControlling(nsIDocument* aDoc)
+ {
+   AssertIsOnMainThread();
+   MOZ_ASSERT(aDoc);
+@@ -2187,30 +2190,45 @@ ServiceWorkerManager::MaybeCheckNavigati
+   //    algorithm.
+   RefPtr<ServiceWorkerRegistrationInfo> registration;
+   mControlledDocuments.Get(aDoc, getter_AddRefs(registration));
+   if (registration) {
+     registration->MaybeScheduleUpdate();
+   }
+ }
+ 
+-void
++already_AddRefed<GenericPromise>
+ ServiceWorkerManager::StartControllingADocument(ServiceWorkerRegistrationInfo* aRegistration,
+                                                 nsIDocument* aDoc,
+                                                 const nsAString& aDocumentId)
+ {
    MOZ_ASSERT(aRegistration);
    MOZ_ASSERT(aDoc);
  
++  RefPtr<GenericPromise> ref = GenericPromise::CreateAndResolve(true, __func__);
++
    aRegistration->StartControllingADocument();
    mControlledDocuments.Put(aDoc, aRegistration);
    if (!aDocumentId.IsEmpty()) {
@@ -4035,13 +4210,12 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
 +      RefPtr<ClientHandle> clientHandle =
 +        ClientManager::CreateHandle(clientInfo.ref());
 +      if (clientHandle) {
-+        // TODO: Clients.claim() should not resolve promise until all of these
-+        //       MozPromise values resolve.
-+        clientHandle->Control(activeWorker->Scope(), activeWorker->ID());
++        ref = clientHandle->Control(activeWorker->Scope(), activeWorker->ID());
 +      }
 +    }
 +  }
    Telemetry::Accumulate(Telemetry::SERVICE_WORKER_CONTROLLED_DOCUMENTS, 1);
++  return ref.forget();
  }
  
  void
@@ -4049,7 +4223,8 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
  {
    aRegistration->StopControllingADocument();
    if (aRegistration->IsControllingDocuments() || !aRegistration->IsIdle()) {
-@@ -2476,19 +2492,16 @@ ServiceWorkerManager::DispatchFetchEvent
+     return;
+@@ -2476,19 +2494,16 @@ ServiceWorkerManager::DispatchFetchEvent
      nsCOMPtr<nsIChannel> internalChannel;
      aRv = aChannel->GetChannel(getter_AddRefs(internalChannel));
      if (NS_WARN_IF(aRv.Failed())) {
@@ -4069,7 +4244,7 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
  
      // non-subresource request means the URI contains the principal
      nsCOMPtr<nsIPrincipal> principal =
-@@ -2507,16 +2520,40 @@ ServiceWorkerManager::DispatchFetchEvent
+@@ -2507,16 +2522,41 @@ ServiceWorkerManager::DispatchFetchEvent
      // before we get to this point.  Therefore we must handle a nullptr
      // active worker here.
      serviceWorker = registration->GetActive();
@@ -4090,7 +4265,8 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
 +        RefPtr<ClientHandle> clientHandle =
 +          ClientManager::CreateHandle(clientInfo.ref());
 +        if (clientHandle) {
-+          clientHandle->Control(serviceWorker->Scope(), serviceWorker->ID());
++          RefPtr<GenericPromise> p =
++            clientHandle->Control(serviceWorker->Scope(), serviceWorker->ID());
 +        }
 +
 +        // But we also note the reserved state on the LoadInfo.  This allows the
@@ -4110,7 +4286,7 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
    }
  
    MOZ_DIAGNOSTIC_ASSERT(serviceWorker);
-@@ -2603,32 +2640,52 @@ ServiceWorkerManager::GetDocumentRegistr
+@@ -2603,32 +2643,52 @@ ServiceWorkerManager::GetDocumentRegistr
  NS_IMETHODIMP
  ServiceWorkerManager::GetDocumentController(nsPIDOMWindowInner* aWindow,
                                              nsISupports** aServiceWorker)
@@ -4169,7 +4345,7 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
                                      const nsAString& aScope,
                                      nsISupports** aServiceWorker)
  {
-@@ -2866,47 +2923,16 @@ ServiceWorkerManager::Update(nsIPrincipa
+@@ -2866,47 +2926,16 @@ ServiceWorkerManager::Update(nsIPrincipa
                                 registration->GetLoadFlags());
  
    RefPtr<UpdateJobCallback> cb = new UpdateJobCallback(aCallback);
@@ -4217,25 +4393,129 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
    UniquePtr<ServiceWorkerClientInfo> clientInfo;
    nsCOMPtr<nsISupportsInterfacePointer> ifptr =
      do_CreateInstance(NS_SUPPORTS_INTERFACE_POINTER_CONTRACTID);
-@@ -3063,17 +3089,16 @@ ServiceWorkerManager::MaybeClaimClient(n
-     return;
+@@ -3033,87 +3062,106 @@ ServiceWorkerManager::GetAllClients(nsIP
+   for (uint32_t i = 0; i < docList.Length(); ++i) {
+     aDocuments.AppendElement(ServiceWorkerClientInfo(docList[i], ordinal));
+     ordinal += 1;
+   }
+ 
+   aDocuments.Sort();
+ }
+ 
+-void
++already_AddRefed<GenericPromise>
+ ServiceWorkerManager::MaybeClaimClient(nsIDocument* aDocument,
+                                        ServiceWorkerRegistrationInfo* aWorkerRegistration)
+ {
+   MOZ_ASSERT(aWorkerRegistration);
+   MOZ_ASSERT(aWorkerRegistration->GetActive());
+ 
++  RefPtr<GenericPromise> ref;
++
+   // Same origin check
+   if (!aWorkerRegistration->mPrincipal->Equals(aDocument->NodePrincipal())) {
+-    return;
++    printf_stderr("### ### MaybeClaimClient 1\n");
++    ref = GenericPromise::CreateAndReject(NS_ERROR_DOM_SECURITY_ERR, __func__);
++    return ref.forget();
+   }
+ 
+   // The registration that should be controlling the client
+   RefPtr<ServiceWorkerRegistrationInfo> matchingRegistration =
+     GetServiceWorkerRegistrationInfo(aDocument);
+ 
+   // The registration currently controlling the client
+   RefPtr<ServiceWorkerRegistrationInfo> controllingRegistration;
+   GetDocumentRegistration(aDocument, getter_AddRefs(controllingRegistration));
+ 
+   if (aWorkerRegistration != matchingRegistration ||
+-        aWorkerRegistration == controllingRegistration) {
+-    return;
++      aWorkerRegistration == controllingRegistration) {
++    ref = GenericPromise::CreateAndResolve(true, __func__);
++    return ref.forget();
    }
  
    if (controllingRegistration) {
      StopControllingADocument(controllingRegistration);
    }
  
-   StartControllingADocument(aWorkerRegistration, aDocument, NS_LITERAL_STRING(""));
+-  StartControllingADocument(aWorkerRegistration, aDocument, NS_LITERAL_STRING(""));
 -  FireControllerChangeOnDocument(aDocument);
++  ref = StartControllingADocument(aWorkerRegistration, aDocument,
++                                  NS_LITERAL_STRING(""));
++  return ref.forget();
  }
  
- nsresult
+-nsresult
++already_AddRefed<GenericPromise::AllPromiseType>
  ServiceWorkerManager::ClaimClients(nsIPrincipal* aPrincipal,
                                     const nsCString& aScope, uint64_t aId)
  {
++  RefPtr<GenericPromise::AllPromiseType> ref;
++
    RefPtr<ServiceWorkerRegistrationInfo> registration =
      GetRegistration(aPrincipal, aScope);
-@@ -3132,30 +3157,46 @@ ServiceWorkerManager::SetSkipWaitingFlag
+ 
+   if (!registration || !registration->GetActive() ||
+       !(registration->GetActive()->ID() == aId)) {
+     // The worker is not active.
+-    return NS_ERROR_DOM_INVALID_STATE_ERR;
++    printf_stderr("### ### ClaimClients 1\n");
++    ref = GenericPromise::AllPromiseType::CreateAndReject(NS_ERROR_DOM_INVALID_STATE_ERR,
++                                                          __func__);
++    return ref.forget();
+   }
+ 
+   nsCOMPtr<nsIObserverService> obs = mozilla::services::GetObserverService();
+   if (NS_WARN_IF(!obs)) {
+-    return NS_ERROR_FAILURE;
++    printf_stderr("### ### ClaimClients 2\n");
++    ref = GenericPromise::AllPromiseType::CreateAndReject(NS_ERROR_FAILURE,
++                                                          __func__);
++    return ref.forget();
+   }
+ 
+   nsCOMPtr<nsISimpleEnumerator> enumerator;
+   nsresult rv = obs->EnumerateObservers("service-worker-get-client",
+                                         getter_AddRefs(enumerator));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    return rv;
+-  }
++    printf_stderr("### ### ClaimClients 3\n");
++    ref = GenericPromise::AllPromiseType::CreateAndReject(rv, __func__);
++    return ref.forget();
++  }
++
++  AutoTArray<RefPtr<GenericPromise>, 32> claimPromiseList;
+ 
+   bool loop = true;
+   while (NS_SUCCEEDED(enumerator->HasMoreElements(&loop)) && loop) {
+     nsCOMPtr<nsISupports> ptr;
+     rv = enumerator->GetNext(getter_AddRefs(ptr));
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       continue;
+     }
+ 
+     nsCOMPtr<nsIDocument> doc = do_QueryInterface(ptr);
+-    MaybeClaimClient(doc, registration);
+-  }
+-
+-  return NS_OK;
++    claimPromiseList.AppendElement(MaybeClaimClient(doc, registration));
++  }
++
++  ref = GenericPromise::All(AbstractThread::GetCurrent(), claimPromiseList);
++  return ref.forget();
+ }
+ 
+ void
+ ServiceWorkerManager::SetSkipWaitingFlag(nsIPrincipal* aPrincipal,
+                                          const nsCString& aScope,
+                                          uint64_t aServiceWorkerID)
+ {
+   RefPtr<ServiceWorkerRegistrationInfo> registration =
+@@ -3132,30 +3180,47 @@ ServiceWorkerManager::SetSkipWaitingFlag
    worker->SetSkipWaitingFlag();
  
    if (worker->State() == ServiceWorkerState::Installed) {
@@ -4273,7 +4553,8 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
 +      RefPtr<ClientHandle> clientHandle =
 +        ClientManager::CreateHandle(clientInfo.ref());
 +      if (clientHandle) {
-+        clientHandle->Control(activeWorker->Scope(), activeWorker->ID());
++        RefPtr<GenericPromise> p =
++          clientHandle->Control(activeWorker->Scope(), activeWorker->ID());
 +      }
 +    }
    }
@@ -4287,7 +4568,68 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
 diff --git a/dom/workers/ServiceWorkerManager.h b/dom/workers/ServiceWorkerManager.h
 --- a/dom/workers/ServiceWorkerManager.h
 +++ b/dom/workers/ServiceWorkerManager.h
-@@ -424,17 +424,17 @@ private:
+@@ -10,16 +10,17 @@
+ #include "nsIServiceWorkerManager.h"
+ #include "nsCOMPtr.h"
+ 
+ #include "ipc/IPCMessageUtils.h"
+ #include "mozilla/Attributes.h"
+ #include "mozilla/AutoRestore.h"
+ #include "mozilla/ConsoleReportCollector.h"
+ #include "mozilla/LinkedList.h"
++#include "mozilla/MozPromise.h"
+ #include "mozilla/Preferences.h"
+ #include "mozilla/TypedEnumBits.h"
+ #include "mozilla/UniquePtr.h"
+ #include "mozilla/WeakPtr.h"
+ #include "mozilla/dom/BindingUtils.h"
+ #include "mozilla/dom/Promise.h"
+ #include "mozilla/dom/ServiceWorkerCommon.h"
+ #include "mozilla/dom/ServiceWorkerRegistrar.h"
+@@ -271,21 +272,21 @@ public:
+ 
+   void
+   GetAllClients(nsIPrincipal* aPrincipal,
+                 const nsCString& aScope,
+                 uint64_t aServiceWorkerID,
+                 bool aIncludeUncontrolled,
+                 nsTArray<ServiceWorkerClientInfo>& aDocuments);
+ 
+-  void
++  already_AddRefed<GenericPromise>
+   MaybeClaimClient(nsIDocument* aDocument,
+                    ServiceWorkerRegistrationInfo* aWorkerRegistration);
+ 
+-  nsresult
++  already_AddRefed<GenericPromise::AllPromiseType>
+   ClaimClients(nsIPrincipal* aPrincipal, const nsCString& aScope, uint64_t aId);
+ 
+   void
+   SetSkipWaitingFlag(nsIPrincipal* aPrincipal, const nsCString& aScope,
+                      uint64_t aServiceWorkerID);
+ 
+   static already_AddRefed<ServiceWorkerManager>
+   GetInstance();
+@@ -374,17 +375,17 @@ private:
+                                             WhichServiceWorker aWhichOne);
+   void
+   InvalidateServiceWorkerRegistrationWorker(ServiceWorkerRegistrationInfo* aRegistration,
+                                             WhichServiceWorker aWhichOnes);
+ 
+   void
+   NotifyServiceWorkerRegistrationRemoved(ServiceWorkerRegistrationInfo* aRegistration);
+ 
+-  void
++  already_AddRefed<GenericPromise>
+   StartControllingADocument(ServiceWorkerRegistrationInfo* aRegistration,
+                             nsIDocument* aDoc,
+                             const nsAString& aDocumentId);
+ 
+   void
+   StopControllingADocument(ServiceWorkerRegistrationInfo* aRegistration);
+ 
+   already_AddRefed<ServiceWorkerRegistrationInfo>
+@@ -424,17 +425,17 @@ private:
    void
    QueueFireEventOnServiceWorkerRegistrations(ServiceWorkerRegistrationInfo* aRegistration,
                                               const nsAString& aName);
