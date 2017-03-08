@@ -1,0 +1,270 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  1762ca78bca463c93e36faa43bc55dbe3eaf784a
+Bug 1345251 Make MozPromise usable on worker threads. r=gerald
+
+diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
+--- a/dom/workers/RuntimeService.cpp
++++ b/dom/workers/RuntimeService.cpp
+@@ -21,16 +21,17 @@
+ #include "nsITimer.h"
+ #include "nsIURI.h"
+ #include "nsPIDOMWindow.h"
+ 
+ #include <algorithm>
+ #include "BackgroundChild.h"
+ #include "GeckoProfiler.h"
+ #include "jsfriendapi.h"
++#include "mozilla/AbstractThread.h"
+ #include "mozilla/ArrayUtils.h"
+ #include "mozilla/AsyncEventDispatcher.h"
+ #include "mozilla/Atomics.h"
+ #include "mozilla/CycleCollectedJSContext.h"
+ #include "mozilla/Telemetry.h"
+ #include "mozilla/TimeStamp.h"
+ #include "mozilla/dom/asmjscache/AsmJSCache.h"
+ #include "mozilla/dom/AtomList.h"
+@@ -2811,20 +2812,22 @@ WorkerThreadPrimaryRunnable::Run()
+     // Failed in creating BackgroundChild: probably in shutdown. Continue to run
+     // without BackgroundChild created.
+   }
+ 
+   class MOZ_STACK_CLASS SetThreadHelper final
+   {
+     // Raw pointer: this class is on the stack.
+     WorkerPrivate* mWorkerPrivate;
++    RefPtr<AbstractThread> mAbstractThread;
+ 
+   public:
+     SetThreadHelper(WorkerPrivate* aWorkerPrivate, WorkerThread* aThread)
+       : mWorkerPrivate(aWorkerPrivate)
++      , mAbstractThread(AbstractThread::CreateXPCOMThreadWrapper(NS_GetCurrentThread(), false))
+     {
+       MOZ_ASSERT(aWorkerPrivate);
+       MOZ_ASSERT(aThread);
+ 
+       mWorkerPrivate->SetThread(aThread);
+     }
+ 
+     ~SetThreadHelper()
+diff --git a/xpcom/threads/AbstractThread.cpp b/xpcom/threads/AbstractThread.cpp
+--- a/xpcom/threads/AbstractThread.cpp
++++ b/xpcom/threads/AbstractThread.cpp
+@@ -123,17 +123,17 @@ private:
+   virtual already_AddRefed<nsIRunnable>
+   CreateDirectTaskDrainer(already_AddRefed<nsIRunnable> aRunnable) override
+   {
+     RefPtr<Runner> runner =
+       new Runner(this, Move(aRunnable), /* aDrainDirectTasks */ true);
+     return runner.forget();
+   }
+ 
+-  class Runner : public Runnable {
++  class Runner : public CancelableRunnable {
+   public:
+     explicit Runner(EventTargetWrapper* aThread,
+                     already_AddRefed<nsIRunnable> aRunnable,
+                     bool aDrainDirectTasks)
+       : mThread(aThread)
+       , mRunnable(aRunnable)
+       , mDrainDirectTasks(aDrainDirectTasks)
+     {
+@@ -165,16 +165,49 @@ private:
+ 
+       if (mDrainDirectTasks) {
+         mThread->TailDispatcher().DrainDirectTasks();
+       }
+ 
+       return rv;
+     }
+ 
++    nsresult Cancel() override
++    {
++      // Set the TLS during Cancel() just in case it calls Run().
++      class MOZ_STACK_CLASS AutoTaskGuard final {
++      public:
++        explicit AutoTaskGuard(EventTargetWrapper* aThread)
++          : mLastCurrentThread(nullptr)
++        {
++          MOZ_ASSERT(aThread);
++          mLastCurrentThread = sCurrentThreadTLS.get();
++          sCurrentThreadTLS.set(aThread);
++        }
++
++        ~AutoTaskGuard()
++        {
++          sCurrentThreadTLS.set(mLastCurrentThread);
++        }
++      private:
++        AbstractThread* mLastCurrentThread;
++      } taskGuard(mThread);
++
++      nsresult rv = NS_OK;
++
++      // Try to cancel the runnable if it implements the right interface.
++      // Otherwise just skip the runnable.
++      nsCOMPtr<nsICancelableRunnable> cr = do_QueryInterface(mRunnable);
++      if (cr) {
++        rv = cr->Cancel();
++      }
++
++      return rv;
++    }
++
+     NS_IMETHOD GetName(nsACString& aName) override
+     {
+       aName.AssignLiteral("AbstractThread::Runner");
+       if (nsCOMPtr<nsINamed> named = do_QueryInterface(mRunnable)) {
+         nsAutoCString name;
+         named->GetName(name);
+         if (!name.IsEmpty()) {
+           aName.AppendLiteral(" for ");
+@@ -260,16 +293,25 @@ AbstractThread::DispatchDirectTask(alrea
+   GetCurrent()->TailDispatcher().AddDirectTask(Move(aRunnable));
+ }
+ 
+ /* static */
+ already_AddRefed<AbstractThread>
+ AbstractThread::CreateXPCOMThreadWrapper(nsIThread* aThread, bool aRequireTailDispatch)
+ {
+   RefPtr<EventTargetWrapper> wrapper = new EventTargetWrapper(aThread, aRequireTailDispatch);
++
++  bool onCurrentThread = false;
++  Unused << aThread->IsOnCurrentThread(&onCurrentThread);
++
++  if (onCurrentThread) {
++    sCurrentThreadTLS.set(wrapper);
++    return wrapper.forget();
++  }
++
+   // Set the thread-local sCurrentThreadTLS to point to the wrapper on the
+   // target thread. This ensures that sCurrentThreadTLS is as expected by
+   // AbstractThread::GetCurrent() on the target thread.
+   nsCOMPtr<nsIRunnable> r =
+     NS_NewRunnableFunction([wrapper]() { sCurrentThreadTLS.set(wrapper); });
+   aThread->Dispatch(r.forget(), NS_DISPATCH_NORMAL);
+   return wrapper.forget();
+ }
+diff --git a/xpcom/threads/MozPromise.h b/xpcom/threads/MozPromise.h
+--- a/xpcom/threads/MozPromise.h
++++ b/xpcom/threads/MozPromise.h
+@@ -311,17 +311,17 @@ protected:
+    * invokes the resolve/reject method and then deletes the ThenValue.
+    */
+   class ThenValueBase : public Request
+   {
+     friend class MozPromise;
+     static const uint32_t sMagic = 0xfadece11;
+ 
+   public:
+-    class ResolveOrRejectRunnable : public Runnable
++    class ResolveOrRejectRunnable : public CancelableRunnable
+     {
+     public:
+       ResolveOrRejectRunnable(ThenValueBase* aThenValue, MozPromise* aPromise)
+         : mThenValue(aThenValue)
+         , mPromise(aPromise)
+       {
+         MOZ_DIAGNOSTIC_ASSERT(!mPromise->IsPending());
+       }
+@@ -337,16 +337,21 @@ protected:
+       {
+         PROMISE_LOG("ResolveOrRejectRunnable::Run() [this=%p]", this);
+         mThenValue->DoResolveOrReject(mPromise->Value());
+         mThenValue = nullptr;
+         mPromise = nullptr;
+         return NS_OK;
+       }
+ 
++      nsresult Cancel() override
++      {
++        return Run();
++      }
++
+     private:
+       RefPtr<ThenValueBase> mThenValue;
+       RefPtr<MozPromise> mPromise;
+     };
+ 
+     ThenValueBase(AbstractThread* aResponseTarget,
+                   const char* aCallSite)
+       : mResponseTarget(aResponseTarget)
+@@ -1213,31 +1218,36 @@ public:
+ private:
+   MethodType mMethod;
+   RefPtr<ThisType> mThisVal;
+   RunnableMethodArguments<Storages...> mArgs;
+ };
+ 
+ template<typename PromiseType, typename MethodType, typename ThisType,
+          typename... Storages>
+-class ProxyRunnable : public Runnable
++class ProxyRunnable : public CancelableRunnable
+ {
+ public:
+   ProxyRunnable(typename PromiseType::Private* aProxyPromise,
+                 MethodCall<PromiseType, MethodType, ThisType, Storages...>* aMethodCall)
+     : mProxyPromise(aProxyPromise), mMethodCall(aMethodCall) {}
+ 
+   NS_IMETHOD Run() override
+   {
+     RefPtr<PromiseType> p = mMethodCall->Invoke();
+     mMethodCall = nullptr;
+     p->ChainTo(mProxyPromise.forget(), "<Proxy Promise>");
+     return NS_OK;
+   }
+ 
++  nsresult Cancel() override
++  {
++    return Run();
++  }
++
+ private:
+   RefPtr<typename PromiseType::Private> mProxyPromise;
+   nsAutoPtr<MethodCall<PromiseType, MethodType, ThisType, Storages...>> mMethodCall;
+ };
+ 
+ template<typename... Storages,
+          typename PromiseType, typename ThisType, typename... ArgTypes,
+          typename... ActualArgTypes>
+@@ -1319,17 +1329,17 @@ InvokeAsync(AbstractThread* aTarget, Thi
+   return detail::InvokeAsyncImpl<StoreCopyPassByRRef<ArgTypes>...>(
+            aTarget, aThisVal, aCallerName, aMethod,
+            Forward<ActualArgTypes>(aArgs)...);
+ }
+ 
+ namespace detail {
+ 
+ template<typename Function, typename PromiseType>
+-class ProxyFunctionRunnable : public Runnable
++class ProxyFunctionRunnable : public CancelableRunnable
+ {
+   typedef typename Decay<Function>::Type FunctionStorage;
+ public:
+   template <typename F>
+   ProxyFunctionRunnable(typename PromiseType::Private* aProxyPromise,
+                         F&& aFunction)
+     : mProxyPromise(aProxyPromise)
+     , mFunction(new FunctionStorage(Forward<F>(aFunction))) {}
+@@ -1337,16 +1347,21 @@ public:
+   NS_IMETHOD Run() override
+   {
+     RefPtr<PromiseType> p = (*mFunction)();
+     mFunction = nullptr;
+     p->ChainTo(mProxyPromise.forget(), "<Proxy Promise>");
+     return NS_OK;
+   }
+ 
++  nsresult Cancel() override
++  {
++    return Run();
++  }
++
+ private:
+   RefPtr<typename PromiseType::Private> mProxyPromise;
+   UniquePtr<FunctionStorage> mFunction;
+ };
+ 
+ // Note: The following struct and function are not for public consumption (yet?)
+ // as we would prefer all calls to pass on-the-spot lambdas (or at least moved
+ // function objects). They could be moved outside of detail if really needed.
