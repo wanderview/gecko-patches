@@ -1390,7 +1390,7 @@ diff --git a/dom/clients/manager/ClientManager.cpp b/dom/clients/manager/ClientM
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientManager.cpp
-@@ -0,0 +1,346 @@
+@@ -0,0 +1,349 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1399,7 +1399,9 @@ new file mode 100644
 +
 +#include "ClientManager.h"
 +
++#include "ClientHandle.h"
 +#include "ClientManagerChild.h"
++#include "ClientQueryChild.h"
 +#include "ClientSource.h"
 +#include "mozilla/dom/WorkerPrivate.h"
 +#include "mozilla/dom/workers/bindings/WorkerHolderToken.h"
@@ -1462,8 +1464,6 @@ new file mode 100644
 +                  nsIIPCBackgroundChildCreateCallback);
 +
 +ClientManager::ClientManager()
-+  : mActor(nullptr)
-+  , mShutdown(false)
 +{
 +  PBackgroundChild* actor = BackgroundChild::GetForCurrentThread();
 +  if (actor) {
@@ -1498,10 +1498,9 @@ new file mode 100644
 +{
 +  NS_ASSERT_OWNINGTHREAD(ClientManager);
 +
-+  if (mShutdown) {
++  if (IsShutdown()) {
 +    return;
 +  }
-+  mShutdown = true;
 +
 +  nsTArray<ClientSource*> pendingSourceList;
 +  mPendingSourceList.SwapElements(pendingSourceList);
@@ -1515,12 +1514,7 @@ new file mode 100644
 +    handle->Shutdown();
 +  }
 +
-+  if (!mActor) {
-+    return;
-+  }
-+  mActor->RevokeManager(this);
-+  mActor->MaybeStartTeardown();
-+  mActor = nullptr;
++  ShutdownThing();
 +}
 +
 +UniquePtr<ClientSource>
@@ -1529,7 +1523,7 @@ new file mode 100644
 +{
 +  NS_ASSERT_OWNINGTHREAD(ClientManager);
 +
-+  if (mShutdown) {
++  if (IsShutdown()) {
 +    return nullptr;
 +  }
 +
@@ -1550,8 +1544,10 @@ new file mode 100644
 +  ClientSourceConstructorArgs args(id, aType, aPrincipal, TimeStamp::Now());
 +  UniquePtr<ClientSource> source(new ClientSource(this, args));
 +
-+  if (mActor) {
-+    source->Activate(mActor);
++  // TODO: Replace with MaybeExecute()?  How to handle error shutdown? How
++  //       to track UniquePtr<ClientSource>?
++  if (GetActor()) {
++    source->Activate(GetActor());
 +  } else {
 +    mPendingSourceList.AppendElement(source.get());
 +  }
@@ -1564,14 +1560,15 @@ new file mode 100644
 +{
 +  NS_ASSERT_OWNINGTHREAD(ClientManager);
 +
-+  if (mShutdown) {
++  if (IsShutdown()) {
 +    return nullptr;
 +  }
 +
 +  RefPtr<ClientHandle> handle = new ClientHandle(this, aClientInfo);
 +
-+  if (mActor) {
-+    handle->Activate(mActor);
++  // TODO: Replace with MaybeExecute()?  How to handle error shutdown?
++  if (GetActor()) {
++    handle->Activate(GetActor());
 +  } else {
 +    mPendingHandleList.AppendElement(handle);
 +  }
@@ -1582,21 +1579,27 @@ new file mode 100644
 +already_AddRefed<ClientQueryPromise>
 +ClientManager::QueryInternal(const ClientQueryConstructorArgs& aArgs)
 +{
-+  // TODO:
-+  // Handle async creation of actor here.
-+  RefPtr<ClientQueryPromise> ref =
-+    ClientQueryPromise::CreateAndReject(NS_ERROR_FAILURE, __func__);
-+  return ref.forget();
-+}
++  RefPtr<ClientQueryPromise::Private> promise =
++    new ClientQueryPromise::Private(__func__);
 +
-+void
-+ClientManager::RevokeActor(ClientManagerChild* aActor)
-+{
-+  NS_ASSERT_OWNINGTHREAD(ClientManager);
-+  MOZ_ASSERT(mActor);
-+  MOZ_ASSERT(mActor == aActor);
-+  mActor->RevokeManager(this);
-+  mActor = nullptr;
++  // Hold a ref to the client until the remote operation completes.  Otherwise
++  // the ClientHandle might get de-refed and teardown the actor before we
++  // get an answer.
++  RefPtr<ClientManager> kungFuGrip = this;
++  promise->Then(AbstractThread::GetCurrent(), __func__,
++                [kungFuGrip] (const ClientQueryResult &) { },
++                [kungFuGrip] (nsresult) { });
++
++  MaybeExecute([aArgs, promise] (ClientManagerChild* aActor) {
++    ClientQueryChild* actor = new ClientQueryChild(aArgs, promise);
++    if (!aActor->SendPClientQueryConstructor(actor, aArgs)) {
++      // Constructor failure will reject promise via ActorDestroy()
++      return;
++    }
++  });
++
++  RefPtr<ClientQueryPromise> ref = promise.get();
++  return ref.forget();
 +}
 +
 +void
@@ -1610,8 +1613,8 @@ new file mode 100644
 +ClientManager::GetWorkerPrivate() const
 +{
 +  NS_ASSERT_OWNINGTHREAD(ClientManager);
-+  MOZ_DIAGNOSTIC_ASSERT(mActor);
-+  return mActor->GetWorkerPrivate();
++  MOZ_DIAGNOSTIC_ASSERT(GetActor());
++  return GetActor()->GetWorkerPrivate();
 +}
 +
 +void
@@ -1627,7 +1630,7 @@ new file mode 100644
 +  NS_ASSERT_OWNINGTHREAD(ClientManager);
 +  MOZ_ASSERT(aActor);
 +
-+  if (mShutdown) {
++  if (IsShutdown()) {
 +    return;
 +  }
 +
@@ -1641,7 +1644,7 @@ new file mode 100644
 +    }
 +  }
 +
-+  ClientManagerChild* actor = new ClientManagerChild(this, workerHolderToken);
++  ClientManagerChild* actor = new ClientManagerChild(workerHolderToken);
 +  PClientManagerChild *sentActor = aActor->SendPClientManagerConstructor(actor);
 +  if (NS_WARN_IF(!sentActor)) {
 +    Shutdown();
@@ -1649,18 +1652,18 @@ new file mode 100644
 +  }
 +  MOZ_ASSERT(sentActor == actor);
 +
-+  mActor = static_cast<ClientManagerChild*>(actor);
++  ActivateThing(static_cast<ClientManagerChild*>(actor));
 +
 +  nsTArray<ClientSource*> pendingSourceList;
 +  mPendingSourceList.SwapElements(pendingSourceList);
 +  for (ClientSource* source : pendingSourceList) {
-+    source->Activate(mActor);
++    source->Activate(GetActor());
 +  }
 +
 +  nsTArray<ClientHandle*> pendingHandleList;
 +  mPendingHandleList.SwapElements(pendingHandleList);
 +  for (ClientHandle* handle : pendingHandleList) {
-+    handle->Activate(mActor);
++    handle->Activate(GetActor());
 +  }
 +}
 +
@@ -1741,7 +1744,7 @@ diff --git a/dom/clients/manager/ClientManager.h b/dom/clients/manager/ClientMan
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientManager.h
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,98 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1752,6 +1755,7 @@ new file mode 100644
 +
 +#include "mozilla/dom/PClientManager.h"
 +#include "mozilla/dom/ClientOpPromise.h"
++#include "mozilla/dom/ClientThing.h"
 +#include "nsTArray.h"
 +
 +class nsIPrincipal;
@@ -1773,17 +1777,15 @@ new file mode 100644
 +class WorkerPrivate;
 +} // workers namespace
 +
-+class ClientManager final
++class ClientManager final : public ClientThing<ClientManagerChild>
 +{
 +  friend class ClientHandle;
 +  friend class ClientManagerChild;
 +  friend class ClientSource;
 +  class PBackgroundCreateCallback;
 +
-+  ClientManagerChild* mActor;
 +  nsTArray<ClientSource*> mPendingSourceList;
 +  nsTArray<ClientHandle*> mPendingHandleList;
-+  bool mShutdown;
 +
 +  ClientManager();
 +  ~ClientManager();
@@ -1803,10 +1805,6 @@ new file mode 100644
 +
 +  void
 +  PBackgroundActorCreated(mozilla::ipc::PBackgroundChild* aActor);
-+
-+  // Private methods called by ClientManagerChild
-+  void
-+  RevokeActor(ClientManagerChild* aActor);
 +
 +  // Private methods called by ClientSource
 +  void
@@ -1931,7 +1929,7 @@ diff --git a/dom/clients/manager/ClientManagerChild.cpp b/dom/clients/manager/Cl
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientManagerChild.cpp
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,129 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -2012,13 +2010,11 @@ new file mode 100644
 +  MaybeStartTeardown();
 +}
 +
-+ClientManagerChild::ClientManagerChild(ClientManager* aManager,
-+                                       WorkerHolderToken* aWorkerHolderToken)
-+  : mManager(aManager)
++ClientManagerChild::ClientManagerChild(WorkerHolderToken* aWorkerHolderToken)
++  : mManager(nullptr)
 +  , mWorkerHolderToken(aWorkerHolderToken)
 +  , mTeardownStarted(false)
 +{
-+  MOZ_ASSERT(mManager);
 +  MOZ_ASSERT_IF(!NS_IsMainThread(), mWorkerHolderToken);
 +
 +  if (mWorkerHolderToken) {
@@ -2027,10 +2023,18 @@ new file mode 100644
 +}
 +
 +void
-+ClientManagerChild::RevokeManager(ClientManager* aManager)
++ClientManagerChild::SetOwner(ClientThing<ClientManagerChild>* aThing)
 +{
-+  MOZ_ASSERT(mManager);
-+  MOZ_ASSERT(mManager == aManager);
++  MOZ_DIAGNOSTIC_ASSERT(aThing);
++  MOZ_DIAGNOSTIC_ASSERT(!mManager);
++  mManager = static_cast<ClientManager*>(aThing);
++}
++
++void
++ClientManagerChild::RevokeOwner(ClientThing<ClientManagerChild>* aThing)
++{
++  MOZ_DIAGNOSTIC_ASSERT(mManager);
++  MOZ_DIAGNOSTIC_ASSERT(mManager == static_cast<ClientManager*>(aThing));
 +  mManager = nullptr;
 +}
 +
@@ -2059,7 +2063,7 @@ diff --git a/dom/clients/manager/ClientManagerChild.h b/dom/clients/manager/Clie
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientManagerChild.h
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,74 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -2115,11 +2119,13 @@ new file mode 100644
 +  WorkerShuttingDown() override;
 +
 +public:
-+  ClientManagerChild(ClientManager* aManager,
-+                     mozilla::dom::workers::WorkerHolderToken* aWorkerHolderToken);
++  explicit ClientManagerChild(workers::WorkerHolderToken* aWorkerHolderToken);
 +
 +  void
-+  RevokeManager(ClientManager* aManager);
++  SetOwner(ClientThing<ClientManagerChild>* aThing);
++
++  void
++  RevokeOwner(ClientThing<ClientManagerChild>* aThing);
 +
 +  void
 +  MaybeStartTeardown();
