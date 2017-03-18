@@ -454,7 +454,7 @@ diff --git a/dom/clients/api/Client.cpp b/dom/clients/api/Client.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/api/Client.cpp
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,194 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -464,10 +464,17 @@ new file mode 100644
 +#include "Client.h"
 +
 +#include "mozilla/dom/ClientBinding.h"
++#include "mozilla/dom/ClientHandle.h"
++#include "mozilla/dom/ClientManager.h"
++#include "mozilla/dom/Promise.h"
++#include "mozilla/dom/WorkerPrivate.h"
 +#include "nsIGlobalObject.h"
 +
 +namespace mozilla {
 +namespace dom {
++
++using mozilla::dom::workers::GetCurrentThreadWorkerPrivate;
++using mozilla::dom::workers::WorkerPrivate;
 +
 +NS_IMPL_CYCLE_COLLECTING_ADDREF(Client);
 +NS_IMPL_CYCLE_COLLECTING_RELEASE(Client);
@@ -482,10 +489,18 @@ new file mode 100644
 +{
 +}
 +
-+Client::Client(nsIGlobalObject* aGlobal,
-+               const ClientInfoAndState& aClientInfoAndState)
++void
++Client::EnsureHandle()
++{
++  NS_ASSERT_OWNINGTHREAD(Client);
++  if (!mHandle) {
++    mHandle = ClientManager::CreateHandle(mData.info());
++  }
++}
++
++Client::Client(nsIGlobalObject* aGlobal, const ClientInfoAndState& aData)
 +  : mGlobal(aGlobal)
-+  , mClientInfoAndState(aClientInfoAndState)
++  , mData(aData)
 +{
 +  MOZ_DIAGNOSTIC_ASSERT(mGlobal);
 +}
@@ -493,16 +508,16 @@ new file mode 100644
 +TimeStamp
 +Client::CreationTime() const
 +{
-+  return mClientInfoAndState.info().creationTime();
++  return mData.info().creationTime();
 +}
 +
 +TimeStamp
 +Client::LastFocusTime() const
 +{
-+  if (mClientInfoAndState.info().type() != ClientType::Window) {
++  if (mData.info().type() != ClientType::Window) {
 +    return TimeStamp();
 +  }
-+  return mClientInfoAndState.state().get_ClientWindowState().lastFocusTime();
++  return mData.state().get_ClientWindowState().lastFocusTime();
 +}
 +
 +JSObject*
@@ -520,27 +535,27 @@ new file mode 100644
 +void
 +Client::GetUrl(nsAString& aUrlOut) const
 +{
-+  CopyUTF8toUTF16(mClientInfoAndState.info().url(), aUrlOut);
++  CopyUTF8toUTF16(mData.info().url(), aUrlOut);
 +}
 +
 +void
 +Client::GetId(nsAString& aIdOut) const
 +{
 +  char buf[NSID_LENGTH];
-+  mClientInfoAndState.info().id().ToProvidedString(buf);
++  mData.info().id().ToProvidedString(buf);
 +  CopyUTF8toUTF16(nsDependentCString(buf), aIdOut);
 +}
 +
 +ClientType
 +Client::Type() const
 +{
-+  return mClientInfoAndState.info().type();
++  return mData.info().type();
 +}
 +
 +FrameType
 +Client::GetFrameType() const
 +{
-+  return mClientInfoAndState.info().frameType();
++  return mData.info().frameType();
 +}
 +
 +void
@@ -553,27 +568,83 @@ new file mode 100644
 +VisibilityState
 +Client::GetVisibilityState() const
 +{
-+  return mClientInfoAndState.state().get_ClientWindowState().visibilityState();
++  return mData.state().get_ClientWindowState().visibilityState();
 +}
 +
 +bool
 +Client::Focused() const
 +{
-+  return mClientInfoAndState.state().get_ClientWindowState().focused();
++  return mData.state().get_ClientWindowState().focused();
 +}
 +
 +already_AddRefed<Promise>
 +Client::Focus(ErrorResult& aRv)
 +{
-+  // TODO
-+  return nullptr;
++  RefPtr<Promise> outerPromise = Promise::Create(mGlobal, aRv);
++  if (aRv.Failed()) {
++    return outerPromise.forget();
++  }
++
++  EnsureHandle();
++
++  RefPtr<Client> self = this;
++
++  RefPtr<ClientStatePromise> innerPromise = mHandle->Focus();
++  innerPromise->Then(AbstractThread::GetCurrent(), __func__,
++    [self, outerPromise] (const ClientState& aResult) {
++      RefPtr<Client> newClient =
++        new Client(self->mGlobal, ClientInfoAndState(self->mData.info(), aResult));
++      outerPromise->MaybeResolve(newClient);
++    }, [self, outerPromise] (nsresult aResult) {
++      outerPromise->MaybeReject(aResult);
++    });
++
++  return outerPromise.forget();
 +}
 +
 +already_AddRefed<Promise>
 +Client::Navigate(const nsAString& aURL, ErrorResult& aRv)
 +{
-+  // TODO
-+  return nullptr;
++  RefPtr<Promise> outerPromise = Promise::Create(mGlobal, aRv);
++  if (aRv.Failed()) {
++    return outerPromise.forget();
++  }
++
++  nsCString baseURL;
++  nsCOMPtr<nsPIDOMWindowInner> window = do_QueryInterface(mGlobal);
++  if (window) {
++    nsCOMPtr<nsIURI> uri = window->GetDocBaseURI();
++    if (uri) {
++      Unused << uri->GetSpec(baseURL);
++    }
++  } else {
++    MOZ_ASSERT(!NS_IsMainThread());
++    WorkerPrivate* workerPrivate = GetCurrentThreadWorkerPrivate();
++    if (workerPrivate) {
++      CopyUTF16toUTF8(workerPrivate->ScriptURL(), baseURL);
++    }
++  }
++
++  EnsureHandle();
++
++  RefPtr<Client> self = this;
++
++  RefPtr<ClientHandle::NavigatePromise> innerPromise =
++    mHandle->Navigate(NS_ConvertUTF16toUTF8(aURL), baseURL);
++
++  innerPromise->Then(AbstractThread::GetCurrent(), __func__,
++    [self, outerPromise] (const Maybe<ClientInfoAndState>& aResult) {
++      if (aResult.isNothing()) {
++        outerPromise->MaybeResolveWithUndefined();
++        return;
++      }
++      RefPtr<Client> newClient = new Client(self->mGlobal, aResult.ref());
++      outerPromise->MaybeResolve(newClient);
++    }, [self, outerPromise] (nsresult aResult) {
++      outerPromise->MaybeReject(aResult);
++    });
++
++  return outerPromise.forget();
 +}
 +
 +} // namespace dom
@@ -582,7 +653,7 @@ diff --git a/dom/clients/api/Client.h b/dom/clients/api/Client.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/api/Client.h
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,93 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -604,6 +675,7 @@ new file mode 100644
 +
 +namespace dom {
 +
++class ClientHandle;
 +class Promise;
 +template <typename t> class Sequence;
 +
@@ -611,13 +683,16 @@ new file mode 100644
 +                   , public nsWrapperCache
 +{
 +  nsCOMPtr<nsIGlobalObject> mGlobal;
-+  const ClientInfoAndState mClientInfoAndState;
++  const ClientInfoAndState mData;
++  RefPtr<ClientHandle> mHandle;
 +
 +  ~Client();
 +
++  void
++  EnsureHandle();
++
 +public:
-+  Client(nsIGlobalObject* aGlobal,
-+         const ClientInfoAndState& aClientInfoAndState);
++  Client(nsIGlobalObject* aGlobal, const ClientInfoAndState& aData);
 +
 +  TimeStamp
 +  CreationTime() const;
@@ -676,7 +751,7 @@ diff --git a/dom/clients/api/Clients.cpp b/dom/clients/api/Clients.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/api/Clients.cpp
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,157 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -783,7 +858,8 @@ new file mode 100644
 +    if (clientInfo.isSome()) {
 +      endpoint = clientInfo.ref();
 +    }
-+  } else if (!NS_IsMainThread()) {
++  } else {
++    MOZ_ASSERT(!NS_IsMainThread());
 +    WorkerPrivate* workerPrivate = GetCurrentThreadWorkerPrivate();
 +    if (workerPrivate) {
 +      if (workerPrivate->IsServiceWorker()) {
@@ -795,11 +871,10 @@ new file mode 100644
 +      }
 +    }
 +  }
-+  ServiceWorkerDescriptor source;
 +
 +  // We don't expose this reserved clients yet
 +  const bool includeReserved = false;
-+  ClientQueryConstructorArgs args(source, aOptions.mType,
++  ClientQueryConstructorArgs args(endpoint, aOptions.mType,
 +                                  aOptions.mIncludeUncontrolled,
 +                                  includeReserved);
 +  RefPtr<ClientQueryPromise> innerPromise = ClientManager::Query(args);
@@ -821,12 +896,14 @@ new file mode 100644
 +already_AddRefed<Promise>
 +Clients::OpenWindow(const nsAString& aURL, ErrorResult& aRv)
 +{
++  // TODO: OMG this will take a lot of work
 +  return nullptr;
 +}
 +
 +already_AddRefed<Promise>
 +Clients::Claim(ErrorResult& aRv)
 +{
++  // TODO
 +  return nullptr;
 +}
 +
@@ -1110,17 +1187,17 @@ new file mode 100644
 +
 +already_AddRefed<GenericPromise>
 +ClientHandle::PostMessage(StructuredCloneData& aData,
-+                          const ServiceWorkerDescriptor& aSource)
++                          const ClientEndPoint& aEndPoint)
 +{
 +  RefPtr<GenericPromise> ref;
 +
 +  ClientPostMessageArgs args;
-+  args.endpoint() = aSource;
++  args.endpoint() = aEndPoint;
 +
 +  // TODO: Ideally we should be able to wait for the actor to initialize,
-+  //       but for now just fail the postMessage() if its not ready.  I'm
-+  //       not sure if we can safely copy the StructuredCloneData object to
-+  //       use it asynchronously.
++  //       but for now just fail the postMessage() if its not ready.  We
++  //       need a RefCounted version of the StructuredCloneData in order
++  //       to capture it in the lambda here.
 +  if (!GetActor() ||
 +      !aData.BuildClonedMessageDataForBackgroundChild(GetActor()->Manager()->Manager(),
 +                                                      args.clonedData())) {
@@ -1221,7 +1298,7 @@ new file mode 100644
 +
 +  already_AddRefed<GenericPromise>
 +  PostMessage(ipc::StructuredCloneData& aData,
-+              const ServiceWorkerDescriptor& aSource);
++              const ClientEndPoint& aEndPoint);
 +
 +  NS_INLINE_DECL_REFCOUNTING(ClientHandle);
 +};
@@ -2851,7 +2928,7 @@ diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientManagerService.cpp
-@@ -0,0 +1,310 @@
+@@ -0,0 +1,320 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -3137,12 +3214,22 @@ new file mode 100644
 +    }
 +
 +    if (!aArgs.includeUncontrolled()) {
++      if (endpoint.type() != ClientEndPoint::TServiceWorkerDescriptor) {
++        continue;
++      }
++
++
 +      const Maybe<ServiceWorkerDescriptor>& controller =
 +        source->GetController();
-+      if (controller.isSome() &&
-+          endpoint.type() == ClientEndPoint::TServiceWorkerDescriptor &&
-+          (controller.ref().id() != endpoint.get_ServiceWorkerDescriptor().id() ||
-+           controller.ref().scope() != endpoint.get_ServiceWorkerDescriptor().scope())) {
++      if (controller.isNothing()) {
++        continue;
++      }
++
++      const ServiceWorkerDescriptor serviceWorker =
++        endpoint.get_ServiceWorkerDescriptor();
++
++      if(controller.ref().id() != serviceWorker.id() ||
++         controller.ref().scope() != serviceWorker.scope()) {
 +        continue;
 +      }
 +    }
@@ -4937,7 +5024,7 @@ diff --git a/dom/clients/manager/ClientThing.h b/dom/clients/manager/ClientThing
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientThing.h
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,137 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -5059,6 +5146,8 @@ new file mode 100644
 +    }
 +    mShutdown = true;
 +
++    // TODO: We should provide a way to pass an error code to all
++    //       pending tasks.
 +    mTaskList.Clear();
 +
 +    if (mActor) {
