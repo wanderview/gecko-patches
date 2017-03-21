@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  05bfa2831c0ba4a26fa72328ffe6a99aba9c356a
+# Parent  bd4f3810b402147f8656390555b29502ce5e2644
 
 diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
 --- a/docshell/base/nsDocShell.cpp
@@ -751,7 +751,7 @@ diff --git a/dom/clients/api/Clients.cpp b/dom/clients/api/Clients.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/api/Clients.cpp
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,216 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -774,6 +774,7 @@ new file mode 100644
 +
 +using mozilla::dom::workers::GetCurrentThreadWorkerPrivate;
 +using mozilla::dom::workers::WorkerPrivate;
++using mozilla::ipc::PrincipalInfo;
 +
 +NS_IMPL_CYCLE_COLLECTING_ADDREF(Clients);
 +NS_IMPL_CYCLE_COLLECTING_RELEASE(Clients);
@@ -786,6 +787,35 @@ new file mode 100644
 +
 +Clients::~Clients()
 +{
++}
++
++nsresult
++Clients::GetEndPoint(ClientEndPoint& aEndPointOut)
++{
++  nsCOMPtr<nsPIDOMWindowInner> window = do_QueryInterface(mGlobal);
++  if (window) {
++    const Maybe<ClientInfo>& clientInfo = window->GetClientInfo();
++    if (clientInfo.isSome()) {
++      aEndPointOut = clientInfo.ref();
++      return NS_OK;
++    }
++  } else {
++    MOZ_ASSERT(!NS_IsMainThread());
++    WorkerPrivate* workerPrivate = GetCurrentThreadWorkerPrivate();
++    if (workerPrivate) {
++      if (workerPrivate->IsServiceWorker()) {
++        aEndPointOut = ServiceWorkerDescriptor(workerPrivate->ServiceWorkerID(),
++                                               workerPrivate->GetPrincipalInfo(),
++                                               workerPrivate->WorkerName());
++        return NS_OK;
++      } else {
++        aEndPointOut = workerPrivate->GetClientInfo();
++        return NS_OK;
++      }
++    }
++  }
++
++  return NS_ERROR_DOM_INVALID_STATE_ERR;
 +}
 +
 +JSObject*
@@ -803,7 +833,28 @@ new file mode 100644
 +already_AddRefed<Promise>
 +Clients::Get(const nsAString& aClientID, ErrorResult& aRv)
 +{
-+  return nullptr;
++  RefPtr<Promise> outerPromise = Promise::Create(mGlobal, aRv);
++  if (aRv.Failed()) {
++    return outerPromise.forget();
++  }
++
++  nsCOMPtr<nsIGlobalObject> global = mGlobal;
++
++  // TODO
++  nsID id;
++  PrincipalInfo principalInfo;
++
++  RefPtr<ClientOpPromise> innerPromise =
++    ClientManager::GetInfoAndState(ClientGetInfoAndStateArgs(id, principalInfo));
++  innerPromise->Then(AbstractThread::GetCurrent(), __func__,
++    [outerPromise, global] (const ClientOpResult& aResult) {
++      outerPromise->MaybeResolve(
++        new Client(global, aResult.get_ClientInfoAndState()));
++    }, [outerPromise] (nsresult aResult) {
++      outerPromise->MaybeResolveWithUndefined();
++    });
++
++  return outerPromise.forget();
 +}
 +
 +namespace {
@@ -846,40 +897,23 @@ new file mode 100644
 +    return outerPromise.forget();
 +  }
 +
-+  Maybe<ServiceWorkerDescriptor> serviceWorker;
++  ClientEndPoint endpoint;
++  nsresult rv = GetEndPoint(endpoint);
++  if (NS_FAILED(rv)) {
++    aRv.Throw(rv);
++    return outerPromise.forget();
++  }
 +
 +  nsCOMPtr<nsIGlobalObject> global = mGlobal;
 +
-+  ClientEndPoint endpoint;
-+
-+  nsCOMPtr<nsPIDOMWindowInner> window = do_QueryInterface(global);
-+  if (window) {
-+    const Maybe<ClientInfo>& clientInfo = window->GetClientInfo();
-+    if (clientInfo.isSome()) {
-+      endpoint = clientInfo.ref();
-+    }
-+  } else {
-+    MOZ_ASSERT(!NS_IsMainThread());
-+    WorkerPrivate* workerPrivate = GetCurrentThreadWorkerPrivate();
-+    if (workerPrivate) {
-+      if (workerPrivate->IsServiceWorker()) {
-+        endpoint = ServiceWorkerDescriptor(workerPrivate->ServiceWorkerID(),
-+                                           workerPrivate->GetPrincipalInfo(),
-+                                           workerPrivate->WorkerName());
-+      } else {
-+        endpoint = workerPrivate->GetClientInfo();
-+      }
-+    }
-+  }
-+
 +  // We don't expose this reserved clients yet
 +  const bool includeReserved = false;
-+  ClientQueryConstructorArgs args(endpoint, aOptions.mType,
-+                                  aOptions.mIncludeUncontrolled,
-+                                  includeReserved);
-+  RefPtr<ClientQueryPromise> innerPromise = ClientManager::Query(args);
++  ClientMatchAllArgs args(endpoint, aOptions.mType,
++                          aOptions.mIncludeUncontrolled,
++                          includeReserved);
++  RefPtr<ClientOpPromise> innerPromise = ClientManager::MatchAll(args);
 +  innerPromise->Then(AbstractThread::GetCurrent(), __func__,
-+    [outerPromise, global] (const ClientQueryResult& aResult) {
++    [outerPromise, global] (const ClientOpResult& aResult) {
 +      nsTArray<RefPtr<Client>> clientList;
 +      for (const ClientInfoAndState& value : aResult.get_ClientList().values()) {
 +        clientList.AppendElement(new Client(global, value));
@@ -903,8 +937,33 @@ new file mode 100644
 +already_AddRefed<Promise>
 +Clients::Claim(ErrorResult& aRv)
 +{
-+  // TODO
-+  return nullptr;
++  RefPtr<Promise> outerPromise = Promise::Create(mGlobal, aRv);
++  if (aRv.Failed()) {
++    return outerPromise.forget();
++  }
++
++  ClientEndPoint endpoint;
++  nsresult rv = GetEndPoint(endpoint);
++  if (NS_FAILED(rv)) {
++    aRv.Throw(rv);
++    return outerPromise.forget();
++  }
++
++  if (endpoint.type() != ClientEndPoint::TServiceWorkerDescriptor) {
++    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
++    return outerPromise.forget();
++  }
++
++  RefPtr<ClientOpPromise> innerPromise =
++    ClientManager::Claim(ClientClaimArgs(endpoint.get_ServiceWorkerDescriptor()));
++  innerPromise->Then(AbstractThread::GetCurrent(), __func__,
++    [outerPromise] (const ClientOpResult& aResult) {
++      outerPromise->MaybeResolveWithUndefined();
++    }, [outerPromise] (nsresult aResult) {
++      outerPromise->MaybeReject(aResult);
++    });
++
++  return outerPromise.forget();
 +}
 +
 +} // namespace dom
@@ -913,7 +972,7 @@ diff --git a/dom/clients/api/Clients.h b/dom/clients/api/Clients.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/api/Clients.h
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,63 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -934,6 +993,7 @@ new file mode 100644
 +
 +namespace dom {
 +
++class ClientEndPoint;
 +class ClientQueryOptions;
 +class Promise;
 +
@@ -943,6 +1003,9 @@ new file mode 100644
 +  nsCOMPtr<nsIGlobalObject> mGlobal;
 +
 +  ~Clients();
++
++  nsresult
++  GetEndPoint(ClientEndPoint& aEndPointOut);
 +
 +public:
 +  // nsWrapperCache interface methods
@@ -1738,7 +1801,7 @@ new file mode 100644
 +void
 +ClientHandleParent::Init(const ClientInfo& aClientInfo)
 +{
-+  mSource = mService->FindSource(aClientInfo);
++  mSource = mService->FindSource(aClientInfo.id(), aClientInfo.principalInfo());
 +  if (!mSource) {
 +    Unused << Send__delete__(this);
 +    return;
@@ -1828,7 +1891,7 @@ diff --git a/dom/clients/manager/ClientIPCTypes.ipdlh b/dom/clients/manager/Clie
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientIPCTypes.ipdlh
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,140 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -1931,6 +1994,17 @@ new file mode 100644
 +  bool includeReserved;
 +};
 +
++struct ClientClaimArgs
++{
++  ServiceWorkerDescriptor serviceWorker;
++};
++
++struct ClientGetInfoAndStateArgs
++{
++  nsID id;
++  PrincipalInfo principalInfo;
++};
++
 +union ClientOpConstructorArgs
 +{
 +  ClientControlledArgs;
@@ -1939,6 +2013,8 @@ new file mode 100644
 +  ClientPostMessageArgs;
 +  ClientGetStateArgs;
 +  ClientMatchAllArgs;
++  ClientClaimArgs;
++  ClientGetInfoAndStateArgs;
 +};
 +
 +struct ClientList
@@ -1951,20 +2027,6 @@ new file mode 100644
 +  nsresult;
 +  ClientState;
 +  ClientInfoAndState;
-+  ClientList;
-+};
-+
-+struct ClientQueryConstructorArgs
-+{
-+  ClientEndPoint endpoint;
-+  ClientType type;
-+  bool includeUncontrolled;
-+  bool includeReserved;
-+};
-+
-+union ClientQueryResult
-+{
-+  nsresult;
 +  ClientList;
 +};
 +
@@ -2016,7 +2078,7 @@ diff --git a/dom/clients/manager/ClientManager.cpp b/dom/clients/manager/ClientM
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientManager.cpp
-@@ -0,0 +1,349 @@
+@@ -0,0 +1,365 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -2027,7 +2089,7 @@ new file mode 100644
 +
 +#include "ClientHandle.h"
 +#include "ClientManagerChild.h"
-+#include "ClientQueryChild.h"
++#include "ClientManagerOpChild.h"
 +#include "ClientSource.h"
 +#include "mozilla/dom/WorkerPrivate.h"
 +#include "mozilla/dom/workers/bindings/WorkerHolderToken.h"
@@ -2202,29 +2264,29 @@ new file mode 100644
 +  return handle.forget();
 +}
 +
-+already_AddRefed<ClientQueryPromise>
-+ClientManager::QueryInternal(const ClientQueryConstructorArgs& aArgs)
++already_AddRefed<ClientOpPromise>
++ClientManager::StartOp(const ClientOpConstructorArgs& aArgs)
 +{
-+  RefPtr<ClientQueryPromise::Private> promise =
-+    new ClientQueryPromise::Private(__func__);
++  RefPtr<ClientOpPromise::Private> promise =
++    new ClientOpPromise::Private(__func__);
 +
 +  // Hold a ref to the client until the remote operation completes.  Otherwise
 +  // the ClientHandle might get de-refed and teardown the actor before we
 +  // get an answer.
 +  RefPtr<ClientManager> kungFuGrip = this;
 +  promise->Then(AbstractThread::GetCurrent(), __func__,
-+                [kungFuGrip] (const ClientQueryResult &) { },
++                [kungFuGrip] (const ClientList &) { },
 +                [kungFuGrip] (nsresult) { });
 +
 +  MaybeExecute([aArgs, promise] (ClientManagerChild* aActor) {
-+    ClientQueryChild* actor = new ClientQueryChild(aArgs, promise);
-+    if (!aActor->SendPClientQueryConstructor(actor, aArgs)) {
++    ClientManagerOpChild* actor = new ClientManagerOpChild(aArgs, promise);
++    if (!aActor->SendPClientManagerOpConstructor(actor, aArgs)) {
 +      // Constructor failure will reject promise via ActorDestroy()
 +      return;
 +    }
 +  });
 +
-+  RefPtr<ClientQueryPromise> ref = promise.get();
++  RefPtr<ClientOpPromise> ref = promise.get();
 +  return ref.forget();
 +}
 +
@@ -2357,11 +2419,27 @@ new file mode 100644
 +}
 +
 +// static
-+already_AddRefed<ClientQueryPromise>
-+ClientManager::Query(const ClientQueryConstructorArgs& aArgs)
++already_AddRefed<ClientOpPromise>
++ClientManager::MatchAll(const ClientMatchAllArgs& aArgs)
 +{
 +  RefPtr<ClientManager> mgr = GetOrCreateForCurrentThread();
-+  return mgr->QueryInternal(aArgs);
++  return mgr->StartOp(aArgs);
++}
++
++// static
++already_AddRefed<ClientOpPromise>
++ClientManager::Claim(const ClientClaimArgs& aArgs)
++{
++  RefPtr<ClientManager> mgr = GetOrCreateForCurrentThread();
++  return mgr->StartOp(aArgs);
++}
++
++// static
++already_AddRefed<ClientOpPromise>
++ClientManager::GetInfoAndState(const ClientGetInfoAndStateArgs& aArgs)
++{
++  RefPtr<ClientManager> mgr = GetOrCreateForCurrentThread();
++  return mgr->StartOp(aArgs);
 +}
 +
 +} // namespace dom
@@ -2370,7 +2448,7 @@ diff --git a/dom/clients/manager/ClientManager.h b/dom/clients/manager/ClientMan
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientManager.h
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,104 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -2426,8 +2504,8 @@ new file mode 100644
 +  already_AddRefed<ClientHandle>
 +  CreateHandleInternal(const ClientInfo& aClientInfo);
 +
-+  already_AddRefed<ClientQueryPromise>
-+  QueryInternal(const ClientQueryConstructorArgs& aArgs);
++  already_AddRefed<ClientOpPromise>
++  StartOp(const ClientOpConstructorArgs& aArgs);
 +
 +  void
 +  PBackgroundActorCreated(mozilla::ipc::PBackgroundChild* aActor);
@@ -2459,8 +2537,14 @@ new file mode 100644
 +  static already_AddRefed<ClientHandle>
 +  CreateHandle(const ClientInfo& aClientInfo);
 +
-+  static already_AddRefed<ClientQueryPromise>
-+  Query(const ClientQueryConstructorArgs& aArgs);
++  static already_AddRefed<ClientOpPromise>
++  MatchAll(const ClientMatchAllArgs& aArgs);
++
++  static already_AddRefed<ClientOpPromise>
++  Claim(const ClientClaimArgs& aArgs);
++
++  static already_AddRefed<ClientOpPromise>
++  GetInfoAndState(const ClientGetInfoAndStateArgs& aArgs);
 +
 +  NS_INLINE_DECL_REFCOUNTING(mozilla::dom::ClientManager)
 +};
@@ -2555,7 +2639,7 @@ diff --git a/dom/clients/manager/ClientManagerChild.cpp b/dom/clients/manager/Cl
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientManagerChild.cpp
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,129 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -2567,7 +2651,6 @@ new file mode 100644
 +#include "ClientHandleChild.h"
 +#include "ClientManager.h"
 +#include "ClientManagerOpChild.h"
-+#include "ClientQueryChild.h"
 +#include "ClientSourceChild.h"
 +
 +namespace mozilla {
@@ -2613,20 +2696,6 @@ new file mode 100644
 +
 +bool
 +ClientManagerChild::DeallocPClientManagerOpChild(PClientManagerOpChild* aActor)
-+{
-+  delete aActor;
-+  return true;
-+}
-+
-+PClientQueryChild*
-+ClientManagerChild::AllocPClientQueryChild(const ClientQueryConstructorArgs& aArgs)
-+{
-+  MOZ_ASSERT_UNREACHABLE("ClientQueryChild must be explicitly constructed.");
-+  return nullptr;
-+}
-+
-+bool
-+ClientManagerChild::DeallocPClientQueryChild(PClientQueryChild* aActor)
 +{
 +  delete aActor;
 +  return true;
@@ -2704,7 +2773,7 @@ diff --git a/dom/clients/manager/ClientManagerChild.h b/dom/clients/manager/Clie
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientManagerChild.h
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,74 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -2748,12 +2817,6 @@ new file mode 100644
 +
 +  bool
 +  DeallocPClientManagerOpChild(PClientManagerOpChild* aActor) override;
-+
-+  PClientQueryChild*
-+  AllocPClientQueryChild(const ClientQueryConstructorArgs& aArgs) override;
-+
-+  bool
-+  DeallocPClientQueryChild(PClientQueryChild* aActor) override;
 +
 +  PClientSourceChild*
 +  AllocPClientSourceChild(const ClientSourceConstructorArgs& aArgs) override;
@@ -2826,7 +2889,7 @@ new file mode 100644
 +}
 +
 +ClientManagerOpChild::ClientManagerOpChild(const ClientOpConstructorArgs& aArgs,
-+                                         ClientOpPromise::Private* aPromise)
++                                           ClientOpPromise::Private* aPromise)
 +  : mPromise(aPromise)
 +{
 +  MOZ_DIAGNOSTIC_ASSERT(mPromise);
@@ -2885,7 +2948,7 @@ diff --git a/dom/clients/manager/ClientManagerOpParent.cpp b/dom/clients/manager
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientManagerOpParent.cpp
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,74 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -2933,6 +2996,29 @@ new file mode 100644
 +void
 +ClientManagerOpParent::Init(const ClientOpConstructorArgs& aArgs)
 +{
++  switch (aArgs.type()) {
++    case ClientOpConstructorArgs::TClientMatchAllArgs:
++    {
++      DoServiceOp(&ClientManagerService::MatchAll,
++                  aArgs.get_ClientMatchAllArgs());
++      break;
++    }
++    case ClientOpConstructorArgs::TClientClaimArgs:
++    {
++      DoServiceOp(&ClientManagerService::Claim, aArgs.get_ClientClaimArgs());
++      break;
++    }
++    case ClientOpConstructorArgs::TClientGetInfoAndStateArgs:
++    {
++      DoServiceOp(&ClientManagerService::GetInfoAndState,
++                  aArgs.get_ClientGetInfoAndStateArgs());
++    };
++    default:
++    {
++      MOZ_ASSERT_UNREACHABLE("Unknown Client operation!");
++      break;
++    }
++  }
 +}
 +
 +} // namespace dom
@@ -2987,7 +3073,7 @@ diff --git a/dom/clients/manager/ClientManagerParent.cpp b/dom/clients/manager/C
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientManagerParent.cpp
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,99 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -2999,7 +3085,6 @@ new file mode 100644
 +#include "ClientHandleParent.h"
 +#include "ClientManagerService.h"
 +#include "ClientManagerOpParent.h"
-+#include "ClientQueryParent.h"
 +#include "ClientSourceParent.h"
 +#include "mozilla/Unused.h"
 +
@@ -3064,28 +3149,6 @@ new file mode 100644
 +  return IPC_OK();
 +}
 +
-+PClientQueryParent*
-+ClientManagerParent::AllocPClientQueryParent(const ClientQueryConstructorArgs& aArgs)
-+{
-+  return new ClientQueryParent();
-+}
-+
-+bool
-+ClientManagerParent::DeallocPClientQueryParent(PClientQueryParent* aActor)
-+{
-+  delete aActor;
-+  return true;
-+}
-+
-+IPCResult
-+ClientManagerParent::RecvPClientQueryConstructor(PClientQueryParent* aActor,
-+                                                 const ClientQueryConstructorArgs& aArgs)
-+{
-+  ClientQueryParent* actor = static_cast<ClientQueryParent*>(aActor);
-+  actor->Init(mService, aArgs);
-+  return IPC_OK();
-+}
-+
 +PClientSourceParent*
 +ClientManagerParent::AllocPClientSourceParent(const ClientSourceConstructorArgs& aArgs)
 +{
@@ -3114,7 +3177,7 @@ diff --git a/dom/clients/manager/ClientManagerParent.h b/dom/clients/manager/Cli
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientManagerParent.h
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,61 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -3161,16 +3224,6 @@ new file mode 100644
 +  RecvPClientManagerOpConstructor(PClientManagerOpParent* aActor,
 +                                 const ClientOpConstructorArgs& aArgs) override;
 +
-+  PClientQueryParent*
-+  AllocPClientQueryParent(const ClientQueryConstructorArgs& aArgs) override;
-+
-+  bool
-+  DeallocPClientQueryParent(PClientQueryParent* aActor) override;
-+
-+  mozilla::ipc::IPCResult
-+  RecvPClientQueryConstructor(PClientQueryParent* aActor,
-+                              const ClientQueryConstructorArgs& aArgs) override;
-+
 +  PClientSourceParent*
 +  AllocPClientSourceParent(const ClientSourceConstructorArgs& aArgs) override;
 +
@@ -3190,7 +3243,7 @@ diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientManagerService.cpp
-@@ -0,0 +1,320 @@
+@@ -0,0 +1,356 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -3211,100 +3264,6 @@ new file mode 100644
 +namespace {
 +
 +ClientManagerService* sClientManagerServiceInstance = nullptr;
-+
-+} // anonymous namespace
-+
-+ClientManagerService::ClientManagerService()
-+ : mBackgroundThread(AbstractThread::CreateXPCOMThreadWrapper(NS_GetCurrentThread(), false))
-+{
-+  AssertIsOnBackgroundThread();
-+  printf_stderr("### ### [%p] ClientManagerService()\n", this);
-+}
-+
-+ClientManagerService::~ClientManagerService()
-+{
-+  AssertIsOnBackgroundThread();
-+
-+  printf_stderr("### ### [%p] ~ClientManagerService()\n", this);
-+
-+  MOZ_ASSERT(mSourceList.IsEmpty());
-+
-+  MOZ_DIAGNOSTIC_ASSERT(sClientManagerServiceInstance == this);
-+  sClientManagerServiceInstance = nullptr;
-+}
-+
-+// static
-+already_AddRefed<ClientManagerService>
-+ClientManagerService::GetOrCreateInstance()
-+{
-+  AssertIsOnBackgroundThread();
-+
-+  if (!sClientManagerServiceInstance) {
-+    sClientManagerServiceInstance = new ClientManagerService();
-+  }
-+
-+  RefPtr<ClientManagerService> ref(sClientManagerServiceInstance);
-+  return ref.forget();
-+}
-+
-+AbstractThread*
-+ClientManagerService::BackgroundThread() const
-+{
-+  return mBackgroundThread;
-+}
-+
-+void
-+ClientManagerService::AddSource(ClientSourceParent* aSource)
-+{
-+  AssertIsOnBackgroundThread();
-+  MOZ_ASSERT(aSource);
-+  MOZ_ASSERT(!mSourceList.Contains(aSource));
-+  nsCString type(ClientTypeValues::strings[(uint8_t)aSource->Type()].value,
-+                 ClientTypeValues::strings[(uint8_t)aSource->Type()].length);
-+  nsCString spec;
-+  if (aSource->GetPrincipalInfo().type() == PrincipalInfo::TContentPrincipalInfo) {
-+    spec = aSource->GetPrincipalInfo().get_ContentPrincipalInfo().spec();
-+  }
-+  printf_stderr("### ### [%p] ClientManagerService::AddSource(%p) list %lu to %lu - type:%s origin:%s\n",
-+                this, aSource, mSourceList.Length(), (mSourceList.Length() + 1),
-+                type.get(), spec.get());
-+  mSourceList.AppendElement(aSource);
-+}
-+
-+void
-+ClientManagerService::RemoveSource(ClientSourceParent* aSource)
-+{
-+  AssertIsOnBackgroundThread();
-+  MOZ_ASSERT(aSource);
-+  nsCString type(ClientTypeValues::strings[(uint8_t)aSource->Type()].value,
-+                 ClientTypeValues::strings[(uint8_t)aSource->Type()].length);
-+  nsCString spec;
-+  if (aSource->GetPrincipalInfo().type() == PrincipalInfo::TContentPrincipalInfo) {
-+    spec = aSource->GetPrincipalInfo().get_ContentPrincipalInfo().spec();
-+  }
-+  printf_stderr("### ### [%p] ClientManagerService::RemoveSource(%p) list %lu to %lu - type:%s origin:%s\n",
-+                this, aSource, mSourceList.Length(), (mSourceList.Length() - 1),
-+                type.get(), spec.get());
-+  MOZ_ALWAYS_TRUE(mSourceList.RemoveElement(aSource));
-+}
-+
-+ClientSourceParent*
-+ClientManagerService::FindSource(const ClientInfo& aClientInfo)
-+{
-+  AssertIsOnBackgroundThread();
-+  for (ClientSourceParent* source : mSourceList) {
-+    MOZ_DIAGNOSTIC_ASSERT(source);
-+    if (source->ID() == aClientInfo.id() &&
-+        source->Type() == aClientInfo.type() &&
-+        source->GetPrincipalInfo() == aClientInfo.principalInfo()) {
-+      return source;
-+    }
-+  }
-+  return nullptr;
-+}
-+
-+namespace
-+{
 +
 +bool
 +OriginFromSpec(const nsCString& aSpec, nsACString& aOriginOut)
@@ -3377,10 +3336,81 @@ new file mode 100644
 +  MOZ_CRASH("unexpected principal type!");
 +}
 +
-+class QueryListPromiseHolder final
++} // anonymous namespace
++
++ClientManagerService::ClientManagerService()
++ : mBackgroundThread(AbstractThread::CreateXPCOMThreadWrapper(NS_GetCurrentThread(), false))
++{
++  AssertIsOnBackgroundThread();
++}
++
++ClientManagerService::~ClientManagerService()
++{
++  AssertIsOnBackgroundThread();
++  MOZ_DIAGNOSTIC_ASSERT(mSourceList.IsEmpty());
++
++  MOZ_DIAGNOSTIC_ASSERT(sClientManagerServiceInstance == this);
++  sClientManagerServiceInstance = nullptr;
++}
++
++// static
++already_AddRefed<ClientManagerService>
++ClientManagerService::GetOrCreateInstance()
++{
++  AssertIsOnBackgroundThread();
++
++  if (!sClientManagerServiceInstance) {
++    sClientManagerServiceInstance = new ClientManagerService();
++  }
++
++  RefPtr<ClientManagerService> ref(sClientManagerServiceInstance);
++  return ref.forget();
++}
++
++AbstractThread*
++ClientManagerService::BackgroundThread() const
++{
++  return mBackgroundThread;
++}
++
++void
++ClientManagerService::AddSource(ClientSourceParent* aSource)
++{
++  AssertIsOnBackgroundThread();
++  MOZ_ASSERT(aSource);
++  MOZ_ASSERT(!mSourceList.Contains(aSource));
++  mSourceList.AppendElement(aSource);
++}
++
++void
++ClientManagerService::RemoveSource(ClientSourceParent* aSource)
++{
++  AssertIsOnBackgroundThread();
++  MOZ_ASSERT(aSource);
++  MOZ_ALWAYS_TRUE(mSourceList.RemoveElement(aSource));
++}
++
++ClientSourceParent*
++ClientManagerService::FindSource(const nsID& aID, const PrincipalInfo& aPrincipalInfo)
++{
++  AssertIsOnBackgroundThread();
++  for (ClientSourceParent* source : mSourceList) {
++    MOZ_DIAGNOSTIC_ASSERT(source);
++    if (source->Info().id() == aID &&
++        MatchPrincipalInfo(source->Info().principalInfo(), aPrincipalInfo)) {
++      return source;
++    }
++  }
++  return nullptr;
++}
++
++namespace
++{
++
++class PromiseListHolder final
 +{
 +  RefPtr<AbstractThread> mTarget;
-+  RefPtr<ClientQueryPromise::Private> mResultPromise;
++  RefPtr<ClientOpPromise::Private> mResultPromise;
 +  nsTArray<RefPtr<ClientOpPromise>> mPromiseList;
 +  nsTArray<ClientInfoAndState> mResultList;
 +  uint32_t mOutstandingPromiseCount;
@@ -3400,19 +3430,19 @@ new file mode 100644
 +    MaybeFinish();
 +  }
 +
-+  ~QueryListPromiseHolder() = default;
++  ~PromiseListHolder() = default;
 +public:
-+  explicit QueryListPromiseHolder(AbstractThread* aTarget)
++  explicit PromiseListHolder(AbstractThread* aTarget)
 +    : mTarget(aTarget)
-+    , mResultPromise(new ClientQueryPromise::Private(__func__))
++    , mResultPromise(new ClientOpPromise::Private(__func__))
 +    , mOutstandingPromiseCount(0)
 +  {
 +  }
 +
-+  already_AddRefed<ClientQueryPromise>
++  already_AddRefed<ClientOpPromise>
 +  GetResultPromise() const
 +  {
-+    RefPtr<ClientQueryPromise> ref = mResultPromise;
++    RefPtr<ClientOpPromise> ref = mResultPromise;
 +    return ref.forget();
 +  }
 +
@@ -3423,7 +3453,7 @@ new file mode 100644
 +    MOZ_DIAGNOSTIC_ASSERT(mPromiseList.LastElement());
 +    mOutstandingPromiseCount += 1;
 +
-+    RefPtr<QueryListPromiseHolder> self(this);
++    RefPtr<PromiseListHolder> self(this);
 +    mPromiseList.LastElement()->Then(mTarget, __func__,
 +      [self] (const ClientOpResult& aResult) {
 +        if (aResult.type() == ClientOpResult::TClientInfoAndState) {
@@ -3443,13 +3473,13 @@ new file mode 100644
 +    }
 +  }
 +
-+  NS_INLINE_DECL_REFCOUNTING(QueryListPromiseHolder)
++  NS_INLINE_DECL_REFCOUNTING(PromiseListHolder)
 +};
 +
 +} // anonymous namespace
 +
-+already_AddRefed<ClientQueryPromise>
-+ClientManagerService::Query(const ClientQueryConstructorArgs& aArgs)
++already_AddRefed<ClientOpPromise>
++ClientManagerService::MatchAll(const ClientMatchAllArgs& aArgs)
 +{
 +  AssertIsOnBackgroundThread();
 +
@@ -3460,18 +3490,18 @@ new file mode 100644
 +      ? endpoint.get_ClientInfo().principalInfo()
 +      : endpoint.get_ServiceWorkerDescriptor().principalInfo();
 +
-+  RefPtr<QueryListPromiseHolder> promiseList =
-+    new QueryListPromiseHolder(mBackgroundThread);
++  RefPtr<PromiseListHolder> promiseList =
++    new PromiseListHolder(mBackgroundThread);
 +
-+  // TODO: replace this single global list with a better data structure
 +  for (ClientSourceParent* source : mSourceList) {
 +    MOZ_DIAGNOSTIC_ASSERT(source);
 +
-+    if (!MatchPrincipalInfo(source->GetPrincipalInfo(), principalInfo)) {
++    if (!MatchPrincipalInfo(source->Info().principalInfo(), principalInfo)) {
 +      continue;
 +    }
 +
-+    if (aArgs.type() != ClientType::All && source->Type() != aArgs.type()) {
++    if (aArgs.type() != ClientType::All &&
++        source->Info().type() != aArgs.type()) {
 +      continue;
 +    }
 +
@@ -3509,13 +3539,72 @@ new file mode 100644
 +  return promiseList->GetResultPromise();
 +}
 +
++already_AddRefed<ClientOpPromise>
++ClientManagerService::Claim(const ClientClaimArgs& aArgs)
++{
++  AssertIsOnBackgroundThread();
++
++  const ServiceWorkerDescriptor& serviceWorker = aArgs.serviceWorker();
++  const PrincipalInfo& principalInfo = serviceWorker.principalInfo();
++
++  RefPtr<PromiseListHolder> promiseList =
++    new PromiseListHolder(mBackgroundThread);
++
++  for (ClientSourceParent* source : mSourceList) {
++    MOZ_DIAGNOSTIC_ASSERT(source);
++
++    if (!MatchPrincipalInfo(source->Info().principalInfo(), principalInfo)) {
++      continue;
++    }
++
++    const Maybe<ServiceWorkerDescriptor>& controller = source->GetController();
++    if (controller.isSome() &&
++        controller.ref().scope() == serviceWorker.scope() &&
++        controller.ref().id() == serviceWorker.id()) {
++      continue;
++    }
++
++    // TODO: This logic to determine if a service worker should control
++    //       a particular client should be moved to the ServiceWorkerManager.
++    //       This can't happen until the SWM is moved to the parent process,
++    //       though.
++    if (!source->ExecutionReady() ||
++        source->Info().type() == ClientType::Serviceworker ||
++        source->Info().url().Find(serviceWorker.scope()) != 0) {
++      continue;
++    }
++
++    promiseList->AddPromise(source->StartOp(aArgs));
++  }
++
++  // Maybe finish the promise now in case we didn't find any matching clients.
++  promiseList->MaybeFinish();
++
++  return promiseList->GetResultPromise();
++}
++
++already_AddRefed<ClientOpPromise>
++ClientManagerService::GetInfoAndState(const ClientGetInfoAndStateArgs& aArgs)
++{
++  RefPtr<ClientOpPromise> ref;
++
++  ClientSourceParent* source = FindSource(aArgs.id(), aArgs.principalInfo());
++  if (!source) {
++    ref = ClientOpPromise::CreateAndReject(NS_ERROR_FAILURE, __func__);
++    return ref.forget();
++  }
++
++  // TODO: maybe change this to just GetState from source and use local info?
++  return source->StartOp(aArgs);
++}
++
 +} // namespace dom
 +} // namespace mozilla
 diff --git a/dom/clients/manager/ClientManagerService.h b/dom/clients/manager/ClientManagerService.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientManagerService.h
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,66 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -3529,6 +3618,11 @@ new file mode 100644
 +#include "ClientOpPromise.h"
 +
 +namespace mozilla {
++
++namespace ipc {
++class PrincipalInfo;
++}
++
 +namespace dom {
 +
 +class ClientSourceParent;
@@ -3558,10 +3652,17 @@ new file mode 100644
 +  RemoveSource(ClientSourceParent* aSource);
 +
 +  ClientSourceParent*
-+  FindSource(const ClientInfo& aClientInfo);
++  FindSource(const nsID& aID,
++             const mozilla::ipc::PrincipalInfo& aPrincipalInfo);
 +
-+  already_AddRefed<ClientQueryPromise>
-+  Query(const ClientQueryConstructorArgs& aArgs);
++  already_AddRefed<ClientOpPromise>
++  MatchAll(const ClientMatchAllArgs& aArgs);
++
++  already_AddRefed<ClientOpPromise>
++  Claim(const ClientClaimArgs& aArgs);
++
++  already_AddRefed<ClientOpPromise>
++  GetInfoAndState(const ClientGetInfoAndStateArgs& aArgs);
 +
 +  NS_INLINE_DECL_REFCOUNTING(mozilla::dom::ClientManagerService)
 +};
@@ -3574,7 +3675,7 @@ diff --git a/dom/clients/manager/ClientOpPromise.h b/dom/clients/manager/ClientO
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientOpPromise.h
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,22 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -3593,162 +3694,15 @@ new file mode 100644
 +
 +typedef MozPromise<ClientState, nsresult, false> ClientStatePromise;
 +
-+typedef MozPromise<ClientList, nsresult, false> ClientQueryPromise;
-+
 +} // namespace dom
 +} // namespace mozilla
 +
 +#endif // _mozilla_dom_ClientOpPromise_h
-diff --git a/dom/clients/manager/ClientQueryChild.cpp b/dom/clients/manager/ClientQueryChild.cpp
-new file mode 100644
---- /dev/null
-+++ b/dom/clients/manager/ClientQueryChild.cpp
-@@ -0,0 +1,23 @@
-+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
-+/* vim: set ts=8 sts=2 et sw=2 tw=80: */
-+/* This Source Code Form is subject to the terms of the Mozilla Public
-+ * License, v. 2.0. If a copy of the MPL was not distributed with this
-+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
-+
-+#include "ClientQueryChild.h"
-+
-+namespace mozilla {
-+namespace dom {
-+
-+void
-+ClientQueryChild::ActorDestroy(ActorDestroyReason aReason)
-+{
-+}
-+
-+ClientQueryChild::ClientQueryChild(const ClientQueryConstructorArgs& aArgs,
-+                                   ClientQueryPromise::Private* aPromise)
-+{
-+}
-+
-+} // namespace dom
-+} // namespace mozilla
-diff --git a/dom/clients/manager/ClientQueryChild.h b/dom/clients/manager/ClientQueryChild.h
-new file mode 100644
---- /dev/null
-+++ b/dom/clients/manager/ClientQueryChild.h
-@@ -0,0 +1,30 @@
-+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
-+/* vim: set ts=8 sts=2 et sw=2 tw=80: */
-+/* This Source Code Form is subject to the terms of the Mozilla Public
-+ * License, v. 2.0. If a copy of the MPL was not distributed with this
-+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
-+#ifndef _mozilla_dom_ClientQueryChild_h
-+#define _mozilla_dom_ClientQueryChild_h
-+
-+#include "mozilla/dom/PClientQueryChild.h"
-+
-+#include "ClientOpPromise.h"
-+
-+namespace mozilla {
-+namespace dom {
-+
-+class ClientQueryChild final : public PClientQueryChild
-+{
-+  // PClientQueryChild interface
-+  void
-+  ActorDestroy(ActorDestroyReason aReason) override;
-+
-+public:
-+  ClientQueryChild(const ClientQueryConstructorArgs& aArgs,
-+                   ClientQueryPromise::Private* aPromise);
-+};
-+
-+} // namespace dom
-+} // namespace mozilla
-+
-+#endif // _mozilla_dom_ClientQueryChild_h
-diff --git a/dom/clients/manager/ClientQueryParent.cpp b/dom/clients/manager/ClientQueryParent.cpp
-new file mode 100644
---- /dev/null
-+++ b/dom/clients/manager/ClientQueryParent.cpp
-@@ -0,0 +1,37 @@
-+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
-+/* vim: set ts=8 sts=2 et sw=2 tw=80: */
-+/* This Source Code Form is subject to the terms of the Mozilla Public
-+ * License, v. 2.0. If a copy of the MPL was not distributed with this
-+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
-+
-+#include "ClientQueryParent.h"
-+
-+namespace mozilla {
-+namespace dom {
-+
-+void
-+ClientQueryParent::ActorDestroy(ActorDestroyReason aReason)
-+{
-+  mPromiseRequestHolder.DisconnectIfExists();
-+}
-+
-+void
-+ClientQueryParent::Init(ClientManagerService* aService,
-+                        const ClientQueryConstructorArgs& aArgs)
-+{
-+  MOZ_DIAGNOSTIC_ASSERT(aService);
-+
-+  RefPtr<ClientQueryPromise> p = aService->Query(aArgs);
-+
-+  p->Then(aService->BackgroundThread(), __func__,
-+          [this] (const ClientList& aResult) {
-+            mPromiseRequestHolder.Complete();
-+            Unused << PClientQueryParent::Send__delete__(this, aResult);
-+          }, [this] (nsresult aResult) {
-+            mPromiseRequestHolder.Complete();
-+            Unused << PClientQueryParent::Send__delete__(this, aResult);
-+          })->Track(mPromiseRequestHolder);
-+}
-+
-+} // namespace dom
-+} // namespace mozilla
-diff --git a/dom/clients/manager/ClientQueryParent.h b/dom/clients/manager/ClientQueryParent.h
-new file mode 100644
---- /dev/null
-+++ b/dom/clients/manager/ClientQueryParent.h
-@@ -0,0 +1,35 @@
-+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
-+/* vim: set ts=8 sts=2 et sw=2 tw=80: */
-+/* This Source Code Form is subject to the terms of the Mozilla Public
-+ * License, v. 2.0. If a copy of the MPL was not distributed with this
-+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
-+#ifndef _mozilla_dom_ClientQueryParent_h
-+#define _mozilla_dom_ClientQueryParent_h
-+
-+#include "mozilla/dom/PClientQueryParent.h"
-+
-+namespace mozilla {
-+namespace dom {
-+
-+class ClientManagerService;
-+
-+class ClientQueryParent final : public PClientQueryParent
-+{
-+  MozPromiseRequestHolder<ClientQueryPromise> mPromiseRequestHolder;
-+
-+  // PClientQueryParent interface
-+  void
-+  ActorDestroy(ActorDestroyReason aReason) override;
-+
-+public:
-+  ClientQueryParent() = default;
-+  ~ClientQueryParent() = default;
-+
-+  void
-+  Init(ClientManagerService* aService, const ClientQueryConstructorArgs& aArgs);
-+};
-+
-+} // namespace dom
-+} // namespace mozilla
-+
-+#endif // _mozilla_dom_ClientQueryParent_h
 diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSource.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientSource.cpp
-@@ -0,0 +1,732 @@
+@@ -0,0 +1,786 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -4462,6 +4416,60 @@ new file mode 100644
 +  return ref.forget();
 +}
 +
++already_AddRefed<ClientOpPromise>
++ClientSource::Claim(const ClientClaimArgs& aArgs)
++{
++  RefPtr<ClientOpPromise> ref;
++
++  // Today the ServiceWorkerManager maintains its own list of
++  // nsIDocument objects controlled by each service worker.  We
++  // need to try to update that data structure for now.  If we
++  // can't, however, then simply mark the Client as controlled.
++  // In the future this will be enough for the SWM as well since
++  // it will eventually hold ClientHandle objects instead of
++  // nsIDocuments.
++  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
++  nsPIDOMWindowInner* innerWindow = GetInnerWindow();
++  nsIDocument* doc = innerWindow ? innerWindow->GetExtantDoc() : nullptr;
++  if (!swm || !doc) {
++    SetController(aArgs.serviceWorker());
++
++    ref = ClientOpPromise::CreateAndResolve(NS_OK, __func__);
++    return ref.forget();
++  }
++
++  RefPtr<ClientOpPromise::Private> outerPromise =
++    new ClientOpPromise::Private(__func__);
++
++  RefPtr<GenericPromise> p = swm->MaybeClaimClient(doc, aArgs.serviceWorker());
++  p->Then(AbstractThread::GetCurrent(), __func__,
++    [outerPromise] (bool aResult) {
++      outerPromise->Resolve(NS_OK, __func__);
++    }, [outerPromise] (nsresult aResult) {
++      outerPromise->Reject(aResult, __func__);
++    });
++
++  ref = outerPromise;
++  return ref.forget();
++}
++
++already_AddRefed<ClientOpPromise>
++ClientSource::GetInfoAndState(const ClientGetInfoAndStateArgs& aArgs)
++{
++  RefPtr<ClientOpPromise> ref;
++
++  ClientState state;
++  nsresult rv = SnapshotState(&state);
++  if (NS_FAILED(rv)) {
++    ref = ClientOpPromise::CreateAndReject(rv, __func__);
++    return ref.forget();
++  }
++
++  ref = ClientOpPromise::CreateAndResolve(ClientInfoAndState(mClientInfo, state),
++                                          __func__);
++  return ref.forget();
++}
++
 +nsresult
 +ClientSource::SnapshotState(ClientState* aStateOut)
 +{
@@ -4485,7 +4493,7 @@ diff --git a/dom/clients/manager/ClientSource.h b/dom/clients/manager/ClientSour
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientSource.h
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,123 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -4594,6 +4602,12 @@ new file mode 100644
 +
 +  already_AddRefed<ClientOpPromise>
 +  GetState(const ClientGetStateArgs& aArgs);
++
++  already_AddRefed<ClientOpPromise>
++  Claim(const ClientClaimArgs& aArgs);
++
++  already_AddRefed<ClientOpPromise>
++  GetInfoAndState(const ClientGetInfoAndStateArgs& aArgs);
 +
 +  nsresult
 +  SnapshotState(ClientState* aStateOut);
@@ -4758,7 +4772,7 @@ diff --git a/dom/clients/manager/ClientSourceOpChild.cpp b/dom/clients/manager/C
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientSourceOpChild.cpp
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,109 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -4846,7 +4860,18 @@ new file mode 100644
 +    {
 +      DoSourceOp(&ClientSource::GetState, aArgs.get_ClientGetStateArgs());
 +      break;
-+    };
++    }
++    case ClientOpConstructorArgs::TClientClaimArgs:
++    {
++      DoSourceOp(&ClientSource::Claim, aArgs.get_ClientClaimArgs());
++      break;
++    }
++    case ClientOpConstructorArgs::TClientGetInfoAndStateArgs:
++    {
++      DoSourceOp(&ClientSource::GetInfoAndState,
++                 aArgs.get_ClientGetInfoAndStateArgs());
++      break;
++    }
 +    default:
 +    {
 +      MOZ_ASSERT_UNREACHABLE("Unknown Client operation!");
@@ -5005,7 +5030,7 @@ diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/Cl
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientSourceParent.cpp
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,173 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -5123,22 +5148,10 @@ new file mode 100644
 +  MOZ_DIAGNOSTIC_ASSERT(mHandleList.IsEmpty());
 +}
 +
-+const nsID&
-+ClientSourceParent::ID() const
++const ClientInfo&
++ClientSourceParent::Info() const
 +{
-+  return mClientInfo.id();
-+}
-+
-+ClientType
-+ClientSourceParent::Type() const
-+{
-+  return mClientInfo.type();
-+}
-+
-+const PrincipalInfo&
-+ClientSourceParent::GetPrincipalInfo() const
-+{
-+  return mClientInfo.principalInfo();
++  return mClientInfo;
 +}
 +
 +bool
@@ -5195,7 +5208,7 @@ diff --git a/dom/clients/manager/ClientSourceParent.h b/dom/clients/manager/Clie
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientSourceParent.h
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,84 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -5222,7 +5235,6 @@ new file mode 100644
 +  ClientInfo mClientInfo;
 +  Maybe<ServiceWorkerDescriptor> mController;
 +  RefPtr<ClientManagerService> mService;
-+  nsCString mCreationURL;
 +  nsTArray<ClientHandleParent*> mHandleList;
 +  bool mExecutionReady;
 +
@@ -5258,14 +5270,8 @@ new file mode 100644
 +  explicit ClientSourceParent(const ClientSourceConstructorArgs& aArgs);
 +  ~ClientSourceParent();
 +
-+  const nsID&
-+  ID() const;
-+
-+  ClientType
-+  Type() const;
-+
-+  const mozilla::ipc::PrincipalInfo&
-+  GetPrincipalInfo() const;
++  const ClientInfo&
++  Info() const;
 +
 +  bool
 +  ExecutionReady() const;
@@ -5494,7 +5500,7 @@ diff --git a/dom/clients/manager/PClientManager.ipdl b/dom/clients/manager/PClie
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/PClientManager.ipdl
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,34 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this file,
 + * You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -5502,7 +5508,6 @@ new file mode 100644
 +include protocol PBackground;
 +include protocol PClientHandle;
 +include protocol PClientManagerOp;
-+include protocol PClientQuery;
 +include protocol PClientSource;
 +include ClientIPCTypes;
 +
@@ -5515,7 +5520,6 @@ new file mode 100644
 +
 +  manages PClientHandle;
 +  manages PClientManagerOp;
-+  manages PClientQuery;
 +  manages PClientSource;
 +
 +parent:
@@ -5523,7 +5527,6 @@ new file mode 100644
 +
 +  async PClientHandle(ClientInfo aClientInfo);
 +  async PClientManagerOp(ClientOpConstructorArgs aArgs);
-+  async PClientQuery(ClientQueryConstructorArgs aArgs);
 +  async PClientSource(ClientSourceConstructorArgs aArgs);
 +
 +child:
@@ -5553,31 +5556,6 @@ new file mode 100644
 +
 +child:
 +  async __delete__(ClientOpResult aResult);
-+};
-+
-+} // namespace dom
-+} // namespace mozilla
-diff --git a/dom/clients/manager/PClientQuery.ipdl b/dom/clients/manager/PClientQuery.ipdl
-new file mode 100644
---- /dev/null
-+++ b/dom/clients/manager/PClientQuery.ipdl
-@@ -0,0 +1,20 @@
-+/* This Source Code Form is subject to the terms of the Mozilla Public
-+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
-+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
-+
-+include protocol PClientManager;
-+include ClientIPCTypes;
-+
-+namespace mozilla {
-+namespace dom {
-+
-+protocol PClientQuery
-+{
-+  manager PClientManager;
-+
-+child:
-+  async __delete__(ClientQueryResult aResult);
 +};
 +
 +} // namespace dom
@@ -5861,7 +5839,7 @@ diff --git a/dom/clients/manager/moz.build b/dom/clients/manager/moz.build
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/moz.build
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,65 @@
 +# -*- Mode: python; indent-tabs-mode: nil; tab-width: 40 -*-
 +# vim: set filetype=python:
 +# This Source Code Form is subject to the terms of the Mozilla Public
@@ -5892,8 +5870,6 @@ new file mode 100644
 +  'ClientManagerOpParent.cpp',
 +  'ClientManagerParent.cpp',
 +  'ClientManagerService.cpp',
-+  'ClientQueryChild.cpp',
-+  'ClientQueryParent.cpp',
 +  'ClientSource.cpp',
 +  'ClientSourceChild.cpp',
 +  'ClientSourceOpChild.cpp',
@@ -5908,7 +5884,6 @@ new file mode 100644
 +  'PClientHandleOp.ipdl',
 +  'PClientManager.ipdl',
 +  'PClientManagerOp.ipdl',
-+  'PClientQuery.ipdl',
 +  'PClientSource.ipdl',
 +  'PClientSourceOp.ipdl',
 +]
@@ -6921,7 +6896,7 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
                                      nsTArray<ServiceWorkerClientInfo>& aDocuments)
  {
    MOZ_ASSERT(aPrincipal);
-@@ -3032,88 +3062,104 @@ ServiceWorkerManager::GetAllClients(nsIP
+@@ -3032,88 +3062,128 @@ ServiceWorkerManager::GetAllClients(nsIP
    uint32_t ordinal = 0;
    for (uint32_t i = 0; i < docList.Length(); ++i) {
      aDocuments.AppendElement(ServiceWorkerClientInfo(docList[i], ordinal));
@@ -6978,6 +6953,30 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
  }
  
 -nsresult
++already_AddRefed<GenericPromise>
++ServiceWorkerManager::MaybeClaimClient(nsIDocument* aDoc,
++                                       const ServiceWorkerDescriptor& aServiceWorker)
++{
++  RefPtr<GenericPromise> ref;
++
++  nsCOMPtr<nsIPrincipal> principal =
++    PrincipalInfoToPrincipal(aServiceWorker.principalInfo());
++  if (!principal) {
++    ref = GenericPromise::CreateAndResolve(false, __func__);
++    return ref.forget();
++  }
++
++  RefPtr<ServiceWorkerRegistrationInfo> registration =
++    GetRegistration(principal, aServiceWorker.scope());
++  if (!registration) {
++    ref = GenericPromise::CreateAndResolve(false, __func__);
++    return ref.forget();
++  }
++
++  ref = MaybeClaimClient(aDoc, registration);
++  return ref.forget();
++}
++
 +already_AddRefed<GenericPromise::AllPromiseType>
  ServiceWorkerManager::ClaimClients(nsIPrincipal* aPrincipal,
                                     const nsCString& aScope, uint64_t aId)
@@ -7042,7 +7041,7 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
                                           uint64_t aServiceWorkerID)
  {
    RefPtr<ServiceWorkerRegistrationInfo> registration =
-@@ -3132,30 +3178,47 @@ ServiceWorkerManager::SetSkipWaitingFlag
+@@ -3132,30 +3202,47 @@ ServiceWorkerManager::SetSkipWaitingFlag
    worker->SetSkipWaitingFlag();
  
    if (worker->State() == ServiceWorkerState::Installed) {
@@ -7131,7 +7130,7 @@ diff --git a/dom/workers/ServiceWorkerManager.h b/dom/workers/ServiceWorkerManag
  class ServiceWorkerUpdateFinishCallback
  {
  protected:
-@@ -259,33 +259,35 @@ public:
+@@ -259,33 +259,39 @@ public:
                const nsString& aMessage,
                const nsString& aFilename,
                const nsString& aLine,
@@ -7160,6 +7159,10 @@ diff --git a/dom/workers/ServiceWorkerManager.h b/dom/workers/ServiceWorkerManag
                     ServiceWorkerRegistrationInfo* aWorkerRegistration);
  
 -  nsresult
++  already_AddRefed<GenericPromise>
++  MaybeClaimClient(nsIDocument* aDoc,
++                   const ServiceWorkerDescriptor& aServiceWorker);
++
 +  already_AddRefed<GenericPromise::AllPromiseType>
    ClaimClients(nsIPrincipal* aPrincipal, const nsCString& aScope, uint64_t aId);
  
@@ -7169,7 +7172,7 @@ diff --git a/dom/workers/ServiceWorkerManager.h b/dom/workers/ServiceWorkerManag
  
    static already_AddRefed<ServiceWorkerManager>
    GetInstance();
-@@ -374,17 +376,17 @@ private:
+@@ -374,17 +380,17 @@ private:
                                              WhichServiceWorker aWhichOne);
    void
    InvalidateServiceWorkerRegistrationWorker(ServiceWorkerRegistrationInfo* aRegistration,
@@ -7188,7 +7191,7 @@ diff --git a/dom/workers/ServiceWorkerManager.h b/dom/workers/ServiceWorkerManag
    StopControllingADocument(ServiceWorkerRegistrationInfo* aRegistration);
  
    already_AddRefed<ServiceWorkerRegistrationInfo>
-@@ -424,17 +426,17 @@ private:
+@@ -424,17 +430,17 @@ private:
    void
    QueueFireEventOnServiceWorkerRegistrations(ServiceWorkerRegistrationInfo* aRegistration,
                                               const nsAString& aName);
@@ -8296,7 +8299,7 @@ diff --git a/ipc/glue/PBackground.ipdl b/ipc/glue/PBackground.ipdl
 diff --git a/ipc/ipdl/sync-messages.ini b/ipc/ipdl/sync-messages.ini
 --- a/ipc/ipdl/sync-messages.ini
 +++ b/ipc/ipdl/sync-messages.ini
-@@ -984,8 +984,10 @@ description =
+@@ -982,8 +982,10 @@ description =
  [PPrinting::SavePrintSettings]
  description =
  [PHandlerService::FillHandlerInfo]
