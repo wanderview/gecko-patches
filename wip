@@ -470,7 +470,7 @@ diff --git a/dom/clients/api/Client.cpp b/dom/clients/api/Client.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/api/Client.cpp
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,249 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -491,6 +491,7 @@ new file mode 100644
 +
 +using mozilla::dom::workers::GetCurrentThreadWorkerPrivate;
 +using mozilla::dom::workers::WorkerPrivate;
++using mozilla::dom::ipc::StructuredCloneData;
 +
 +NS_IMPL_CYCLE_COLLECTING_ADDREF(Client);
 +NS_IMPL_CYCLE_COLLECTING_RELEASE(Client);
@@ -512,6 +513,36 @@ new file mode 100644
 +  if (!mHandle) {
 +    mHandle = ClientManager::CreateHandle(mData.info());
 +  }
++}
++
++// TODO: unify this with code in Clients
++nsresult
++Client::GetEndPoint(ClientEndPoint& aEndPointOut)
++{
++  nsCOMPtr<nsPIDOMWindowInner> window = do_QueryInterface(mGlobal);
++  if (window) {
++    const Maybe<ClientInfo>& clientInfo = window->GetClientInfo();
++    if (clientInfo.isSome()) {
++      aEndPointOut = clientInfo.ref();
++      return NS_OK;
++    }
++  } else {
++    MOZ_ASSERT(!NS_IsMainThread());
++    WorkerPrivate* workerPrivate = GetCurrentThreadWorkerPrivate();
++    if (workerPrivate) {
++      if (workerPrivate->IsServiceWorker()) {
++        aEndPointOut = ServiceWorkerDescriptor(workerPrivate->ServiceWorkerID(),
++                                               workerPrivate->GetPrincipalInfo(),
++                                               workerPrivate->WorkerName());
++        return NS_OK;
++      } else {
++        aEndPointOut = workerPrivate->GetClientInfo();
++        return NS_OK;
++      }
++    }
++  }
++
++  return NS_ERROR_DOM_INVALID_STATE_ERR;
 +}
 +
 +Client::Client(nsIGlobalObject* aGlobal, const ClientInfoAndState& aData)
@@ -579,9 +610,30 @@ new file mode 100644
 +
 +void
 +Client::PostMessage(JSContext* aCx, JS::Handle<JS::Value> aMessage,
-+                    const Sequence<JSObject*>& aTransferrable,
++                    const Sequence<JSObject*>& aTransferable,
 +                    ErrorResult& aRv)
 +{
++  JS::Rooted<JS::Value> transferable(aCx, JS::UndefinedValue());
++  aRv = nsContentUtils::CreateJSValueFromSequenceOfObject(aCx, aTransferable,
++                                                          &transferable);
++  if (aRv.Failed()) {
++    return;
++  }
++
++  StructuredCloneData data;
++  data.Write(aCx, aMessage, transferable, aRv);
++  if (aRv.Failed()) {
++    return;
++  }
++
++  ClientEndPoint endpoint;
++  aRv = GetEndPoint(endpoint);
++  if (aRv.Failed()) {
++    return;
++  }
++
++  EnsureHandle();
++  RefPtr<GenericPromise> p = mHandle->PostMessage(data, endpoint);
 +}
 +
 +VisibilityState
@@ -672,7 +724,7 @@ diff --git a/dom/clients/api/Client.h b/dom/clients/api/Client.h
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/api/Client.h
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,96 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -709,6 +761,9 @@ new file mode 100644
 +
 +  void
 +  EnsureHandle();
++
++  nsresult
++  GetEndPoint(ClientEndPoint& aEndPointOut);
 +
 +public:
 +  Client(nsIGlobalObject* aGlobal, const ClientInfoAndState& aData);
@@ -1420,7 +1475,7 @@ diff --git a/dom/clients/manager/ClientHandleChild.cpp b/dom/clients/manager/Cli
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientHandleChild.cpp
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,82 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1497,7 +1552,6 @@ new file mode 100644
 +  if (mTeardownStarted) {
 +    return;
 +  }
-+  printf_stderr("### ### ClientHandleChild::MaybeStartTeardown()\n");
 +  mTeardownStarted = true;
 +  Unused << SendTeardown();
 +}
@@ -1565,7 +1619,7 @@ diff --git a/dom/clients/manager/ClientHandleOpChild.cpp b/dom/clients/manager/C
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientHandleOpChild.cpp
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,48 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1581,7 +1635,6 @@ new file mode 100644
 +ClientHandleOpChild::ActorDestroy(ActorDestroyReason aReason)
 +{
 +  if (mPromise) {
-+    printf_stderr("### ### ClientHandleOpChild::ActorDestroy()\n");
 +    mPromise->Reject(NS_ERROR_ABORT, __func__);
 +    mPromise = nullptr;
 +  }
@@ -2898,7 +2951,7 @@ diff --git a/dom/clients/manager/ClientManagerOpChild.cpp b/dom/clients/manager/
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientManagerOpChild.cpp
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,48 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -2914,7 +2967,6 @@ new file mode 100644
 +ClientManagerOpChild::ActorDestroy(ActorDestroyReason aReason)
 +{
 +  if (mPromise) {
-+    printf_stderr("### ### ClientManagerOpChild::ActorDestroy()\n");
 +    mPromise->Reject(NS_ERROR_ABORT, __func__);
 +    mPromise = nullptr;
 +  }
@@ -3465,14 +3517,12 @@ new file mode 100644
 +  void
 +  ProcessSuccess(const ClientInfoAndState& aResult)
 +  {
-+    MOZ_DIAGNOSTIC_ASSERT(mOutstandingPromiseCount > 0);
 +    mResultList.AppendElement(aResult);
-+    mOutstandingPromiseCount -= 1;
-+    MaybeFinish();
++    ProcessCompletion();
 +  }
 +
 +  void
-+  ProcessFailure(nsresult aResult)
++  ProcessCompletion()
 +  {
 +    MOZ_DIAGNOSTIC_ASSERT(mOutstandingPromiseCount > 0);
 +    mOutstandingPromiseCount -= 1;
@@ -3515,9 +3565,11 @@ new file mode 100644
 +        //       even though they expect different return values.
 +        if (aResult.type() == ClientOpResult::TClientInfoAndState) {
 +          self->ProcessSuccess(aResult.get_ClientInfoAndState());
++        } else {
++          self->ProcessCompletion();
 +        }
 +      }, [self] (nsresult aResult) {
-+        self->ProcessFailure(aResult);
++        self->ProcessCompletion();
 +      });
 +  }
 +
@@ -4328,7 +4380,7 @@ new file mode 100644
 +      : endpoint.get_ServiceWorkerDescriptor().principalInfo();
 +
 +  // TODO: this should probably not require strict spec matching
-+  if (!(mClientInfo.principalInfo() == principalInfo)) {
++  if (false && !(mClientInfo.principalInfo() == principalInfo)) {
 +    ref = ClientOpPromise::CreateAndReject(NS_ERROR_FAILURE, __func__);
 +    return ref.forget();
 +  }
@@ -4425,7 +4477,7 @@ new file mode 100644
 +  }
 +
 +  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
-+  if (swm) {
++  if (!swm) {
 +    // Shutting down. Just don't deliver this message.
 +    ref = ClientOpPromise::CreateAndReject(NS_ERROR_FAILURE, __func__);
 +    return ref.forget();
@@ -5091,7 +5143,7 @@ diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/Cl
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientSourceParent.cpp
-@@ -0,0 +1,173 @@
+@@ -0,0 +1,172 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -5143,7 +5195,6 @@ new file mode 100644
 +{
 +  // TODO: Validate this against nsIURI and nsIPrincipal
 +  // TODO: mark execution ready
-+  printf_stderr("### ### ExecutionReady() %s\n", aArgs.url().get());
 +  mClientInfo.url() = aArgs.url();
 +  mClientInfo.frameType() = aArgs.frameType();
 +  mExecutionReady = true;
@@ -7907,7 +7958,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
                                   DebuggerScript, rv);
      rv.WouldReportJSException();
      // Explicitly ignore NS_BINDING_ABORTED on rv.  Or more precisely, still
-@@ -4591,30 +4597,35 @@ WorkerPrivate::Constructor(JSContext* aC
+@@ -4591,16 +4597,18 @@ WorkerPrivate::Constructor(JSContext* aC
    }
  
    // Only service and shared workers can have names.
@@ -7922,28 +7973,11 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
    if (!aLoadInfo) {
      stackLoadInfo.emplace();
  
-+    printf_stderr("### ### Calling GetLoadInfo() %s\n", scriptURL.get());
      nsresult rv = GetLoadInfo(aCx, nullptr, parent, aScriptURL,
                                aIsChromeWorker, InheritLoadGroup,
                                aWorkerType, stackLoadInfo.ptr());
      aRv.MightThrowJSException();
-     if (NS_FAILED(rv)) {
-       scriptloader::ReportLoadError(aRv, rv, aScriptURL);
-       return nullptr;
-     }
- 
-     aLoadInfo = stackLoadInfo.ptr();
-+  } else {
-+    printf_stderr("### ### Not calling GetLoadInfo() %s\n", scriptURL.get());
-   }
- 
-   // NB: This has to be done before creating the WorkerPrivate, because it will
-   // attempt to use static variables that are initialized in the RuntimeService
-   // constructor.
-   RuntimeService* runtimeService;
- 
-   if (!parent) {
-@@ -5030,16 +5041,18 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
+@@ -5030,16 +5038,18 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
        }
  
        // If we're supposed to die then we should exit the loop.
@@ -7962,7 +7996,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
            MutexAutoLock lock(mMutex);
  
            mStatus = Dead;
-@@ -5190,16 +5203,81 @@ WorkerPrivate::DispatchToMainThread(alre
+@@ -5190,16 +5200,81 @@ WorkerPrivate::DispatchToMainThread(alre
  
  nsIEventTarget*
  WorkerPrivate::ControlEventTarget()
@@ -8044,7 +8078,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
    // periodically (PERIODIC_GC_TIMER_DELAY_SEC) while the worker is running.
    // Once the worker goes idle we set a short (IDLE_GC_TIMER_DELAY_SEC) timer to
    // run a shrinking GC. If the worker receives more messages then the short
-@@ -5531,16 +5609,18 @@ WorkerPrivate::ClearDebuggerEventQueue()
+@@ -5531,16 +5606,18 @@ WorkerPrivate::ClearDebuggerEventQueue()
  
  bool
  WorkerPrivate::FreezeInternal()
@@ -8063,7 +8097,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
  
    return true;
  }
-@@ -5552,16 +5632,19 @@ WorkerPrivate::ThawInternal()
+@@ -5552,16 +5629,19 @@ WorkerPrivate::ThawInternal()
  
    NS_ASSERTION(mFrozen, "Not yet frozen!");
  
