@@ -230,7 +230,43 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
      return false;
    }
    auto outer = GetOuterWindow();
-@@ -12553,16 +12643,53 @@ nsGlobalWindow::CallOnChildren(Method aM
+@@ -12416,16 +12506,17 @@ nsGlobalWindow::FreezeInternal()
+   MOZ_ASSERT(mSuspendDepth >= mFreezeDepth);
+   if (mFreezeDepth != 1) {
+     return;
+   }
+ 
+   mozilla::dom::workers::FreezeWorkersForWindow(AsInner());
+ 
+   mTimeoutManager->Freeze();
++  mClientSource->Freeze();
+ 
+   NotifyDOMWindowFrozen(this);
+ }
+ 
+ void
+ nsGlobalWindow::Thaw()
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+@@ -12445,16 +12536,17 @@ nsGlobalWindow::ThawInternal()
+ 
+   MOZ_ASSERT(mFreezeDepth != 0);
+   mFreezeDepth -= 1;
+   MOZ_ASSERT(mSuspendDepth >= mFreezeDepth);
+   if (mFreezeDepth != 0) {
+     return;
+   }
+ 
++  mClientSource->Thaw();
+   mTimeoutManager->Thaw();
+ 
+   mozilla::dom::workers::ThawWorkersForWindow(AsInner());
+ 
+   NotifyDOMWindowThawed(this);
+ }
+ 
+ bool
+@@ -12553,16 +12645,53 @@ nsGlobalWindow::CallOnChildren(Method aM
      if (!mDoc || !frame || mDoc != frame->OwnerDoc() || !inner) {
        continue;
      }
@@ -825,7 +861,7 @@ diff --git a/dom/clients/api/Clients.cpp b/dom/clients/api/Clients.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/api/Clients.cpp
-@@ -0,0 +1,241 @@
+@@ -0,0 +1,246 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -966,16 +1002,21 @@ new file mode 100644
 +  {
 +    TimeStamp leftFocusTime = aLeft->LastFocusTime();
 +    TimeStamp rightFocusTime = aRight->LastFocusTime();
++    // If the focus times are the same, then default to creation order.
++    // MatchAll should return oldest Clients first.
 +    if (leftFocusTime == rightFocusTime) {
 +      return aLeft->CreationTime() < aRight->CreationTime();
 +    }
++
++    // Otherwise compare focus times.  We reverse the logic here so
++    // that the most recently focused window is first in the list.
 +    if (!leftFocusTime.IsNull() && rightFocusTime.IsNull()) {
 +      return true;
 +    }
 +    if (leftFocusTime.IsNull() && !rightFocusTime.IsNull()) {
 +      return false;
 +    }
-+    return leftFocusTime < rightFocusTime;
++    return leftFocusTime > rightFocusTime;
 +  }
 +
 +  bool
@@ -3342,7 +3383,7 @@ diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientManagerService.cpp
-@@ -0,0 +1,367 @@
+@@ -0,0 +1,376 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -3495,7 +3536,8 @@ new file mode 100644
 +  AssertIsOnBackgroundThread();
 +  for (ClientSourceParent* source : mSourceList) {
 +    MOZ_DIAGNOSTIC_ASSERT(source);
-+    if (source->Info().id() == aID &&
++    if (!source->IsFrozen() &&
++        source->Info().id() == aID &&
 +        MatchPrincipalInfo(source->Info().principalInfo(), aPrincipalInfo)) {
 +      return source;
 +    }
@@ -3604,6 +3646,10 @@ new file mode 100644
 +  for (ClientSourceParent* source : mSourceList) {
 +    MOZ_DIAGNOSTIC_ASSERT(source);
 +
++    if (source->IsFrozen()) {
++      continue;
++    }
++
 +    if (!MatchPrincipalInfo(source->Info().principalInfo(), principalInfo)) {
 +      continue;
 +    }
@@ -3662,6 +3708,10 @@ new file mode 100644
 +
 +  for (ClientSourceParent* source : mSourceList) {
 +    MOZ_DIAGNOSTIC_ASSERT(source);
++
++    if (source->IsFrozen()) {
++      continue;
++    }
 +
 +    if (!MatchPrincipalInfo(source->Info().principalInfo(), principalInfo)) {
 +      continue;
@@ -5143,7 +5193,7 @@ diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/Cl
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientSourceParent.cpp
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,188 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -5209,14 +5259,23 @@ new file mode 100644
 +IPCResult
 +ClientSourceParent::RecvFreeze()
 +{
-+  // TODO: impl freeze
++  MOZ_DIAGNOSTIC_ASSERT(!mFrozen);
++  mFrozen = true;
++
++  nsTArray<ClientHandleParent*> handleList;
++  mHandleList.SwapElements(handleList);
++  for (ClientHandleParent* handle : handleList) {
++    Unused << ClientHandleParent::Send__delete__(handle);
++  }
++
 +  return IPC_OK();
 +}
 +
 +IPCResult
 +ClientSourceParent::RecvThaw()
 +{
-+  // TODO: impl thaw
++  MOZ_DIAGNOSTIC_ASSERT(mFrozen);
++  mFrozen = false;
 +  return IPC_OK();
 +}
 +
@@ -5251,6 +5310,7 @@ new file mode 100644
 +                EmptyCString(), FrameType::None)
 +  , mService(ClientManagerService::GetOrCreateInstance())
 +  , mExecutionReady(false)
++  , mFrozen(false)
 +{
 +  mService->AddSource(this);
 +}
@@ -5258,6 +5318,12 @@ new file mode 100644
 +ClientSourceParent::~ClientSourceParent()
 +{
 +  MOZ_DIAGNOSTIC_ASSERT(mHandleList.IsEmpty());
++}
++
++bool
++ClientSourceParent::IsFrozen() const
++{
++  return mFrozen;
 +}
 +
 +const ClientInfo&
@@ -5320,7 +5386,7 @@ diff --git a/dom/clients/manager/ClientSourceParent.h b/dom/clients/manager/Clie
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientSourceParent.h
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,88 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -5349,6 +5415,7 @@ new file mode 100644
 +  RefPtr<ClientManagerService> mService;
 +  nsTArray<ClientHandleParent*> mHandleList;
 +  bool mExecutionReady;
++  bool mFrozen;
 +
 +  // PClientSourceParent
 +  mozilla::ipc::IPCResult
@@ -5381,6 +5448,9 @@ new file mode 100644
 +public:
 +  explicit ClientSourceParent(const ClientSourceConstructorArgs& aArgs);
 +  ~ClientSourceParent();
++
++  bool
++  IsFrozen() const;
 +
 +  const ClientInfo&
 +  Info() const;
