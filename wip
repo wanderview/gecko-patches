@@ -859,7 +859,7 @@ diff --git a/dom/clients/api/Clients.cpp b/dom/clients/api/Clients.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/api/Clients.cpp
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,253 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1090,8 +1090,17 @@ new file mode 100644
 +    return outerPromise.forget();
 +  }
 +
++  const ServiceWorkerDescriptor& serviceWorker =
++    endpoint.get_ServiceWorkerDescriptor();
++
++  if (serviceWorker.state() != ServiceWorkerState::Activating &&
++      serviceWorker.state() != ServiceWorkerState::Activated) {
++    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
++    return outerPromise.forget();
++  }
++
 +  RefPtr<ClientOpPromise> innerPromise =
-+    ClientManager::Claim(ClientClaimArgs(endpoint.get_ServiceWorkerDescriptor()));
++    ClientManager::Claim(ClientClaimArgs(serviceWorker));
 +  innerPromise->Then(AbstractThread::GetCurrent(), __func__,
 +    [outerPromise] (const ClientOpResult& aResult) {
 +      outerPromise->MaybeResolveWithUndefined();
@@ -6828,7 +6837,7 @@ new file mode 100644
 diff --git a/dom/workers/ServiceWorkerInfo.cpp b/dom/workers/ServiceWorkerInfo.cpp
 --- a/dom/workers/ServiceWorkerInfo.cpp
 +++ b/dom/workers/ServiceWorkerInfo.cpp
-@@ -161,49 +161,55 @@ ServiceWorkerInfo::UpdateState(ServiceWo
+@@ -161,49 +161,51 @@ ServiceWorkerInfo::UpdateState(ServiceWo
    }
    // Activated can only go to redundant.
    MOZ_ASSERT_IF(mState == ServiceWorkerState::Activated, aState == ServiceWorkerState::Redundant);
@@ -6841,10 +6850,6 @@ diff --git a/dom/workers/ServiceWorkerInfo.cpp b/dom/workers/ServiceWorkerInfo.c
 -    mServiceWorkerPrivate->Activated();
 +  if (mState != aState) {
 +    mServiceWorkerPrivate->UpdateState(aState);
-+    // TODO: roll this into ServiceWorkerPrivate::UpdateState
-+    if (aState == ServiceWorkerState::Activated) {
-+      mServiceWorkerPrivate->Activated();
-+    }
    }
    mState = aState;
    nsCOMPtr<nsIRunnable> r = new ChangeStateUpdater(mInstances, mState);
@@ -7940,6 +7945,70 @@ diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPri
  
    return NS_OK;
  }
+@@ -1853,25 +1860,58 @@ ServiceWorkerPrivate::TerminateWorker()
+ void
+ ServiceWorkerPrivate::NoteDeadServiceWorkerInfo()
+ {
+   AssertIsOnMainThread();
+   mInfo = nullptr;
+   TerminateWorker();
+ }
+ 
++namespace {
++
++class UpdateStateControlRunnable : public MainThreadWorkerControlRunnable
++{
++  const ServiceWorkerState mState;
++
++  bool
++  WorkerRun(JSContext* aCx, WorkerPrivate* aWorkerPrivate) override
++  {
++    MOZ_DIAGNOSTIC_ASSERT(aWorkerPrivate);
++    aWorkerPrivate->UpdateServiceWorkerState(mState);
++    return true;
++  }
++
++public:
++  UpdateStateControlRunnable(WorkerPrivate* aWorkerPrivate,
++                             ServiceWorkerState aState)
++    : MainThreadWorkerControlRunnable(aWorkerPrivate)
++    , mState(aState)
++  {
++  }
++};
++
++} // anonymous namespace
++
+ void
+-ServiceWorkerPrivate::Activated()
++ServiceWorkerPrivate::UpdateState(ServiceWorkerState aState)
+ {
+   AssertIsOnMainThread();
+ 
+-  // If we had to queue up events due to the worker activating, that means
+-  // the worker must be currently running.  We should be called synchronously
+-  // when the worker becomes activated.
+-  MOZ_ASSERT_IF(!mPendingFunctionalEvents.IsEmpty(), mWorkerPrivate);
++  if (!mWorkerPrivate) {
++    MOZ_DIAGNOSTIC_ASSERT(mPendingFunctionalEvents.IsEmpty());
++    return;
++  }
++
++  RefPtr<WorkerRunnable> r =
++    new UpdateStateControlRunnable(mWorkerPrivate, aState);
++  Unused << r->Dispatch();
++
++  if (aState != ServiceWorkerState::Activated) {
++    return;
++  }
+ 
+   nsTArray<RefPtr<WorkerRunnable>> pendingEvents;
+   mPendingFunctionalEvents.SwapElements(pendingEvents);
+ 
+   for (uint32_t i = 0; i < pendingEvents.Length(); ++i) {
+     RefPtr<WorkerRunnable> r = pendingEvents[i].forget();
+     if (NS_WARN_IF(!r->Dispatch())) {
+       NS_WARNING("Failed to dispatch pending functional event!");
 diff --git a/dom/workers/ServiceWorkerPrivate.h b/dom/workers/ServiceWorkerPrivate.h
 --- a/dom/workers/ServiceWorkerPrivate.h
 +++ b/dom/workers/ServiceWorkerPrivate.h
@@ -8005,6 +8074,25 @@ diff --git a/dom/workers/ServiceWorkerPrivate.h b/dom/workers/ServiceWorkerPriva
    RemoveISupports(nsISupports* aSupports);
  
    // This will terminate the current running worker thread and drop the
+@@ -138,17 +139,17 @@ public:
+ 
+   void
+   NoteDeadServiceWorkerInfo();
+ 
+   void
+   NoteStoppedControllingDocuments();
+ 
+   void
+-  Activated();
++  UpdateState(ServiceWorkerState aState);
+ 
+   nsresult
+   GetDebugger(nsIWorkerDebugger** aResult);
+ 
+   nsresult
+   AttachDebugger();
+ 
+   nsresult
 diff --git a/dom/workers/ServiceWorkerRegistrationInfo.cpp b/dom/workers/ServiceWorkerRegistrationInfo.cpp
 --- a/dom/workers/ServiceWorkerRegistrationInfo.cpp
 +++ b/dom/workers/ServiceWorkerRegistrationInfo.cpp
@@ -8534,7 +8622,7 @@ diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
      AssertIsOnMainThread();
      return mLoadInfo.mBaseURI;
    }
-@@ -548,21 +548,29 @@ public:
+@@ -548,21 +548,37 @@ public:
    {
      AssertIsOnMainThread();
      return mLoadInfo.mResolvedScriptURI;
@@ -8557,6 +8645,14 @@ diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
 +    return mLoadInfo.mServiceWorkerDescriptor.ref();
 +  }
 +
++  void
++  UpdateServiceWorkerState(ServiceWorkerState aState)
++  {
++    MOZ_DIAGNOSTIC_ASSERT(IsServiceWorker());
++    MOZ_DIAGNOSTIC_ASSERT(mLoadInfo.mServiceWorkerDescriptor.isSome());
++    mLoadInfo.mServiceWorkerDescriptor.ref().state() = aState;
++  }
++
    const ChannelInfo&
    GetChannelInfo() const
    {
@@ -8565,7 +8661,7 @@ diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
  
    void
    SetChannelInfo(const ChannelInfo& aChannelInfo)
-@@ -1033,16 +1041,17 @@ class WorkerPrivate : public WorkerPriva
+@@ -1033,16 +1049,17 @@ class WorkerPrivate : public WorkerPriva
    // fired on the main thread if the worker script fails to load
    nsCOMPtr<nsIRunnable> mLoadFailedRunnable;
  
@@ -8583,7 +8679,7 @@ diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
    bool mPeriodicGCTimerRunning;
    bool mIdleGCTimerRunning;
    bool mWorkerScriptExecutedSuccessfully;
-@@ -1457,16 +1466,28 @@ public:
+@@ -1457,16 +1474,28 @@ public:
                         uint32_t aFlags = NS_DISPATCH_NORMAL);
  
    // Get an event target that will dispatch runnables as control runnables on
