@@ -565,7 +565,7 @@ diff --git a/dom/clients/manager/ClientNavigateOpChild.cpp b/dom/clients/manager
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientNavigateOpChild.cpp
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,272 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -575,19 +575,265 @@ new file mode 100644
 +#include "ClientNavigateOpChild.h"
 +
 +#include "mozilla/Unused.h"
++#include "nsGlobalWindow.h"
++#include "nsIDocShell.h"
++#include "nsIDocShellLoadInfo.h"
++#include "nsIWebNavigation.h"
++#include "nsIWebProgress.h"
++#include "nsIWebProgressListener.h"
++#include "nsNetUtil.h"
 +
 +namespace mozilla {
 +namespace dom {
 +
++namespace {
++
++class NavigateLoadListener final : public nsIWebProgressListener
++                                 , public nsSupportsWeakReference
++{
++  RefPtr<ClientOpPromise::Private> mPromise;
++  RefPtr<nsPIDOMWindowOuter> mOuterWindow;
++  nsCOMPtr<nsIURI> mBaseURL;
++
++  ~NavigateLoadListener() = default;
++
++public:
++  NavigateLoadListener(ClientOpPromise::Private* aPromise,
++                       nsPIDOMWindowOuter* aOuterWindow,
++                       nsIURI* aBaseURL)
++    : mPromise(aPromise)
++    , mOuterWindow(aOuterWindow)
++    , mBaseURL(aBaseURL)
++  {
++    MOZ_DIAGNOSTIC_ASSERT(mPromise);
++    MOZ_DIAGNOSTIC_ASSERT(mOuterWindow);
++    MOZ_DIAGNOSTIC_ASSERT(mBaseURL);
++  }
++
++  NS_IMETHOD
++  OnStateChange(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
++                uint32_t aStateFlags, nsresult aResult) override
++  {
++    if (!(aStateFlags & STATE_IS_DOCUMENT) ||
++        !(aStateFlags & (STATE_STOP | STATE_TRANSFERRING))) {
++      return NS_OK;
++    }
++
++    aWebProgress->RemoveProgressListener(this);
++
++    nsCOMPtr<nsIChannel> channel = do_QueryInterface(aRequest);
++    if (!channel) {
++      mPromise->Reject(NS_ERROR_DOM_INVALID_STATE_ERR, __func__);
++      return NS_OK;
++    }
++
++    nsCOMPtr<nsIURI> channelURL;
++    nsresult rv = NS_GetFinalChannelURI(channel, getter_AddRefs(channelURL));
++    if (NS_FAILED(rv)) {
++      mPromise->Reject(rv, __func__);
++      return NS_OK;
++    }
++
++    nsIScriptSecurityManager* ssm = nsContentUtils::GetSecurityManager();
++    MOZ_DIAGNOSTIC_ASSERT(ssm);
++    rv = ssm->CheckSameOriginURI(mBaseURL, channelURL, false);
++    if (NS_FAILED(rv)) {
++      mPromise->Resolve(NS_OK, __func__);
++      return NS_OK;
++    }
++
++    // TODO: legacy code only did this for same-origin, was that intentional
++    Unused << nsContentUtils::DispatchFocusChromeEvent(mOuterWindow);
++
++    // TODO: Not clear this progress listener guarantees following assertions...
++
++    nsPIDOMWindowInner* innerWindow = mOuterWindow->GetCurrentInnerWindow();
++    MOZ_DIAGNOSTIC_ASSERT(innerWindow);
++
++    Maybe<ClientInfo> clientInfo = innerWindow->GetClientInfo();
++    MOZ_DIAGNOSTIC_ASSERT(clientInfo.isSome());
++
++    Maybe<ClientState> clientState = innerWindow->GetClientState();
++    MOZ_DIAGNOSTIC_ASSERT(clientState.isSome());
++
++    mPromise->Resolve(ClientInfoAndState(clientInfo.ref(), clientState.ref()),
++                      __func__);
++
++    return NS_OK;
++  }
++
++  NS_IMETHOD
++  OnProgressChange(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
++                   int32_t aCurSelfProgress, int32_t aMaxSelfProgress,
++                   int32_t aCurTotalProgress, int32_t aMaxTotalProgress) override
++  {
++    MOZ_CRASH("Unexpected notification.");
++    return NS_OK;
++  }
++
++  NS_IMETHOD
++  OnLocationChange(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
++                   nsIURI* aLocation, uint32_t aFlags) override
++  {
++    MOZ_CRASH("Unexpected notification.");
++    return NS_OK;
++  }
++
++  NS_IMETHOD
++  OnStatusChange(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
++                 nsresult aStatus, const char16_t* aMessage) override
++  {
++    MOZ_CRASH("Unexpected notification.");
++    return NS_OK;
++  }
++
++  NS_IMETHOD
++  OnSecurityChange(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
++                   uint32_t aState) override
++  {
++    MOZ_CRASH("Unexpected notification.");
++    return NS_OK;
++  }
++
++  NS_DECL_ISUPPORTS
++};
++
++NS_IMPL_ISUPPORTS(NavigateLoadListener, nsIWebProgressListener,
++                                        nsISupportsWeakReference);
++
++} // anonymous namespace
++
++already_AddRefed<ClientOpPromise>
++ClientNavigateOpChild::DoNavigate(const ClientNavigateOpConstructorArgs& aArgs)
++{
++  RefPtr<ClientOpPromise> ref;
++
++  ClientSourceChild* targetActor =
++    static_cast<ClientSourceChild*>(aArgs.targetChild());
++  MOZ_DIAGNOSTIC_ASSERT(targetActor);
++
++  ClientSource* target = targetActor->GetSource();
++  if (!target) {
++    ref = ClientOpPromise::CreateAndReject(NS_ERROR_DOM_INVALID_STATE_ERR,
++                                           __func__);
++    return ref.forget();
++  }
++
++  nsPIDOMWindowInner* window = target->GetInnerWindow();
++  if (!window) {
++    ref = ClientOpPromise::CreateAndReject(NS_ERROR_DOM_INVALID_STATE_ERR,
++                                           __func__);
++    return ref.forget();
++  }
++
++  MOZ_ASSERT(NS_IsMainThread());
++
++  // In theory we could do the URL work before paying the IPC overhead
++  // cost, but in practice its easier to do it here.  The ClientHandle
++  // may be off-main-thread while this method is guaranteed to always
++  // be main thread.
++  nsCOMPtr<nsIURI> baseURL;
++  nsresult rv = NS_NewURI(getter_AddRefs(baseURL), aArgs.baseURL());
++  if (NS_FAILED(rv)) {
++    ref = ClientOpPromise::CreateAndReject(rv, __func__);
++    return ref.forget();
++  }
++
++  nsCOMPtr<nsIURI> url;
++  rv = NS_NewURI(getter_AddRefs(url), aArgs.url(), nullptr, baseURL);
++  if (NS_FAILED(rv)) {
++    ref = ClientOpPromise::CreateAndReject(rv, __func__);
++    return ref.forget();
++  }
++
++  // TODO: We should be able to just keep this from client creation
++  /* TODO
++  nsCOMPtr<nsIPrincipal> principal =
++    PrincipalInfoToPrincipal(mClientInfo.principalInfo(), &rv);
++  if (NS_FAILED(rv)) {
++    ref = ClientOpPromise::CreateAndReject(rv, __func__);
++    return ref.forget();
++  }
++
++  rv = principal->CheckMayLoad(url, true, false);
++  if (NS_FAILED(rv)) {
++    ref = ClientOpPromise::CreateAndReject(rv, __func__);
++    return ref.forget();
++  }
++  */
++
++  nsCOMPtr<nsIDocument> doc = window->GetExtantDoc();
++  if (!doc || !doc->IsActive()) {
++    ref = ClientOpPromise::CreateAndReject(NS_ERROR_DOM_INVALID_STATE_ERR, __func__);
++    return ref.forget();
++  }
++
++  nsCOMPtr<nsIDocShell> docShell = window->GetDocShell();
++  nsCOMPtr<nsIWebProgress> webProgress = do_GetInterface(docShell);
++  if (!docShell || !webProgress) {
++    ref = ClientOpPromise::CreateAndReject(NS_ERROR_DOM_INVALID_STATE_ERR, __func__);
++    return ref.forget();
++  }
++
++  nsCOMPtr<nsIDocShellLoadInfo> loadInfo;
++  rv = docShell->CreateLoadInfo(getter_AddRefs(loadInfo));
++  if (NS_FAILED(rv)) {
++    ref = ClientOpPromise::CreateAndReject(rv, __func__);
++    return ref.forget();
++  }
++
++  // TODO
++  //loadInfo->SetTriggeringPrincipal(principal);
++  loadInfo->SetReferrerPolicy(doc->GetReferrerPolicy());
++  loadInfo->SetLoadType(nsIDocShellLoadInfo::loadStopContentAndReplace);
++  loadInfo->SetSourceDocShell(docShell);
++  rv = docShell->LoadURI(url, loadInfo, nsIWebNavigation::LOAD_FLAGS_NONE, true);
++  if (NS_FAILED(rv)) {
++    ref = ClientOpPromise::CreateAndReject(rv, __func__);
++    return ref.forget();
++  }
++
++  RefPtr<ClientOpPromise::Private> promise =
++    new ClientOpPromise::Private(__func__);
++
++  nsCOMPtr<nsIWebProgressListener> listener =
++    new NavigateLoadListener(promise, window->GetOuterWindow(), baseURL);
++
++  rv = webProgress->AddProgressListener(listener,
++                                        nsIWebProgress::NOTIFY_STATE_DOCUMENT);
++  if (NS_FAILED(rv)) {
++    promise->Reject(rv, __func__);
++    ref = promise;
++    return ref.forget();
++  }
++
++  ref = promise.get();
++
++  ref->Then(AbstractThread::GetCurrent(), __func__,
++    [listener] (const ClientOpResult& aResult) { },
++    [listener] (nsresult aResult) { });
++
++  return ref.forget();
++}
++
 +void
 +ClientNavigateOpChild::ActorDestroy(ActorDestroyReason aReason)
 +{
++  mPromiseRequestHolder.DisconnectIfExists();
 +}
 +
 +void
 +ClientNavigateOpChild::Init(const ClientNavigateOpConstructorArgs& aArgs)
 +{
-+  // TODO
++  RefPtr<ClientOpPromise> promise = DoNavigate(aArgs);
++  promise->Then(AbstractThread::GetCurrent(), __func__,
++    [this] (const ClientOpResult& aResult) {
++      mPromiseRequestHolder.Complete();
++      PClientNavigateOpChild::Send__delete__(this, aResult);
++    }, [this] (nsresult aResult) {
++      mPromiseRequestHolder.Complete();
++      PClientNavigateOpChild::Send__delete__(this, aResult);
++    })->Track(mPromiseRequestHolder);
 +}
 +
 +} // namespace dom
@@ -596,7 +842,7 @@ diff --git a/dom/clients/manager/ClientNavigateOpChild.h b/dom/clients/manager/C
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientNavigateOpChild.h
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,39 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -615,6 +861,11 @@ new file mode 100644
 +
 +class ClientNavigateOpChild final : public PClientNavigateOpChild
 +{
++  MozPromiseRequestHolder<ClientOpPromise> mPromiseRequestHolder;
++
++  already_AddRefed<ClientOpPromise>
++  DoNavigate(const ClientNavigateOpConstructorArgs& aArgs);
++
 +  // PClientNavigateOpChild interface
 +  void
 +  ActorDestroy(ActorDestroyReason aReason) override;
@@ -727,6 +978,410 @@ new file mode 100644
 +} // namespace mozilla
 +
 +#endif // _mozilla_dom_ClientNavigateOpParent_h
+diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSource.cpp
+--- a/dom/clients/manager/ClientSource.cpp
++++ b/dom/clients/manager/ClientSource.cpp
+@@ -11,53 +11,26 @@
+ #include "mozilla/dom/MessageEvent.h"
+ #include "mozilla/dom/MessageEventBinding.h"
+ #include "mozilla/dom/Navigator.h"
+ #include "mozilla/dom/WorkerPrivate.h"
+ #include "mozilla/dom/WorkerScope.h"
+ #include "mozilla/dom/ServiceWorkerContainer.h"
+ #include "mozilla/dom/workers/ServiceWorkerManager.h"
+ #include "mozilla/dom/workers/bindings/ServiceWorker.h"
+-#include "nsGlobalWindow.h"
+-#include "nsIDocShell.h"
+-#include "nsIDocShellLoadInfo.h"
+-#include "nsIWebNavigation.h"
+-#include "nsIWebProgress.h"
+-#include "nsIWebProgressListener.h"
+-#include "nsNetUtil.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ using mozilla::dom::ipc::StructuredCloneData;
+ using mozilla::dom::workers::ServiceWorkerInfo;
+ using mozilla::dom::workers::ServiceWorkerManager;
+ using mozilla::dom::workers::ServiceWorkerRegistrationInfo;
+ using mozilla::dom::workers::WorkerPrivate;
+ 
+-nsPIDOMWindowInner*
+-ClientSource::GetInnerWindow() const
+-{
+-  NS_ASSERT_OWNINGTHREAD(ClientSource);
+-  if (!mOwner.is<RefPtr<nsPIDOMWindowInner>>()) {
+-    return nullptr;
+-  }
+-  return mOwner.as<RefPtr<nsPIDOMWindowInner>>();
+-}
+-
+-WorkerPrivate*
+-ClientSource::GetWorkerPrivate() const
+-{
+-  NS_ASSERT_OWNINGTHREAD(ClientSource);
+-  if (!mOwner.is<WorkerPrivate*>()) {
+-    return nullptr;
+-  }
+-  return mOwner.as<WorkerPrivate*>();
+-}
+-
+ void
+ ClientSource::Shutdown()
+ {
+   NS_ASSERT_OWNINGTHREAD(ClientSource);
+   if (IsShutdown()) {
+     return;
+   }
+ 
+@@ -141,16 +114,36 @@ ClientSource::Activate(PClientManagerChi
+   MaybeExecuteTaskList();
+ }
+ 
+ ClientSource::~ClientSource()
+ {
+   Shutdown();
+ }
+ 
++nsPIDOMWindowInner*
++ClientSource::GetInnerWindow() const
++{
++  NS_ASSERT_OWNINGTHREAD(ClientSource);
++  if (!mOwner.is<RefPtr<nsPIDOMWindowInner>>()) {
++    return nullptr;
++  }
++  return mOwner.as<RefPtr<nsPIDOMWindowInner>>();
++}
++
++WorkerPrivate*
++ClientSource::GetWorkerPrivate() const
++{
++  NS_ASSERT_OWNINGTHREAD(ClientSource);
++  if (!mOwner.is<WorkerPrivate*>()) {
++    return nullptr;
++  }
++  return mOwner.as<WorkerPrivate*>();
++}
++
+ void
+ ClientSource::WorkerExecutionReady(WorkerPrivate* aWorkerPrivate)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(aWorkerPrivate);
+   aWorkerPrivate->AssertIsOnWorkerThread();
+ 
+   // Its safe to store the WorkerPrivate* here because the ClientSource
+   // is explicitly destroyed by WorkerPrivate before exiting its run loop.
+@@ -331,240 +324,16 @@ ClientSource::Focus(const ClientFocusArg
+     ref = ClientOpPromise::CreateAndReject(rv, __func__);
+     return ref.forget();
+   }
+ 
+   ref = ClientOpPromise::CreateAndResolve(state, __func__);
+   return ref.forget();
+ }
+ 
+-namespace {
+-
+-class NavigateLoadListener final : public nsIWebProgressListener
+-                                 , public nsSupportsWeakReference
+-{
+-  RefPtr<ClientOpPromise::Private> mPromise;
+-  RefPtr<nsPIDOMWindowOuter> mOuterWindow;
+-  nsCOMPtr<nsIURI> mBaseURL;
+-
+-  ~NavigateLoadListener() = default;
+-
+-public:
+-  NavigateLoadListener(ClientOpPromise::Private* aPromise,
+-                       nsPIDOMWindowOuter* aOuterWindow,
+-                       nsIURI* aBaseURL)
+-    : mPromise(aPromise)
+-    , mOuterWindow(aOuterWindow)
+-    , mBaseURL(aBaseURL)
+-  {
+-    MOZ_DIAGNOSTIC_ASSERT(mPromise);
+-    MOZ_DIAGNOSTIC_ASSERT(mOuterWindow);
+-    MOZ_DIAGNOSTIC_ASSERT(mBaseURL);
+-  }
+-
+-  NS_IMETHOD
+-  OnStateChange(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
+-                uint32_t aStateFlags, nsresult aResult) override
+-  {
+-    if (!(aStateFlags & STATE_IS_DOCUMENT) ||
+-        !(aStateFlags & (STATE_STOP | STATE_TRANSFERRING))) {
+-      return NS_OK;
+-    }
+-
+-    aWebProgress->RemoveProgressListener(this);
+-
+-    nsCOMPtr<nsIChannel> channel = do_QueryInterface(aRequest);
+-    if (!channel) {
+-      mPromise->Reject(NS_ERROR_DOM_INVALID_STATE_ERR, __func__);
+-      return NS_OK;
+-    }
+-
+-    nsCOMPtr<nsIURI> channelURL;
+-    nsresult rv = NS_GetFinalChannelURI(channel, getter_AddRefs(channelURL));
+-    if (NS_FAILED(rv)) {
+-      mPromise->Reject(rv, __func__);
+-      return NS_OK;
+-    }
+-
+-    nsIScriptSecurityManager* ssm = nsContentUtils::GetSecurityManager();
+-    MOZ_DIAGNOSTIC_ASSERT(ssm);
+-    rv = ssm->CheckSameOriginURI(mBaseURL, channelURL, false);
+-    if (NS_FAILED(rv)) {
+-      mPromise->Resolve(NS_OK, __func__);
+-      return NS_OK;
+-    }
+-
+-    // TODO: legacy code only did this for same-origin, was that intentional
+-    Unused << nsContentUtils::DispatchFocusChromeEvent(mOuterWindow);
+-
+-    // TODO: Not clear this progress listener guarantees following assertions...
+-
+-    nsPIDOMWindowInner* innerWindow = mOuterWindow->GetCurrentInnerWindow();
+-    MOZ_DIAGNOSTIC_ASSERT(innerWindow);
+-
+-    Maybe<ClientInfo> clientInfo = innerWindow->GetClientInfo();
+-    MOZ_DIAGNOSTIC_ASSERT(clientInfo.isSome());
+-
+-    Maybe<ClientState> clientState = innerWindow->GetClientState();
+-    MOZ_DIAGNOSTIC_ASSERT(clientState.isSome());
+-
+-    mPromise->Resolve(ClientInfoAndState(clientInfo.ref(), clientState.ref()),
+-                      __func__);
+-
+-    return NS_OK;
+-  }
+-
+-  NS_IMETHOD
+-  OnProgressChange(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
+-                   int32_t aCurSelfProgress, int32_t aMaxSelfProgress,
+-                   int32_t aCurTotalProgress, int32_t aMaxTotalProgress) override
+-  {
+-    MOZ_CRASH("Unexpected notification.");
+-    return NS_OK;
+-  }
+-
+-  NS_IMETHOD
+-  OnLocationChange(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
+-                   nsIURI* aLocation, uint32_t aFlags) override
+-  {
+-    MOZ_CRASH("Unexpected notification.");
+-    return NS_OK;
+-  }
+-
+-  NS_IMETHOD
+-  OnStatusChange(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
+-                 nsresult aStatus, const char16_t* aMessage) override
+-  {
+-    MOZ_CRASH("Unexpected notification.");
+-    return NS_OK;
+-  }
+-
+-  NS_IMETHOD
+-  OnSecurityChange(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
+-                   uint32_t aState) override
+-  {
+-    MOZ_CRASH("Unexpected notification.");
+-    return NS_OK;
+-  }
+-
+-  NS_DECL_ISUPPORTS
+-};
+-
+-NS_IMPL_ISUPPORTS(NavigateLoadListener, nsIWebProgressListener,
+-                                        nsISupportsWeakReference);
+-
+-} // anonymous namespace
+-
+-already_AddRefed<ClientOpPromise>
+-ClientSource::Navigate(const ClientNavigateArgs& aArgs)
+-{
+-  NS_ASSERT_OWNINGTHREAD(ClientSource);
+-
+-  RefPtr<ClientOpPromise> ref;
+-
+-  if (mArgs.type() != ClientType::Window) {
+-    ref = ClientOpPromise::CreateAndReject(NS_ERROR_DOM_NOT_SUPPORTED_ERR,
+-                                           __func__);
+-    return ref.forget();
+-  }
+-
+-  MOZ_ASSERT(NS_IsMainThread());
+-
+-  nsPIDOMWindowInner* window = GetInnerWindow();
+-  if (!window) {
+-    ref = ClientOpPromise::CreateAndReject(NS_ERROR_DOM_INVALID_STATE_ERR,
+-                                           __func__);
+-    return ref.forget();
+-  }
+-
+-  // In theory we could do the URL work before paying the IPC overhead
+-  // cost, but in practice its easier to do it here.  The ClientHandle
+-  // may be off-main-thread while this method is guaranteed to always
+-  // be main thread.
+-  nsCOMPtr<nsIURI> baseURL;
+-  nsresult rv = NS_NewURI(getter_AddRefs(baseURL), aArgs.baseURL());
+-  if (NS_FAILED(rv)) {
+-    ref = ClientOpPromise::CreateAndReject(rv, __func__);
+-    return ref.forget();
+-  }
+-
+-  nsCOMPtr<nsIURI> url;
+-  rv = NS_NewURI(getter_AddRefs(url), aArgs.url(), nullptr, baseURL);
+-  if (NS_FAILED(rv)) {
+-    ref = ClientOpPromise::CreateAndReject(rv, __func__);
+-    return ref.forget();
+-  }
+-
+-  // TODO: We should be able to just keep this from client creation
+-  nsCOMPtr<nsIPrincipal> principal =
+-    PrincipalInfoToPrincipal(mClientInfo.principalInfo(), &rv);
+-  if (NS_FAILED(rv)) {
+-    ref = ClientOpPromise::CreateAndReject(rv, __func__);
+-    return ref.forget();
+-  }
+-
+-  rv = principal->CheckMayLoad(url, true, false);
+-  if (NS_FAILED(rv)) {
+-    ref = ClientOpPromise::CreateAndReject(rv, __func__);
+-    return ref.forget();
+-  }
+-
+-  nsCOMPtr<nsIDocument> doc = window->GetExtantDoc();
+-  if (!doc || !doc->IsActive()) {
+-    ref = ClientOpPromise::CreateAndReject(NS_ERROR_DOM_INVALID_STATE_ERR, __func__);
+-    return ref.forget();
+-  }
+-
+-  nsCOMPtr<nsIDocShell> docShell = window->GetDocShell();
+-  nsCOMPtr<nsIWebProgress> webProgress = do_GetInterface(docShell);
+-  if (!docShell || !webProgress) {
+-    ref = ClientOpPromise::CreateAndReject(NS_ERROR_DOM_INVALID_STATE_ERR, __func__);
+-    return ref.forget();
+-  }
+-
+-  nsCOMPtr<nsIDocShellLoadInfo> loadInfo;
+-  rv = docShell->CreateLoadInfo(getter_AddRefs(loadInfo));
+-  if (NS_FAILED(rv)) {
+-    ref = ClientOpPromise::CreateAndReject(rv, __func__);
+-    return ref.forget();
+-  }
+-
+-  loadInfo->SetTriggeringPrincipal(principal);
+-  loadInfo->SetReferrerPolicy(doc->GetReferrerPolicy());
+-  loadInfo->SetLoadType(nsIDocShellLoadInfo::loadStopContentAndReplace);
+-  loadInfo->SetSourceDocShell(docShell);
+-  rv = docShell->LoadURI(url, loadInfo, nsIWebNavigation::LOAD_FLAGS_NONE, true);
+-  if (NS_FAILED(rv)) {
+-    ref = ClientOpPromise::CreateAndReject(rv, __func__);
+-    return ref.forget();
+-  }
+-
+-  RefPtr<ClientOpPromise::Private> promise =
+-    new ClientOpPromise::Private(__func__);
+-
+-  nsCOMPtr<nsIWebProgressListener> listener =
+-    new NavigateLoadListener(promise, window->GetOuterWindow(), baseURL);
+-
+-  rv = webProgress->AddProgressListener(listener,
+-                                        nsIWebProgress::NOTIFY_STATE_DOCUMENT);
+-  if (NS_FAILED(rv)) {
+-    promise->Reject(rv, __func__);
+-    ref = promise;
+-    return ref.forget();
+-  }
+-
+-  ref = promise.get();
+-
+-  ref->Then(AbstractThread::GetCurrent(), __func__,
+-    [listener] (const ClientOpResult& aResult) { },
+-    [listener] (nsresult aResult) { });
+-
+-  return ref.forget();
+-}
+-
+ already_AddRefed<ClientOpPromise>
+ ClientSource::PostMessage(const ClientPostMessageArgs& aArgs)
+ {
+   NS_ASSERT_OWNINGTHREAD(ClientSource);
+   RefPtr<ClientOpPromise> ref;
+ 
+   const ClientEndPoint& endpoint = aArgs.endpoint();
+   const PrincipalInfo& principalInfo =
+diff --git a/dom/clients/manager/ClientSource.h b/dom/clients/manager/ClientSource.h
+--- a/dom/clients/manager/ClientSource.h
++++ b/dom/clients/manager/ClientSource.h
+@@ -38,22 +38,16 @@ class ClientSource final : public Client
+   Variant<void_t,
+           RefPtr<nsPIDOMWindowInner>,
+           mozilla::dom::workers::WorkerPrivate*> mOwner;
+ 
+   const ClientSourceConstructorArgs mArgs;
+   ClientInfo mClientInfo;
+   Maybe<ServiceWorkerDescriptor> mController;
+ 
+-  nsPIDOMWindowInner*
+-  GetInnerWindow() const;
+-
+-  mozilla::dom::workers::WorkerPrivate*
+-  GetWorkerPrivate() const;
+-
+   void
+   Shutdown();
+ 
+   void
+   ExecutionReady(const ClientSourceExecutionReadyArgs& aArgs);
+ 
+   nsresult
+   SnapshotWindowState(ClientWindowState* aStateOut);
+@@ -63,16 +57,22 @@ class ClientSource final : public Client
+                const ClientSourceConstructorArgs& aArgs);
+ 
+   void
+   Activate(PClientManagerChild* aActor);
+ 
+ public:
+   ~ClientSource();
+ 
++  nsPIDOMWindowInner*
++  GetInnerWindow() const;
++
++  mozilla::dom::workers::WorkerPrivate*
++  GetWorkerPrivate() const;
++
+   void
+   WorkerExecutionReady(mozilla::dom::workers::WorkerPrivate* aWorkerPrivate);
+ 
+   nsresult
+   WindowExecutionReady(nsPIDOMWindowInner* aInnerWindow);
+ 
+   void
+   Freeze();
+@@ -94,19 +94,16 @@ public:
+ 
+   const Maybe<ServiceWorkerDescriptor>&
+   GetController() const;
+ 
+   already_AddRefed<ClientOpPromise>
+   Focus(const ClientFocusArgs& aArgs);
+ 
+   already_AddRefed<ClientOpPromise>
+-  Navigate(const ClientNavigateArgs& aArgs);
+-
+-  already_AddRefed<ClientOpPromise>
+   PostMessage(const ClientPostMessageArgs& aArgs);
+ 
+   already_AddRefed<ClientOpPromise>
+   GetState(const ClientGetStateArgs& aArgs);
+ 
+   already_AddRefed<ClientOpPromise>
+   Claim(const ClientClaimArgs& aArgs);
+ 
 diff --git a/dom/clients/manager/ClientSourceOpChild.cpp b/dom/clients/manager/ClientSourceOpChild.cpp
 --- a/dom/clients/manager/ClientSourceOpChild.cpp
 +++ b/dom/clients/manager/ClientSourceOpChild.cpp
