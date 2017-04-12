@@ -1,0 +1,608 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  48be09c470ff643efa811e00521186a75569442d
+
+diff --git a/dom/clients/api/Clients.cpp b/dom/clients/api/Clients.cpp
+--- a/dom/clients/api/Clients.cpp
++++ b/dom/clients/api/Clients.cpp
+@@ -199,19 +199,67 @@ Clients::MatchAll(const ClientQueryOptio
+     });
+ 
+   return outerPromise.forget();
+ }
+ 
+ already_AddRefed<Promise>
+ Clients::OpenWindow(const nsAString& aURL, ErrorResult& aRv)
+ {
+-  // TODO: OMG this will take a lot of work
+-  aRv.Throw(NS_ERROR_FAILURE);
+-  return nullptr;
++  RefPtr<Promise> outerPromise = Promise::Create(mGlobal, aRv);
++  if (aRv.Failed()) {
++    return outerPromise.forget();
++  }
++
++  PrincipalInfo principalInfo;
++  nsCString baseURL;
++  nsCOMPtr<nsPIDOMWindowInner> window = do_QueryInterface(mGlobal);
++  if (window) {
++    nsCOMPtr<nsIURI> uri = window->GetDocBaseURI();
++    if (uri) {
++      Unused << uri->GetSpec(baseURL);
++    }
++    nsIDocument* doc = window->GetExtantDoc();
++    if (doc) {
++      nsIPrincipal* principal = doc->NodePrincipal();
++      if (principal) {
++        aRv = PrincipalToPrincipalInfo(principal, &principalInfo);
++        if (aRv.Failed()) {
++          return outerPromise.forget();
++        }
++      }
++    }
++  } else {
++    MOZ_ASSERT(!NS_IsMainThread());
++    WorkerPrivate* workerPrivate = GetCurrentThreadWorkerPrivate();
++    if (workerPrivate) {
++      baseURL = workerPrivate->GetLocationInfo().mHref;
++      principalInfo = workerPrivate->GetPrincipalInfo();
++    }
++  }
++
++  nsCOMPtr<nsIGlobalObject> global = mGlobal;
++
++  ClientOpenWindowArgs args(principalInfo, NS_ConvertUTF16toUTF8(aURL), baseURL);
++  RefPtr<ClientOpPromise> innerPromise = ClientManager::OpenWindow(args);
++  innerPromise->Then(AbstractThread::GetCurrent(), __func__,
++    [outerPromise, global] (const ClientOpResult& aResult) {
++      if (aResult.type() != ClientOpResult::TClientInfoAndState) {
++        outerPromise->MaybeResolve(JS::NullHandleValue);
++        return;
++      }
++      RefPtr<Client> client =
++        new Client(global, aResult.get_ClientInfoAndState());
++      outerPromise->MaybeResolve(client);
++    }, [outerPromise] (nsresult aResult) {
++      // TODO: get type error and message from site of error
++      outerPromise->MaybeReject(NS_ERROR_TYPE_ERR);
++    });
++
++  return outerPromise.forget();
+ }
+ 
+ already_AddRefed<Promise>
+ Clients::Claim(ErrorResult& aRv)
+ {
+   RefPtr<Promise> outerPromise = Promise::Create(mGlobal, aRv);
+   if (aRv.Failed()) {
+     return outerPromise.forget();
+diff --git a/dom/clients/manager/ClientIPCTypes.ipdlh b/dom/clients/manager/ClientIPCTypes.ipdlh
+--- a/dom/clients/manager/ClientIPCTypes.ipdlh
++++ b/dom/clients/manager/ClientIPCTypes.ipdlh
+@@ -1,21 +1,21 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ include protocol PClientSource;
+ include DOMTypes;
+ include PBackgroundSharedTypes;
+ include ServiceWorkerDescriptor;
++include ProtocolTypes;
+ using class mozilla::TimeStamp from "mozilla/TimeStamp.h";
+ using ClientType from "mozilla/dom/ClientIPCUtils.h";
+ using FrameType from "mozilla/dom/ClientIPCUtils.h";
+ using VisibilityState from "mozilla/dom/ClientIPCUtils.h";
+-using struct nsID from "nsID.h";
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ struct ClientSourceConstructorArgs
+ {
+   nsID id;
+   ClientType type;
+@@ -108,26 +108,34 @@ struct ClientClaimArgs
+ };
+ 
+ struct ClientGetInfoAndStateArgs
+ {
+   nsID id;
+   PrincipalInfo principalInfo;
+ };
+ 
++struct ClientOpenWindowArgs
++{
++  PrincipalInfo principalInfo;
++  nsCString url;
++  nsCString baseURL;
++};
++
+ union ClientOpConstructorArgs
+ {
+   ClientControlledArgs;
+   ClientFocusArgs;
+   ClientNavigateArgs;
+   ClientPostMessageArgs;
+   ClientGetStateArgs;
+   ClientMatchAllArgs;
+   ClientClaimArgs;
+   ClientGetInfoAndStateArgs;
++  ClientOpenWindowArgs;
+ };
+ 
+ struct ClientList
+ {
+   ClientInfoAndState[] values;
+ };
+ 
+ struct ClientNavigateOpConstructorArgs
+diff --git a/dom/clients/manager/ClientManager.cpp b/dom/clients/manager/ClientManager.cpp
+--- a/dom/clients/manager/ClientManager.cpp
++++ b/dom/clients/manager/ClientManager.cpp
+@@ -364,10 +364,18 @@ ClientManager::GetInfoAndState(const Cli
+ // static
+ already_AddRefed<ClientOpPromise>
+ ClientManager::Navigate(const ClientNavigateArgs& aArgs)
+ {
+   RefPtr<ClientManager> mgr = GetOrCreateForCurrentThread();
+   return mgr->StartOp(aArgs);
+ }
+ 
++// static
++already_AddRefed<ClientOpPromise>
++ClientManager::OpenWindow(const ClientOpenWindowArgs& aArgs)
++{
++  RefPtr<ClientManager> mgr = GetOrCreateForCurrentThread();
++  return mgr->StartOp(aArgs);
++}
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/clients/manager/ClientManager.h b/dom/clients/manager/ClientManager.h
+--- a/dom/clients/manager/ClientManager.h
++++ b/dom/clients/manager/ClientManager.h
+@@ -93,15 +93,18 @@ public:
+   Claim(const ClientClaimArgs& aArgs);
+ 
+   static already_AddRefed<ClientOpPromise>
+   GetInfoAndState(const ClientGetInfoAndStateArgs& aArgs);
+ 
+   static already_AddRefed<ClientOpPromise>
+   Navigate(const ClientNavigateArgs& aArgs);
+ 
++  static already_AddRefed<ClientOpPromise>
++  OpenWindow(const ClientOpenWindowArgs& aArgs);
++
+   NS_INLINE_DECL_REFCOUNTING(mozilla::dom::ClientManager)
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // _mozilla_dom_ClientManager_h
+diff --git a/dom/clients/manager/ClientManagerOpParent.cpp b/dom/clients/manager/ClientManagerOpParent.cpp
+--- a/dom/clients/manager/ClientManagerOpParent.cpp
++++ b/dom/clients/manager/ClientManagerOpParent.cpp
+@@ -64,16 +64,22 @@ ClientManagerOpParent::Init(const Client
+       break;
+     }
+     case ClientOpConstructorArgs::TClientGetInfoAndStateArgs:
+     {
+       DoServiceOp(&ClientManagerService::GetInfoAndState,
+                   aArgs.get_ClientGetInfoAndStateArgs());
+       break;
+     }
++    case ClientOpConstructorArgs::TClientOpenWindowArgs:
++    {
++      DoServiceOp(&ClientManagerService::OpenWindow,
++                  aArgs.get_ClientOpenWindowArgs());
++      break;
++    }
+     default:
+     {
+       MOZ_ASSERT_UNREACHABLE("Unknown Client operation!");
+       break;
+     }
+   }
+ }
+ 
+diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/ClientManagerService.cpp
+--- a/dom/clients/manager/ClientManagerService.cpp
++++ b/dom/clients/manager/ClientManagerService.cpp
+@@ -410,10 +410,62 @@ ClientManagerService::GetInfoAndState(co
+     ref = ClientOpPromise::CreateAndReject(NS_ERROR_FAILURE, __func__);
+     return ref.forget();
+   }
+ 
+   // TODO: maybe change this to just GetState from source and use local info?
+   return source->StartOp(aArgs);
+ }
+ 
++namespace {
++
++class OpenWindowRunnable : public Runnable
++{
++  RefPtr<ClientOpPromise::Private> mPromise;
++  RefPtr<AbstractThread> mTarget;
++  const ClientOpenWindowArgs mArgs;
++
++public:
++  OpenWindowRunnable(ClientOpPromise::Private* aPromise,
++                     AbstractThread* aTarget,
++                     const ClientOpenWindowArgs& aArgs)
++    : mPromise(aPromise)
++    , mArgs(aArgs)
++  {
++    MOZ_DIAGNOSTIC_ASSERT(mPromise);
++  }
++
++  NS_IMETHOD
++  Run() override
++  {
++    // TODO
++
++    // if e10s disabled
++      // open window in current process
++
++    // else if e10s enabled
++      // get or create PContent
++      // create op actor on PContent
++
++    return NS_OK;
++  }
++};
++
++} // anonymous namespace
++
++already_AddRefed<ClientOpPromise>
++ClientManagerService::OpenWindow(const ClientOpenWindowArgs& aArgs)
++{
++  RefPtr<ClientOpPromise::Private> promise =
++    new ClientOpPromise::Private(__func__);
++
++  // TODO: How do we clean this up if bg thread and main thread shutdown?
++
++  nsCOMPtr<nsIRunnable> r =
++    new OpenWindowRunnable(promise, mBackgroundThread, aArgs);
++  MOZ_ALWAYS_SUCCEEDS(NS_DispatchToMainThread(r.forget()));
++
++  RefPtr<ClientOpPromise> ref = promise;
++  return ref.forget();
++}
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/clients/manager/ClientManagerService.h b/dom/clients/manager/ClientManagerService.h
+--- a/dom/clients/manager/ClientManagerService.h
++++ b/dom/clients/manager/ClientManagerService.h
+@@ -55,15 +55,18 @@ public:
+   MatchAll(const ClientMatchAllArgs& aArgs);
+ 
+   already_AddRefed<ClientOpPromise>
+   Claim(const ClientClaimArgs& aArgs);
+ 
+   already_AddRefed<ClientOpPromise>
+   GetInfoAndState(const ClientGetInfoAndStateArgs& aArgs);
+ 
++  already_AddRefed<ClientOpPromise>
++  OpenWindow(const ClientOpenWindowArgs& aArgs);
++
+   NS_INLINE_DECL_REFCOUNTING(mozilla::dom::ClientManagerService)
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // _mozilla_dom_ClientManagerService_h
+diff --git a/dom/clients/manager/ClientOpenWindowOpActors.h b/dom/clients/manager/ClientOpenWindowOpActors.h
+new file mode 100644
+--- /dev/null
++++ b/dom/clients/manager/ClientOpenWindowOpActors.h
+@@ -0,0 +1,31 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++#ifndef _mozilla_dom_ClientOpenWindowOpActors_h
++#define _mozilla_dom_ClientOpenWindowOpActors_h
++
++namespace mozilla {
++namespace dom {
++
++class PClientOpenWindowOpChild;
++class PClientOpenWindowOpParent;
++
++PClientOpenWindowOpChild*
++AllocClientOpenWindowOpChild();
++
++bool
++DeallocClientOpenWindowOpChild(PClientOpenWindowOpChild* aActor);
++
++PClientOpenWindowOpParent*
++AllocClientOpenWindowOpParent();
++
++bool
++DeallocClientOpenWindowOpParent(PClientOpenWindowOpParent* aActor);
++
++
++} // namespace dom
++} // namespace mozilla
++
++#endif // _mozilla_dom_ClientOpenWindowOpActors_h
+diff --git a/dom/clients/manager/PClientOpenWindowOp.ipdl b/dom/clients/manager/PClientOpenWindowOp.ipdl
+new file mode 100644
+--- /dev/null
++++ b/dom/clients/manager/PClientOpenWindowOp.ipdl
+@@ -0,0 +1,20 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
++ * You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++include protocol PContent;
++include ClientIPCTypes;
++
++namespace mozilla {
++namespace dom {
++
++protocol PClientOpenWindowOp
++{
++  manager PContent;
++
++parent:
++  async __delete__(ClientOpResult aResult);
++};
++
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/clients/manager/moz.build b/dom/clients/manager/moz.build
+--- a/dom/clients/manager/moz.build
++++ b/dom/clients/manager/moz.build
+@@ -4,16 +4,17 @@
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ EXPORTS.mozilla.dom += [
+   'ClientHandle.h',
+   'ClientIPCUtils.h',
+   'ClientManager.h',
+   'ClientManagerActors.h',
++  'ClientOpenWindowOpActors.h',
+   'ClientOpPromise.h',
+   'ClientSource.h',
+   'ClientThing.h',
+   'ReservedClientHelper.h',
+ ]
+ 
+ UNIFIED_SOURCES += [
+   'ClientHandle.cpp',
+@@ -40,16 +41,17 @@ UNIFIED_SOURCES += [
+ 
+ IPDL_SOURCES += [
+   'ClientIPCTypes.ipdlh',
+   'PClientHandle.ipdl',
+   'PClientHandleOp.ipdl',
+   'PClientManager.ipdl',
+   'PClientManagerOp.ipdl',
+   'PClientNavigateOp.ipdl',
++  'PClientOpenWindowOp.ipdl',
+   'PClientSource.ipdl',
+   'PClientSourceOp.ipdl',
+ ]
+ 
+ include('/ipc/chromium/chromium-config.mozbuild')
+ 
+ LOCAL_INCLUDES += [
+   '/dom/base',
+diff --git a/dom/indexedDB/ActorsParent.cpp b/dom/indexedDB/ActorsParent.cpp
+--- a/dom/indexedDB/ActorsParent.cpp
++++ b/dom/indexedDB/ActorsParent.cpp
+@@ -133,16 +133,17 @@ MOZ_TYPE_SPECIFIC_SCOPED_POINTER_TEMPLAT
+                                           PRFileDesc,
+                                           PR_Close);
+ 
+ namespace dom {
+ namespace indexedDB {
+ 
+ using namespace mozilla::dom::quota;
+ using namespace mozilla::ipc;
++using mozilla::dom::quota::Client;
+ 
+ namespace {
+ 
+ class ConnectionPool;
+ class Cursor;
+ class Database;
+ struct DatabaseActorInfo;
+ class DatabaseFile;
+diff --git a/dom/ipc/ContentChild.cpp b/dom/ipc/ContentChild.cpp
+--- a/dom/ipc/ContentChild.cpp
++++ b/dom/ipc/ContentChild.cpp
+@@ -3304,10 +3304,24 @@ ContentChild::RecvSetPermissionsWithKey(
+ mozilla::ipc::IPCResult
+ ContentChild::RecvRefreshScreens(nsTArray<ScreenDetails>&& aScreens)
+ {
+   ScreenManager& screenManager = ScreenManager::GetSingleton();
+   screenManager.Refresh(Move(aScreens));
+   return IPC_OK();
+ }
+ 
++PClientOpenWindowOpChild*
++ContentChild::AllocPClientOpenWindowOpChild(const ClientOpenWindowArgs& aArgs)
++{
++  // TODO
++  return nullptr;
++}
++
++bool
++ContentChild::DeallocPClientOpenWindowOpChild(PClientOpenWindowOpChild* aActor)
++{
++  // TODO
++  return true;
++}
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/ipc/ContentChild.h b/dom/ipc/ContentChild.h
+--- a/dom/ipc/ContentChild.h
++++ b/dom/ipc/ContentChild.h
+@@ -646,16 +646,22 @@ public:
+                       const nsAString& aFullPath, const nsAString& aType,
+                       const nsAString& aName,
+                       const Optional<int64_t>& aLastModified,
+                       bool aExistenceCheck, bool aIsFromNsIFile);
+ 
+   typedef std::function<void(PRFileDesc*)> AnonymousTemporaryFileCallback;
+   nsresult AsyncOpenAnonymousTemporaryFile(AnonymousTemporaryFileCallback aCallback);
+ 
++  virtual PClientOpenWindowOpChild*
++  AllocPClientOpenWindowOpChild(const ClientOpenWindowArgs& aArgs) override;
++
++  virtual bool
++  DeallocPClientOpenWindowOpChild(PClientOpenWindowOpChild* aActor) override;
++
+ private:
+   static void ForceKillTimerCallback(nsITimer* aTimer, void* aClosure);
+   void StartForceKillTimer();
+ 
+   virtual void ActorDestroy(ActorDestroyReason why) override;
+ 
+   virtual void ProcessingError(Result aCode, const char* aReason) override;
+ 
+diff --git a/dom/ipc/ContentParent.cpp b/dom/ipc/ContentParent.cpp
+--- a/dom/ipc/ContentParent.cpp
++++ b/dom/ipc/ContentParent.cpp
+@@ -5108,16 +5108,30 @@ ContentParent::EnsurePermissionsByKey(co
+ }
+ 
+ bool
+ ContentParent::NeedsPermissionsUpdate(const nsACString& aPermissionKey) const
+ {
+   return mActivePermissionKeys.Contains(aPermissionKey);
+ }
+ 
++PClientOpenWindowOpParent*
++ContentParent::AllocPClientOpenWindowOpParent(const ClientOpenWindowArgs& aArgs)
++{
++  // TODO
++  return nullptr;
++}
++
++bool
++ContentParent::DeallocPClientOpenWindowOpParent(PClientOpenWindowOpParent* aActor)
++{
++  // TODO
++  return true;
++}
++
+ mozilla::ipc::IPCResult
+ ContentParent::RecvAccumulateChildHistograms(
+                 InfallibleTArray<Accumulation>&& aAccumulations)
+ {
+   TelemetryIPC::AccumulateChildHistograms(GeckoProcessType_Content, aAccumulations);
+   return IPC_OK();
+ }
+ 
+diff --git a/dom/ipc/ContentParent.h b/dom/ipc/ContentParent.h
+--- a/dom/ipc/ContentParent.h
++++ b/dom/ipc/ContentParent.h
+@@ -656,16 +656,22 @@ public:
+ 
+   // Use the PHangMonitor channel to ask the child to repaint a tab.
+   void ForceTabPaint(TabParent* aTabParent, uint64_t aLayerObserverEpoch);
+ 
+   nsresult TransmitPermissionsFor(nsIChannel* aChannel);
+ 
+   nsresult TransmitPermissionsForPrincipal(nsIPrincipal* aPrincipal);
+ 
++  virtual PClientOpenWindowOpParent*
++  AllocPClientOpenWindowOpParent(const ClientOpenWindowArgs& aArgs) override;
++
++  virtual bool
++  DeallocPClientOpenWindowOpParent(PClientOpenWindowOpParent* aActor) override;
++
+ protected:
+   void OnChannelConnected(int32_t pid) override;
+ 
+   virtual void ActorDestroy(ActorDestroyReason why) override;
+ 
+   bool ShouldContinueFromReplyTimeout() override;
+ 
+   void OnVarChanged(const GfxVarUpdate& aVar) override;
+diff --git a/dom/ipc/PContent.ipdl b/dom/ipc/PContent.ipdl
+--- a/dom/ipc/PContent.ipdl
++++ b/dom/ipc/PContent.ipdl
+@@ -2,16 +2,17 @@
+ /* vim: set sw=4 ts=8 et tw=80 ft=cpp : */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ include protocol PBackground;
+ include protocol PBlob;
+ include protocol PBrowser;
++include protocol PClientOpenWindowOp;
+ include protocol PCompositorBridge;
+ include protocol PContentBridge;
+ include protocol PContentPermissionRequest;
+ include protocol PCycleCollectWithLogs;
+ include protocol PPSMContentDownloader;
+ include protocol PExternalHelperApp;
+ include protocol PHandlerService;
+ include protocol PFileDescriptorSet;
+@@ -52,16 +53,17 @@ include URIParams;
+ include PluginTypes;
+ include ProtocolTypes;
+ include PBackgroundSharedTypes;
+ include PContentPermission;
+ include ServiceWorkerConfiguration;
+ include GraphicsMessages;
+ include ProfilerTypes;
+ include MemoryReportTypes;
++include ClientIPCTypes;
+ 
+ // Workaround to prevent error if PContentChild.cpp & PContentBridgeParent.cpp
+ // are put into different UnifiedProtocolsXX.cpp files.
+ // XXX Remove this once bug 1069073 is fixed
+ include "mozilla/dom/PContentBridgeParent.h";
+ 
+ using GeoPosition from "nsGeoPositionIPCSerialiser.h";
+ using AlertNotificationType from "mozilla/AlertNotificationIPCSerializer.h";
+@@ -273,16 +275,17 @@ struct XPCOMInitData
+  * The PContent protocol is a top-level protocol between the UI process
+  * and a content process. There is exactly one PContentParent/PContentChild pair
+  * for each content process.
+  */
+ nested(upto inside_cpow) sync protocol PContent
+ {
+     manages PBlob;
+     manages PBrowser;
++    manages PClientOpenWindowOp;
+     manages PContentPermissionRequest;
+     manages PCycleCollectWithLogs;
+     manages PPSMContentDownloader;
+     manages PExternalHelperApp;
+     manages PFileDescriptorSet;
+     manages PHal;
+     manages PHandlerService;
+     manages PHeapSnapshotTempFileHelper;
+@@ -596,16 +599,18 @@ child:
+     async PParentToChildStream();
+ 
+     async ProvideAnonymousTemporaryFile(uint64_t aID, FileDescOrError aFD);
+ 
+     async SetPermissionsWithKey(nsCString aPermissionKey, Permission[] aPermissions);
+ 
+     async RefreshScreens(ScreenDetails[] aScreens);
+ 
++    async PClientOpenWindowOp(ClientOpenWindowArgs aArgs);
++
+ parent:
+     async InitBackground(Endpoint<PBackgroundParent> aEndpoint);
+ 
+     sync CreateChildProcess(IPCTabContext context,
+                             ProcessPriority priority,
+                             TabId openerTabId)
+         returns (ContentParentId cpId, bool isForBrowser, TabId tabId);
+     sync BridgeToChildProcess(ContentParentId cpId)
