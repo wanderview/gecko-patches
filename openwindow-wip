@@ -618,7 +618,7 @@ diff --git a/dom/clients/manager/ClientOpenWindowUtils.cpp b/dom/clients/manager
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientOpenWindowUtils.cpp
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,308 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -627,14 +627,302 @@ new file mode 100644
 +
 +#include "ClientOpenWindowUtils.h"
 +
++#include "nsContentUtils.h"
++#include "nsIBrowserDOMWindow.h"
++#include "nsIDocShell.h"
++#include "nsIDOMChromeWindow.h"
++#include "nsIURI.h"
++#include "nsIWebProgress.h"
++#include "nsIWebProgressListener.h"
++#include "nsIWindowWatcher.h"
++#include "nsNetUtil.h"
++#include "nsPIDOMWindow.h"
++#include "nsPIWindowWatcher.h"
++
 +namespace mozilla {
 +namespace dom {
 +
-+already_AddRefed<ClientOpPromise>
-+ClientOpenWindowInCurrentProcess(const ClientOpenWindowArgs &aArgs)
++namespace {
++
++class WebProgressListener final : public nsIWebProgressListener
 +{
-+  // TODO
-+  return nullptr;
++public:
++  NS_DECL_ISUPPORTS
++
++  WebProgressListener(nsPIDOMWindowOuter* aWindow,
++                      nsIURI* aBaseURI)
++  : mPromise(new ClientOpPromise::Private(__func__))
++  , mWindow(aWindow)
++  , mBaseURI(aBaseURI)
++  {
++    MOZ_ASSERT(aWindow);
++    MOZ_ASSERT(aWindow->IsOuterWindow());
++    MOZ_ASSERT(aBaseURI);
++    MOZ_ASSERT(NS_IsMainThread());
++  }
++
++  ClientOpPromise*
++  Promise() const
++  {
++    return mPromise;
++  }
++
++  NS_IMETHOD
++  OnStateChange(nsIWebProgress* aWebProgress,
++                nsIRequest* aRequest,
++                uint32_t aStateFlags, nsresult aStatus) override
++  {
++    if (!(aStateFlags & STATE_IS_DOCUMENT) ||
++         !(aStateFlags & (STATE_STOP | STATE_TRANSFERRING))) {
++      return NS_OK;
++    }
++
++    // Our caller keeps a strong reference, so it is safe to remove the listener
++    // from ServiceWorkerPrivate.
++    aWebProgress->RemoveProgressListener(this);
++
++    nsCOMPtr<nsIDocument> doc = mWindow->GetExtantDoc();
++    if (!doc) {
++      mPromise->Reject(NS_ERROR_FAILURE, __func__);
++      mPromise = nullptr;
++      return NS_OK;
++    }
++
++    // Check same origin.
++    nsCOMPtr<nsIScriptSecurityManager> securityManager =
++      nsContentUtils::GetSecurityManager();
++    nsresult rv = securityManager->CheckSameOriginURI(doc->GetOriginalURI(),
++                                                      mBaseURI, false);
++    if (NS_FAILED(rv)) {
++      mPromise->Resolve(NS_OK, __func__);
++      mPromise = nullptr;
++      return NS_OK;
++    }
++
++    nsPIDOMWindowInner* innerWindow = doc->GetInnerWindow();
++    if (!innerWindow) {
++      mPromise->Reject(NS_ERROR_FAILURE, __func__);
++      mPromise = nullptr;
++      return NS_OK;
++    }
++
++    Maybe<ClientInfo> info = innerWindow->GetClientInfo();
++    Maybe<ClientState> state = innerWindow->GetClientState();
++
++    if (info.isNothing() || state.isNothing()) {
++      mPromise->Reject(NS_ERROR_FAILURE, __func__);
++      mPromise = nullptr;
++      return NS_OK;
++    }
++
++    mPromise->Resolve(ClientInfoAndState(info.ref(), state.ref()), __func__);
++    mPromise = nullptr;
++
++    return NS_OK;
++  }
++
++  NS_IMETHOD
++  OnProgressChange(nsIWebProgress* aWebProgress,
++                   nsIRequest* aRequest,
++                   int32_t aCurSelfProgress,
++                   int32_t aMaxSelfProgress,
++                   int32_t aCurTotalProgress,
++                   int32_t aMaxTotalProgress) override
++  {
++    MOZ_ASSERT(false, "Unexpected notification.");
++    return NS_OK;
++  }
++
++  NS_IMETHOD
++  OnLocationChange(nsIWebProgress* aWebProgress,
++                   nsIRequest* aRequest,
++                   nsIURI* aLocation,
++                   uint32_t aFlags) override
++  {
++    MOZ_ASSERT(false, "Unexpected notification.");
++    return NS_OK;
++  }
++
++  NS_IMETHOD
++  OnStatusChange(nsIWebProgress* aWebProgress,
++                 nsIRequest* aRequest,
++                 nsresult aStatus, const char16_t* aMessage) override
++  {
++    MOZ_ASSERT(false, "Unexpected notification.");
++    return NS_OK;
++  }
++
++  NS_IMETHOD
++  OnSecurityChange(nsIWebProgress* aWebProgress,
++                   nsIRequest* aRequest,
++                   uint32_t aState) override
++  {
++    MOZ_ASSERT(false, "Unexpected notification.");
++    return NS_OK;
++  }
++
++private:
++  ~WebProgressListener()
++  { }
++
++  RefPtr<ClientOpPromise::Private> mPromise;
++  // TODO: make window a weak ref and stop cycle collecting
++  nsCOMPtr<nsPIDOMWindowOuter> mWindow;
++  nsCOMPtr<nsIURI> mBaseURI;
++};
++
++NS_IMPL_ISUPPORTS(WebProgressListener, nsIWebProgressListener);
++
++nsresult
++OpenWindow(const ClientOpenWindowArgs& aArgs,
++           nsPIDOMWindowOuter** aWindow)
++{
++  MOZ_DIAGNOSTIC_ASSERT(aWindow);
++
++  // [[1. Let url be the result of parsing url with entry settings object's API
++  //   base URL.]]
++  nsCOMPtr<nsIURI> uri;
++
++  nsCOMPtr<nsIURI> baseURI;
++  nsresult rv = NS_NewURI(getter_AddRefs(baseURI), aArgs.baseURL());
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return NS_ERROR_TYPE_ERR;
++  }
++
++  rv = NS_NewURI(getter_AddRefs(uri), aArgs.url(), nullptr, baseURI);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return NS_ERROR_TYPE_ERR;
++  }
++
++  // [[6.1 Open Window]]
++  if (XRE_IsContentProcess()) {
++    // ContentProcess
++    nsCOMPtr<nsIWindowWatcher> wwatch =
++      do_GetService(NS_WINDOWWATCHER_CONTRACTID, &rv);
++    if (NS_WARN_IF(NS_FAILED(rv))) {
++      return rv;
++    }
++    nsCOMPtr<nsPIWindowWatcher> pwwatch(do_QueryInterface(wwatch));
++    NS_ENSURE_STATE(pwwatch);
++
++    nsCString spec;
++    rv = uri->GetSpec(spec);
++    if (NS_WARN_IF(NS_FAILED(rv))) {
++      return rv;
++    }
++
++    nsCOMPtr<mozIDOMWindowProxy> newWindow;
++    rv = pwwatch->OpenWindow2(nullptr,
++                              spec.get(),
++                              nullptr,
++                              nullptr,
++                              false, false, true, nullptr,
++                              // Not a spammy popup; we got permission, we swear!
++                              /* aIsPopupSpam = */ false,
++                              // Don't force noopener.  We're not passing in an
++                              // opener anyway, and we _do_ want the returned
++                              // window.
++                              /* aForceNoOpener = */ false,
++                              /* aLoadInfp = */ nullptr,
++                              getter_AddRefs(newWindow));
++    if (NS_WARN_IF(NS_FAILED(rv))) {
++      return rv;
++    }
++    nsCOMPtr<nsPIDOMWindowOuter> pwindow = nsPIDOMWindowOuter::From(newWindow);
++    pwindow.forget(aWindow);
++    MOZ_DIAGNOSTIC_ASSERT(*aWindow);
++    return NS_OK;
++  }
++
++  // Find the most recent browser window and open a new tab in it.
++  nsCOMPtr<nsPIDOMWindowOuter> browserWindow =
++    nsContentUtils::GetMostRecentNonPBWindow();
++  if (!browserWindow) {
++    // It is possible to be running without a browser window on Mac OS, so
++    // we need to open a new chrome window.
++    // TODO(catalinb): open new chrome window. Bug 1218080
++    return NS_ERROR_NOT_AVAILABLE;
++  }
++
++  nsCOMPtr<nsIDOMChromeWindow> chromeWin = do_QueryInterface(browserWindow);
++  if (NS_WARN_IF(!chromeWin)) {
++    return NS_ERROR_FAILURE;
++  }
++
++  nsCOMPtr<nsIBrowserDOMWindow> bwin;
++  chromeWin->GetBrowserDOMWindow(getter_AddRefs(bwin));
++
++  if (NS_WARN_IF(!bwin)) {
++    return NS_ERROR_FAILURE;
++  }
++
++  nsCOMPtr<mozIDOMWindowProxy> win;
++  rv = bwin->OpenURI(uri, nullptr,
++                     nsIBrowserDOMWindow::OPEN_DEFAULTWINDOW,
++                     nsIBrowserDOMWindow::OPEN_NEW,
++                     getter_AddRefs(win));
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return rv;
++  }
++  NS_ENSURE_STATE(win);
++
++  nsCOMPtr<nsPIDOMWindowOuter> pWin = nsPIDOMWindowOuter::From(win);
++  pWin.forget(aWindow);
++  MOZ_DIAGNOSTIC_ASSERT(*aWindow);
++
++  return NS_OK;
++}
++
++} // anonymous namespace
++
++already_AddRefed<ClientOpPromise>
++ClientOpenWindowInCurrentProcess(const ClientOpenWindowArgs& aArgs)
++{
++  RefPtr<ClientOpPromise> ref;
++
++  nsCOMPtr<nsPIDOMWindowOuter> outerWindow;
++  nsresult rv = OpenWindow(aArgs, getter_AddRefs(outerWindow));
++  if (NS_FAILED(rv)) {
++    ref = ClientOpPromise::CreateAndReject(rv, __func__);
++    return ref.forget();
++  }
++
++  MOZ_DIAGNOSTIC_ASSERT(outerWindow);
++
++  rv = nsContentUtils::DispatchFocusChromeEvent(outerWindow);
++  if (NS_FAILED(rv)) {
++    ref = ClientOpPromise::CreateAndReject(rv, __func__);
++    return ref.forget();
++  }
++
++  nsCOMPtr<nsIURI> baseURI;
++  rv = NS_NewURI(getter_AddRefs(baseURI), aArgs.baseURL());
++  if (NS_FAILED(rv)) {
++    ref = ClientOpPromise::CreateAndReject(rv, __func__);
++    return ref.forget();
++  }
++
++  nsCOMPtr<nsIDocShell> docShell = outerWindow->GetDocShell();
++  nsCOMPtr<nsIWebProgress> webProgress = do_GetInterface(docShell);
++
++  if (!webProgress) {
++    ref = ClientOpPromise::CreateAndReject(NS_ERROR_FAILURE, __func__);
++    return ref.forget();
++  }
++
++  RefPtr<WebProgressListener> listener =
++    new WebProgressListener(outerWindow, baseURI);
++
++  ref = listener->Promise();
++
++  rv = webProgress->AddProgressListener(listener,
++                                        nsIWebProgress::NOTIFY_STATE_DOCUMENT);
++  if (NS_FAILED(rv)) {
++    ref = ClientOpPromise::CreateAndReject(rv, __func__);
++    return ref.forget();
++  }
++
++  return ref.forget();
 +}
 +
 +} // namespace dom
