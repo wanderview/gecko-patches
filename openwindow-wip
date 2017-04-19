@@ -1,11 +1,49 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  d943ca1bdac4c694d616ef8e4ec1941efa47510c
+# Parent  d6b265300b740d8b5718608b0aadd9c7dc1d172d
 
+diff --git a/dom/clients/api/Client.cpp b/dom/clients/api/Client.cpp
+--- a/dom/clients/api/Client.cpp
++++ b/dom/clients/api/Client.cpp
+@@ -186,23 +186,30 @@ Client::Focus(ErrorResult& aRv)
+   }
+ 
+   ClientEndPoint endpoint;
+   aRv = GetEndPoint(endpoint);
+   if (aRv.Failed()) {
+     return outerPromise.forget();
+   }
+ 
++  bool interactionAllowed = false;
++
+   if (endpoint.type() == ClientEndPoint::TServiceWorkerDescriptor) {
+     WorkerPrivate* workerPrivate = GetCurrentThreadWorkerPrivate();
+     MOZ_DIAGNOSTIC_ASSERT(workerPrivate);
+-    if (!workerPrivate->GlobalScope()->WindowInteractionAllowed()) {
+-      outerPromise->MaybeReject(NS_ERROR_DOM_INVALID_ACCESS_ERR);
+-      return outerPromise.forget();
+-    }
++    interactionAllowed = workerPrivate->GlobalScope()->WindowInteractionAllowed();
++  } else {
++    // TODO: hook this up to the gPopupControlState code in nsGlobalWindow
++    interactionAllowed = false;
++  }
++
++  if (!interactionAllowed) {
++    outerPromise->MaybeReject(NS_ERROR_DOM_INVALID_ACCESS_ERR);
++    return outerPromise.forget();
+   }
+ 
+   EnsureHandle();
+ 
+   RefPtr<Client> self = this;
+ 
+   RefPtr<ClientStatePromise> innerPromise = mHandle->Focus();
+   innerPromise->Then(AbstractThread::GetCurrent(), __func__,
 diff --git a/dom/clients/api/Clients.cpp b/dom/clients/api/Clients.cpp
 --- a/dom/clients/api/Clients.cpp
 +++ b/dom/clients/api/Clients.cpp
-@@ -199,19 +199,67 @@ Clients::MatchAll(const ClientQueryOptio
+@@ -199,19 +199,83 @@ Clients::MatchAll(const ClientQueryOptio
      });
  
    return outerPromise.forget();
@@ -21,6 +59,13 @@ diff --git a/dom/clients/api/Clients.cpp b/dom/clients/api/Clients.cpp
 +  if (aRv.Failed()) {
 +    return outerPromise.forget();
 +  }
++
++  if (aURL.EqualsLiteral("about:blank")) {
++    outerPromise->MaybeReject(NS_ERROR_DOM_TYPE_ERR);
++    return outerPromise.forget();
++  }
++
++  bool interactionAllowed = false;
 +
 +  PrincipalInfo principalInfo;
 +  nsCString baseURL;
@@ -40,13 +85,22 @@ diff --git a/dom/clients/api/Clients.cpp b/dom/clients/api/Clients.cpp
 +        }
 +      }
 +    }
++    // TODO: hook this up to the gPopupControlState code in nsGlobalWindow
++    interactionAllowed = false;
 +  } else {
 +    MOZ_ASSERT(!NS_IsMainThread());
 +    WorkerPrivate* workerPrivate = GetCurrentThreadWorkerPrivate();
 +    if (workerPrivate) {
 +      baseURL = workerPrivate->GetLocationInfo().mHref;
 +      principalInfo = workerPrivate->GetPrincipalInfo();
++
++      interactionAllowed = workerPrivate->GlobalScope()->WindowInteractionAllowed();
 +    }
++  }
++
++  if (!interactionAllowed) {
++    outerPromise->MaybeReject(NS_ERROR_DOM_INVALID_ACCESS_ERR);
++    return outerPromise.forget();
 +  }
 +
 +  nsCOMPtr<nsIGlobalObject> global = mGlobal;
@@ -184,7 +238,41 @@ diff --git a/dom/clients/manager/ClientManager.h b/dom/clients/manager/ClientMan
 diff --git a/dom/clients/manager/ClientManagerOpParent.cpp b/dom/clients/manager/ClientManagerOpParent.cpp
 --- a/dom/clients/manager/ClientManagerOpParent.cpp
 +++ b/dom/clients/manager/ClientManagerOpParent.cpp
-@@ -64,16 +64,22 @@ ClientManagerOpParent::Init(const Client
+@@ -2,25 +2,30 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "ClientManagerOpParent.h"
+ 
+ #include "ClientManagerService.h"
++#include "mozilla/ipc/BackgroundParent.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+-template <typename Method, typename Args>
++using mozilla::ipc::BackgroundParent;
++
++template <typename Method, typename... Args>
+ void
+-ClientManagerOpParent::DoServiceOp(Method aMethod, const Args& aArgs)
++ClientManagerOpParent::DoServiceOp(Method aMethod, Args&&... aArgs)
+ {
+-  RefPtr<ClientOpPromise> p = (mService->*aMethod)(aArgs);
++  // Note, we need perfect forarding of the template type in order
++  // to allow already_AddRefed<> to be passed as an arg.
++  RefPtr<ClientOpPromise> p = (mService->*aMethod)(Forward<Args>(aArgs)...);
+ 
+   // Capturing `this` is safe here because we disconnect the promise in
+   // ActorDestroy() which ensures neither lambda is called if the actor
+   // is destroyed before the source operation completes.
+   p->Then(mService->BackgroundThread(), __func__,
+     [this] (const ClientOpResult& aResult) {
+       mPromiseRequestHolder.Complete();
+       Unused << PClientManagerOpParent::Send__delete__(this, aResult);
+@@ -64,16 +69,24 @@ ClientManagerOpParent::Init(const Client
        break;
      }
      case ClientOpConstructorArgs::TClientGetInfoAndStateArgs:
@@ -195,8 +283,10 @@ diff --git a/dom/clients/manager/ClientManagerOpParent.cpp b/dom/clients/manager
      }
 +    case ClientOpConstructorArgs::TClientOpenWindowArgs:
 +    {
++      RefPtr<ContentParent> contentParent =
++        BackgroundParent::GetContentParent(Manager()->Manager());
 +      DoServiceOp(&ClientManagerService::OpenWindow,
-+                  aArgs.get_ClientOpenWindowArgs());
++                  aArgs.get_ClientOpenWindowArgs(), contentParent.forget());
 +      break;
 +    }
      default:
@@ -207,10 +297,35 @@ diff --git a/dom/clients/manager/ClientManagerOpParent.cpp b/dom/clients/manager
    }
  }
  
+diff --git a/dom/clients/manager/ClientManagerOpParent.h b/dom/clients/manager/ClientManagerOpParent.h
+--- a/dom/clients/manager/ClientManagerOpParent.h
++++ b/dom/clients/manager/ClientManagerOpParent.h
+@@ -14,19 +14,19 @@ namespace dom {
+ 
+ class ClientManagerService;
+ 
+ class ClientManagerOpParent final : public PClientManagerOpParent
+ {
+   RefPtr<ClientManagerService> mService;
+   MozPromiseRequestHolder<ClientOpPromise> mPromiseRequestHolder;
+ 
+-  template <typename Method, typename Args>
++  template <typename Method, typename... Args>
+   void
+-  DoServiceOp(Method aMethod, const Args& aArgs);
++  DoServiceOp(Method aMethod, Args&&... aArgs);
+ 
+   // PClientManagerOpParent interface
+   void
+   ActorDestroy(ActorDestroyReason aReason) override;
+ 
+ public:
+   explicit ClientManagerOpParent(ClientManagerService* aService);
+   ~ClientManagerOpParent() = default;
 diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/ClientManagerService.cpp
 --- a/dom/clients/manager/ClientManagerService.cpp
 +++ b/dom/clients/manager/ClientManagerService.cpp
-@@ -2,17 +2,22 @@
+@@ -2,17 +2,23 @@
  /* vim: set ts=8 sts=2 et sw=2 tw=80: */
  /* This Source Code Form is subject to the terms of the Mozilla Public
   * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -225,6 +340,7 @@ diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/
  #include "mozilla/ipc/BackgroundParent.h"
 +#include "mozilla/Unused.h"
 +#include "nsIXULRuntime.h"
++#include "nsProxyRelease.h"
  #include "nsURLParsers.h"
  
  namespace mozilla {
@@ -233,7 +349,7 @@ diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/
  using mozilla::ipc::AssertIsOnBackgroundThread;
  using mozilla::ipc::ContentPrincipalInfo;
  
-@@ -410,10 +415,73 @@ ClientManagerService::GetInfoAndState(co
+@@ -410,10 +416,97 @@ ClientManagerService::GetInfoAndState(co
      ref = ClientOpPromise::CreateAndReject(NS_ERROR_FAILURE, __func__);
      return ref.forget();
    }
@@ -249,13 +365,21 @@ diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/
 +  RefPtr<ClientOpPromise::Private> mPromise;
 +  RefPtr<AbstractThread> mTarget;
 +  const ClientOpenWindowArgs mArgs;
++  RefPtr<ContentParent> mSourceProcess;
++
++  ~OpenWindowRunnable()
++  {
++    NS_ReleaseOnMainThread(mSourceProcess.forget());
++  }
 +
 +public:
 +  OpenWindowRunnable(ClientOpPromise::Private* aPromise,
 +                     AbstractThread* aTarget,
-+                     const ClientOpenWindowArgs& aArgs)
++                     const ClientOpenWindowArgs& aArgs,
++                     already_AddRefed<ContentParent> aSourceProcess)
 +    : mPromise(aPromise)
 +    , mArgs(aArgs)
++    , mSourceProcess(aSourceProcess)
 +  {
 +    MOZ_DIAGNOSTIC_ASSERT(mPromise);
 +  }
@@ -271,17 +395,32 @@ diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/
 +      return NS_OK;
 +    }
 +
-+    RefPtr<ContentParent> contentParent =
-+      ContentParent::GetNewOrUsedBrowserProcess(NS_LITERAL_STRING(DEFAULT_REMOTE_TYPE),
-+                                                ContentParent::GetInitialProcessPriority(nullptr),
-+                                                nullptr);
++    RefPtr<ContentParent> targetProcess;
++
++    // Possibly try to open the window in the same process that called
++    // openWindow().  This is a temporary compat setting until the
++    // multi-e10s service worker refactor is complete.
++    if (Preferences::GetBool("dom.clients.openwindow_favors_same_process",
++                             false)) {
++      targetProcess = mSourceProcess;
++    }
++
++    // Otherwise, use our normal remote process selection mechanism for
++    // opening the window.  This will start a process if one is not
++    // present.
++    if (!targetProcess) {
++      targetProcess =
++        ContentParent::GetNewOrUsedBrowserProcess(NS_LITERAL_STRING(DEFAULT_REMOTE_TYPE),
++                                                  ContentParent::GetInitialProcessPriority(nullptr),
++                                                  nullptr);
++    }
 +
 +    ClientOpenWindowOpParent* actor =
 +      new ClientOpenWindowOpParent(mArgs, mPromise);
 +
 +    // If this fails the actor will be automatically destroyed which will
 +    // reject the promise.
-+    Unused << contentParent->SendPClientOpenWindowOpConstructor(actor, mArgs);
++    Unused << targetProcess->SendPClientOpenWindowOpConstructor(actor, mArgs);
 +
 +    return NS_OK;
 +  }
@@ -290,15 +429,16 @@ diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/
 +} // anonymous namespace
 +
 +already_AddRefed<ClientOpPromise>
-+ClientManagerService::OpenWindow(const ClientOpenWindowArgs& aArgs)
++ClientManagerService::OpenWindow(const ClientOpenWindowArgs& aArgs,
++                                 already_AddRefed<ContentParent> aSourceProcess)
 +{
 +  RefPtr<ClientOpPromise::Private> promise =
 +    new ClientOpPromise::Private(__func__);
 +
 +  // TODO: How do we clean this up if bg thread and main thread shutdown?
 +
-+  nsCOMPtr<nsIRunnable> r =
-+    new OpenWindowRunnable(promise, mBackgroundThread, aArgs);
++  nsCOMPtr<nsIRunnable> r = new OpenWindowRunnable(promise, mBackgroundThread,
++                                                   aArgs, Move(aSourceProcess));
 +  MOZ_ALWAYS_SUCCEEDS(NS_DispatchToMainThread(r.forget()));
 +
 +  RefPtr<ClientOpPromise> ref = promise;
@@ -310,7 +450,7 @@ diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/
 diff --git a/dom/clients/manager/ClientManagerService.h b/dom/clients/manager/ClientManagerService.h
 --- a/dom/clients/manager/ClientManagerService.h
 +++ b/dom/clients/manager/ClientManagerService.h
-@@ -55,15 +55,18 @@ public:
+@@ -55,15 +55,19 @@ public:
    MatchAll(const ClientMatchAllArgs& aArgs);
  
    already_AddRefed<ClientOpPromise>
@@ -320,7 +460,8 @@ diff --git a/dom/clients/manager/ClientManagerService.h b/dom/clients/manager/Cl
    GetInfoAndState(const ClientGetInfoAndStateArgs& aArgs);
  
 +  already_AddRefed<ClientOpPromise>
-+  OpenWindow(const ClientOpenWindowArgs& aArgs);
++  OpenWindow(const ClientOpenWindowArgs& aArgs,
++             already_AddRefed<ContentParent> aSourceProcess);
 +
    NS_INLINE_DECL_REFCOUNTING(mozilla::dom::ClientManagerService)
  };
@@ -1165,7 +1306,7 @@ diff --git a/dom/ipc/ContentChild.cpp b/dom/ipc/ContentChild.cpp
  #include "mozilla/dom/DocGroup.h"
  #include "mozilla/dom/ExternalHelperAppChild.h"
  #include "mozilla/dom/FileCreatorHelper.h"
-@@ -3349,10 +3350,30 @@ ContentChild::RecvSetPermissionsWithKey(
+@@ -3378,10 +3379,30 @@ ContentChild::RecvSetPermissionsWithKey(
  mozilla::ipc::IPCResult
  ContentChild::RecvRefreshScreens(nsTArray<ScreenDetails>&& aScreens)
  {
@@ -1199,7 +1340,7 @@ diff --git a/dom/ipc/ContentChild.cpp b/dom/ipc/ContentChild.cpp
 diff --git a/dom/ipc/ContentChild.h b/dom/ipc/ContentChild.h
 --- a/dom/ipc/ContentChild.h
 +++ b/dom/ipc/ContentChild.h
-@@ -649,16 +649,26 @@ public:
+@@ -651,16 +651,26 @@ public:
                        const nsAString& aFullPath, const nsAString& aType,
                        const nsAString& aName,
                        const Optional<int64_t>& aLastModified,
@@ -1380,7 +1521,7 @@ diff --git a/dom/ipc/PContent.ipdl b/dom/ipc/PContent.ipdl
      manages PHal;
      manages PHandlerService;
      manages PHeapSnapshotTempFileHelper;
-@@ -602,16 +605,18 @@ child:
+@@ -604,16 +607,18 @@ child:
      async PParentToChildStream();
  
      async ProvideAnonymousTemporaryFile(uint64_t aID, FileDescOrError aFD);
@@ -1460,3 +1601,22 @@ diff --git a/dom/workers/test/serviceworkers/openWindow_worker.js b/dom/workers/
 +  }));
  }
  
+diff --git a/modules/libpref/init/all.js b/modules/libpref/init/all.js
+--- a/modules/libpref/init/all.js
++++ b/modules/libpref/init/all.js
+@@ -5678,8 +5678,15 @@ pref("fuzzing.enabled", false);
+ // turn these on and off, instead use the conditional-pref code in gfxPrefs.h
+ // to do that.
+ pref("layers.advanced.border-layers", 2);
+ pref("layers.advanced.boxshadow-inset-layers", 2);
+ pref("layers.advanced.boxshadow-outer-layers", 2);
+ pref("layers.advanced.caret-layers", 2);
+ pref("layers.advanced.displaybuttonborder-layers", 2);
+ pref("layers.advanced.outline-layers", 2);
++
++// Control whether clients.openWindow() opens windows in the same process
++// that called the API vs following our normal multi-process selection
++// algorithm.  Restricting openWindow to same process improves service worker
++// web compat in the short term.  Once the SW multi-e10s refactor is complete
++// this can be removed.
++pref("dom.clients.openwindow_favors_same_process", true);
