@@ -1,0 +1,191 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  e1e5750fa8cfe5ef1ae6d6f53a1081db45f5196c
+
+diff --git a/dom/clients/manager/ClientOpenWindowUtils.cpp b/dom/clients/manager/ClientOpenWindowUtils.cpp
+--- a/dom/clients/manager/ClientOpenWindowUtils.cpp
++++ b/dom/clients/manager/ClientOpenWindowUtils.cpp
+@@ -29,33 +29,28 @@ namespace {
+ 
+ class WebProgressListener final : public nsIWebProgressListener
+                                 , public nsSupportsWeakReference
+ {
+ public:
+   NS_DECL_ISUPPORTS
+ 
+   WebProgressListener(nsPIDOMWindowOuter* aWindow,
+-                      nsIURI* aBaseURI)
+-  : mPromise(new ClientOpPromise::Private(__func__))
++                      nsIURI* aBaseURI,
++                      already_AddRefed<ClientOpPromise::Private> aPromise)
++  : mPromise(aPromise)
+   , mWindow(aWindow)
+   , mBaseURI(aBaseURI)
+   {
+     MOZ_ASSERT(aWindow);
+     MOZ_ASSERT(aWindow->IsOuterWindow());
+     MOZ_ASSERT(aBaseURI);
+     MOZ_ASSERT(NS_IsMainThread());
+   }
+ 
+-  ClientOpPromise*
+-  Promise() const
+-  {
+-    return mPromise;
+-  }
+-
+   NS_IMETHOD
+   OnStateChange(nsIWebProgress* aWebProgress,
+                 nsIRequest* aRequest,
+                 uint32_t aStateFlags, nsresult aStatus) override
+   {
+     if (!(aStateFlags & STATE_IS_DOCUMENT) ||
+          !(aStateFlags & (STATE_STOP | STATE_TRANSFERRING))) {
+       return NS_OK;
+@@ -258,73 +253,114 @@ OpenWindow(const ClientOpenWindowArgs& a
+ 
+   nsCOMPtr<nsPIDOMWindowOuter> pWin = nsPIDOMWindowOuter::From(win);
+   pWin.forget(aWindow);
+   MOZ_DIAGNOSTIC_ASSERT(*aWindow);
+ 
+   return NS_OK;
+ }
+ 
+-} // anonymous namespace
++void
++WaitForLoad(const ClientOpenWindowArgs& aArgs,
++            nsPIDOMWindowOuter* aOuterWindow,
++            ClientOpPromise::Private* aPromise)
++{
++  MOZ_DIAGNOSTIC_ASSERT(aOuterWindow);
+ 
+-already_AddRefed<ClientOpPromise>
+-ClientOpenWindowInCurrentProcess(const ClientOpenWindowArgs& aArgs)
+-{
+-  RefPtr<ClientOpPromise> ref;
++  RefPtr<ClientOpPromise::Private> promise = aPromise;
+ 
+-#ifdef MOZ_WIDGET_ANDROID
+-  // This fires an intent that will start launching Fennec and foreground it,
+-  // if necessary.
+-  java::GeckoAppShell::LaunchOrBringToFront();
+-#endif
+-
+-  nsCOMPtr<nsPIDOMWindowOuter> outerWindow;
+-  nsresult rv = OpenWindow(aArgs, getter_AddRefs(outerWindow));
++  nsresult rv = nsContentUtils::DispatchFocusChromeEvent(aOuterWindow);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    ref = ClientOpPromise::CreateAndReject(rv, __func__);
+-    return ref.forget();
+-  }
+-
+-  MOZ_DIAGNOSTIC_ASSERT(outerWindow);
+-
+-  rv = nsContentUtils::DispatchFocusChromeEvent(outerWindow);
+-  if (NS_WARN_IF(NS_FAILED(rv))) {
+-    ref = ClientOpPromise::CreateAndReject(rv, __func__);
+-    return ref.forget();
++    promise->Reject(rv, __func__);
++    return;
+   }
+ 
+   nsCOMPtr<nsIURI> baseURI;
+   rv = NS_NewURI(getter_AddRefs(baseURI), aArgs.baseURL());
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    ref = ClientOpPromise::CreateAndReject(rv, __func__);
+-    return ref.forget();
++    promise->Reject(rv, __func__);
++    return;
+   }
+ 
+-  nsCOMPtr<nsIDocShell> docShell = outerWindow->GetDocShell();
++  nsCOMPtr<nsIDocShell> docShell = aOuterWindow->GetDocShell();
+   nsCOMPtr<nsIWebProgress> webProgress = do_GetInterface(docShell);
+ 
+   if (NS_WARN_IF(!webProgress)) {
+-    ref = ClientOpPromise::CreateAndReject(NS_ERROR_FAILURE, __func__);
+-    return ref.forget();
++    promise->Reject(NS_ERROR_FAILURE, __func__);
++    return;
+   }
+ 
++  RefPtr<ClientOpPromise> ref = promise;
++
+   RefPtr<WebProgressListener> listener =
+-    new WebProgressListener(outerWindow, baseURI);
++    new WebProgressListener(aOuterWindow, baseURI, promise.forget());
+ 
+-  ref = listener->Promise();
+ 
+   rv = webProgress->AddProgressListener(listener,
+                                         nsIWebProgress::NOTIFY_STATE_DOCUMENT);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    ref = ClientOpPromise::CreateAndReject(rv, __func__);
+-    return ref.forget();
++    promise->Reject(rv, __func__);
++    return;
+   }
+ 
+   // Hold the listener alive until the promise settles
+   ref->Then(AbstractThread::GetCurrent(), __func__,
+     [listener] (const ClientOpResult& aResult) { },
+     [listener] (nsresult aResult) { });
++}
++
++#ifdef MOZ_WIDGET_ANDROID
++already_AddRefed<GenericPromise>
++WaitForLaunch()
++{
++  RefPtr<GenericPromise::Private> promise =
++    new GenericPromise::Private(__func__);
++
++  // TODO
++  RefPtr<GenericPromise> ref = promise;
++  return ref.forget();
++}
++#endif // MOZ_WIDGET_ANDROID
++
++} // anonymous namespace
++
++already_AddRefed<ClientOpPromise>
++ClientOpenWindowInCurrentProcess(const ClientOpenWindowArgs& aArgs)
++{
++  RefPtr<ClientOpPromise::Private> promise =
++    new ClientOpPromise::Private(__func__);
++  RefPtr<ClientOpPromise> ref = promise;
++
++#ifdef MOZ_WIDGET_ANDROID
++  // This fires an intent that will start launching Fennec and foreground it,
++  // if necessary.
++  java::GeckoAppShell::LaunchOrBringToFront();
++#endif // MOZ_WIDGET_ANDROID
++
++  nsCOMPtr<nsPIDOMWindowOuter> outerWindow;
++  nsresult rv = OpenWindow(aArgs, getter_AddRefs(outerWindow));
++
++#ifdef MOZ_WIDGET_ANDROID
++  if (rv == NS_ERROR_NOT_AVAILABLE) {
++    RefPtr<GenericPromise> p = WaitForLaunch();
++    p->Then(AbstractThread::GetCurrent(), __func__,
++      [aArgs, outerWindow, promise] (bool aResult) {
++        WaitForLoad(aArgs, outerWindow, promise);
++      }, [promise] (nsresult aResult) {
++        promise->Reject(aResult, __func__);
++      });
++    return ref.forget();
++  }
++#endif // MOZ_WIDGET_ANDROID
++
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    promise->Reject(rv, __func__);
++    return ref.forget();
++  }
++
++  MOZ_DIAGNOSTIC_ASSERT(outerWindow);
++  WaitForLoad(aArgs, outerWindow, promise);
+ 
+   return ref.forget();
+ }
+ 
+ } // namespace dom
+ } // namespace mozilla
