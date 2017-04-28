@@ -1,0 +1,599 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  be0375982907e219b872b2d828cb66b572efe41a
+
+diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
+--- a/dom/base/nsGlobalWindow.cpp
++++ b/dom/base/nsGlobalWindow.cpp
+@@ -13,19 +13,19 @@
+ // Local Includes
+ #include "Navigator.h"
+ #include "nsContentSecurityManager.h"
+ #include "nsScreen.h"
+ #include "nsHistory.h"
+ #include "nsDOMNavigationTiming.h"
+ #include "nsIDOMStorageManager.h"
+ #include "mozilla/dom/Storage.h"
+-#include "mozilla/dom/ClientIPCTypes.h"
+ #include "mozilla/dom/ClientManager.h"
+ #include "mozilla/dom/ClientSource.h"
++#include "mozilla/dom/ClientState.h"
+ #include "mozilla/dom/IdleRequest.h"
+ #include "mozilla/dom/Performance.h"
+ #include "mozilla/dom/StorageEvent.h"
+ #include "mozilla/dom/StorageEventBinding.h"
+ #include "mozilla/dom/Timeout.h"
+ #include "mozilla/dom/TimeoutHandler.h"
+ #include "mozilla/dom/TimeoutManager.h"
+ #include "mozilla/IntegerPrintfMacros.h"
+diff --git a/dom/clients/api/Client.cpp b/dom/clients/api/Client.cpp
+--- a/dom/clients/api/Client.cpp
++++ b/dom/clients/api/Client.cpp
+@@ -4,16 +4,17 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "Client.h"
+ 
+ #include "mozilla/dom/ClientHandle.h"
+ #include "mozilla/dom/ClientIPCTypes.h"
+ #include "mozilla/dom/ClientManager.h"
++#include "mozilla/dom/ClientState.h"
+ #include "mozilla/dom/Promise.h"
+ #include "mozilla/dom/WorkerPrivate.h"
+ #include "mozilla/dom/WorkerScope.h"
+ #include "nsIGlobalObject.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+@@ -85,17 +86,17 @@ Client::CreationTime() const
+ }
+ 
+ TimeStamp
+ Client::LastFocusTime() const
+ {
+   if (mData->info().type() != ClientType::Window) {
+     return TimeStamp();
+   }
+-  return mData->state().get_ClientWindowState().lastFocusTime();
++  return mData->state().get_IPCClientWindowState().lastFocusTime();
+ }
+ 
+ JSObject*
+ Client::WrapObject(JSContext* aCx, JS::Handle<JSObject*> aGivenProto)
+ {
+   if (mData->info().type() == ClientType::Window) {
+     return WindowClientBinding::Wrap(aCx, this, aGivenProto);
+   }
+@@ -163,23 +164,23 @@ Client::PostMessage(JSContext* aCx, JS::
+ 
+   EnsureHandle();
+   RefPtr<GenericPromise> p = mHandle->PostMessage(data, endpoint);
+ }
+ 
+ VisibilityState
+ Client::GetVisibilityState() const
+ {
+-  return mData->state().get_ClientWindowState().visibilityState();
++  return mData->state().get_IPCClientWindowState().visibilityState();
+ }
+ 
+ bool
+ Client::Focused() const
+ {
+-  return mData->state().get_ClientWindowState().focused();
++  return mData->state().get_IPCClientWindowState().focused();
+ }
+ 
+ already_AddRefed<Promise>
+ Client::Focus(ErrorResult& aRv)
+ {
+   RefPtr<Promise> outerPromise = Promise::Create(mGlobal, aRv);
+   if (aRv.Failed()) {
+     return outerPromise.forget();
+@@ -203,17 +204,17 @@ Client::Focus(ErrorResult& aRv)
+   EnsureHandle();
+ 
+   RefPtr<Client> self = this;
+ 
+   RefPtr<ClientStatePromise> innerPromise = mHandle->Focus();
+   innerPromise->Then(AbstractThread::GetCurrent(), __func__,
+     [self, outerPromise] (const ClientState& aResult) {
+       RefPtr<Client> newClient =
+-        new Client(self->mGlobal, ClientInfoAndState(self->mData->info(), aResult));
++        new Client(self->mGlobal, ClientInfoAndState(self->mData->info(), aResult.ToIPC()));
+       outerPromise->MaybeResolve(newClient);
+     }, [self, outerPromise] (nsresult aResult) {
+       outerPromise->MaybeReject(aResult);
+     });
+ 
+   return outerPromise.forget();
+ }
+ 
+diff --git a/dom/clients/manager/ClientHandle.cpp b/dom/clients/manager/ClientHandle.cpp
+--- a/dom/clients/manager/ClientHandle.cpp
++++ b/dom/clients/manager/ClientHandle.cpp
+@@ -4,16 +4,17 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "ClientHandle.h"
+ 
+ #include "ClientHandleChild.h"
+ #include "ClientHandleOpChild.h"
+ #include "ClientManager.h"
++#include "ClientState.h"
+ #include "mozilla/dom/PClientManagerChild.h"
+ #include "mozilla/dom/ServiceWorkerDescriptor.h"
+ #include "mozilla/dom/ipc/StructuredCloneData.h"
+ #include "mozilla/Unused.h"
+ 
+ #ifdef XP_WIN
+ #undef PostMessage
+ #endif
+@@ -134,17 +135,17 @@ ClientHandle::Focus()
+ {
+   RefPtr<ClientStatePromise::Private> outerPromise =
+     new ClientStatePromise::Private(__func__);
+ 
+   RefPtr<ClientOpPromise> innerPromise = StartOp(ClientFocusArgs());
+ 
+   innerPromise->Then(AbstractThread::GetCurrent(), __func__,
+     [outerPromise](const ClientOpResult& aResult) {
+-      outerPromise->Resolve(aResult.get_ClientState(), __func__);
++      outerPromise->Resolve(ClientState::FromIPC(aResult.get_IPCClientState()), __func__);
+     }, [outerPromise](const ClientOpResult& aResult) {
+       outerPromise->Reject(aResult.get_nsresult(), __func__);
+     });
+ 
+   RefPtr<ClientStatePromise> ref = outerPromise.get();
+   return ref.forget();
+ }
+ 
+diff --git a/dom/clients/manager/ClientIPCTypes.ipdlh b/dom/clients/manager/ClientIPCTypes.ipdlh
+--- a/dom/clients/manager/ClientIPCTypes.ipdlh
++++ b/dom/clients/manager/ClientIPCTypes.ipdlh
+@@ -28,37 +28,37 @@ struct IPCClientInfo
+   nsID id;
+   ClientType type;
+   PrincipalInfo principalInfo;
+   TimeStamp creationTime;
+   nsCString url;
+   FrameType frameType;
+ };
+ 
+-struct ClientWindowState
++struct IPCClientWindowState
+ {
+   VisibilityState visibilityState;
+   TimeStamp lastFocusTime;
+   bool focused;
+ };
+ 
+-struct ClientWorkerState
++struct IPCClientWorkerState
+ {
+ };
+ 
+-union ClientState
++union IPCClientState
+ {
+-  ClientWindowState;
+-  ClientWorkerState;
++  IPCClientWindowState;
++  IPCClientWorkerState;
+ };
+ 
+ struct ClientInfoAndState
+ {
+   IPCClientInfo info;
+-  ClientState state;
++  IPCClientState state;
+ };
+ 
+ struct ClientSourceExecutionReadyArgs
+ {
+   nsCString url;
+   FrameType frameType;
+ };
+ 
+@@ -135,15 +135,15 @@ struct ClientNavigateOpConstructorArgs
+   PClientSource target;
+   nsCString url;
+   nsCString baseURL;
+ };
+ 
+ union ClientOpResult
+ {
+   nsresult;
+-  ClientState;
++  IPCClientState;
+   ClientInfoAndState;
+   ClientList;
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/clients/manager/ClientInfo.cpp b/dom/clients/manager/ClientInfo.cpp
+--- a/dom/clients/manager/ClientInfo.cpp
++++ b/dom/clients/manager/ClientInfo.cpp
+@@ -34,16 +34,33 @@ ClientInfo::ClientInfo(const ClientInfo&
+ ClientInfo&
+ ClientInfo::operator=(const ClientInfo& aRight)
+ {
+   mData.reset();
+   mData = MakeUnique<IPCClientInfo>(*aRight.mData);
+   return *this;
+ }
+ 
++ClientInfo::ClientInfo(ClientInfo&& aRight)
++  : mData(Move(aRight.mData))
++{
++}
++
++ClientInfo&
++ClientInfo::operator=(ClientInfo&& aRight)
++{
++  mData.reset();
++  mData = Move(aRight.mData);
++  return *this;
++}
++
++ClientInfo::~ClientInfo()
++{
++}
++
+ const nsID&
+ ClientInfo::Id() const
+ {
+   return mData->id();
+ }
+ 
+ ClientType
+ ClientInfo::Type() const
+diff --git a/dom/clients/manager/ClientInfo.h b/dom/clients/manager/ClientInfo.h
+--- a/dom/clients/manager/ClientInfo.h
++++ b/dom/clients/manager/ClientInfo.h
+@@ -29,23 +29,25 @@ public:
+              const mozilla::ipc::PrincipalInfo& aPrincipalInfo,
+              const TimeStamp& aCreationTime);
+ 
+   ClientInfo(const ClientInfo& aRight);
+ 
+   ClientInfo&
+   operator=(const ClientInfo& aRight);
+ 
+-  ClientInfo(ClientInfo&& aRight) = default;
++  ClientInfo(ClientInfo&& aRight);
+ 
+   ClientInfo&
+-  operator=(ClientInfo&& aRight) = default;
++  operator=(ClientInfo&& aRight);
+ 
+   explicit ClientInfo(const IPCClientInfo& aData);
+ 
++  ~ClientInfo();
++
+   const nsID&
+   Id() const;
+ 
+   ClientType
+   Type() const;
+ 
+   const mozilla::ipc::PrincipalInfo&
+   PrincipalInfo() const;
+diff --git a/dom/clients/manager/ClientNavigateOpChild.cpp b/dom/clients/manager/ClientNavigateOpChild.cpp
+--- a/dom/clients/manager/ClientNavigateOpChild.cpp
++++ b/dom/clients/manager/ClientNavigateOpChild.cpp
+@@ -84,17 +84,17 @@ public:
+ 
+     Maybe<ClientInfo> clientInfo = innerWindow->GetClientInfo();
+     MOZ_DIAGNOSTIC_ASSERT(clientInfo.isSome());
+ 
+     Maybe<ClientState> clientState = innerWindow->GetClientState();
+     MOZ_DIAGNOSTIC_ASSERT(clientState.isSome());
+ 
+     mPromise->Resolve(ClientInfoAndState(clientInfo.ref().ToIPC(),
+-                                         clientState.ref()), __func__);
++                                         clientState.ref().ToIPC()), __func__);
+ 
+     return NS_OK;
+   }
+ 
+   NS_IMETHOD
+   OnProgressChange(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
+                    int32_t aCurSelfProgress, int32_t aMaxSelfProgress,
+                    int32_t aCurTotalProgress, int32_t aMaxTotalProgress) override
+diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSource.cpp
+--- a/dom/clients/manager/ClientSource.cpp
++++ b/dom/clients/manager/ClientSource.cpp
+@@ -47,43 +47,42 @@ ClientSource::ExecutionReady(const Clien
+   mClientInfo.SetURL(aArgs.url());
+   mClientInfo.SetFrameType(aArgs.frameType());
+   MaybeExecute([aArgs](PClientSourceChild* aActor) {
+     aActor->SendExecutionReady(aArgs);
+   });
+ }
+ 
+ nsresult
+-ClientSource::SnapshotWindowState(ClientWindowState* aStateOut)
++ClientSource::SnapshotWindowState(ClientState* aStateOut)
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+ 
+   nsPIDOMWindowInner* window = GetInnerWindow();
+   if (!window || !window->IsCurrentInnerWindow() ||
+       !window->HasActiveDocument()) {
+-    aStateOut->focused() = false;
+-    aStateOut->lastFocusTime() = TimeStamp();
+-    aStateOut->visibilityState() = VisibilityState::Hidden;
++    *aStateOut = ClientState(ClientWindowState(VisibilityState::Hidden,
++                                               TimeStamp(), false));
+     return NS_OK;
+   }
+ 
+   nsIDocument* doc = window->GetExtantDoc();
+   if (NS_WARN_IF(!doc)) {
+     return NS_ERROR_UNEXPECTED;
+   }
+ 
+   ErrorResult rv;
+-  aStateOut->focused() = doc->HasFocus(rv);
++  bool focused = doc->HasFocus(rv);
+   if (NS_WARN_IF(rv.Failed())) {
+     rv.SuppressException();
+     return rv.StealNSResult();
+   }
+ 
+-  aStateOut->lastFocusTime() = doc->LastFocusTime();
+-  aStateOut->visibilityState() = doc->VisibilityState();
++  *aStateOut = ClientState(ClientWindowState(doc->VisibilityState(),
++                                             doc->LastFocusTime(), focused));
+ 
+   return NS_OK;
+ }
+ 
+ ClientSource::ClientSource(ClientManager* aManager,
+                            const ClientSourceConstructorArgs& aArgs)
+   : mManager(aManager)
+   , mClientInfo(aArgs.id(), aArgs.type(), aArgs.principalInfo(), aArgs.creationTime())
+@@ -320,17 +319,17 @@ ClientSource::Focus(const ClientFocusArg
+ 
+   ClientState state;
+   rv = SnapshotState(&state);
+   if (NS_FAILED(rv)) {
+     ref = ClientOpPromise::CreateAndReject(rv, __func__);
+     return ref.forget();
+   }
+ 
+-  ref = ClientOpPromise::CreateAndResolve(state, __func__);
++  ref = ClientOpPromise::CreateAndResolve(state.ToIPC(), __func__);
+   return ref.forget();
+ }
+ 
+ already_AddRefed<ClientOpPromise>
+ ClientSource::PostMessage(const ClientPostMessageArgs& aArgs)
+ {
+   NS_ASSERT_OWNINGTHREAD(ClientSource);
+   RefPtr<ClientOpPromise> ref;
+@@ -482,17 +481,17 @@ ClientSource::GetState(const ClientGetSt
+ 
+   ClientState state;
+   nsresult rv = SnapshotState(&state);
+   if (NS_FAILED(rv)) {
+     ref = ClientOpPromise::CreateAndReject(rv, __func__);
+     return ref.forget();
+   }
+ 
+-  ref = ClientOpPromise::CreateAndResolve(state, __func__);
++  ref = ClientOpPromise::CreateAndResolve(state.ToIPC(), __func__);
+   return ref.forget();
+ }
+ 
+ already_AddRefed<ClientOpPromise>
+ ClientSource::Claim(const ClientClaimArgs& aArgs)
+ {
+   RefPtr<ClientOpPromise> ref;
+ 
+@@ -538,31 +537,33 @@ ClientSource::GetInfoAndState(const Clie
+   ClientState state;
+   nsresult rv = SnapshotState(&state);
+   if (NS_FAILED(rv)) {
+     ref = ClientOpPromise::CreateAndReject(rv, __func__);
+     return ref.forget();
+   }
+ 
+   ref = ClientOpPromise::CreateAndResolve(ClientInfoAndState(mClientInfo.ToIPC(),
+-                                                             state), __func__);
++                                                             state.ToIPC()), __func__);
+   return ref.forget();
+ }
+ 
+ nsresult
+ ClientSource::SnapshotState(ClientState* aStateOut)
+ {
+   NS_ASSERT_OWNINGTHREAD(ClientSource);
+   MOZ_DIAGNOSTIC_ASSERT(aStateOut);
+ 
+   // TODO: Handle state on reserved client where no window/workerprivate yet.
+ 
+   if (mClientInfo.Type() == ClientType::Window) {
+-    *aStateOut = ClientWindowState();
+-    return SnapshotWindowState(&aStateOut->get_ClientWindowState());
++    nsresult rv = SnapshotWindowState(aStateOut);
++    if (NS_FAILED(rv)) {
++      return rv;
++    }
+   }
+ 
+-  *aStateOut = ClientWorkerState();
++  *aStateOut = ClientState(ClientWorkerState());
+   return NS_OK;
+ }
+ 
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/clients/manager/ClientSource.h b/dom/clients/manager/ClientSource.h
+--- a/dom/clients/manager/ClientSource.h
++++ b/dom/clients/manager/ClientSource.h
+@@ -52,17 +52,17 @@ class ClientSource final : public Client
+ 
+   void
+   Shutdown();
+ 
+   void
+   ExecutionReady(const ClientSourceExecutionReadyArgs& aArgs);
+ 
+   nsresult
+-  SnapshotWindowState(ClientWindowState* aStateOut);
++  SnapshotWindowState(ClientState* aStateOut);
+ 
+   // Private methods called by ClientManager
+   ClientSource(ClientManager* aManager,
+                const ClientSourceConstructorArgs& aArgs);
+ 
+   void
+   Activate(PClientManagerChild* aActor);
+ 
+diff --git a/dom/clients/manager/moz.build b/dom/clients/manager/moz.build
+--- a/dom/clients/manager/moz.build
++++ b/dom/clients/manager/moz.build
+@@ -7,16 +7,17 @@
+ EXPORTS.mozilla.dom += [
+   'ClientHandle.h',
+   'ClientInfo.h',
+   'ClientIPCUtils.h',
+   'ClientManager.h',
+   'ClientManagerActors.h',
+   'ClientOpPromise.h',
+   'ClientSource.h',
++  'ClientState.h',
+   'ClientThing.h',
+   'ReservedClientHelper.h',
+ ]
+ 
+ UNIFIED_SOURCES += [
+   'ClientHandle.cpp',
+   'ClientHandleChild.cpp',
+   'ClientHandleOpChild.cpp',
+@@ -32,16 +33,17 @@ UNIFIED_SOURCES += [
+   'ClientManagerService.cpp',
+   'ClientNavigateOpChild.cpp',
+   'ClientNavigateOpParent.cpp',
+   'ClientSource.cpp',
+   'ClientSourceChild.cpp',
+   'ClientSourceOpChild.cpp',
+   'ClientSourceOpParent.cpp',
+   'ClientSourceParent.cpp',
++  'ClientState.cpp',
+   'ReservedClientHelper.cpp',
+ ]
+ 
+ IPDL_SOURCES += [
+   'ClientIPCTypes.ipdlh',
+   'PClientHandle.ipdl',
+   'PClientHandleOp.ipdl',
+   'PClientManager.ipdl',
+diff --git a/dom/workers/ServiceWorker.cpp b/dom/workers/ServiceWorker.cpp
+--- a/dom/workers/ServiceWorker.cpp
++++ b/dom/workers/ServiceWorker.cpp
+@@ -9,16 +9,17 @@
+ #include "nsIDocument.h"
+ #include "nsPIDOMWindow.h"
+ #include "ServiceWorkerManager.h"
+ #include "ServiceWorkerPrivate.h"
+ #include "WorkerPrivate.h"
+ 
+ #include "mozilla/Preferences.h"
+ #include "mozilla/dom/ClientIPCTypes.h"
++#include "mozilla/dom/ClientState.h"
+ #include "mozilla/dom/Promise.h"
+ #include "mozilla/dom/ServiceWorkerGlobalScopeBinding.h"
+ 
+ #ifdef XP_WIN
+ #undef PostMessage
+ #endif
+ 
+ using mozilla::ErrorResult;
+@@ -100,14 +101,14 @@ ServiceWorker::PostMessage(JSContext* aC
+   if (clientInfo.isNothing() || clientState.isNothing()) {
+     aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+     return;
+   }
+ 
+   ServiceWorkerPrivate* workerPrivate = mInfo->WorkerPrivate();
+   aRv = workerPrivate->SendMessageEvent(aCx, aMessage, aTransferable,
+                                         ClientInfoAndState(clientInfo.ref().ToIPC(),
+-                                                           clientState.ref()));
++                                                           clientState.ref().ToIPC()));
+ }
+ 
+ } // namespace workers
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/workers/ServiceWorkerDescriptor.cpp b/dom/workers/ServiceWorkerDescriptor.cpp
+--- a/dom/workers/ServiceWorkerDescriptor.cpp
++++ b/dom/workers/ServiceWorkerDescriptor.cpp
+@@ -38,16 +38,33 @@ ServiceWorkerDescriptor::ServiceWorkerDe
+ ServiceWorkerDescriptor&
+ ServiceWorkerDescriptor::operator=(const ServiceWorkerDescriptor& aRight)
+ {
+   mData.reset();
+   mData = MakeUnique<IPCServiceWorkerDescriptor>(*aRight.mData);
+   return *this;
+ }
+ 
++ServiceWorkerDescriptor::ServiceWorkerDescriptor(ServiceWorkerDescriptor&& aRight)
++  : mData(Move(aRight.mData))
++{
++}
++
++ServiceWorkerDescriptor&
++ServiceWorkerDescriptor::operator=(ServiceWorkerDescriptor&& aRight)
++{
++  mData.reset();
++  mData = Move(aRight.mData);
++  return *this;
++}
++
++ServiceWorkerDescriptor::~ServiceWorkerDescriptor()
++{
++}
++
+ bool
+ ServiceWorkerDescriptor::operator==(const ServiceWorkerDescriptor& aRight) const
+ {
+   return mData->id() == aRight.mData->id() &&
+          mData->scope() == aRight.mData->scope() &&
+          mData->principalInfo() == aRight.mData->principalInfo();
+ }
+ 
+diff --git a/dom/workers/ServiceWorkerDescriptor.h b/dom/workers/ServiceWorkerDescriptor.h
+--- a/dom/workers/ServiceWorkerDescriptor.h
++++ b/dom/workers/ServiceWorkerDescriptor.h
+@@ -31,20 +31,22 @@ public:
+ 
+   explicit ServiceWorkerDescriptor(const IPCServiceWorkerDescriptor& aDescriptor);
+ 
+   ServiceWorkerDescriptor(const ServiceWorkerDescriptor& aRight);
+ 
+   ServiceWorkerDescriptor&
+   operator=(const ServiceWorkerDescriptor& aRight);
+ 
+-  ServiceWorkerDescriptor(ServiceWorkerDescriptor&& aRight) = default;
++  ServiceWorkerDescriptor(ServiceWorkerDescriptor&& aRight);
+ 
+   ServiceWorkerDescriptor&
+-  operator=(ServiceWorkerDescriptor&& aRight) = default;
++  operator=(ServiceWorkerDescriptor&& aRight);
++
++  ~ServiceWorkerDescriptor();
+ 
+   bool
+   operator==(const ServiceWorkerDescriptor& aRight) const;
+ 
+   uint64_t
+   Id() const;
+ 
+   const mozilla::ipc::PrincipalInfo&
