@@ -1,0 +1,85 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  ce2218406119c36a551e3faea4e192186ee46cc5
+Bug 1343912 P1 Cleanup logic in TimeoutManager::RunTimeout() to keep firing depth and other data consistent. r=ehsan
+
+diff --git a/dom/base/TimeoutManager.cpp b/dom/base/TimeoutManager.cpp
+--- a/dom/base/TimeoutManager.cpp
++++ b/dom/base/TimeoutManager.cpp
+@@ -674,50 +674,54 @@ TimeoutManager::RunTimeout(Timeout* aTim
+     OrderedTimeoutIterator runIter(mNormalTimeouts,
+                                    mTrackingTimeouts,
+                                    last_expired_normal_timeout ?
+                                      last_expired_normal_timeout->getNext() :
+                                      nullptr,
+                                    last_expired_tracking_timeout ?
+                                      last_expired_tracking_timeout->getNext() :
+                                      nullptr);
+-    while (!mWindow.IsFrozen()) {
++    while (true) {
+       Timeout* timeout = runIter.Next();
+       MOZ_ASSERT(timeout != dummy_normal_timeout &&
+                  timeout != dummy_tracking_timeout,
+                  "We should have stopped iterating before getting to the dummy timeout");
+       if (!timeout) {
+         // We have run out of timeouts!
+         break;
+       }
+       runIter.UpdateIterator();
+ 
+       if (timeout->mFiringDepth != firingDepth) {
+         // We skip the timeout since it's on the list to run at another
+         // depth.
+         continue;
+       }
+ 
++      MOZ_ASSERT_IF(mWindow.IsFrozen(), mWindow.IsSuspended());
+       if (mWindow.IsSuspended()) {
+         // Some timer did suspend us. Make sure the
+         // rest of the timers get executed later.
+         timeout->mFiringDepth = 0;
+         continue;
+       }
+ 
+       // The timeout is on the list to run at this depth, go ahead and
+       // process it.
+ 
+       // Get the script context (a strong ref to prevent it going away)
+       // for this timeout and ensure the script language is enabled.
+       nsCOMPtr<nsIScriptContext> scx = mWindow.GetContextInternal();
+ 
+       if (!scx) {
+         // No context means this window was closed or never properly
+-        // initialized for this language.
++        // initialized for this language.  This timer will never fire
++        // so just remove it.
++        timeout->remove();
++        timeout->Release();
+         continue;
+       }
+ 
+       // This timeout is good to run
+       bool timeout_was_cleared = mWindow.RunTimeoutHandler(timeout, scx);
+       MOZ_LOG(gLog, LogLevel::Debug,
+               ("Run%s(TimeoutManager=%p, timeout=%p, aTimeout=%p, tracking=%d) returned %d\n", timeout->mIsInterval ? "Interval" : "Timeout",
+                this, timeout, aTimeout,
+@@ -744,16 +748,19 @@ TimeoutManager::RunTimeout(Timeout* aTim
+           MOZ_ASSERT(dummy_normal_timeout->HasRefCnt(2), "dummy_normal_timeout may leak");
+           MOZ_ASSERT(dummy_tracking_timeout->HasRefCnt(1), "dummy_tracking_timeout may leak");
+           Unused << timeoutExtraRef2.forget().take();
+         }
+ 
+         mNormalTimeouts.SetInsertionPoint(last_normal_insertion_point);
+         mTrackingTimeouts.SetInsertionPoint(last_tracking_insertion_point);
+ 
++        // Since ClearAllTimeouts() was called the lists should be empty.
++        MOZ_DIAGNOSTIC_ASSERT(!HasTimeouts());
++
+         return;
+       }
+ 
+       // If we have a regular interval timer, we re-schedule the
+       // timeout, accounting for clock drift.
+       bool needsReinsertion = RescheduleTimeout(timeout, now, !aTimeout);
+ 
+       // Running a timeout can cause another timeout to be deleted, so

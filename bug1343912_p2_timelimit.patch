@@ -1,0 +1,133 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  4b9071292221b56dce9bfb7e20abc454da5be3dc
+Bug 1343912 P2 Only execute consecutive timeout handlers for a limit period of time. r=ehsan
+
+diff --git a/dom/base/TimeoutManager.cpp b/dom/base/TimeoutManager.cpp
+--- a/dom/base/TimeoutManager.cpp
++++ b/dom/base/TimeoutManager.cpp
+@@ -179,16 +179,21 @@ static int32_t gTimeoutBucketingStrategy
+ // timer code can handle, really. See DELAY_INTERVAL_LIMIT in
+ // nsTimerImpl.h for details.
+ #define DOM_MAX_TIMEOUT_VALUE    DELAY_INTERVAL_LIMIT
+ 
+ uint32_t TimeoutManager::sNestingLevel = 0;
+ 
+ namespace {
+ 
++// The maximum number of milliseconds to allow consecutive timer callbacks
++// to run in a single event loop runnable.
++#define DEFAULT_MAX_CONSECUTIVE_CALLBACK_MILLISECONDS 4
++uint32_t gMaxConsecutiveCallbackMilliseconds;
++
+ // The maximum number of timer callbacks we will try to run in a single event
+ // loop runnable.
+ #define DEFAULT_TARGET_MAX_CONSECUTIVE_CALLBACKS 5
+ uint32_t gTargetMaxConsecutiveCallbacks;
+ 
+ // The number of queued runnables within the TabGroup ThrottledEventQueue
+ // at which to begin applying back pressure to the window.
+ #define DEFAULT_THROTTLED_EVENT_QUEUE_BACK_PRESSURE 5000
+@@ -299,16 +304,20 @@ TimeoutManager::Initialize()
+                                DEFAULT_BACK_PRESSURE_DELAY_REDUCTION_THRESHOLD_MS);
+   Preferences::AddUintVarCache(&gBackPressureDelayMinimumMS,
+                                "dom.timeout.back_pressure_delay_minimum_ms",
+                                DEFAULT_BACK_PRESSURE_DELAY_MINIMUM_MS);
+ 
+   Preferences::AddUintVarCache(&gTargetMaxConsecutiveCallbacks,
+                                "dom.timeout.max_consecutive_callbacks",
+                                DEFAULT_TARGET_MAX_CONSECUTIVE_CALLBACKS);
++
++  Preferences::AddUintVarCache(&gMaxConsecutiveCallbackMilliseconds,
++                               "dom.timeout.max_consecutive_callback_ms",
++                               DEFAULT_MAX_CONSECUTIVE_CALLBACK_MILLISECONDS);
+ }
+ 
+ uint32_t
+ TimeoutManager::GetTimeoutId(Timeout::Reason aReason)
+ {
+   switch (aReason) {
+     case Timeout::Reason::eIdleCallbackTimeout:
+       return ++mIdleCallbackTimeoutCounter;
+@@ -657,16 +666,22 @@ TimeoutManager::RunTimeout(Timeout* aTim
+ 
+   last_tracking_insertion_point = mTrackingTimeouts.InsertionPoint();
+   if (!last_expired_timeout_is_normal) {
+     // If we ever start setting mTrackingTimeoutInsertionPoint to a non-dummy timeout,
+     // the logic in ResetTimersForThrottleReduction will need to change.
+     mTrackingTimeouts.SetInsertionPoint(dummy_tracking_timeout);
+   }
+ 
++  uint32_t timeLimitMS = std::max(1u, gMaxConsecutiveCallbackMilliseconds);
++  const TimeDuration timeLimit = TimeDuration::FromMilliseconds(timeLimitMS);
++  TimeStamp start = TimeStamp::Now();
++
++  bool targetTimeoutSeen = false;
++
+   // We stop iterating each list when we go past the last expired timeout from
+   // that list that we have observed above.  That timeout will either be the
+   // dummy timeout for the list that the last expired timeout came from, or it
+   // will be the next item after the last timeout we looked at (or nullptr if
+   // we have exhausted the entire list while looking for the last expired
+   // timeout).
+   {
+     // Use a nested scope in order to make sure the strong references held by
+@@ -715,16 +730,34 @@ TimeoutManager::RunTimeout(Timeout* aTim
+         // No context means this window was closed or never properly
+         // initialized for this language.  This timer will never fire
+         // so just remove it.
+         timeout->remove();
+         timeout->Release();
+         continue;
+       }
+ 
++      // Check to see if we have run out of time to execute timeout handlers.
++      // If we've exceeded our time budget simply cleanup our remaining
++      // handlers to run by marking their firing depth back to zero.
++      //
++      // Note, we only do this if we have seen the Timeout object explicitly
++      // passed to RunTimeout().  The target timeout must always be executed.
++      if (targetTimeoutSeen) {
++        TimeDuration elapsed = TimeStamp::Now() - start;
++        if (elapsed >= timeLimit) {
++          timeout->mFiringDepth = 0;
++          continue;
++        }
++      }
++
++      if (timeout == aTimeout) {
++        targetTimeoutSeen = true;
++      }
++
+       // This timeout is good to run
+       bool timeout_was_cleared = mWindow.RunTimeoutHandler(timeout, scx);
+       MOZ_LOG(gLog, LogLevel::Debug,
+               ("Run%s(TimeoutManager=%p, timeout=%p, aTimeout=%p, tracking=%d) returned %d\n", timeout->mIsInterval ? "Interval" : "Timeout",
+                this, timeout, aTimeout,
+                int(aTimeout->mIsTracking),
+                !!timeout_was_cleared));
+ 
+diff --git a/modules/libpref/init/all.js b/modules/libpref/init/all.js
+--- a/modules/libpref/init/all.js
++++ b/modules/libpref/init/all.js
+@@ -5692,16 +5692,20 @@ pref("dom.IntersectionObserver.enabled",
+ 
+ // Whether module scripts (<script type="module">) are enabled for content.
+ pref("dom.moduleScripts.enabled", false);
+ 
+ // Maximum number of setTimeout()/setInterval() callbacks to run in a single
+ // event loop runnable. Minimum value of 1.
+ pref("dom.timeout.max_consecutive_callbacks", 5);
+ 
++// Maximum amount of time in milliseconds consecutive setTimeout()/setInterval()
++// callback are allowed to run before yielding the event loop.
++pref("dom.timeout.max_consecutive_callback_ms", 4);
++
+ #ifdef FUZZING
+ pref("fuzzing.enabled", false);
+ #endif
+ 
+ // Set advanced layers preferences here to have them show up in about:config or
+ // to be overridable in reftest.list files. They should pretty much all be set
+ // to a value of 2, and the conditional-pref code in gfxPrefs.h will convert
+ // it to a boolean as appropriate. In particular, do NOT add ifdefs here to

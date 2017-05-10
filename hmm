@@ -1,0 +1,140 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  ce2218406119c36a551e3faea4e192186ee46cc5
+
+diff --git a/dom/base/TimeoutManager.cpp b/dom/base/TimeoutManager.cpp
+--- a/dom/base/TimeoutManager.cpp
++++ b/dom/base/TimeoutManager.cpp
+@@ -562,59 +562,32 @@ TimeoutManager::RunTimeout(Timeout* aTim
+   {
+     // Use a nested scope in order to make sure the strong references held by
+     // the iterator are freed after the loop.
+     OrderedTimeoutIterator expiredIter(mNormalTimeouts,
+                                        mTrackingTimeouts,
+                                        nullptr,
+                                        nullptr);
+ 
+-    uint32_t numTimersToRun = 0;
+-    bool targetTimerSeen = false;
+-
+     while (true) {
+       Timeout* timeout = expiredIter.Next();
+       if (!timeout || timeout->When() > deadline) {
+         break;
+       }
+ 
+       if (timeout->mFiringDepth == 0) {
+         // Mark any timeouts that are on the list to be fired with the
+         // firing depth so that we can reentrantly run timeouts
+         timeout->mFiringDepth = firingDepth;
+         last_expired_timeout_is_normal = expiredIter.PickedNormalIter();
+         if (last_expired_timeout_is_normal) {
+           last_expired_normal_timeout = timeout;
+         } else {
+           last_expired_tracking_timeout = timeout;
+         }
+-
+-        numTimersToRun += 1;
+-
+-        // Note that we have seen our target timer.  This means we can now
+-        // stop processing timers once we hit our threshold below.
+-        if (timeout == aTimeout) {
+-          targetTimerSeen = true;
+-        }
+-
+-        // Run only a limited number of timers based on the configured
+-        // maximum.  Note, we must always run our target timer however.
+-        // Further timers that are ready will get picked up by their own
+-        // nsITimer runnables when they execute.
+-        //
+-        // For chrome windows, however, we do coalesce all timers and
+-        // do not yield the main thread.  This is partly because we
+-        // trust chrome windows not to misbehave and partly because a
+-        // number of browser chrome tests have races that depend on this
+-        // coalescing.
+-        if (targetTimerSeen &&
+-            numTimersToRun >= gTargetMaxConsecutiveCallbacks &&
+-            !mWindow.IsChromeWindow()) {
+-          break;
+-        }
+       }
+ 
+       expiredIter.UpdateIterator();
+     }
+   }
+ 
+   // Maybe the timeout that the event was fired for has been deleted
+   // and there are no others timeouts with deadlines that make them
+@@ -664,60 +637,70 @@ TimeoutManager::RunTimeout(Timeout* aTim
+ 
+   // We stop iterating each list when we go past the last expired timeout from
+   // that list that we have observed above.  That timeout will either be the
+   // dummy timeout for the list that the last expired timeout came from, or it
+   // will be the next item after the last timeout we looked at (or nullptr if
+   // we have exhausted the entire list while looking for the last expired
+   // timeout).
+   {
++    const TimeDuration limit = TimeDuration::FromMilliseconds(4);
++    TimeStamp start = TimeStamp::Now();
++
+     // Use a nested scope in order to make sure the strong references held by
+     // the iterator are freed after the loop.
+     OrderedTimeoutIterator runIter(mNormalTimeouts,
+                                    mTrackingTimeouts,
+                                    last_expired_normal_timeout ?
+                                      last_expired_normal_timeout->getNext() :
+                                      nullptr,
+                                    last_expired_tracking_timeout ?
+                                      last_expired_tracking_timeout->getNext() :
+                                      nullptr);
+-    while (!mWindow.IsFrozen()) {
++    while (true) {
+       Timeout* timeout = runIter.Next();
+       MOZ_ASSERT(timeout != dummy_normal_timeout &&
+                  timeout != dummy_tracking_timeout,
+                  "We should have stopped iterating before getting to the dummy timeout");
+       if (!timeout) {
+         // We have run out of timeouts!
+         break;
+       }
+       runIter.UpdateIterator();
+ 
+       if (timeout->mFiringDepth != firingDepth) {
+         // We skip the timeout since it's on the list to run at another
+         // depth.
+         continue;
+       }
+ 
+-      if (mWindow.IsSuspended()) {
++      if (mWindow.IsSuspended() || mWindow.IsFrozen()) {
+         // Some timer did suspend us. Make sure the
+         // rest of the timers get executed later.
+         timeout->mFiringDepth = 0;
+         continue;
+       }
+ 
+       // The timeout is on the list to run at this depth, go ahead and
+       // process it.
+ 
+       // Get the script context (a strong ref to prevent it going away)
+       // for this timeout and ensure the script language is enabled.
+       nsCOMPtr<nsIScriptContext> scx = mWindow.GetContextInternal();
+ 
+       if (!scx) {
+         // No context means this window was closed or never properly
+         // initialized for this language.
++        timeout->remove();
++        continue;
++      }
++
++      TimeDuration elapsed = TimeStamp::Now() - start;
++      if (elapsed >= limit) {
++        timeout->mFiringDepth = 0;
+         continue;
+       }
+ 
+       // This timeout is good to run
+       bool timeout_was_cleared = mWindow.RunTimeoutHandler(timeout, scx);
+       MOZ_LOG(gLog, LogLevel::Debug,
+               ("Run%s(TimeoutManager=%p, timeout=%p, aTimeout=%p, tracking=%d) returned %d\n", timeout->mIsInterval ? "Interval" : "Timeout",
+                this, timeout, aTimeout,
