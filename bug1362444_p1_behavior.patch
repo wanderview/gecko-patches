@@ -1,0 +1,181 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  06344d7b1cb16986603c6c0ad5bacff5dadf11bc
+Bug 1362444 P1 Allow idle worker shutdown to begin for an opt-in WorkerHolder mode. r=baku
+
+diff --git a/dom/workers/WorkerHolder.cpp b/dom/workers/WorkerHolder.cpp
+--- a/dom/workers/WorkerHolder.cpp
++++ b/dom/workers/WorkerHolder.cpp
+@@ -4,18 +4,19 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "WorkerHolder.h"
+ #include "WorkerPrivate.h"
+ 
+ BEGIN_WORKERS_NAMESPACE
+ 
+-WorkerHolder::WorkerHolder()
++WorkerHolder::WorkerHolder(Behavior aBehavior)
+   : mWorkerPrivate(nullptr)
++  , mBehavior(aBehavior)
+ {
+ }
+ 
+ WorkerHolder::~WorkerHolder()
+ {
+   NS_ASSERT_OWNINGTHREAD(WorkerHolder);
+   ReleaseWorkerInternal();
+   MOZ_ASSERT(mWorkerPrivate == nullptr);
+@@ -40,16 +41,22 @@ void
+ WorkerHolder::ReleaseWorker()
+ {
+   NS_ASSERT_OWNINGTHREAD(WorkerHolder);
+   MOZ_ASSERT(mWorkerPrivate);
+ 
+   ReleaseWorkerInternal();
+ }
+ 
++WorkerHolder::Behavior
++WorkerHolder::GetBehavior() const
++{
++  return mBehavior;
++}
++
+ void
+ WorkerHolder::ReleaseWorkerInternal()
+ {
+   NS_ASSERT_OWNINGTHREAD(WorkerHolder);
+ 
+   if (mWorkerPrivate) {
+     mWorkerPrivate->AssertIsOnWorkerThread();
+     mWorkerPrivate->RemoveHolder(this);
+diff --git a/dom/workers/WorkerHolder.h b/dom/workers/WorkerHolder.h
+--- a/dom/workers/WorkerHolder.h
++++ b/dom/workers/WorkerHolder.h
+@@ -69,28 +69,37 @@ enum Status
+   Dead
+ };
+ 
+ class WorkerHolder
+ {
+ public:
+   NS_DECL_OWNINGTHREAD
+ 
+-  WorkerHolder();
++  enum Behavior {
++    AllowIdleShutdownStart,
++    PreventIdleShutdownStart,
++  };
++
++  explicit WorkerHolder(Behavior aBehavior = PreventIdleShutdownStart);
+   virtual ~WorkerHolder();
+ 
+   bool HoldWorker(WorkerPrivate* aWorkerPrivate, Status aFailStatus);
+   void ReleaseWorker();
+ 
+   virtual bool Notify(Status aStatus) = 0;
+ 
++  Behavior GetBehavior() const;
++
+ protected:
+   void ReleaseWorkerInternal();
+ 
+   WorkerPrivate* MOZ_NON_OWNING_REF mWorkerPrivate;
+ 
+ private:
+   void AssertIsOwningThread() const;
++
++  const Behavior mBehavior;
+ };
+ 
+ END_WORKERS_NAMESPACE
+ 
+ #endif /* mozilla_dom_workers_WorkerHolder_h */
+diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
+--- a/dom/workers/WorkerPrivate.cpp
++++ b/dom/workers/WorkerPrivate.cpp
+@@ -4424,16 +4424,17 @@ WorkerPrivate::WorkerPrivate(WorkerPriva
+                              WorkerLoadInfo& aLoadInfo)
+   : WorkerPrivateParent<WorkerPrivate>(aParent, aScriptURL,
+                                        aIsChromeWorker, aWorkerType,
+                                        aWorkerName, aLoadInfo)
+   , mDebuggerRegistered(false)
+   , mDebugger(nullptr)
+   , mJSContext(nullptr)
+   , mPRThread(nullptr)
++  , mNumHoldersPreventingShutdownStart(0)
+   , mDebuggerEventLoopLevel(0)
+   , mMainThreadEventTarget(do_GetMainThread())
+   , mWorkerControlEventTarget(new WorkerControlEventTarget(this))
+   , mErrorHandlerRecursionCount(0)
+   , mNextTimeoutId(1)
+   , mStatus(Pending)
+   , mFrozen(false)
+   , mTimerRunning(false)
+@@ -5642,34 +5643,40 @@ WorkerPrivate::AddHolder(WorkerHolder* a
+ 
+     if (mStatus >= aFailStatus) {
+       return false;
+     }
+   }
+ 
+   MOZ_ASSERT(!mHolders.Contains(aHolder), "Already know about this one!");
+ 
+-  if (mHolders.IsEmpty() && !ModifyBusyCountFromWorker(true)) {
+-    return false;
++  if (aHolder->GetBehavior() == WorkerHolder::PreventIdleShutdownStart) {
++    if (!mNumHoldersPreventingShutdownStart && !ModifyBusyCountFromWorker(true)) {
++      return false;
++    }
++    mNumHoldersPreventingShutdownStart += 1;
+   }
+ 
+   mHolders.AppendElement(aHolder);
+   return true;
+ }
+ 
+ void
+ WorkerPrivate::RemoveHolder(WorkerHolder* aHolder)
+ {
+   AssertIsOnWorkerThread();
+ 
+   MOZ_ASSERT(mHolders.Contains(aHolder), "Didn't know about this one!");
+   mHolders.RemoveElement(aHolder);
+ 
+-  if (mHolders.IsEmpty() && !ModifyBusyCountFromWorker(false)) {
+-    NS_WARNING("Failed to modify busy count!");
++  if (aHolder->GetBehavior() == WorkerHolder::PreventIdleShutdownStart) {
++    mNumHoldersPreventingShutdownStart -= 1;
++    if (!mNumHoldersPreventingShutdownStart && !ModifyBusyCountFromWorker(false)) {
++      NS_WARNING("Failed to modify busy count!");
++    }
+   }
+ }
+ 
+ void
+ WorkerPrivate::NotifyHolders(JSContext* aCx, Status aStatus)
+ {
+   AssertIsOnWorkerThread();
+   MOZ_ASSERT(!JS_IsExceptionPending(aCx));
+diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
+--- a/dom/workers/WorkerPrivate.h
++++ b/dom/workers/WorkerPrivate.h
+@@ -991,16 +991,17 @@ class WorkerPrivate : public WorkerPriva
+   RefPtr<WorkerThread> mThread;
+   PRThread* mPRThread;
+ 
+   // Things touched on worker thread only.
+   RefPtr<WorkerGlobalScope> mScope;
+   RefPtr<WorkerDebuggerGlobalScope> mDebuggerScope;
+   nsTArray<ParentType*> mChildWorkers;
+   nsTObserverArray<WorkerHolder*> mHolders;
++  uint32_t mNumHoldersPreventingShutdownStart;
+   nsTArray<nsAutoPtr<TimeoutInfo>> mTimeouts;
+   uint32_t mDebuggerEventLoopLevel;
+   RefPtr<ThrottledEventQueue> mMainThreadThrottledEventQueue;
+   nsCOMPtr<nsIEventTarget> mMainThreadEventTarget;
+   RefPtr<WorkerControlEventTarget> mWorkerControlEventTarget;
+ 
+   struct SyncLoopInfo
+   {
