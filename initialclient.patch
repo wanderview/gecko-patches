@@ -1,0 +1,395 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  6789875787d470b10b3c04aaa09ef9c53a15d441
+
+diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
+--- a/docshell/base/nsDocShell.cpp
++++ b/docshell/base/nsDocShell.cpp
+@@ -8,25 +8,25 @@
+ 
+ #include <algorithm>
+ 
+ #include "mozilla/ArrayUtils.h"
+ #include "mozilla/Attributes.h"
+ #include "mozilla/AutoRestore.h"
+ #include "mozilla/BasePrincipal.h"
+ #include "mozilla/Casting.h"
++#include "mozilla/dom/ClientChannelHelper.h"
+ #include "mozilla/dom/ContentChild.h"
+ #include "mozilla/dom/Element.h"
+ #include "mozilla/dom/PendingGlobalHistoryEntry.h"
+ #include "mozilla/dom/TabChild.h"
+ #include "mozilla/dom/ProfileTimelineMarkerBinding.h"
+ #include "mozilla/dom/ScreenOrientation.h"
+ #include "mozilla/dom/ToJSValue.h"
+ #include "mozilla/dom/PermissionMessageUtils.h"
+-#include "mozilla/dom/ReservedClientHelper.h"
+ #include "mozilla/dom/workers/ServiceWorkerManager.h"
+ #include "mozilla/EventStateManager.h"
+ #include "mozilla/LoadInfo.h"
+ #include "mozilla/Preferences.h"
+ #include "mozilla/Services.h"
+ #include "mozilla/StartupTimeline.h"
+ #include "mozilla/Telemetry.h"
+ #include "mozilla/Unused.h"
+@@ -11560,17 +11560,17 @@ nsDocShell::DoChannelLoad(nsIChannel* aC
+   uint32_t openFlags = 0;
+   if (mLoadType == LOAD_LINK) {
+     openFlags |= nsIURILoader::IS_CONTENT_PREFERRED;
+   }
+   if (!mAllowContentRetargeting) {
+     openFlags |= nsIURILoader::DONT_RETARGET;
+   }
+ 
+-  rv = ReserveClientForChannel(aChannel);
++  rv = AddClientChannelHelperToChannel(this, aChannel);
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   rv = aURILoader->OpenURI(aChannel, openFlags, this);
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   return NS_OK;
+ }
+ 
+diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
+--- a/dom/base/nsGlobalWindow.cpp
++++ b/dom/base/nsGlobalWindow.cpp
+@@ -3500,19 +3500,22 @@ nsGlobalWindow::EnsureClientSource()
+ 
+   nsCOMPtr<nsILoadInfo> loadInfo;
+   nsCOMPtr<nsIChannel> channel = mDoc->GetChannel();
+   if (channel) {
+     loadInfo = channel->GetLoadInfo();
+   }
+ 
+   // Try to get the reserved client from the loading document
+-  if (!mClientSource && loadInfo) {
+-    mClientSource = loadInfo->TakeReservedClient();
+-    newClientSource = true;
++  if (loadInfo) {
++    UniquePtr<ClientSource> reservedClient = loadInfo->TakeReservedClient();
++    if (reservedClient) {
++      mClientSource = Move(reservedClient);
++      newClientSource = true;
++    }
+   }
+ 
+   // If we don't have a reserved client we need to create one now
+   if (!mClientSource) {
+     mClientSource = ClientManager::CreateSource(ClientType::Window,
+                                                 mDoc->NodePrincipal());
+     if (NS_WARN_IF(!mClientSource)) {
+       return NS_ERROR_FAILURE;
+diff --git a/dom/clients/manager/ReservedClientHelper.cpp b/dom/clients/manager/ClientChannelHelper.cpp
+rename from dom/clients/manager/ReservedClientHelper.cpp
+rename to dom/clients/manager/ClientChannelHelper.cpp
+--- a/dom/clients/manager/ReservedClientHelper.cpp
++++ b/dom/clients/manager/ClientChannelHelper.cpp
+@@ -1,37 +1,38 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+-#include "ReservedClientHelper.h"
++#include "ClientChannelHelper.h"
+ 
+ #include "ClientManager.h"
+ #include "ClientSource.h"
+ #include "MainThreadUtils.h"
+ #include "nsContentUtils.h"
+ #include "nsIAsyncVerifyRedirectCallback.h"
+ #include "nsIChannel.h"
+ #include "nsIChannelEventSink.h"
++#include "nsIDocShell.h"
+ #include "nsIInterfaceRequestor.h"
+ #include "nsIInterfaceRequestorUtils.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ namespace {
+ 
+-class ReserveClientHelper final : public nsIInterfaceRequestor
++class ClientChannelHelper final : public nsIInterfaceRequestor
+                                 , public nsIChannelEventSink
+ {
+   nsCOMPtr<nsIInterfaceRequestor> mOuter;
+ 
+-  ~ReserveClientHelper()
++  ~ClientChannelHelper()
+   {
+   }
+ 
+   NS_IMETHOD
+   GetInterface(const nsIID & aIID, void **aResultOut) override
+   {
+     if (aIID.Equals(NS_GET_IID(nsIChannelEventSink))) {
+       *aResultOut = static_cast<nsIChannelEventSink*>(this);
+@@ -71,32 +72,35 @@ class ReserveClientHelper final : public
+       return rv;
+     }
+ 
+     UniquePtr<ClientSource> reservedClient = oldLoadInfo->TakeReservedClient();
+ 
+     // If its a same-origin redirect we just move our reserved client to the
+     // new channel.
+     if (NS_SUCCEEDED(rv)) {
+-      newLoadInfo->GiveReservedClient(Move(reservedClient));
++      if (reservedClient) {
++        newLoadInfo->GiveReservedClient(Move(reservedClient));
++      }
+     }
+ 
+     // If its a cross-origin redirect then we discard the old reserved client
+     // and create a new one.
+     else {
+       // If CheckSameOrigin() worked, then the security manager must exist.
+       nsIScriptSecurityManager* ssm = nsContentUtils::GetSecurityManager();
+       MOZ_DIAGNOSTIC_ASSERT(ssm);
+ 
+       nsCOMPtr<nsIPrincipal> principal;
+       rv = ssm->GetChannelResultPrincipal(aNewChannel, getter_AddRefs(principal));
+       if (NS_WARN_IF(NS_FAILED(rv))) {
+         return rv;
+       }
+ 
++      reservedClient.reset();
+       reservedClient =
+         ClientManager::CreateSource(ClientType::Window, principal);
+ 
+       newLoadInfo->GiveReservedClient(Move(reservedClient));
+     }
+ 
+     nsCOMPtr<nsIChannelEventSink> outerSink = do_GetInterface(mOuter);
+     if (outerSink) {
+@@ -104,76 +108,111 @@ class ReserveClientHelper final : public
+                                                aCallback);
+     }
+ 
+     aCallback->OnRedirectVerifyCallback(NS_OK);
+     return NS_OK;
+   }
+ 
+ public:
+-  explicit ReserveClientHelper(nsIInterfaceRequestor* aOuter)
++  explicit ClientChannelHelper(nsIInterfaceRequestor* aOuter)
+     : mOuter(aOuter)
+   {
+   }
+ 
+   NS_DECL_ISUPPORTS
+ };
+ 
+-NS_IMPL_ISUPPORTS(ReserveClientHelper, nsIInterfaceRequestor,
++NS_IMPL_ISUPPORTS(ClientChannelHelper, nsIInterfaceRequestor,
+                                        nsIChannelEventSink);
+ 
+ } // anonymous namespace
+ 
+ nsresult
+-ReserveClientForChannel(nsIChannel* aChannel)
++AddClientChannelHelperToChannel(nsIDocShell* aDocShell, nsIChannel* aChannel)
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+ 
+-  nsCOMPtr<nsIInterfaceRequestor> outer;
+-  nsresult rv = aChannel->GetNotificationCallbacks(getter_AddRefs(outer));
++  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->GetLoadInfo();
++  if (NS_WARN_IF(!loadInfo)) {
++    return NS_ERROR_FAILURE;
++  }
++
++  Maybe<ClientInfo> initialClientInfo;
++  nsPIDOMWindowOuter* outerWindow = aDocShell->GetWindow();
++  if (outerWindow) {
++    nsPIDOMWindowInner* innerWindow = outerWindow->GetCurrentInnerWindow();
++    if (innerWindow) {
++      nsIDocument* doc = innerWindow->GetExtantDoc();
++      if (doc && doc->IsInitialDocument()) {
++        nsCOMPtr<nsIURI> channelURL;
++        nsresult rv = aChannel->GetURI(getter_AddRefs(channelURL));
++        if (NS_WARN_IF(NS_FAILED(rv))) {
++          return rv;
++        }
++
++        nsIPrincipal* initialPrincipal = doc->NodePrincipal();
++        initialPrincipal->CheckMayLoad(channelURL,
++                                       false /* report */,
++                                       false /* inherit */);
++        if (NS_WARN_IF(NS_FAILED(rv) && rv != NS_ERROR_DOM_BAD_URI)) {
++          return rv;
++        }
++
++        if (NS_SUCCEEDED(rv)) {
++          initialClientInfo = innerWindow->GetClientInfo();
++        }
++      }
++    }
++  }
++
++  nsCOMPtr<nsIInterfaceRequestor> outerCallbacks;
++  nsresult rv = aChannel->GetNotificationCallbacks(getter_AddRefs(outerCallbacks));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return rv;
+   }
+ 
+-  nsIScriptSecurityManager* ssm = nsContentUtils::GetSecurityManager();
+-  if (!ssm) {
+-    return NS_ERROR_FAILURE;
++  UniquePtr<ClientSource> reservedClient;
++  if (initialClientInfo.isNothing()) {
++    nsIScriptSecurityManager* ssm = nsContentUtils::GetSecurityManager();
++    if (NS_WARN_IF(!ssm)) {
++      return NS_ERROR_FAILURE;
++    }
++
++    nsCOMPtr<nsIPrincipal> channelPrincipal;
++    rv = ssm->GetChannelResultPrincipal(aChannel, getter_AddRefs(channelPrincipal));
++    if (NS_WARN_IF(NS_FAILED(rv))) {
++      return rv;
++    }
++
++    // Wait to reserve the client until we are reasonably sure this method
++    // will succeed.
++    reservedClient = ClientManager::CreateSource(ClientType::Window,
++                                                 channelPrincipal);
++    if (!reservedClient) {
++      return NS_ERROR_FAILURE;
++    }
+   }
+ 
+-  nsCOMPtr<nsIPrincipal> principal;
+-  rv = ssm->GetChannelResultPrincipal(aChannel, getter_AddRefs(principal));
+-  if (NS_WARN_IF(NS_FAILED(rv))) {
+-    return rv;
+-  }
+-
+-  nsCOMPtr<nsILoadInfo> loadInfo;
+-  rv = aChannel->GetLoadInfo(getter_AddRefs(loadInfo));
+-  if (NS_WARN_IF(NS_FAILED(rv))) {
+-    return rv;
+-  }
+-
+-  // Wait to reserve the client until we are reasonably sure this method
+-  // will succeed.
+-  UniquePtr<ClientSource> reservedClient =
+-    ClientManager::CreateSource(ClientType::Window, principal);
+-  if (!reservedClient) {
+-    return NS_ERROR_FAILURE;
+-  }
+-
+-  RefPtr<ReserveClientHelper> helper =
+-    new ReserveClientHelper(outer);
++  RefPtr<ClientChannelHelper> helper =
++    new ClientChannelHelper(outerCallbacks);
+ 
+   // Only set the callbacks helper if we are able to reserve the client
+   // successfully.
+   rv = aChannel->SetNotificationCallbacks(helper);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return rv;
+   }
+ 
+   // Finally preserve the reserved client on the nsILoadInfo once the
+   // redirect helper has been added to the channel.
+-  loadInfo->GiveReservedClient(Move(reservedClient));
++  if (reservedClient) {
++    loadInfo->GiveReservedClient(Move(reservedClient));
++  }
++
++  // TODO: In the future we should also store the initial ClientInfo on
++  //       the loadInfo object.  Its not exposed yet, though.
+ 
+   return NS_OK;
+ }
+ 
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/clients/manager/ReservedClientHelper.h b/dom/clients/manager/ClientChannelHelper.h
+rename from dom/clients/manager/ReservedClientHelper.h
+rename to dom/clients/manager/ClientChannelHelper.h
+--- a/dom/clients/manager/ReservedClientHelper.h
++++ b/dom/clients/manager/ClientChannelHelper.h
+@@ -1,22 +1,23 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-#ifndef _mozilla_dom_ReservedClientHelper_h
+-#define _mozilla_dom_ReservedClientHelper_h
++#ifndef _mozilla_dom_ClientChannelHelper_h
++#define _mozilla_dom_ClientChannelHelper_h
+ 
+ #include "nsError.h"
+ 
+ class nsIChannel;
++class nsIDocShell;
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ nsresult
+-ReserveClientForChannel(nsIChannel* aChannel);
++AddClientChannelHelperToChannel(nsIDocShell* aDocShell, nsIChannel* aChannel);
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+-#endif // _mozilla_dom_ReservedClientHelper_h
++#endif // _mozilla_dom_ClientChannelHelper_h
+diff --git a/dom/clients/manager/moz.build b/dom/clients/manager/moz.build
+--- a/dom/clients/manager/moz.build
++++ b/dom/clients/manager/moz.build
+@@ -1,29 +1,30 @@
+ # -*- Mode: python; indent-tabs-mode: nil; tab-width: 40 -*-
+ # vim: set filetype=python:
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ EXPORTS.mozilla.dom += [
++  'ClientChannelHelper.h',
+   'ClientHandle.h',
+   'ClientInfo.h',
+   'ClientIPCUtils.h',
+   'ClientManager.h',
+   'ClientManagerActors.h',
+   'ClientOpenWindowOpActors.h',
+   'ClientOpPromise.h',
+   'ClientSource.h',
+   'ClientState.h',
+   'ClientThing.h',
+-  'ReservedClientHelper.h',
+ ]
+ 
+ UNIFIED_SOURCES += [
++  'ClientChannelHelper.cpp',
+   'ClientHandle.cpp',
+   'ClientHandleChild.cpp',
+   'ClientHandleOpChild.cpp',
+   'ClientHandleOpParent.cpp',
+   'ClientHandleParent.cpp',
+   'ClientInfo.cpp',
+   'ClientManager.cpp',
+   'ClientManagerActors.cpp',
+@@ -39,17 +40,16 @@ UNIFIED_SOURCES += [
+   'ClientOpenWindowOpParent.cpp',
+   'ClientOpenWindowUtils.cpp',
+   'ClientSource.cpp',
+   'ClientSourceChild.cpp',
+   'ClientSourceOpChild.cpp',
+   'ClientSourceOpParent.cpp',
+   'ClientSourceParent.cpp',
+   'ClientState.cpp',
+-  'ReservedClientHelper.cpp',
+ ]
+ 
+ IPDL_SOURCES += [
+   'ClientIPCTypes.ipdlh',
+   'PClientHandle.ipdl',
+   'PClientHandleOp.ipdl',
+   'PClientManager.ipdl',
+   'PClientManagerOp.ipdl',
