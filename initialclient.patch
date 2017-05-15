@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  6789875787d470b10b3c04aaa09ef9c53a15d441
+# Parent  e5aaf3554e2754939b6c641315dc3126a0f7c97b
 
 diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
 --- a/docshell/base/nsDocShell.cpp
@@ -54,7 +54,7 @@ diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
 diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 --- a/dom/base/nsGlobalWindow.cpp
 +++ b/dom/base/nsGlobalWindow.cpp
-@@ -3500,19 +3500,22 @@ nsGlobalWindow::EnsureClientSource()
+@@ -3500,19 +3500,23 @@ nsGlobalWindow::EnsureClientSource()
  
    nsCOMPtr<nsILoadInfo> loadInfo;
    nsCOMPtr<nsIChannel> channel = mDoc->GetChannel();
@@ -69,6 +69,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 +  if (loadInfo) {
 +    UniquePtr<ClientSource> reservedClient = loadInfo->TakeReservedClient();
 +    if (reservedClient) {
++      mClientSource.reset();
 +      mClientSource = Move(reservedClient);
 +      newClientSource = true;
 +    }
@@ -127,7 +128,7 @@ rename to dom/clients/manager/ClientChannelHelper.cpp
    {
      if (aIID.Equals(NS_GET_IID(nsIChannelEventSink))) {
        *aResultOut = static_cast<nsIChannelEventSink*>(this);
-@@ -71,32 +72,35 @@ class ReserveClientHelper final : public
+@@ -71,109 +72,169 @@ class ReserveClientHelper final : public
        return rv;
      }
  
@@ -139,6 +140,18 @@ rename to dom/clients/manager/ClientChannelHelper.cpp
 -      newLoadInfo->GiveReservedClient(Move(reservedClient));
 +      if (reservedClient) {
 +        newLoadInfo->GiveReservedClient(Move(reservedClient));
++      } else {
++        const Maybe<ClientInfo>& reservedClientInfo =
++          oldLoadInfo->GetReservedClientInfo();
++        if (reservedClientInfo.isSome()) {
++          newLoadInfo->SetReservedClientInfo(reservedClientInfo.ref());
++        } else {
++          const Maybe<ClientInfo>& initialClientInfo =
++            oldLoadInfo->GetInitialClientInfo();
++          if (initialClientInfo.isSome()) {
++            newLoadInfo->SetInitialClientInfo(initialClientInfo.ref());
++          }
++        }
 +      }
      }
  
@@ -162,9 +175,18 @@ rename to dom/clients/manager/ClientChannelHelper.cpp
        newLoadInfo->GiveReservedClient(Move(reservedClient));
      }
  
++    if (aFlags & (nsIChannelEventSink::REDIRECT_INTERNAL |
++                  nsIChannelEventSink::REDIRECT_STS_UPGRADE)) {
++      const Maybe<ServiceWorkerDescriptor>& controller = oldLoadInfo->GetController();
++      if (controller.isSome()) {
++        newLoadInfo->SetController(controller.ref());
++      }
++    }
++
++    // TODO: We need to do this for worker channels as well.
      nsCOMPtr<nsIChannelEventSink> outerSink = do_GetInterface(mOuter);
      if (outerSink) {
-@@ -104,76 +108,111 @@ class ReserveClientHelper final : public
+       return outerSink->AsyncOnChannelRedirect(aOldChannel, aNewChannel, aFlags,
                                                 aCallback);
      }
  
@@ -299,8 +321,9 @@ rename to dom/clients/manager/ClientChannelHelper.cpp
 +    loadInfo->GiveReservedClient(Move(reservedClient));
 +  }
 +
-+  // TODO: In the future we should also store the initial ClientInfo on
-+  //       the loadInfo object.  Its not exposed yet, though.
++  if (initialClientInfo.isSome()) {
++    loadInfo->SetInitialClientInfo(initialClientInfo.ref());
++  }
  
    return NS_OK;
  }
@@ -393,3 +416,170 @@ diff --git a/dom/clients/manager/moz.build b/dom/clients/manager/moz.build
    'PClientHandleOp.ipdl',
    'PClientManager.ipdl',
    'PClientManagerOp.ipdl',
+diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
+--- a/dom/workers/ServiceWorkerManager.cpp
++++ b/dom/workers/ServiceWorkerManager.cpp
+@@ -2772,17 +2772,20 @@ ServiceWorkerManager::DispatchFetchEvent
+       aRv.Throw(NS_ERROR_FAILURE);
+       return;
+     }
+ 
+     // If there is a reserved client it should be marked as controlled before
+     // the FetchEvent.
+     nsCOMPtr<nsILoadInfo> loadInfo = internalChannel->GetLoadInfo();
+     if (loadInfo) {
+-      const Maybe<ClientInfo>& clientInfo = loadInfo->GetReservedClientInfo();
++      Maybe<ClientInfo> clientInfo = loadInfo->GetReservedClientInfo();
++      if (clientInfo.isNothing()) {
++        clientInfo = loadInfo->GetInitialClientInfo();
++      }
+       if (clientInfo.isSome()) {
+         // First, attempt to mark the reserved client controlled directly.  This
+         // will update the controlled status in the ClientManagerService in the
+         // parent.  It will also eventually propagate back to the ClientSource.
+         RefPtr<ClientHandle> clientHandle =
+           ClientManager::CreateHandle(clientInfo.ref());
+         if (clientHandle) {
+           RefPtr<GenericPromise> p =
+@@ -2902,22 +2905,22 @@ ServiceWorkerManager::GetDocumentControl
+   }
+ 
+   Maybe<ServiceWorkerDescriptor> controller = aWindow->GetController();
+   if (controller.isNothing()) {
+     return NS_ERROR_DOM_INVALID_STATE_ERR;
+   }
+ 
+   nsCOMPtr<nsIDocument> doc = aWindow->GetExtantDoc();
+-  if (!doc) {
++  if (NS_WARN_IF(!doc)) {
+     return NS_ERROR_DOM_INVALID_STATE_ERR;
+   }
+ 
+   nsCOMPtr<nsIPrincipal> principal = doc->NodePrincipal();
+-  if (!principal) {
++  if (NS_WARN_IF(!principal)) {
+     return NS_ERROR_DOM_INVALID_STATE_ERR;
+   }
+ 
+   nsAutoCString scopeKey;
+   nsresult rv = PrincipalToScopeKey(principal, scopeKey);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return rv;
+   }
+diff --git a/netwerk/base/LoadInfo.cpp b/netwerk/base/LoadInfo.cpp
+--- a/netwerk/base/LoadInfo.cpp
++++ b/netwerk/base/LoadInfo.cpp
+@@ -895,26 +895,41 @@ LoadInfo::TakeReservedClient()
+ {
+   mReservedClientInfo.reset();
+   return Move(mReservedClient);
+ }
+ 
+ void
+ LoadInfo::SetReservedClientInfo(const ClientInfo& aClientInfo)
+ {
++  MOZ_DIAGNOSTIC_ASSERT(mInitialClientInfo.isNothing());
+   mReservedClientInfo.emplace(aClientInfo);
+ }
+ 
+ const Maybe<ClientInfo>&
+ LoadInfo::GetReservedClientInfo() const
+ {
+   return mReservedClientInfo;
+ }
+ 
+ void
++LoadInfo::SetInitialClientInfo(const ClientInfo& aClientInfo)
++{
++  MOZ_DIAGNOSTIC_ASSERT(!mReservedClient);
++  MOZ_DIAGNOSTIC_ASSERT(mReservedClientInfo.isNothing());
++  mInitialClientInfo.emplace(aClientInfo);
++}
++
++const Maybe<ClientInfo>&
++LoadInfo::GetInitialClientInfo() const
++{
++  return mInitialClientInfo;
++}
++
++void
+ LoadInfo::SetClientInfo(const ClientInfo& aClientInfo)
+ {
+   mClientInfo.emplace(aClientInfo);
+ }
+ 
+ const Maybe<ClientInfo>&
+ LoadInfo::GetClientInfo() const
+ {
+diff --git a/netwerk/base/LoadInfo.h b/netwerk/base/LoadInfo.h
+--- a/netwerk/base/LoadInfo.h
++++ b/netwerk/base/LoadInfo.h
+@@ -86,16 +86,22 @@ public:
+ 
+   void
+   SetReservedClientInfo(const mozilla::dom::ClientInfo& aClientInfo) override;
+ 
+   const Maybe<mozilla::dom::ClientInfo>&
+   GetReservedClientInfo() const override;
+ 
+   void
++  SetInitialClientInfo(const mozilla::dom::ClientInfo& aClientInfo) override;
++
++  const Maybe<mozilla::dom::ClientInfo>&
++  GetInitialClientInfo() const override;
++
++  void
+   SetClientInfo(const mozilla::dom::ClientInfo& aClientInfo) override;
+ 
+   const Maybe<mozilla::dom::ClientInfo>&
+   GetClientInfo() const override;
+ 
+   void
+   SetController(const mozilla::dom::ServiceWorkerDescriptor& aServiceWorker) override;
+ 
+@@ -152,17 +158,19 @@ private:
+ 
+   // if you add a member, please also update the copy constructor
+   nsCOMPtr<nsIPrincipal>           mLoadingPrincipal;
+   nsCOMPtr<nsIPrincipal>           mTriggeringPrincipal;
+   nsCOMPtr<nsIPrincipal>           mPrincipalToInherit;
+   nsCOMPtr<nsIPrincipal>           mSandboxedLoadingPrincipal;
+   nsCOMPtr<nsIURI>                 mResultPrincipalURI;
+   UniquePtr<mozilla::dom::ClientSource> mReservedClient;
++  // TODO: Make this a variant since we should never have both reserved and initial
+   Maybe<mozilla::dom::ClientInfo>  mReservedClientInfo;
++  Maybe<mozilla::dom::ClientInfo>  mInitialClientInfo;
+   Maybe<mozilla::dom::ClientInfo>  mClientInfo;
+   Maybe<mozilla::dom::ServiceWorkerDescriptor> mController;
+   nsWeakPtr                        mLoadingContext;
+   nsSecurityFlags                  mSecurityFlags;
+   nsContentPolicyType              mInternalContentPolicyType;
+   LoadTainting                     mTainting;
+   bool                             mUpgradeInsecureRequests;
+   bool                             mVerifySignedContent;
+diff --git a/netwerk/base/nsILoadInfo.idl b/netwerk/base/nsILoadInfo.idl
+--- a/netwerk/base/nsILoadInfo.idl
++++ b/netwerk/base/nsILoadInfo.idl
+@@ -777,16 +777,22 @@ interface nsILoadInfo : nsISupports
+ 
+   virtual void
+   SetReservedClientInfo(const mozilla::dom::ClientInfo& aClientInfo) = 0;
+ 
+   virtual const mozilla::Maybe<mozilla::dom::ClientInfo>&
+   GetReservedClientInfo() const = 0;
+ 
+   virtual void
++  SetInitialClientInfo(const mozilla::dom::ClientInfo& aClientInfo) = 0;
++
++  virtual const mozilla::Maybe<mozilla::dom::ClientInfo>&
++  GetInitialClientInfo() const = 0;
++
++  virtual void
+   SetClientInfo(const mozilla::dom::ClientInfo& aClientInfo) = 0;
+ 
+   virtual const mozilla::Maybe<mozilla::dom::ClientInfo>&
+   GetClientInfo() const = 0;
+ 
+   virtual void
+   SetController(const mozilla::dom::ServiceWorkerDescriptor& aServiceWorker) = 0;
+ 
