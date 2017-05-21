@@ -1,0 +1,124 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  700e0c67240af4e74d8ee58d09509d8436e04edc
+Bug 1363829 P4 Store the scheduled delay on Timeout instead of relying on the nsITimer to hold it. r=ehsan
+
+diff --git a/dom/base/Timeout.cpp b/dom/base/Timeout.cpp
+--- a/dom/base/Timeout.cpp
++++ b/dom/base/Timeout.cpp
+@@ -149,24 +149,26 @@ Timeout::SetWhenOrTimeRemaining(const Ti
+ 
+   // If we are frozen simply set mTimeRemaining to be the "time remaining" in
+   // the timeout (i.e., the interval itself).  This will be used to create a
+   // new mWhen time when the window is thawed.  The end effect is that time does
+   // not appear to pass for frozen windows.
+   if (mWindow->IsFrozen()) {
+     mWhen = TimeStamp();
+     mTimeRemaining = aDelay;
++    mScheduledDelay = TimeDuration(0);
+     return;
+   }
+ 
+   // Since we are not frozen we must set a precise mWhen target wakeup
+   // time.  Even if we are suspended we want to use this target time so
+   // that it appears time passes while suspended.
+   mWhen = aBaseTime + aDelay;
+   mTimeRemaining = TimeDuration(0);
++  mScheduledDelay = aDelay;
+ }
+ 
+ void
+ Timeout::SetDummyWhen(const TimeStamp& aWhen)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(!mWindow);
+   mWhen = aWhen;
+ }
+@@ -184,10 +186,17 @@ const TimeDuration&
+ Timeout::TimeRemaining() const
+ {
+   MOZ_DIAGNOSTIC_ASSERT(mWhen.IsNull());
+   // Note, mWindow->IsFrozen() can be false here.  The Thaw() method calls
+   // TimeRemaining() to calculate the new When() value.
+   return mTimeRemaining;
+ }
+ 
++const TimeDuration&
++Timeout::ScheduledDelay() const
++{
++  MOZ_DIAGNOSTIC_ASSERT(!mWhen.IsNull());
++  return mScheduledDelay;
++}
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/base/Timeout.h b/dom/base/Timeout.h
+--- a/dom/base/Timeout.h
++++ b/dom/base/Timeout.h
+@@ -59,16 +59,19 @@ public:
+   void SetDummyWhen(const TimeStamp& aWhen);
+ 
+   // Can only be called when not frozen.
+   const TimeStamp& When() const;
+ 
+   // Can only be called when frozen.
+   const TimeDuration& TimeRemaining() const;
+ 
++  // Can only be called when not frozen.
++  const TimeDuration& ScheduledDelay() const;
++
+   // Window for which this timeout fires
+   RefPtr<nsGlobalWindow> mWindow;
+ 
+   // The actual timer object
+   nsCOMPtr<nsITimer> mTimer;
+ 
+   // True if the timeout was cleared
+   bool mCleared;
+@@ -108,18 +111,23 @@ public:
+   RefPtr<Timeout> mClosureSelfRef;
+ 
+ private:
+   // mWhen and mTimeRemaining can't be in a union, sadly, because they
+   // have constructors.
+   // Nominal time to run this timeout.  Use only when timeouts are not
+   // frozen.
+   TimeStamp mWhen;
++
+   // Remaining time to wait.  Used only when timeouts are frozen.
+   TimeDuration mTimeRemaining;
+ 
++  // The actual interval in milliseconds.  This may be throttled to
++  // a longer delay than mInterval for a number of reasons.
++  TimeDuration mScheduledDelay;
++
+   ~Timeout();
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_timeout_h
+diff --git a/dom/base/TimeoutManager.cpp b/dom/base/TimeoutManager.cpp
+--- a/dom/base/TimeoutManager.cpp
++++ b/dom/base/TimeoutManager.cpp
+@@ -1109,19 +1109,17 @@ TimeoutManager::Timeouts::ResetTimersFor
+     // We reduced our throttled delay. Re-init the timer appropriately.
+     // Compute the interval the timer should have had if it had not been set in a
+     // background window
+     TimeDuration interval =
+       TimeDuration::FromMilliseconds(
+           std::max(timeout->mInterval,
+                    uint32_t(aTimeoutManager.
+                                 DOMMinTimeoutValue(timeout->mIsTracking))));
+-    uint32_t oldIntervalMillisecs = 0;
+-    timeout->mTimer->GetDelay(&oldIntervalMillisecs);
+-    TimeDuration oldInterval = TimeDuration::FromMilliseconds(oldIntervalMillisecs);
++    const TimeDuration& oldInterval = timeout->ScheduledDelay();
+     if (oldInterval > interval) {
+       // unclamp
+       TimeStamp firingTime =
+         std::max(timeout->When() - oldInterval + interval, now);
+ 
+       NS_ASSERTION(firingTime < timeout->When(),
+                    "Our firing time should strictly decrease!");
+ 

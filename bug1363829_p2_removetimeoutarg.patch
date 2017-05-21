@@ -1,0 +1,238 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  7257ddaec0871a6e1161124e2af835aa22aaf3cf
+Bug 1363829 P2 Removing the Timeout argument to TimeoutManager::RunTimeout(). r=ehsan
+
+diff --git a/dom/base/Timeout.cpp b/dom/base/Timeout.cpp
+--- a/dom/base/Timeout.cpp
++++ b/dom/base/Timeout.cpp
+@@ -55,17 +55,17 @@ NS_IMPL_CYCLE_COLLECTION_ROOT_NATIVE(Tim
+ NS_IMPL_CYCLE_COLLECTION_UNROOT_NATIVE(Timeout, Release)
+ 
+ namespace {
+ 
+ void
+ TimerCallback(nsITimer*, void* aClosure)
+ {
+   RefPtr<Timeout> timeout = (Timeout*)aClosure;
+-  timeout->mWindow->AsInner()->TimeoutManager().RunTimeout(timeout);
++  timeout->mWindow->AsInner()->TimeoutManager().RunTimeout(timeout->When());
+ }
+ 
+ void
+ TimerNameCallback(nsITimer* aTimer, bool aAnonymize, void* aClosure,
+                   char* aBuf, size_t aLen)
+ {
+   RefPtr<Timeout> timeout = (Timeout*)aClosure;
+ 
+diff --git a/dom/base/TimeoutManager.cpp b/dom/base/TimeoutManager.cpp
+--- a/dom/base/TimeoutManager.cpp
++++ b/dom/base/TimeoutManager.cpp
+@@ -575,19 +575,19 @@ TimeoutManager::ClearTimeout(int32_t aTi
+       }
+       return true; // abort!
+     }
+     return false;
+   });
+ }
+ 
+ void
+-TimeoutManager::RunTimeout(Timeout* aTimeout)
++TimeoutManager::RunTimeout(const TimeStamp& aTargetDeadline)
+ {
+-  MOZ_DIAGNOSTIC_ASSERT(aTimeout);
++  MOZ_DIAGNOSTIC_ASSERT(!aTargetDeadline.IsNull());
+ 
+   if (mWindow.IsSuspended()) {
+     return;
+   }
+ 
+   NS_ASSERTION(!mWindow.IsFrozen(), "Timeout running on a window in the bfcache!");
+ 
+   // Limit the overall time spent in RunTimeout() to reduce jank.
+@@ -626,44 +626,42 @@ TimeoutManager::RunTimeout(Timeout* aTim
+   // the same as the lifetime of the containing nsGlobalWindow.
+   Unused << windowKungFuDeathGrip;
+ 
+   // A native timer has gone off. See which of our timeouts need
+   // servicing
+   TimeStamp now = TimeStamp::Now();
+   TimeStamp deadline;
+ 
+-  if (aTimeout->When() > now) {
++  if (aTargetDeadline > now) {
+     // The OS timer fired early (which can happen due to the timers
+     // having lower precision than TimeStamp does).  Set |deadline| to
+     // be the time when the OS timer *should* have fired so that any
+-    // timers that *should* have fired before aTimeout *will* be fired
+-    // now.
++    // timers that *should* have fired *will* be fired now.
+ 
+-    deadline = aTimeout->When();
++    deadline = aTargetDeadline;
+   } else {
+     deadline = now;
+   }
+ 
+   // The timeout list is kept in deadline order. Discover the latest timeout
+   // whose deadline has expired. On some platforms, native timeout events fire
+-  // "early", but we handled that above by setting deadline to aTimeout->When()
++  // "early", but we handled that above by setting deadline to aTargetDeadline
+   // if the timer fired early.  So we can stop walking if we get to timeouts
+   // whose When() is greater than deadline, since once that happens we know
+   // nothing past that point is expired.
+   {
+     // Use a nested scope in order to make sure the strong references held by
+     // the iterator are freed after the loop.
+     OrderedTimeoutIterator expiredIter(mNormalTimeouts,
+                                        mTrackingTimeouts,
+                                        nullptr,
+                                        nullptr);
+ 
+     uint32_t numTimersToRun = 0;
+-    bool targetTimerSeen = false;
+ 
+     while (true) {
+       Timeout* timeout = expiredIter.Next();
+       if (!timeout || timeout->When() > deadline) {
+         break;
+       }
+ 
+       if (IsInvalidFiringId(timeout->mFiringId)) {
+@@ -674,32 +672,21 @@ TimeoutManager::RunTimeout(Timeout* aTim
+         if (last_expired_timeout_is_normal) {
+           last_expired_normal_timeout = timeout;
+         } else {
+           last_expired_tracking_timeout = timeout;
+         }
+ 
+         numTimersToRun += 1;
+ 
+-        // Note that we have seen our target timer.  This means we can now
+-        // stop processing timers once we hit our threshold below.
+-        if (timeout == aTimeout) {
+-          targetTimerSeen = true;
+-        }
+-
+-        // Run only a limited number of timers based on the configured
+-        // maximum.  Note, we must always run our target timer however.
+-        // Further timers that are ready will get picked up by their own
+-        // nsITimer runnables when they execute.
+-        if (targetTimerSeen) {
+-          if (numTimersToRun % kNumTimersPerInitialElapsedCheck == 0) {
+-            TimeDuration elapsed(TimeStamp::Now() - start);
+-            if (elapsed >= initalTimeLimit) {
+-              break;
+-            }
++        // Run only a limited number of timers based on the configured maximum.
++        if (numTimersToRun % kNumTimersPerInitialElapsedCheck == 0) {
++          TimeDuration elapsed(TimeStamp::Now() - start);
++          if (elapsed >= initalTimeLimit) {
++            break;
+           }
+         }
+       }
+ 
+       expiredIter.UpdateIterator();
+     }
+   }
+ 
+@@ -744,18 +731,16 @@ TimeoutManager::RunTimeout(Timeout* aTim
+ 
+   last_tracking_insertion_point = mTrackingTimeouts.InsertionPoint();
+   if (!last_expired_timeout_is_normal) {
+     // If we ever start setting mTrackingTimeoutInsertionPoint to a non-dummy timeout,
+     // the logic in ResetTimersForThrottleReduction will need to change.
+     mTrackingTimeouts.SetInsertionPoint(dummy_tracking_timeout);
+   }
+ 
+-  bool targetTimeoutSeen = false;
+-
+   // We stop iterating each list when we go past the last expired timeout from
+   // that list that we have observed above.  That timeout will either be the
+   // dummy timeout for the list that the last expired timeout came from, or it
+   // will be the next item after the last timeout we looked at (or nullptr if
+   // we have exhausted the entire list while looking for the last expired
+   // timeout).
+   {
+     // Use a nested scope in order to make sure the strong references held by
+@@ -801,26 +786,22 @@ TimeoutManager::RunTimeout(Timeout* aTim
+         // No context means this window was closed or never properly
+         // initialized for this language.  This timer will never fire
+         // so just remove it.
+         timeout->remove();
+         timeout->Release();
+         continue;
+       }
+ 
+-      if (timeout == aTimeout) {
+-        targetTimeoutSeen = true;
+-      }
+-
+       // This timeout is good to run
+       bool timeout_was_cleared = mWindow.RunTimeoutHandler(timeout, scx);
+       MOZ_LOG(gLog, LogLevel::Debug,
+-              ("Run%s(TimeoutManager=%p, timeout=%p, aTimeout=%p, tracking=%d) returned %d\n", timeout->mIsInterval ? "Interval" : "Timeout",
+-               this, timeout, aTimeout,
+-               int(aTimeout->mIsTracking),
++              ("Run%s(TimeoutManager=%p, timeout=%p, tracking=%d) returned %d\n", timeout->mIsInterval ? "Interval" : "Timeout",
++               this, timeout,
++               int(timeout->mIsTracking),
+                !!timeout_was_cleared));
+ 
+       if (timeout_was_cleared) {
+         // Make sure the iterator isn't holding any Timeout objects alive.
+         runIter.Clear();
+ 
+         // The running timeout's window was cleared, this means that
+         // ClearAllTimeouts() was called from a *nested* call, possibly
+@@ -873,24 +854,19 @@ TimeoutManager::RunTimeout(Timeout* aTim
+         }
+       }
+ 
+       // Release the timeout struct since it's possibly out of the list
+       timeout->Release();
+ 
+       // Check to see if we have run out of time to execute timeout handlers.
+       // If we've exceeded our time budget then terminate the loop immediately.
+-      //
+-      // Note, we only do this if we have seen the Timeout object explicitly
+-      // passed to RunTimeout().  The target timeout must always be executed.
+-      if (targetTimeoutSeen) {
+-        TimeDuration elapsed = TimeStamp::Now() - start;
+-        if (elapsed >= totalTimeLimit) {
+-          break;
+-        }
++      TimeDuration elapsed = TimeStamp::Now() - start;
++      if (elapsed >= totalTimeLimit) {
++        break;
+       }
+     }
+   }
+ 
+   // Take the dummy timeout off the head of the list
+   if (dummy_normal_timeout->isInList()) {
+     dummy_normal_timeout->remove();
+   }
+diff --git a/dom/base/TimeoutManager.h b/dom/base/TimeoutManager.h
+--- a/dom/base/TimeoutManager.h
++++ b/dom/base/TimeoutManager.h
+@@ -42,17 +42,17 @@ public:
+   nsresult SetTimeout(nsITimeoutHandler* aHandler,
+                       int32_t interval, bool aIsInterval,
+                       mozilla::dom::Timeout::Reason aReason,
+                       int32_t* aReturn);
+   void ClearTimeout(int32_t aTimerId,
+                     mozilla::dom::Timeout::Reason aReason);
+ 
+   // The timeout implementation functions.
+-  void RunTimeout(mozilla::dom::Timeout* aTimeout);
++  void RunTimeout(const TimeStamp& aTargetDeadline);
+   // Return true if |aTimeout| needs to be reinserted into the timeout list.
+   bool RescheduleTimeout(mozilla::dom::Timeout* aTimeout, const TimeStamp& now);
+ 
+   void ClearAllTimeouts();
+   uint32_t GetTimeoutId(mozilla::dom::Timeout::Reason aReason);
+ 
+   // Apply back pressure to the window if the TabGroup ThrottledEventQueue
+   // exists and has too many runnables waiting to run.  For example, increase

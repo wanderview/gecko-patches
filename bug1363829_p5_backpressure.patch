@@ -1,0 +1,339 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  b32c76db85f09da6b7acad5cf36d7196f6348cc4
+Bug 1363829 P5 Remove TimeoutManager back pressure mechanism. r=ehsan
+
+diff --git a/dom/base/TimeoutManager.cpp b/dom/base/TimeoutManager.cpp
+--- a/dom/base/TimeoutManager.cpp
++++ b/dom/base/TimeoutManager.cpp
+@@ -204,28 +204,26 @@ TimeoutManager::IsInvalidFiringId(uint32
+   // should be rare.  It can only happen with deeply nested event
+   // loop spinning.  For example, a page that does a lot of timers
+   // and a lot of sync XHRs within those timers could be slow here.
+   return !mFiringIdStack.Contains(aFiringId);
+ }
+ 
+ int32_t
+ TimeoutManager::DOMMinTimeoutValue(bool aIsTracking) const {
+-  // First apply any back pressure delay that might be in effect.
+-  int32_t value = std::max(mBackPressureDelayMS, 0);
+   // Don't use the background timeout value when the tab is playing audio.
+   // Until bug 1336484 we only used to do this for pages that use Web Audio.
+   // The original behavior was implemented in bug 11811073.
+   bool isBackground = IsBackground();
+   bool throttleTracking = aIsTracking && mThrottleTrackingTimeouts;
+   auto minValue = throttleTracking ? (isBackground ? gMinTrackingBackgroundTimeoutValue
+                                                    : gMinTrackingTimeoutValue)
+                                    : (isBackground ? gMinBackgroundTimeoutValue
+                                                    : gMinTimeoutValue);
+-  return std::max(minValue, value);
++  return minValue;
+ }
+ 
+ #define TRACKING_SEPARATE_TIMEOUT_BUCKETING_STRATEGY 0 // Consider all timeouts coming from tracking scripts as tracking
+ // These strategies are useful for testing.
+ #define ALL_NORMAL_TIMEOUT_BUCKETING_STRATEGY        1 // Consider all timeouts as normal
+ #define ALTERNATE_TIMEOUT_BUCKETING_STRATEGY         2 // Put every other timeout in the list of tracking timeouts
+ #define RANDOM_TIMEOUT_BUCKETING_STRATEGY            3 // Put timeouts into either the normal or tracking timeouts list randomly
+ static int32_t gTimeoutBucketingStrategy = 0;
+@@ -246,73 +244,25 @@ uint32_t TimeoutManager::sNestingLevel =
+ 
+ namespace {
+ 
+ // The maximum number of milliseconds to allow consecutive timer callbacks
+ // to run in a single event loop runnable.
+ #define DEFAULT_MAX_CONSECUTIVE_CALLBACKS_MILLISECONDS 4
+ uint32_t gMaxConsecutiveCallbacksMilliseconds;
+ 
+-// The number of queued runnables within the TabGroup ThrottledEventQueue
+-// at which to begin applying back pressure to the window.
+-#define DEFAULT_THROTTLED_EVENT_QUEUE_BACK_PRESSURE 5000
+-static uint32_t gThrottledEventQueueBackPressure;
+-
+-// The amount of delay to apply to timers when back pressure is triggered.
+-// As the length of the ThrottledEventQueue grows delay is increased.  The
+-// delay is scaled such that every kThrottledEventQueueBackPressure runnables
+-// in the queue equates to an additional kBackPressureDelayMS.
+-#define DEFAULT_BACK_PRESSURE_DELAY_MS 250
+-static uint32_t gBackPressureDelayMS;
+-
+-// This defines a limit for how much the delay must drop before we actually
+-// reduce back pressure throttle amount.  This makes the throttle delay
+-// a bit "sticky" once we enter back pressure.
+-#define DEFAULT_BACK_PRESSURE_DELAY_REDUCTION_THRESHOLD_MS 1000
+-static uint32_t gBackPressureDelayReductionThresholdMS;
+-
+-// The minimum delay we can reduce back pressure to before we just floor
+-// the value back to zero.  This allows us to ensure that we can exit
+-// back pressure event if there are always a small number of runnables
+-// queued up.
+-#define DEFAULT_BACK_PRESSURE_DELAY_MINIMUM_MS 100
+-static uint32_t gBackPressureDelayMinimumMS;
+-
+-// Convert a ThrottledEventQueue length to a timer delay in milliseconds.
+-// This will return a value between 0 and INT32_MAX.
+-int32_t
+-CalculateNewBackPressureDelayMS(uint32_t aBacklogDepth)
+-{
+-  double multiplier = static_cast<double>(aBacklogDepth) /
+-                      static_cast<double>(gThrottledEventQueueBackPressure);
+-  double value = static_cast<double>(gBackPressureDelayMS) * multiplier;
+-  // Avoid overflow
+-  if (value > INT32_MAX) {
+-    value = INT32_MAX;
+-  }
+-
+-  // Once we get close to an empty queue just floor the delay back to zero.
+-  // We want to ensure we don't get stuck in a condition where there is a
+-  // small amount of delay remaining due to an active, but reasonable, queue.
+-  else if (value < static_cast<double>(gBackPressureDelayMinimumMS)) {
+-    value = 0;
+-  }
+-  return static_cast<int32_t>(value);
+-}
+-
+ } // anonymous namespace
+ 
+ TimeoutManager::TimeoutManager(nsGlobalWindow& aWindow)
+   : mWindow(aWindow),
+     mExecutor(new TimeoutExecutor(this)),
+     mTimeoutIdCounter(1),
+     mNextFiringId(InvalidFiringId + 1),
+     mRunningTimeout(nullptr),
+     mIdleCallbackTimeoutCounter(1),
+-    mBackPressureDelayMS(0),
+     mThrottleTrackingTimeouts(gTrackingTimeoutThrottlingDelay <= 0)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(aWindow.IsInnerWindow());
+ 
+   MOZ_LOG(gLog, LogLevel::Debug,
+           ("TimeoutManager %p created, tracking bucketing %s\n",
+            this, gAnnotateTrackingChannels ? "enabled" : "disabled"));
+ }
+@@ -348,29 +298,16 @@ TimeoutManager::Initialize()
+                               TRACKING_SEPARATE_TIMEOUT_BUCKETING_STRATEGY);
+   Preferences::AddIntVarCache(&gTrackingTimeoutThrottlingDelay,
+                               "dom.timeout.tracking_throttling_delay",
+                               DEFAULT_TRACKING_TIMEOUT_THROTTLING_DELAY);
+   Preferences::AddBoolVarCache(&gAnnotateTrackingChannels,
+                                "privacy.trackingprotection.annotate_channels",
+                                false);
+ 
+-  Preferences::AddUintVarCache(&gThrottledEventQueueBackPressure,
+-                               "dom.timeout.throttled_event_queue_back_pressure",
+-                               DEFAULT_THROTTLED_EVENT_QUEUE_BACK_PRESSURE);
+-  Preferences::AddUintVarCache(&gBackPressureDelayMS,
+-                               "dom.timeout.back_pressure_delay_ms",
+-                               DEFAULT_BACK_PRESSURE_DELAY_MS);
+-  Preferences::AddUintVarCache(&gBackPressureDelayReductionThresholdMS,
+-                               "dom.timeout.back_pressure_delay_reduction_threshold_ms",
+-                               DEFAULT_BACK_PRESSURE_DELAY_REDUCTION_THRESHOLD_MS);
+-  Preferences::AddUintVarCache(&gBackPressureDelayMinimumMS,
+-                               "dom.timeout.back_pressure_delay_minimum_ms",
+-                               DEFAULT_BACK_PRESSURE_DELAY_MINIMUM_MS);
+-
+   Preferences::AddUintVarCache(&gMaxConsecutiveCallbacksMilliseconds,
+                                "dom.timeout.max_consecutive_callbacks_ms",
+                                DEFAULT_MAX_CONSECUTIVE_CALLBACKS_MILLISECONDS);
+ }
+ 
+ uint32_t
+ TimeoutManager::GetTimeoutId(Timeout::Reason aReason)
+ {
+@@ -455,17 +392,17 @@ TimeoutManager::SetTimeout(nsITimeoutHan
+              timeout.get(), timeout->mIsTracking ? "" : "non-"));
+     break;
+   }
+ 
+   // Now clamp the actual interval we will use for the timer based on
+   uint32_t nestingLevel = sNestingLevel + 1;
+   uint32_t realInterval = interval;
+   if (aIsInterval || nestingLevel >= DOM_CLAMP_TIMEOUT_NESTING_LEVEL ||
+-      mBackPressureDelayMS > 0 || mWindow.IsBackgroundInternal() ||
++      mWindow.IsBackgroundInternal() ||
+       timeout->mIsTracking) {
+     // Don't allow timeouts less than DOMMinTimeoutValue() from
+     // now...
+     realInterval = std::max(realInterval,
+                             uint32_t(DOMMinTimeoutValue(timeout->mIsTracking)));
+   }
+ 
+   timeout->mWindow = &mWindow;
+@@ -896,129 +833,16 @@ TimeoutManager::RunTimeout(const TimeSta
+   if (dummy_tracking_timeout->isInList()) {
+     dummy_tracking_timeout->remove();
+   }
+   timeoutExtraRef2 = nullptr;
+   MOZ_ASSERT(dummy_tracking_timeout->HasRefCnt(1), "dummy_tracking_timeout may leak");
+ 
+   mNormalTimeouts.SetInsertionPoint(last_normal_insertion_point);
+   mTrackingTimeouts.SetInsertionPoint(last_tracking_insertion_point);
+-
+-  MaybeApplyBackPressure();
+-}
+-
+-void
+-TimeoutManager::MaybeApplyBackPressure()
+-{
+-  MOZ_ASSERT(NS_IsMainThread());
+-
+-  // If we are already in back pressure then we don't need to apply back
+-  // pressure again.  We also shouldn't need to apply back pressure while
+-  // the window is suspended.
+-  if (mBackPressureDelayMS > 0 || mWindow.IsSuspended()) {
+-    return;
+-  }
+-
+-  RefPtr<ThrottledEventQueue> queue =
+-    do_QueryObject(mWindow.TabGroup()->EventTargetFor(TaskCategory::Timer));
+-  if (!queue) {
+-    return;
+-  }
+-
+-  // Only begin back pressure if the window has greatly fallen behind the main
+-  // thread.  This is a somewhat arbitrary threshold chosen such that it should
+-  // rarely fire under normaly circumstances.  Its low enough, though,
+-  // that we should have time to slow new runnables from being added before an
+-  // OOM occurs.
+-  if (queue->Length() < gThrottledEventQueueBackPressure) {
+-    return;
+-  }
+-
+-  // First attempt to dispatch a runnable to update our back pressure state.  We
+-  // do this first in order to verify we can dispatch successfully before
+-  // entering the back pressure state.
+-  nsCOMPtr<nsIRunnable> r =
+-    NewNonOwningRunnableMethod<StoreRefPtrPassByPtr<nsGlobalWindow>>(this,
+-      &TimeoutManager::CancelOrUpdateBackPressure, &mWindow);
+-  nsresult rv = queue->Dispatch(r.forget(), NS_DISPATCH_NORMAL);
+-  NS_ENSURE_SUCCESS_VOID(rv);
+-
+-  // Since the callback was scheduled successfully we can now persist the
+-  // backpressure value.
+-  mBackPressureDelayMS = CalculateNewBackPressureDelayMS(queue->Length());
+-
+-  MOZ_LOG(gLog, LogLevel::Debug,
+-          ("Applying %dms of back pressure to TimeoutManager %p "
+-           "because of a queue length of %u\n",
+-           mBackPressureDelayMS, this,
+-           queue->Length()));
+-}
+-
+-void
+-TimeoutManager::CancelOrUpdateBackPressure(nsGlobalWindow* aWindow)
+-{
+-  MOZ_ASSERT(NS_IsMainThread());
+-  MOZ_ASSERT(aWindow == &mWindow);
+-  MOZ_ASSERT(mBackPressureDelayMS > 0);
+-
+-  // First, re-calculate the back pressure delay.
+-  RefPtr<ThrottledEventQueue> queue =
+-    do_QueryObject(mWindow.TabGroup()->EventTargetFor(TaskCategory::Timer));
+-  auto queueLength = queue ? queue->Length() : 0;
+-  int32_t newBackPressureDelayMS = CalculateNewBackPressureDelayMS(queueLength);
+-
+-  MOZ_LOG(gLog, LogLevel::Debug,
+-          ("Updating back pressure from %d to %dms for TimeoutManager %p "
+-           "because of a queue length of %u\n",
+-           mBackPressureDelayMS, newBackPressureDelayMS,
+-           this, queueLength));
+-
+-  // If the delay has increased, then simply apply it.  Increasing the delay
+-  // does not risk re-ordering timers with similar parameters.  We want to
+-  // extra careful not to re-order sequential calls to setTimeout(func, 0),
+-  // for example.
+-  if (newBackPressureDelayMS > mBackPressureDelayMS) {
+-    mBackPressureDelayMS = newBackPressureDelayMS;
+-  }
+-
+-  // If the delay has decreased, though, we only apply the new value if it has
+-  // reduced significantly.  This hysteresis avoids thrashing the back pressure
+-  // value back and forth rapidly.  This is important because reducing the
+-  // backpressure delay requires calling ResetTimerForThrottleReduction() which
+-  // can be quite expensive.  We only want to call that method if the back log
+-  // is really clearing.
+-  else if (newBackPressureDelayMS == 0 ||
+-           (static_cast<uint32_t>(mBackPressureDelayMS) >
+-           (newBackPressureDelayMS + gBackPressureDelayReductionThresholdMS))) {
+-    int32_t oldBackPressureDelayMS = mBackPressureDelayMS;
+-    mBackPressureDelayMS = newBackPressureDelayMS;
+-
+-    // If the back pressure delay has gone down we must reset any existing
+-    // timers to use the new value.  Otherwise we run the risk of executing
+-    // timer callbacks out-of-order.
+-    ResetTimersForThrottleReduction(oldBackPressureDelayMS);
+-  }
+-
+-  // If all of the back pressure delay has been removed then we no longer need
+-  // to check back pressure updates.  We can simply return without scheduling
+-  // another update runnable.
+-  if (!mBackPressureDelayMS) {
+-    return;
+-  }
+-
+-  // Otherwise, if there is a back pressure delay still in effect we need
+-  // queue a runnable to check if it can be reduced in the future.  Note
+-  // that this runnable is dispatched to the ThrottledEventQueue.  This
+-  // means we will not check for a new value until the current back log
+-  // has been processed.  The next update will only keep back pressure if
+-  // more runnables continue to be dispatched to the queue.
+-  nsCOMPtr<nsIRunnable> r =
+-    NewNonOwningRunnableMethod<StoreRefPtrPassByPtr<nsGlobalWindow>>(this,
+-      &TimeoutManager::CancelOrUpdateBackPressure, &mWindow);
+-  MOZ_ALWAYS_SUCCEEDS(queue->Dispatch(r.forget(), NS_DISPATCH_NORMAL));
+ }
+ 
+ bool
+ TimeoutManager::RescheduleTimeout(Timeout* aTimeout, const TimeStamp& now)
+ {
+   if (!aTimeout->mIsInterval) {
+     return false;
+   }
+diff --git a/dom/base/TimeoutManager.h b/dom/base/TimeoutManager.h
+--- a/dom/base/TimeoutManager.h
++++ b/dom/base/TimeoutManager.h
+@@ -50,25 +50,16 @@ public:
+   // The timeout implementation functions.
+   void RunTimeout(const TimeStamp& aTargetDeadline);
+   // Return true if |aTimeout| needs to be reinserted into the timeout list.
+   bool RescheduleTimeout(mozilla::dom::Timeout* aTimeout, const TimeStamp& now);
+ 
+   void ClearAllTimeouts();
+   uint32_t GetTimeoutId(mozilla::dom::Timeout::Reason aReason);
+ 
+-  // Apply back pressure to the window if the TabGroup ThrottledEventQueue
+-  // exists and has too many runnables waiting to run.  For example, increase
+-  // the minimum timer delay, etc.
+-  void MaybeApplyBackPressure();
+-
+-  // Check the current ThrottledEventQueue depth and update the back pressure
+-  // state.  If the queue has drained back pressure may be canceled.
+-  void CancelOrUpdateBackPressure(nsGlobalWindow* aWindow);
+-
+   // When timers are being throttled and we reduce the thottle delay we must
+   // reschedule.  The amount of the old throttle delay must be provided in
+   // order to bound how many timers must be examined.
+   nsresult ResetTimersForThrottleReduction();
+ 
+   int32_t DOMMinTimeoutValue(bool aIsTracking) const;
+ 
+   // aTimeout is the timeout that we're about to start running.  This function
+@@ -228,18 +219,16 @@ private:
+   uint32_t                    mTimeoutIdCounter;
+   uint32_t                    mNextFiringId;
+   AutoTArray<uint32_t, 2>     mFiringIdStack;
+   mozilla::dom::Timeout*      mRunningTimeout;
+ 
+    // The current idle request callback timeout handle
+   uint32_t                    mIdleCallbackTimeoutCounter;
+ 
+-  int32_t                     mBackPressureDelayMS;
+-
+   nsCOMPtr<nsITimer>          mThrottleTrackingTimeoutsTimer;
+   bool                        mThrottleTrackingTimeouts;
+ 
+   static uint32_t             sNestingLevel;
+ };
+ 
+ }
+ }

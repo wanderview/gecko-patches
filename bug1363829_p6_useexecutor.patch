@@ -1,0 +1,601 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  adbdd3b0eefdb736c635387c0f549e23dfccb2d9
+Bug 1363829 P6 Use the TimeoutExecutor in TimeoutManager. r=ehsan
+
+diff --git a/dom/base/TimeoutManager.cpp b/dom/base/TimeoutManager.cpp
+--- a/dom/base/TimeoutManager.cpp
++++ b/dom/base/TimeoutManager.cpp
+@@ -8,16 +8,17 @@
+ #include "nsGlobalWindow.h"
+ #include "mozilla/Logging.h"
+ #include "mozilla/Telemetry.h"
+ #include "mozilla/ThrottledEventQueue.h"
+ #include "mozilla/TimeStamp.h"
+ #include "nsITimeoutHandler.h"
+ #include "mozilla/dom/TabGroup.h"
+ #include "OrderedTimeoutIterator.h"
++#include "TimeoutExecutor.h"
+ 
+ using namespace mozilla;
+ using namespace mozilla::dom;
+ 
+ static LazyLogModule gLog("Timeout");
+ 
+ // Time between sampling timeout execution time.
+ const uint32_t kTelemetryPeriodMS = 1000;
+@@ -296,16 +297,17 @@ CalculateNewBackPressureDelayMS(uint32_t
+   }
+   return static_cast<int32_t>(value);
+ }
+ 
+ } // anonymous namespace
+ 
+ TimeoutManager::TimeoutManager(nsGlobalWindow& aWindow)
+   : mWindow(aWindow),
++    mExecutor(new TimeoutExecutor(this)),
+     mTimeoutIdCounter(1),
+     mNextFiringId(InvalidFiringId + 1),
+     mRunningTimeout(nullptr),
+     mIdleCallbackTimeoutCounter(1),
+     mBackPressureDelayMS(0),
+     mThrottleTrackingTimeouts(gTrackingTimeoutThrottlingDelay <= 0)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(aWindow.IsInnerWindow());
+@@ -315,16 +317,18 @@ TimeoutManager::TimeoutManager(nsGlobalW
+            this, gAnnotateTrackingChannels ? "enabled" : "disabled"));
+ }
+ 
+ TimeoutManager::~TimeoutManager()
+ {
+   MOZ_DIAGNOSTIC_ASSERT(mWindow.AsInner()->InnerObjectsFreed());
+   MOZ_DIAGNOSTIC_ASSERT(!mThrottleTrackingTimeoutsTimer);
+ 
++  mExecutor->Shutdown();
++
+   MOZ_LOG(gLog, LogLevel::Debug,
+           ("TimeoutManager %p destroyed\n", this));
+ }
+ 
+ /* static */
+ void
+ TimeoutManager::Initialize()
+ {
+@@ -469,24 +473,17 @@ TimeoutManager::SetTimeout(nsITimeoutHan
+ 
+   TimeDuration delta = TimeDuration::FromMilliseconds(realInterval);
+   timeout->SetWhenOrTimeRemaining(TimeStamp::Now(), delta);
+ 
+   // If we're not suspended, then set the timer.
+   if (!mWindow.IsSuspended()) {
+     MOZ_ASSERT(!timeout->When().IsNull());
+ 
+-    nsresult rv;
+-    timeout->mTimer = do_CreateInstance("@mozilla.org/timer;1", &rv);
+-    if (NS_FAILED(rv)) {
+-      return rv;
+-    }
+-
+-    rv = timeout->InitTimer(mWindow.EventTargetFor(TaskCategory::Timer),
+-                            realInterval);
++    nsresult rv = mExecutor->MaybeSchedule(timeout->When());
+     if (NS_FAILED(rv)) {
+       return rv;
+     }
+   }
+ 
+   if (!aIsInterval) {
+     timeout->mNestingLevel = nestingLevel;
+   }
+@@ -540,38 +537,59 @@ TimeoutManager::SetTimeout(nsITimeoutHan
+   return NS_OK;
+ }
+ 
+ void
+ TimeoutManager::ClearTimeout(int32_t aTimerId, Timeout::Reason aReason)
+ {
+   uint32_t timerId = (uint32_t)aTimerId;
+ 
++  bool firstTimeout = true;
++
+   ForEachUnorderedTimeoutAbortable([&](Timeout* aTimeout) {
+     MOZ_LOG(gLog, LogLevel::Debug,
+             ("Clear%s(TimeoutManager=%p, timeout=%p, aTimerId=%u, ID=%u, tracking=%d)\n", aTimeout->mIsInterval ? "Interval" : "Timeout",
+              this, aTimeout, timerId, aTimeout->mTimeoutId,
+              int(aTimeout->mIsTracking)));
+ 
+     if (aTimeout->mTimeoutId == timerId && aTimeout->mReason == aReason) {
+       if (aTimeout->mRunning) {
+         /* We're running from inside the aTimeout. Mark this
+            aTimeout for deferred deletion by the code in
+            RunTimeout() */
+         aTimeout->mIsInterval = false;
+       }
+       else {
+         /* Delete the aTimeout from the pending aTimeout list */
+-        aTimeout->MaybeCancelTimer();
+         aTimeout->remove();
+       }
+       return true; // abort!
+     }
++
++    firstTimeout = false;
++
+     return false;
+   });
++
++  if (!firstTimeout) {
++    return;
++  }
++
++  // If the first timeout was cancelled we need to stop the executor and
++  // restart at the next soonest deadline.
++  mExecutor->Cancel();
++
++  OrderedTimeoutIterator iter(mNormalTimeouts,
++                              mTrackingTimeouts,
++                              nullptr,
++                              nullptr);
++  Timeout* nextTimeout = iter.Next();
++  if (nextTimeout) {
++    MOZ_ALWAYS_SUCCEEDS(mExecutor->MaybeSchedule(nextTimeout->When()));
++  }
+ }
+ 
+ void
+ TimeoutManager::RunTimeout(const TimeStamp& aTargetDeadline)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(!aTargetDeadline.IsNull());
+ 
+   if (mWindow.IsSuspended()) {
+@@ -627,16 +645,18 @@ TimeoutManager::RunTimeout(const TimeSta
+     // be the time when the OS timer *should* have fired so that any
+     // timers that *should* have fired *will* be fired now.
+ 
+     deadline = aTargetDeadline;
+   } else {
+     deadline = now;
+   }
+ 
++  TimeStamp nextDeadline;
++
+   // The timeout list is kept in deadline order. Discover the latest timeout
+   // whose deadline has expired. On some platforms, native timeout events fire
+   // "early", but we handled that above by setting deadline to aTargetDeadline
+   // if the timer fired early.  So we can stop walking if we get to timeouts
+   // whose When() is greater than deadline, since once that happens we know
+   // nothing past that point is expired.
+   {
+     // Use a nested scope in order to make sure the strong references held by
+@@ -646,16 +666,19 @@ TimeoutManager::RunTimeout(const TimeSta
+                                        nullptr,
+                                        nullptr);
+ 
+     uint32_t numTimersToRun = 0;
+ 
+     while (true) {
+       Timeout* timeout = expiredIter.Next();
+       if (!timeout || timeout->When() > deadline) {
++        if (timeout) {
++          nextDeadline = timeout->When();
++        }
+         break;
+       }
+ 
+       if (IsInvalidFiringId(timeout->mFiringId)) {
+         // Mark any timeouts that are on the list to be fired with the
+         // firing depth so that we can reentrantly run timeouts
+         timeout->mFiringId = firingId;
+         last_expired_timeout_is_normal = expiredIter.PickedNormalIter();
+@@ -666,25 +689,32 @@ TimeoutManager::RunTimeout(const TimeSta
+         }
+ 
+         numTimersToRun += 1;
+ 
+         // Run only a limited number of timers based on the configured maximum.
+         if (numTimersToRun % kNumTimersPerInitialElapsedCheck == 0) {
+           TimeDuration elapsed(TimeStamp::Now() - start);
+           if (elapsed >= initalTimeLimit) {
++            nextDeadline = timeout->When();
+             break;
+           }
+         }
+       }
+ 
+       expiredIter.UpdateIterator();
+     }
+   }
+ 
++  // Wherever we stopped in the timer list, schedule the executor to
++  // run for the next unexpired deadline.
++  if (!nextDeadline.IsNull()) {
++    MOZ_ALWAYS_SUCCEEDS(mExecutor->MaybeSchedule(nextDeadline));
++  }
++
+   // Maybe the timeout that the event was fired for has been deleted
+   // and there are no others timeouts with deadlines that make them
+   // eligible for execution yet. Go away.
+   if (!last_expired_normal_timeout && !last_expired_tracking_timeout) {
+     return;
+   }
+ 
+   // Insert a dummy timeout into the list of timeouts between the
+@@ -821,16 +851,22 @@ TimeoutManager::RunTimeout(const TimeSta
+                                                     : Timeouts::SortBy::TimeWhen);
+         }
+       }
+ 
+       // Check to see if we have run out of time to execute timeout handlers.
+       // If we've exceeded our time budget then terminate the loop immediately.
+       TimeDuration elapsed = TimeStamp::Now() - start;
+       if (elapsed >= totalTimeLimit) {
++        // We ran out of time.  Make sure to schedule the executor to
++        // run immediately for the next timer, if it exists.
++        RefPtr<Timeout> timeout = runIter.Next();
++        if (timeout) {
++          MOZ_ALWAYS_SUCCEEDS(mExecutor->MaybeSchedule(timeout->When()));
++        }
+         break;
+       }
+     }
+   }
+ 
+   // Take the dummy timeout off the head of the list
+   if (dummy_normal_timeout->isInList()) {
+     dummy_normal_timeout->remove();
+@@ -955,20 +991,16 @@ TimeoutManager::CancelOrUpdateBackPressu
+       &TimeoutManager::CancelOrUpdateBackPressure, &mWindow);
+   MOZ_ALWAYS_SUCCEEDS(queue->Dispatch(r.forget(), NS_DISPATCH_NORMAL));
+ }
+ 
+ bool
+ TimeoutManager::RescheduleTimeout(Timeout* aTimeout, const TimeStamp& now)
+ {
+   if (!aTimeout->mIsInterval) {
+-    // The timeout still has an OS timer, and it's not an interval,
+-    // that means that the OS timer could still fire; cancel the OS
+-    // timer and release its reference to the timeout.
+-    aTimeout->MaybeCancelTimer();
+     return false;
+   }
+ 
+   // Compute time to next timeout for interval timer.
+   // Make sure nextInterval is at least DOMMinTimeoutValue().
+   TimeDuration nextInterval =
+     TimeDuration::FromMilliseconds(
+         std::max(aTimeout->mInterval,
+@@ -983,37 +1015,25 @@ TimeoutManager::RescheduleTimeout(Timeou
+   // thread is firing our timers somewhat early or if they're taking a long
+   // time to run the callback.
+   if (delay < TimeDuration(0)) {
+     delay = TimeDuration(0);
+   }
+ 
+   aTimeout->SetWhenOrTimeRemaining(currentNow, delay);
+ 
+-  if (!aTimeout->mTimer) {
+-    MOZ_DIAGNOSTIC_ASSERT(mWindow.IsFrozen() || mWindow.IsSuspended());
++  if (mWindow.IsSuspended()) {
+     return true;
+   }
+ 
+   // Reschedule the OS timer. Don't bother returning any error codes if
+   // this fails since the callers of this method don't care about them.
+-  nsresult rv = aTimeout->InitTimer(mWindow.EventTargetFor(TaskCategory::Timer),
+-                                    delay.ToMilliseconds());
+-
++  nsresult rv = mExecutor->MaybeSchedule(aTimeout->When());
+   if (NS_FAILED(rv)) {
+     NS_ERROR("Error initializing timer for DOM timeout!");
+-
+-    // We failed to initialize the new OS timer, this timer does
+-    // us no good here so we just cancel it (just in case) and
+-    // null out the pointer to the OS timer, this will release the
+-    // OS timer. As we continue executing the code below we'll end
+-    // up deleting the timeout since it's not an interval timeout
+-    // any more (since timeout->mTimer == nullptr).
+-    aTimeout->MaybeCancelTimer();
+-
+     return false;
+   }
+ 
+   return true;
+ }
+ 
+ nsresult
+ TimeoutManager::ResetTimersForThrottleReduction()
+@@ -1028,36 +1048,42 @@ TimeoutManager::ResetTimersForThrottleRe
+ 
+   if (mWindow.IsFrozen() || mWindow.IsSuspended()) {
+     return NS_OK;
+   }
+ 
+   Timeouts::SortBy sortBy = mWindow.IsFrozen() ? Timeouts::SortBy::TimeRemaining
+                                                : Timeouts::SortBy::TimeWhen;
+ 
+-  nsCOMPtr<nsIEventTarget> queue = mWindow.EventTargetFor(TaskCategory::Timer);
+   nsresult rv = mNormalTimeouts.ResetTimersForThrottleReduction(aPreviousThrottleDelayMS,
+                                                                 *this,
+-                                                                sortBy,
+-                                                                queue);
++                                                                sortBy);
+   NS_ENSURE_SUCCESS(rv, rv);
+   rv = mTrackingTimeouts.ResetTimersForThrottleReduction(aPreviousThrottleDelayMS,
+                                                          *this,
+-                                                         sortBy,
+-                                                         queue);
++                                                         sortBy);
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
++  OrderedTimeoutIterator iter(mNormalTimeouts,
++                              mTrackingTimeouts,
++                              nullptr,
++                              nullptr);
++  Timeout* firstTimeout = iter.Next();
++  if (firstTimeout) {
++    rv = mExecutor->MaybeSchedule(firstTimeout->When());
++    NS_ENSURE_SUCCESS(rv, rv);
++  }
++
+   return NS_OK;
+ }
+ 
+ nsresult
+ TimeoutManager::Timeouts::ResetTimersForThrottleReduction(int32_t aPreviousThrottleDelayMS,
+                                                           const TimeoutManager& aTimeoutManager,
+-                                                          SortBy aSortBy,
+-                                                          nsIEventTarget* aQueue)
++                                                          SortBy aSortBy)
+ {
+   TimeStamp now = TimeStamp::Now();
+ 
+   // If insertion point is non-null, we're in the middle of firing timers and
+   // the timers we're planning to fire all come before insertion point;
+   // insertion point itself is a dummy timeout with an When() that may be
+   // semi-bogus.  In that case, we don't need to do anything with insertion
+   // point or anything before it, so should start at the timer after insertion
+@@ -1126,23 +1152,16 @@ TimeoutManager::Timeouts::ResetTimersFor
+                      timeout->When() < nextTimeout->When(), "How did that happen?");
+         timeout->remove();
+         // Insert() will reset mFiringId. Make sure to undo that.
+         uint32_t firingId = timeout->mFiringId;
+         Insert(timeout, aSortBy);
+         timeout->mFiringId = firingId;
+       }
+ 
+-      nsresult rv = timeout->InitTimer(aQueue, delay.ToMilliseconds());
+-
+-      if (NS_FAILED(rv)) {
+-        NS_WARNING("Error resetting non background timer for DOM timeout!");
+-        return rv;
+-      }
+-
+       timeout = nextTimeout;
+     } else {
+       timeout = timeout->getNext();
+     }
+   }
+ 
+   return NS_OK;
+ }
+@@ -1155,28 +1174,28 @@ TimeoutManager::ClearAllTimeouts()
+   MOZ_LOG(gLog, LogLevel::Debug,
+           ("ClearAllTimeouts(TimeoutManager=%p)\n", this));
+ 
+   if (mThrottleTrackingTimeoutsTimer) {
+     mThrottleTrackingTimeoutsTimer->Cancel();
+     mThrottleTrackingTimeoutsTimer = nullptr;
+   }
+ 
++  mExecutor->Cancel();
++
+   ForEachUnorderedTimeout([&](Timeout* aTimeout) {
+     /* If RunTimeout() is higher up on the stack for this
+        window, e.g. as a result of document.write from a timeout,
+        then we need to reset the list insertion point for
+        newly-created timeouts in case the user adds a timeout,
+        before we pop the stack back to RunTimeout. */
+     if (mRunningTimeout == aTimeout) {
+       seenRunningTimeout = true;
+     }
+ 
+-    aTimeout->MaybeCancelTimer();
+-
+     // Set timeout->mCleared to true to indicate that the timeout was
+     // cleared and taken out of the list of timeouts
+     aTimeout->mCleared = true;
+   });
+ 
+   if (seenRunningTimeout) {
+     mNormalTimeouts.SetInsertionPoint(nullptr);
+     mTrackingTimeouts.SetInsertionPoint(nullptr);
+@@ -1274,24 +1293,17 @@ TimeoutManager::Suspend()
+   MOZ_LOG(gLog, LogLevel::Debug,
+           ("Suspend(TimeoutManager=%p)\n", this));
+ 
+   if (mThrottleTrackingTimeoutsTimer) {
+     mThrottleTrackingTimeoutsTimer->Cancel();
+     mThrottleTrackingTimeoutsTimer = nullptr;
+   }
+ 
+-  ForEachUnorderedTimeout([](Timeout* aTimeout) {
+-    // Leave the timers with the current time remaining.  This will
+-    // cause the timers to potentially fire when the window is
+-    // Resume()'d.  Time effectively passes while suspended.
+-
+-    // Drop the XPCOM timer; we'll reschedule when restoring the state.
+-    aTimeout->MaybeCancelTimer();
+-  });
++  mExecutor->Cancel();
+ }
+ 
+ void
+ TimeoutManager::Resume()
+ {
+   MOZ_LOG(gLog, LogLevel::Debug,
+           ("Resume(TimeoutManager=%p)\n", this));
+ 
+@@ -1300,54 +1312,47 @@ TimeoutManager::Resume()
+   // again.
+   if (mWindow.AsInner()->IsDocumentLoaded() && !mThrottleTrackingTimeouts) {
+     MaybeStartThrottleTrackingTimout();
+   }
+ 
+   TimeStamp now = TimeStamp::Now();
+   DebugOnly<bool> _seenDummyTimeout = false;
+ 
++  TimeStamp nextWakeUp;
++
+   ForEachUnorderedTimeout([&](Timeout* aTimeout) {
+     // There's a chance we're being called with RunTimeout on the stack in which
+     // case we have a dummy timeout in the list that *must not* be resumed. It
+     // can be identified by a null mWindow.
+     if (!aTimeout->mWindow) {
+       NS_ASSERTION(!_seenDummyTimeout, "More than one dummy timeout?!");
+       _seenDummyTimeout = true;
+       return;
+     }
+ 
+-    MOZ_ASSERT(!aTimeout->mTimer);
+-
+     // The timeout When() is set to the absolute time when the timer should
+     // fire.  Recalculate the delay from now until that deadline.  If the
+     // the deadline has already passed or falls within our minimum delay
+-    // deadline, then clamp the resulting value to the minimum delay.  The
+-    // When() will remain at its absolute time, but we won'aTimeout fire the OS
+-    // timer until our calculated delay has passed.
++    // deadline, then clamp the resulting value to the minimum delay.
+     int32_t remaining = 0;
+     if (aTimeout->When() > now) {
+       remaining = static_cast<int32_t>((aTimeout->When() - now).ToMilliseconds());
+     }
+     uint32_t delay = std::max(remaining, DOMMinTimeoutValue(aTimeout->mIsTracking));
++    aTimeout->SetWhenOrTimeRemaining(now, TimeDuration::FromMilliseconds(delay));
+ 
+-    aTimeout->mTimer = do_CreateInstance("@mozilla.org/timer;1");
+-    if (!aTimeout->mTimer) {
+-      aTimeout->remove();
+-      return;
+-    }
+-
+-    nsresult rv = aTimeout->InitTimer(mWindow.EventTargetFor(TaskCategory::Timer),
+-                                      delay);
+-    if (NS_FAILED(rv)) {
+-      aTimeout->mTimer = nullptr;
+-      aTimeout->remove();
+-      return;
++    if (nextWakeUp.IsNull() || aTimeout->When() < nextWakeUp) {
++      nextWakeUp = aTimeout->When();
+     }
+   });
++
++  if (!nextWakeUp.IsNull()) {
++    MOZ_ALWAYS_SUCCEEDS(mExecutor->MaybeSchedule(nextWakeUp));
++  }
+ }
+ 
+ void
+ TimeoutManager::Freeze()
+ {
+   MOZ_LOG(gLog, LogLevel::Debug,
+           ("Freeze(TimeoutManager=%p)\n", this));
+ 
+@@ -1366,20 +1371,16 @@ TimeoutManager::Freeze()
+     // shifts timers to the right as if time does not pass while
+     // the window is frozen.
+     TimeDuration delta(0);
+     if (aTimeout->When() > now) {
+       delta = aTimeout->When() - now;
+     }
+     aTimeout->SetWhenOrTimeRemaining(now, delta);
+     MOZ_DIAGNOSTIC_ASSERT(aTimeout->TimeRemaining() == delta);
+-
+-    // Since we are suspended there should be no OS timer set for
+-    // this timeout entry.
+-    MOZ_ASSERT(!aTimeout->mTimer);
+   });
+ }
+ 
+ void
+ TimeoutManager::Thaw()
+ {
+   MOZ_LOG(gLog, LogLevel::Debug,
+           ("Thaw(TimeoutManager=%p)\n", this));
+@@ -1395,18 +1396,16 @@ TimeoutManager::Thaw()
+       NS_ASSERTION(!_seenDummyTimeout, "More than one dummy timeout?!");
+       _seenDummyTimeout = true;
+       return;
+     }
+ 
+     // Set When() back to the time when the timer is supposed to fire.
+     aTimeout->SetWhenOrTimeRemaining(now, aTimeout->TimeRemaining());
+     MOZ_DIAGNOSTIC_ASSERT(!aTimeout->When().IsNull());
+-
+-    MOZ_ASSERT(!aTimeout->mTimer);
+   });
+ }
+ 
+ bool
+ TimeoutManager::IsTimeoutTracking(uint32_t aTimeoutId)
+ {
+   return mTrackingTimeouts.ForEachAbortable([&](Timeout* aTimeout) {
+       return aTimeout->mTimeoutId == aTimeoutId;
+diff --git a/dom/base/TimeoutManager.h b/dom/base/TimeoutManager.h
+--- a/dom/base/TimeoutManager.h
++++ b/dom/base/TimeoutManager.h
+@@ -13,16 +13,17 @@
+ class nsIEventTarget;
+ class nsITimeoutHandler;
+ class nsGlobalWindow;
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ class OrderedTimeoutIterator;
++class TimeoutExecutor;
+ 
+ // This class manages the timeouts in a Window's setTimeout/setInterval pool.
+ class TimeoutManager final
+ {
+ public:
+   explicit TimeoutManager(nsGlobalWindow& aWindow);
+   ~TimeoutManager();
+   TimeoutManager(const TimeoutManager& rhs) = delete;
+@@ -150,18 +151,17 @@ private:
+     enum class SortBy
+     {
+       TimeRemaining,
+       TimeWhen
+     };
+     void Insert(mozilla::dom::Timeout* aTimeout, SortBy aSortBy);
+     nsresult ResetTimersForThrottleReduction(int32_t aPreviousThrottleDelayMS,
+                                              const TimeoutManager& aTimeoutManager,
+-                                             SortBy aSortBy,
+-                                             nsIEventTarget* aQueue);
++                                             SortBy aSortBy);
+ 
+     const Timeout* GetFirst() const { return mTimeoutList.getFirst(); }
+     Timeout* GetFirst() { return mTimeoutList.getFirst(); }
+     const Timeout* GetLast() const { return mTimeoutList.getLast(); }
+     Timeout* GetLast() { return mTimeoutList.getLast(); }
+     bool IsEmpty() const { return mTimeoutList.isEmpty(); }
+     void InsertFront(Timeout* aTimeout) { mTimeoutList.insertFront(aTimeout); }
+     void Clear() { mTimeoutList.clear(); }
+@@ -215,16 +215,17 @@ private:
+     mozilla::dom::Timeout*    mTimeoutInsertionPoint;
+   };
+ 
+   friend class OrderedTimeoutIterator;
+ 
+   // Each nsGlobalWindow object has a TimeoutManager member.  This reference
+   // points to that holder object.
+   nsGlobalWindow&             mWindow;
++  RefPtr<TimeoutExecutor>     mExecutor;
+   // The list of timeouts coming from non-tracking scripts.
+   Timeouts                    mNormalTimeouts;
+   // The list of timeouts coming from scripts on the tracking protection list.
+   Timeouts                    mTrackingTimeouts;
+   uint32_t                    mTimeoutIdCounter;
+   uint32_t                    mNextFiringId;
+   AutoTArray<uint32_t, 2>     mFiringIdStack;
+   mozilla::dom::Timeout*      mRunningTimeout;
