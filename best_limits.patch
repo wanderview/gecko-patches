@@ -1,0 +1,165 @@
+# HG changeset patch
+# Parent  14b5795d374010eb8a1ce02e1fa2fb17bb8cf1b0
+
+diff --git a/dom/base/TimeoutExecutor.cpp b/dom/base/TimeoutExecutor.cpp
+--- a/dom/base/TimeoutExecutor.cpp
++++ b/dom/base/TimeoutExecutor.cpp
+@@ -56,30 +56,17 @@ TimeoutExecutor::ScheduleDelayed(const T
+   // Always call Cancel() in case we are re-using a timer.  Otherwise
+   // the subsequent SetTarget() may fail.
+   rv = mTimer->Cancel();
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   rv = mTimer->SetTarget(mOwner->EventTarget());
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+-  // Convert the precise delay to integral milliseconds for nsITimer.  We can
+-  // round down as long as its within our mFlexTime.  If we round down more
+-  // than this than we might have to trigger another nsITimer after this one
+-  // fires.  Instead, round up to the next integral millisecond if rounding
+-  // down would exceed our mFlexTime.
+-  //
+-  // For example:
+-  //  * if delay is 5.4ms and our flex time is 0.25ms, then round up to 6ms
+-  //  * if delay is 5.4ms and our flex time is 0.5ms, then round down to 5ms
+-  TimeDuration delay = aDeadline - aNow;
+-  uint32_t delayMS = static_cast<uint32_t>(delay.ToMilliseconds() +
+-                                           1.0 - mFlexTime.ToMilliseconds());
+-
+-  rv = mTimer->InitWithCallback(this, delayMS,
++  rv = mTimer->InitWithCallback(this, (aDeadline - aNow).ToMilliseconds(),
+                                 nsITimer::TYPE_ONE_SHOT);
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   mMode = Mode::Delayed;
+   mDeadline = aDeadline;
+ 
+   return NS_OK;
+ }
+@@ -143,17 +130,17 @@ TimeoutExecutor::MaybeExecute()
+ 
+   Cancel();
+ 
+   mOwner->RunTimeout(now, deadline);
+ }
+ 
+ TimeoutExecutor::TimeoutExecutor(TimeoutManager* aOwner)
+   : mOwner(aOwner)
+-  , mFlexTime(TimeDuration::FromMicroseconds(PR_IntervalToMicroseconds(1) / 2))
++  , mFlexTime(TimeDuration::FromMilliseconds(0.1))
+   , mMode(Mode::None)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(mOwner);
+ }
+ 
+ void
+ TimeoutExecutor::Shutdown()
+ {
+diff --git a/dom/base/TimeoutManager.cpp b/dom/base/TimeoutManager.cpp
+--- a/dom/base/TimeoutManager.cpp
++++ b/dom/base/TimeoutManager.cpp
+@@ -545,17 +545,18 @@ TimeoutManager::RunTimeout(const TimeSta
+     TimeDuration::FromMilliseconds(totalTimeLimit.ToMilliseconds() / 4);
+ 
+   // Ammortize overhead from from calling TimeStamp::Now() in the initial
+   // loop, though, by only checking for an elapsed limit every N timeouts.
+   const uint32_t kNumTimersPerInitialElapsedCheck = 100;
+ 
+   // Start measuring elapsed time immediately.  We won't potentially expire
+   // the time budget until at least one Timeout has run, though.
+-  TimeStamp start = aNow;
++  TimeStamp now(aNow);
++  TimeStamp start = now;
+ 
+   Timeout* last_expired_normal_timeout = nullptr;
+   Timeout* last_expired_tracking_timeout = nullptr;
+   bool     last_expired_timeout_is_normal = false;
+   Timeout* last_normal_insertion_point = nullptr;
+   Timeout* last_tracking_insertion_point = nullptr;
+ 
+   uint32_t firingId = CreateFiringId();
+@@ -570,25 +571,25 @@ TimeoutManager::RunTimeout(const TimeSta
+   // members of mWindow here is safe, because the lifetime of TimeoutManager is
+   // the same as the lifetime of the containing nsGlobalWindow.
+   Unused << windowKungFuDeathGrip;
+ 
+   // A native timer has gone off. See which of our timeouts need
+   // servicing
+   TimeStamp deadline;
+ 
+-  if (aTargetDeadline > aNow) {
++  if (aTargetDeadline > now) {
+     // The OS timer fired early (which can happen due to the timers
+     // having lower precision than TimeStamp does).  Set |deadline| to
+     // be the time when the OS timer *should* have fired so that any
+     // timers that *should* have fired *will* be fired now.
+ 
+     deadline = aTargetDeadline;
+   } else {
+-    deadline = aNow;
++    deadline = now;
+   }
+ 
+   TimeStamp nextDeadline;
+ 
+   // The timeout list is kept in deadline order. Discover the latest timeout
+   // whose deadline has expired. On some platforms, native timeout events fire
+   // "early", but we handled that above by setting deadline to aTargetDeadline
+   // if the timer fired early.  So we can stop walking if we get to timeouts
+@@ -635,16 +636,18 @@ TimeoutManager::RunTimeout(const TimeSta
+           }
+         }
+       }
+ 
+       expiredIter.UpdateIterator();
+     }
+   }
+ 
++  now = TimeStamp::Now();
++
+   // Wherever we stopped in the timer list, schedule the executor to
+   // run for the next unexpired deadline.  Note, this *must* be done
+   // before we start executing any content script handlers.  If one
+   // of them spins the event loop the executor must already be scheduled
+   // in order for timeouts to fire properly.
+   if (!nextDeadline.IsNull()) {
+     MOZ_ALWAYS_SUCCEEDS(mExecutor->MaybeSchedule(nextDeadline));
+   }
+@@ -762,16 +765,18 @@ TimeoutManager::RunTimeout(const TimeSta
+         mTrackingTimeouts.SetInsertionPoint(last_tracking_insertion_point);
+ 
+         // Since ClearAllTimeouts() was called the lists should be empty.
+         MOZ_DIAGNOSTIC_ASSERT(!HasTimeouts());
+ 
+         return;
+       }
+ 
++      now = TimeStamp::Now();
++
+       // If we have a regular interval timer, we re-schedule the
+       // timeout, accounting for clock drift.
+       bool needsReinsertion = RescheduleTimeout(timeout, aNow);
+ 
+       // Running a timeout can cause another timeout to be deleted, so
+       // we need to reset the pointer to the following timeout.
+       runIter.UpdateIterator();
+ 
+@@ -788,17 +793,17 @@ TimeoutManager::RunTimeout(const TimeSta
+           mNormalTimeouts.Insert(timeout,
+                                  mWindow.IsFrozen() ? Timeouts::SortBy::TimeRemaining
+                                                     : Timeouts::SortBy::TimeWhen);
+         }
+       }
+ 
+       // Check to see if we have run out of time to execute timeout handlers.
+       // If we've exceeded our time budget then terminate the loop immediately.
+-      TimeDuration elapsed = TimeStamp::Now() - start;
++      TimeDuration elapsed = now - start;
+       if (elapsed >= totalTimeLimit) {
+         // We ran out of time.  Make sure to schedule the executor to
+         // run immediately for the next timer, if it exists.
+         RefPtr<Timeout> timeout = runIter.Next();
+         if (timeout) {
+           MOZ_ALWAYS_SUCCEEDS(mExecutor->MaybeSchedule(timeout->When()));
+         }
+         break;
