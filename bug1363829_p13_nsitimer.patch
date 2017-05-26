@@ -1,8 +1,201 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  9e5414aedd8b9971a9b4db1999eacc72344d4d58
+# Parent  5399c2e263bbdccad9c4a17fdd0dc3af30fdf113
 Bug 1363829 P13 Expose nsITimer::PreciseInitWithCallback() that takes a TimeDuration delay. r=froydnj
 
+diff --git a/xpcom/threads/BlockingResourceBase.cpp b/xpcom/threads/BlockingResourceBase.cpp
+--- a/xpcom/threads/BlockingResourceBase.cpp
++++ b/xpcom/threads/BlockingResourceBase.cpp
+@@ -551,12 +551,36 @@ CondVar::Wait(PRIntervalTime aInterval)
+   // restore saved state
+   mLock->SetAcquisitionState(savedAcquisitionState);
+   mLock->mChainPrev = savedChainPrev;
+   mLock->mOwningThread = savedOwningThread;
+ 
+   return NS_OK;
+ }
+ 
++nsresult
++CondVar::Wait(const TimeDuration& aDelay)
++{
++  AssertCurrentThreadOwnsMutex();
++
++  // save mutex state and reset to empty
++  AcquisitionState savedAcquisitionState = mLock->GetAcquisitionState();
++  BlockingResourceBase* savedChainPrev = mLock->mChainPrev;
++  PRThread* savedOwningThread = mLock->mOwningThread;
++  mLock->ClearAcquisitionState();
++  mLock->mChainPrev = 0;
++  mLock->mOwningThread = nullptr;
++
++  // give up mutex until we're back from Wait()
++  mImpl.wait_for(*mLock, aDelay);
++
++  // restore saved state
++  mLock->SetAcquisitionState(savedAcquisitionState);
++  mLock->mChainPrev = savedChainPrev;
++  mLock->mOwningThread = savedOwningThread;
++
++  return NS_OK;
++}
++
+ #endif // ifdef DEBUG
+ 
+ 
+ } // namespace mozilla
+diff --git a/xpcom/threads/CondVar.h b/xpcom/threads/CondVar.h
+--- a/xpcom/threads/CondVar.h
++++ b/xpcom/threads/CondVar.h
+@@ -66,18 +66,29 @@ public:
+ #endif //MOZILLA_INTERNAL_API
+     if (aInterval == PR_INTERVAL_NO_TIMEOUT) {
+       mImpl.wait(*mLock);
+     } else {
+       mImpl.wait_for(*mLock, TimeDuration::FromMilliseconds(double(aInterval)));
+     }
+     return NS_OK;
+   }
++
++  nsresult Wait(const TimeDuration& aDelay)
++  {
++#ifdef MOZILLA_INTERNAL_API
++    GeckoProfilerThreadSleepRAII sleep;
++#endif //MOZILLA_INTERNAL_API
++    mImpl.wait_for(*mLock, aDelay);
++    return NS_OK;
++  }
++
+ #else
+   nsresult Wait(PRIntervalTime aInterval = PR_INTERVAL_NO_TIMEOUT);
++  nsresult Wait(const TimeDuration& aDelay);
+ #endif // ifndef DEBUG
+ 
+   /**
+    * Notify
+    * @see prcvar.h
+    **/
+   nsresult Notify()
+   {
+diff --git a/xpcom/threads/Monitor.h b/xpcom/threads/Monitor.h
+--- a/xpcom/threads/Monitor.h
++++ b/xpcom/threads/Monitor.h
+@@ -30,16 +30,21 @@ public:
+   {
+   }
+ 
+   ~Monitor() {}
+ 
+   void Lock() { mMutex.Lock(); }
+   void Unlock() { mMutex.Unlock(); }
+ 
++  nsresult Wait(const TimeDuration& aDelay)
++  {
++    return mCondVar.Wait(aDelay);
++  }
++
+   nsresult Wait(PRIntervalTime aInterval = PR_INTERVAL_NO_TIMEOUT)
+   {
+     return mCondVar.Wait(aInterval);
+   }
+ 
+   nsresult Notify() { return mCondVar.Notify(); }
+   nsresult NotifyAll() { return mCondVar.NotifyAll(); }
+ 
+@@ -78,16 +83,21 @@ public:
+     mMonitor->Lock();
+   }
+ 
+   ~MonitorAutoLock()
+   {
+     mMonitor->Unlock();
+   }
+ 
++  nsresult Wait(const TimeDuration& aDelay)
++  {
++    return mMonitor->Wait(aDelay);
++  }
++
+   nsresult Wait(PRIntervalTime aInterval = PR_INTERVAL_NO_TIMEOUT)
+   {
+     return mMonitor->Wait(aInterval);
+   }
+ 
+   nsresult Notify() { return mMonitor->Notify(); }
+   nsresult NotifyAll() { return mMonitor->NotifyAll(); }
+ 
+diff --git a/xpcom/threads/TimerThread.cpp b/xpcom/threads/TimerThread.cpp
+--- a/xpcom/threads/TimerThread.cpp
++++ b/xpcom/threads/TimerThread.cpp
+@@ -407,29 +407,29 @@ TimerThread::Run()
+ 
+   // Half of the amount of microseconds needed to get positive PRIntervalTime.
+   // We use this to decide how to round our wait times later
+   int32_t halfMicrosecondsIntervalResolution = usIntervalResolution / 2;
+   bool forceRunNextTimer = false;
+ 
+   while (!mShutdown) {
+     // Have to use PRIntervalTime here, since PR_WaitCondVar takes it
+-    PRIntervalTime waitFor;
++    TimeDuration waitFor(TimeDuration::Forever());
+     bool forceRunThisTimer = forceRunNextTimer;
+     forceRunNextTimer = false;
+ 
+     if (mSleeping) {
+       // Sleep for 0.1 seconds while not firing timers.
+       uint32_t milliseconds = 100;
+       if (ChaosMode::isActive(ChaosFeature::TimerScheduling)) {
+         milliseconds = ChaosMode::randomUint32LessThan(200);
+       }
+-      waitFor = PR_MillisecondsToInterval(milliseconds);
++      waitFor = TimeDuration::FromMilliseconds(milliseconds);
+     } else {
+-      waitFor = PR_INTERVAL_NO_TIMEOUT;
++      waitFor = TimeDuration::Forever();
+       TimeStamp now = TimeStamp::Now();
+ 
+       RemoveLeadingCanceledTimersInternal();
+ 
+       if (!mTimers.IsEmpty()) {
+         if (now >= mTimers[0]->Value()->mTimeout || forceRunThisTimer) {
+     next:
+           // NB: AddRef before the Release under RemoveTimerInternal to avoid
+@@ -506,30 +506,28 @@ TimerThread::Run()
+             sFractions[ChaosMode::randomUint32LessThan(ArrayLength(sFractions))];
+           forceRunNextTimer = true;
+         }
+ 
+         if (microseconds < halfMicrosecondsIntervalResolution) {
+           forceRunNextTimer = false;
+           goto next; // round down; execute event now
+         }
+-        waitFor = PR_MicrosecondsToInterval(
+-          static_cast<uint32_t>(microseconds)); // Floor is accurate enough.
+-        if (waitFor == 0) {
+-          waitFor = 1;  // round up, wait the minimum time we can wait
+-        }
++        waitFor =
++          TimeDuration::Max(TimeDuration::FromMicroseconds(microseconds),
++                            TimeDuration::Resolution());
+       }
+ 
+       if (MOZ_LOG_TEST(GetTimerLog(), LogLevel::Debug)) {
+-        if (waitFor == PR_INTERVAL_NO_TIMEOUT)
++        if (waitFor == TimeDuration::Forever())
+           MOZ_LOG(GetTimerLog(), LogLevel::Debug,
+-                 ("waiting for PR_INTERVAL_NO_TIMEOUT\n"));
++                 ("waiting for forever\n"));
+         else
+           MOZ_LOG(GetTimerLog(), LogLevel::Debug,
+-                 ("waiting for %u\n", PR_IntervalToMilliseconds(waitFor)));
++                 ("waiting for %0.3f\n", waitFor.ToMilliseconds()));
+       }
+     }
+ 
+     mWaiting = true;
+     mNotified = false;
+     mMonitor.Wait(waitFor);
+     if (mNotified) {
+       forceRunNextTimer = false;
 diff --git a/xpcom/threads/nsITimer.idl b/xpcom/threads/nsITimer.idl
 --- a/xpcom/threads/nsITimer.idl
 +++ b/xpcom/threads/nsITimer.idl
