@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  16ebc9f2dbac500b49fa32c67e7e1e4d880def4d
+# Parent  e6a363c862b45443a190e74061f08ae8269e8b40
 Bug 1363829 P6 Use the TimeoutExecutor in TimeoutManager. r=ehsan
 
 diff --git a/dom/base/Timeout.cpp b/dom/base/Timeout.cpp
@@ -31,8 +31,8 @@ diff --git a/dom/base/TimeoutExecutor.cpp b/dom/base/TimeoutExecutor.cpp
 @@ -133,17 +133,17 @@ TimeoutExecutor::MaybeExecute()
    // by TimeoutManager.
    TimeStamp now(TimeStamp::Now());
-   if (deadline > now + mFlexTime) {
-     deadline = now + mFlexTime;
+   if (deadline > now) {
+     deadline = now;
    }
  
    Cancel();
@@ -43,10 +43,10 @@ diff --git a/dom/base/TimeoutExecutor.cpp b/dom/base/TimeoutExecutor.cpp
  
  TimeoutExecutor::TimeoutExecutor(TimeoutManager* aOwner)
    : mOwner(aOwner)
-   , mFlexTime(TimeDuration::FromMilliseconds(0.1))
    , mMode(Mode::None)
  {
    MOZ_DIAGNOSTIC_ASSERT(mOwner);
+ }
 diff --git a/dom/base/TimeoutManager.cpp b/dom/base/TimeoutManager.cpp
 --- a/dom/base/TimeoutManager.cpp
 +++ b/dom/base/TimeoutManager.cpp
@@ -83,7 +83,7 @@ diff --git a/dom/base/TimeoutManager.cpp b/dom/base/TimeoutManager.cpp
      mRunningTimeout(nullptr),
      mIdleCallbackTimeoutCounter(1),
      mBackPressureDelayMS(0),
-     mThrottleTrackingTimeouts(gTrackingTimeoutThrottlingDelay <= 0)
+     mThrottleTrackingTimeouts(false)
  {
    MOZ_DIAGNOSTIC_ASSERT(aWindow.IsInnerWindow());
 @@ -315,16 +317,18 @@ TimeoutManager::TimeoutManager(nsGlobalW
@@ -380,7 +380,7 @@ diff --git a/dom/base/TimeoutManager.cpp b/dom/base/TimeoutManager.cpp
    TimeDuration nextInterval =
      TimeDuration::FromMilliseconds(
          std::max(aTimeout->mInterval,
-@@ -983,37 +1024,25 @@ TimeoutManager::RescheduleTimeout(Timeou
+@@ -983,39 +1024,22 @@ TimeoutManager::RescheduleTimeout(Timeou
    // thread is firing our timers somewhat early or if they're taking a long
    // time to run the callback.
    if (delay < TimeDuration(0)) {
@@ -395,14 +395,13 @@ diff --git a/dom/base/TimeoutManager.cpp b/dom/base/TimeoutManager.cpp
      return true;
    }
  
-   // Reschedule the OS timer. Don't bother returning any error codes if
-   // this fails since the callers of this method don't care about them.
+-  // Reschedule the OS timer. Don't bother returning any error codes if
+-  // this fails since the callers of this method don't care about them.
 -  nsresult rv = aTimeout->InitTimer(mWindow.EventTargetFor(TaskCategory::Timer),
 -                                    delay.ToMilliseconds());
 -
-+  nsresult rv = mExecutor->MaybeSchedule(aTimeout->When());
-   if (NS_FAILED(rv)) {
-     NS_ERROR("Error initializing timer for DOM timeout!");
+-  if (NS_FAILED(rv)) {
+-    NS_ERROR("Error initializing timer for DOM timeout!");
 -
 -    // We failed to initialize the new OS timer, this timer does
 -    // us no good here so we just cancel it (just in case) and
@@ -412,15 +411,19 @@ diff --git a/dom/base/TimeoutManager.cpp b/dom/base/TimeoutManager.cpp
 -    // any more (since timeout->mTimer == nullptr).
 -    aTimeout->MaybeCancelTimer();
 -
-     return false;
-   }
+-    return false;
+-  }
++  nsresult rv = mExecutor->MaybeSchedule(aTimeout->When());
++  NS_ENSURE_SUCCESS(rv, false);
  
    return true;
  }
  
  nsresult
  TimeoutManager::ResetTimersForThrottleReduction()
-@@ -1028,36 +1057,42 @@ TimeoutManager::ResetTimersForThrottleRe
+ {
+   return ResetTimersForThrottleReduction(gMinBackgroundTimeoutValue);
+@@ -1028,36 +1052,42 @@ TimeoutManager::ResetTimersForThrottleRe
  
    if (mWindow.IsFrozen() || mWindow.IsSuspended()) {
      return NS_OK;
@@ -470,7 +473,7 @@ diff --git a/dom/base/TimeoutManager.cpp b/dom/base/TimeoutManager.cpp
    // insertion point itself is a dummy timeout with an When() that may be
    // semi-bogus.  In that case, we don't need to do anything with insertion
    // point or anything before it, so should start at the timer after insertion
-@@ -1126,23 +1161,16 @@ TimeoutManager::Timeouts::ResetTimersFor
+@@ -1126,23 +1156,16 @@ TimeoutManager::Timeouts::ResetTimersFor
                       timeout->When() < nextTimeout->When(), "How did that happen?");
          timeout->remove();
          // Insert() will reset mFiringId. Make sure to undo that.
@@ -494,7 +497,7 @@ diff --git a/dom/base/TimeoutManager.cpp b/dom/base/TimeoutManager.cpp
  
    return NS_OK;
  }
-@@ -1155,28 +1183,28 @@ TimeoutManager::ClearAllTimeouts()
+@@ -1155,28 +1178,28 @@ TimeoutManager::ClearAllTimeouts()
    MOZ_LOG(gLog, LogLevel::Debug,
            ("ClearAllTimeouts(TimeoutManager=%p)\n", this));
  
@@ -525,7 +528,7 @@ diff --git a/dom/base/TimeoutManager.cpp b/dom/base/TimeoutManager.cpp
    if (seenRunningTimeout) {
      mNormalTimeouts.SetInsertionPoint(nullptr);
      mTrackingTimeouts.SetInsertionPoint(nullptr);
-@@ -1274,24 +1302,17 @@ TimeoutManager::Suspend()
+@@ -1274,24 +1297,17 @@ TimeoutManager::Suspend()
    MOZ_LOG(gLog, LogLevel::Debug,
            ("Suspend(TimeoutManager=%p)\n", this));
  
@@ -551,7 +554,7 @@ diff --git a/dom/base/TimeoutManager.cpp b/dom/base/TimeoutManager.cpp
    MOZ_LOG(gLog, LogLevel::Debug,
            ("Resume(TimeoutManager=%p)\n", this));
  
-@@ -1300,54 +1321,47 @@ TimeoutManager::Resume()
+@@ -1300,54 +1316,47 @@ TimeoutManager::Resume()
    // again.
    if (mWindow.AsInner()->IsDocumentLoaded() && !mThrottleTrackingTimeouts) {
      MaybeStartThrottleTrackingTimout();
@@ -616,7 +619,7 @@ diff --git a/dom/base/TimeoutManager.cpp b/dom/base/TimeoutManager.cpp
    MOZ_LOG(gLog, LogLevel::Debug,
            ("Freeze(TimeoutManager=%p)\n", this));
  
-@@ -1366,20 +1380,16 @@ TimeoutManager::Freeze()
+@@ -1366,20 +1375,16 @@ TimeoutManager::Freeze()
      // shifts timers to the right as if time does not pass while
      // the window is frozen.
      TimeDuration delta(0);
@@ -637,7 +640,7 @@ diff --git a/dom/base/TimeoutManager.cpp b/dom/base/TimeoutManager.cpp
  {
    MOZ_LOG(gLog, LogLevel::Debug,
            ("Thaw(TimeoutManager=%p)\n", this));
-@@ -1395,18 +1405,16 @@ TimeoutManager::Thaw()
+@@ -1395,18 +1400,16 @@ TimeoutManager::Thaw()
        NS_ASSERTION(!_seenDummyTimeout, "More than one dummy timeout?!");
        _seenDummyTimeout = true;
        return;
@@ -716,7 +719,7 @@ diff --git a/dom/base/TimeoutManager.h b/dom/base/TimeoutManager.h
      bool IsEmpty() const { return mTimeoutList.isEmpty(); }
      void InsertFront(Timeout* aTimeout) { mTimeoutList.insertFront(aTimeout); }
      void Clear() { mTimeoutList.clear(); }
-@@ -215,16 +215,17 @@ private:
+@@ -215,16 +215,20 @@ private:
      mozilla::dom::Timeout*    mTimeoutInsertionPoint;
    };
  
@@ -725,6 +728,9 @@ diff --git a/dom/base/TimeoutManager.h b/dom/base/TimeoutManager.h
    // Each nsGlobalWindow object has a TimeoutManager member.  This reference
    // points to that holder object.
    nsGlobalWindow&             mWindow;
++  // The executor is specific to the nsGlobalWindow/TimeoutManager, but it
++  // can live past the destruction of the window if its scheduled.  Therefore
++  // it must be a separate ref-counted object.
 +  RefPtr<TimeoutExecutor>     mExecutor;
    // The list of timeouts coming from non-tracking scripts.
    Timeouts                    mNormalTimeouts;

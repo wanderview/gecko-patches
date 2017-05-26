@@ -1,0 +1,304 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  9e5414aedd8b9971a9b4db1999eacc72344d4d58
+Bug 1363829 P13 Expose nsITimer::PreciseInitWithCallback() that takes a TimeDuration delay. r=froydnj
+
+diff --git a/xpcom/threads/nsITimer.idl b/xpcom/threads/nsITimer.idl
+--- a/xpcom/threads/nsITimer.idl
++++ b/xpcom/threads/nsITimer.idl
+@@ -5,16 +5,17 @@
+ 
+ #include "nsISupports.idl"
+ 
+ interface nsIObserver;
+ interface nsIEventTarget;
+ 
+ %{C++
+ #include "mozilla/MemoryReporting.h"
++#include "mozilla/TimeStamp.h"
+ 
+ /**
+  * The signature of the timer callback function passed to initWithFuncCallback.
+  * This is the function that will get called when the timer expires if the
+  * timer is initialized via initWithFuncCallback.
+  *
+  * @param aTimer the timer which has expired
+  * @param aClosure opaque parameter passed to initWithFuncCallback
+@@ -37,16 +38,17 @@ typedef void (*nsTimerCallbackFunc) (nsI
+ typedef void (*nsTimerNameCallbackFunc) (nsITimer *aTimer,
+                                          bool aAnonymize,
+                                          void *aClosure,
+                                          char *aBuf, size_t aLen);
+ %}
+ 
+ native nsTimerCallbackFunc(nsTimerCallbackFunc);
+ native nsTimerNameCallbackFunc(nsTimerNameCallbackFunc);
++[ref] native TimeDuration(mozilla::TimeDuration);
+ 
+ /**
+  * The callback interface for timers.
+  */
+ interface nsITimer;
+ 
+ [function, scriptable, uuid(a796816d-7d47-4348-9ab8-c7aeb3216a7d)]
+ interface nsITimerCallback : nsISupports
+@@ -146,27 +148,39 @@ interface nsITimer : nsISupports
+    */
+   [noscript] void initWithFuncCallback(in nsTimerCallbackFunc aCallback,
+                                        in voidPtr aClosure,
+                                        in unsigned long aDelay,
+                                        in unsigned long aType);
+ 
+   /**
+    * Initialize a timer to fire after the given millisecond interval.
+-   * This version takes a function to call.
++   * This version takes a callback object.
+    *
+    * @param aFunc      nsITimerCallback interface to call when timer expires
+    * @param aDelay     The millisecond interval
+    * @param aType      Timer type per TYPE* consts defined above
+    */
+   void initWithCallback(in nsITimerCallback aCallback,
+                         in unsigned long aDelay,
+                         in unsigned long aType);
+ 
+   /**
++   * Initialize a timer to fire after the given high precision interval.
++   * This version takes a callback object.
++   *
++   * @param aFunc      nsITimerCallback interface to call when timer expires
++   * @param aDelay     The high precision interval
++   * @param aType      Timer type per TYPE* consts defined above
++   */
++  [noscript] void preciseInitWithCallback(in nsITimerCallback aCallback,
++                                          [const] in TimeDuration aDelay,
++                                          in unsigned long aType);
++
++  /**
+    * Cancel the timer.  This method works on all types, not just on repeating
+    * timers -- you might want to cancel a TYPE_ONE_SHOT timer, and even reuse
+    * it by re-initializing it (to avoid object destruction and creation costs
+    * by conserving one timer instance).
+    */
+   void cancel();
+ 
+   /**
+diff --git a/xpcom/threads/nsTimerImpl.cpp b/xpcom/threads/nsTimerImpl.cpp
+--- a/xpcom/threads/nsTimerImpl.cpp
++++ b/xpcom/threads/nsTimerImpl.cpp
+@@ -136,17 +136,16 @@ nsTimer::Release(void)
+   }
+ 
+   return count;
+ }
+ 
+ nsTimerImpl::nsTimerImpl(nsITimer* aTimer) :
+   mHolder(nullptr),
+   mGeneration(0),
+-  mDelay(0),
+   mITimer(aTimer),
+   mMutex("nsTimerImpl::mMutex")
+ {
+   // XXXbsmedberg: shouldn't this be in Init()?
+   mEventTarget = static_cast<nsIEventTarget*>(NS_GetCurrentThread());
+ }
+ 
+ //static
+@@ -184,19 +183,28 @@ nsTimerImpl::Shutdown()
+   if (!gThread) {
+     return;
+   }
+ 
+   gThread->Shutdown();
+   NS_RELEASE(gThread);
+ }
+ 
++nsresult
++nsTimerImpl::InitCommon(uint32_t aDelayMS, uint32_t aType,
++                        Callback&& aNewCallback)
++{
++  return InitCommon(TimeDuration::FromMilliseconds(aDelayMS),
++                    aType, Move(aNewCallback));
++}
++
+ 
+ nsresult
+-nsTimerImpl::InitCommon(uint32_t aDelay, uint32_t aType, Callback&& newCallback)
++nsTimerImpl::InitCommon(const TimeDuration& aDelay, uint32_t aType,
++                        Callback&& newCallback)
+ {
+   mMutex.AssertCurrentThreadOwns();
+ 
+   if (NS_WARN_IF(!gThread)) {
+     return NS_ERROR_NOT_INITIALIZED;
+   }
+ 
+   if (!mEventTarget) {
+@@ -205,17 +213,17 @@ nsTimerImpl::InitCommon(uint32_t aDelay,
+   }
+ 
+   gThread->RemoveTimer(this);
+   mCallback.swap(newCallback);
+   ++mGeneration;
+ 
+   mType = (uint8_t)aType;
+   mDelay = aDelay;
+-  mTimeout = TimeStamp::Now() + TimeDuration::FromMilliseconds(mDelay);
++  mTimeout = TimeStamp::Now() + mDelay;
+ 
+   return gThread->AddTimer(this);
+ }
+ 
+ nsresult
+ nsTimerImpl::InitWithFuncCallbackCommon(nsTimerCallbackFunc aFunc,
+                                         void* aClosure,
+                                         uint32_t aDelay,
+@@ -268,16 +276,25 @@ nsTimerImpl::InitWithNameableFuncCallbac
+   return InitWithFuncCallbackCommon(aFunc, aClosure, aDelay, aType, name);
+ }
+ 
+ nsresult
+ nsTimerImpl::InitWithCallback(nsITimerCallback* aCallback,
+                               uint32_t aDelay,
+                               uint32_t aType)
+ {
++  return PreciseInitWithCallback(aCallback,
++                                 TimeDuration::FromMilliseconds(aDelay), aType);
++}
++
++nsresult
++nsTimerImpl::PreciseInitWithCallback(nsITimerCallback* aCallback,
++                                     const TimeDuration& aDelay,
++                                     uint32_t aType)
++{
+   if (NS_WARN_IF(!aCallback)) {
+     return NS_ERROR_INVALID_ARG;
+   }
+ 
+   Callback cb; // Goes out of scope after the unlock, prevents deadlock
+   cb.mType = Callback::Type::Interface;
+   cb.mCallback.i = aCallback;
+   NS_ADDREF(cb.mCallback.i);
+@@ -341,31 +358,31 @@ nsTimerImpl::SetDelay(uint32_t aDelay)
+     return NS_ERROR_NOT_INITIALIZED;
+   }
+ 
+   bool reAdd = false;
+   if (gThread) {
+     reAdd = NS_SUCCEEDED(gThread->RemoveTimer(this));
+   }
+ 
+-  mDelay = aDelay;
+-  mTimeout = TimeStamp::Now() + TimeDuration::FromMilliseconds(mDelay);
++  mDelay = TimeDuration::FromMilliseconds(aDelay);
++  mTimeout = TimeStamp::Now() + mDelay;
+ 
+   if (reAdd) {
+     gThread->AddTimer(this);
+   }
+ 
+   return NS_OK;
+ }
+ 
+ nsresult
+ nsTimerImpl::GetDelay(uint32_t* aDelay)
+ {
+   MutexAutoLock lock(mMutex);
+-  *aDelay = mDelay;
++  *aDelay = mDelay.ToMilliseconds();
+   return NS_OK;
+ }
+ 
+ nsresult
+ nsTimerImpl::SetType(uint32_t aType)
+ {
+   MutexAutoLock lock(mMutex);
+   mType = (uint8_t)aType;
+@@ -446,17 +463,17 @@ nsTimerImpl::Fire(int32_t aGeneration)
+     // If some other thread Cancels/Inits after this, they're just too late.
+     MutexAutoLock lock(mMutex);
+     if (aGeneration != mGeneration) {
+       return;
+     }
+ 
+     mCallbackDuringFire.swap(mCallback);
+     oldType = mType;
+-    oldDelay = mDelay;
++    oldDelay = mDelay.ToMilliseconds();
+     oldTimeout = mTimeout;
+     // Ensure that the nsITimer does not unhook from the nsTimerImpl during
+     // Fire; this will cause null pointer crashes if the user of the timer drops
+     // its reference, and then uses the nsITimer* passed in the callback.
+     kungFuDeathGrip = mITimer;
+   }
+ 
+   PROFILER_LABEL("Timer", "Fire",
+@@ -499,21 +516,20 @@ nsTimerImpl::Fire(int32_t aGeneration)
+       ;
+   }
+ 
+   Callback trash; // Swap into here to dispose of callback after the unlock
+   MutexAutoLock lock(mMutex);
+   if (aGeneration == mGeneration && IsRepeating()) {
+     // Repeating timer has not been re-init or canceled; reschedule
+     mCallbackDuringFire.swap(mCallback);
+-    TimeDuration delay = TimeDuration::FromMilliseconds(mDelay);
+     if (mType == nsITimer::TYPE_REPEATING_SLACK) {
+-      mTimeout = TimeStamp::Now() + delay;
++      mTimeout = TimeStamp::Now() + mDelay;
+     } else {
+-      mTimeout = mTimeout + delay;
++      mTimeout = mTimeout + mDelay;
+     }
+     if (gThread) {
+       gThread->AddTimer(this);
+     }
+   }
+ 
+   mCallbackDuringFire.swap(trash);
+ 
+diff --git a/xpcom/threads/nsTimerImpl.h b/xpcom/threads/nsTimerImpl.h
+--- a/xpcom/threads/nsTimerImpl.h
++++ b/xpcom/threads/nsTimerImpl.h
+@@ -124,17 +124,21 @@ public:
+     typedef nsTimerNameCallbackFunc NameFunc;
+     typedef mozilla::Variant<NameNothing, NameString, NameFunc> Name;
+     static const NameNothing Nothing;
+     Name mName;
+ 
+     void*                 mClosure;
+   };
+ 
+-  nsresult InitCommon(uint32_t aDelay, uint32_t aType, Callback&& newCallback);
++  nsresult InitCommon(uint32_t aDelayMS, uint32_t aType,
++                      Callback&& newCallback);
++
++  nsresult InitCommon(const TimeDuration& aDelay, uint32_t aType,
++                      Callback&& newCallback);
+ 
+   Callback& GetCallback()
+   {
+     mMutex.AssertCurrentThreadOwns();
+     if (mCallback.mType == Callback::Type::Unknown) {
+       return mCallbackDuringFire;
+     }
+ 
+@@ -178,17 +182,17 @@ public:
+   uint8_t               mType;
+ 
+   // The generation number of this timer, re-generated each time the timer is
+   // initialized so one-shot timers can be canceled and re-initialized by the
+   // arming thread without any bad race conditions.
+   // Updated only after this timer has been removed from the timer thread.
+   int32_t               mGeneration;
+ 
+-  uint32_t              mDelay;
++  TimeDuration          mDelay;
+   // Updated only after this timer has been removed from the timer thread.
+   TimeStamp             mTimeout;
+ 
+ #ifdef MOZ_TASK_TRACER
+   mozilla::tasktracer::TracedTaskCommon mTracedTask;
+ #endif
+ 
+   static double         sDeltaSum;
