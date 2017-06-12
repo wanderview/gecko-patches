@@ -1,22 +1,28 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
 # Parent  1742b1bdadd13a02df95ca690bea9cc42ff40c91
-Bug 1371664 P1 Add TimeoutExecutor::SetMinimumDelay(). r=ehsan
+Bug 1371664 P1 Add a minimum delay argument to TimeoutExecutor::MaybeSchedule(). r=ehsan
 
 diff --git a/dom/base/TimeoutExecutor.cpp b/dom/base/TimeoutExecutor.cpp
 --- a/dom/base/TimeoutExecutor.cpp
 +++ b/dom/base/TimeoutExecutor.cpp
-@@ -39,17 +39,18 @@ TimeoutExecutor::ScheduleImmediate(const
+@@ -35,21 +35,23 @@ TimeoutExecutor::ScheduleImmediate(const
+   mMode = Mode::Immediate;
+   mDeadline = aDeadline;
+ 
+   return NS_OK;
  }
  
  nsresult
  TimeoutExecutor::ScheduleDelayed(const TimeStamp& aDeadline,
-                                  const TimeStamp& aNow)
+-                                 const TimeStamp& aNow)
++                                 const TimeStamp& aNow,
++                                 const TimeDuration& aMinDelay)
  {
    MOZ_DIAGNOSTIC_ASSERT(mDeadline.IsNull());
    MOZ_DIAGNOSTIC_ASSERT(mMode == Mode::None);
 -  MOZ_DIAGNOSTIC_ASSERT(aDeadline > (aNow + mAllowedEarlyFiringTime));
-+  MOZ_DIAGNOSTIC_ASSERT(!mMinimumDelay.IsZero() ||
++  MOZ_DIAGNOSTIC_ASSERT(!aMinDelay.IsZero() ||
 +                        aDeadline > (aNow + mAllowedEarlyFiringTime));
  
    nsresult rv = NS_OK;
@@ -26,7 +32,7 @@ diff --git a/dom/base/TimeoutExecutor.cpp b/dom/base/TimeoutExecutor.cpp
      NS_ENSURE_SUCCESS(rv, rv);
  
      uint32_t earlyMicros = 0;
-@@ -60,16 +61,25 @@ TimeoutExecutor::ScheduleDelayed(const T
+@@ -60,16 +62,25 @@ TimeoutExecutor::ScheduleDelayed(const T
    // Always call Cancel() in case we are re-using a timer.  Otherwise
    // the subsequent SetTarget() may fail.
    rv = mTimer->Cancel();
@@ -42,7 +48,7 @@ diff --git a/dom/base/TimeoutExecutor.cpp b/dom/base/TimeoutExecutor.cpp
 +  // the nsITimer value.  This is necessary to avoid lots of needless
 +  // rescheduling if more deadlines come in between now and the minimum delay
 +  // firing time.
-+  TimeDuration delay = TimeDuration::Max(mMinimumDelay, aDeadline - aNow);
++  TimeDuration delay = TimeDuration::Max(aMinDelay, aDeadline - aNow);
 +
    // Note, we cannot use the normal nsITimer init methods that take
    // integer milliseconds.  We need higher precision.  Consider this
@@ -52,7 +58,7 @@ diff --git a/dom/base/TimeoutExecutor.cpp b/dom/base/TimeoutExecutor.cpp
    // 2. do some work for 500us
    // 3. setTimeout(g, 1);
    //
-@@ -78,17 +88,17 @@ TimeoutExecutor::ScheduleDelayed(const T
+@@ -78,43 +89,45 @@ TimeoutExecutor::ScheduleDelayed(const T
    // In the past worked because each setTimeout() got its own nsITimer.  The 1ms
    // was preserved and passed through to nsITimer which converted it to a
    // TimeStamp, etc.
@@ -71,9 +77,11 @@ diff --git a/dom/base/TimeoutExecutor.cpp b/dom/base/TimeoutExecutor.cpp
  
    return NS_OK;
  }
-@@ -96,17 +106,17 @@ TimeoutExecutor::ScheduleDelayed(const T
+ 
  nsresult
- TimeoutExecutor::Schedule(const TimeStamp& aDeadline)
+-TimeoutExecutor::Schedule(const TimeStamp& aDeadline)
++TimeoutExecutor::Schedule(const TimeStamp& aDeadline,
++                          const TimeDuration& aMinDelay)
  {
    TimeStamp now(TimeStamp::Now());
  
@@ -81,89 +89,121 @@ diff --git a/dom/base/TimeoutExecutor.cpp b/dom/base/TimeoutExecutor.cpp
    // or is slightly in the future.  This is similar to how nsITimer will
    // fire timers early based on the interval resolution.
 -  if (aDeadline <= (now + mAllowedEarlyFiringTime)) {
-+  if (mMinimumDelay.IsZero() && aDeadline <= (now + mAllowedEarlyFiringTime)) {
++  if (aMinDelay.IsZero() && aDeadline <= (now + mAllowedEarlyFiringTime)) {
      return ScheduleImmediate(aDeadline, now);
    }
  
-   return ScheduleDelayed(aDeadline, now);
+-  return ScheduleDelayed(aDeadline, now);
++  return ScheduleDelayed(aDeadline, now, aMinDelay);
  }
  
  nsresult
- TimeoutExecutor::MaybeReschedule(const TimeStamp& aDeadline)
-@@ -196,16 +206,35 @@ TimeoutExecutor::Cancel()
+-TimeoutExecutor::MaybeReschedule(const TimeStamp& aDeadline)
++TimeoutExecutor::MaybeReschedule(const TimeStamp& aDeadline,
++                                 const TimeDuration& aMinDelay)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(!mDeadline.IsNull());
+   MOZ_DIAGNOSTIC_ASSERT(mMode == Mode::Immediate ||
+                         mMode == Mode::Delayed);
+ 
+   if (aDeadline >= mDeadline) {
+     return NS_OK;
+   }
+@@ -122,17 +135,17 @@ TimeoutExecutor::MaybeReschedule(const T
+   if (mMode == Mode::Immediate) {
+     // Don't reduce the deadline here as we want to execute the
+     // timer we originally scheduled even if its a few microseconds
+     // in the future.
+     return NS_OK;
+   }
+ 
+   Cancel();
+-  return Schedule(aDeadline);
++  return Schedule(aDeadline, aMinDelay);
+ }
+ 
+ void
+ TimeoutExecutor::MaybeExecute()
+ {
+   MOZ_DIAGNOSTIC_ASSERT(mMode != Mode::Shutdown && mMode != Mode::None);
+   MOZ_DIAGNOSTIC_ASSERT(mOwner);
+   MOZ_DIAGNOSTIC_ASSERT(!mDeadline.IsNull());
+@@ -171,29 +184,30 @@ TimeoutExecutor::Shutdown()
+     mTimer = nullptr;
+   }
+ 
+   mMode = Mode::Shutdown;
+   mDeadline = TimeStamp();
+ }
+ 
+ nsresult
+-TimeoutExecutor::MaybeSchedule(const TimeStamp& aDeadline)
++TimeoutExecutor::MaybeSchedule(const TimeStamp& aDeadline,
++                               const TimeDuration& aMinDelay)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(!aDeadline.IsNull());
+ 
+   if (mMode == Mode::Shutdown) {
+     return NS_OK;
+   }
+ 
+   if (mMode == Mode::Immediate || mMode == Mode::Delayed) {
+-    return MaybeReschedule(aDeadline);
++    return MaybeReschedule(aDeadline, aMinDelay);
+   }
+ 
+-  return Schedule(aDeadline);
++  return Schedule(aDeadline, aMinDelay);
+ }
+ 
+ void
+ TimeoutExecutor::Cancel()
  {
    if (mTimer) {
      mTimer->Cancel();
    }
-   mMode = Mode::None;
-   mDeadline = TimeStamp();
- }
- 
-+void
-+TimeoutExecutor::SetMinimumDelay(const TimeDuration& aDelay)
-+{
-+  if (mMinimumDelay == aDelay) {
-+    return;
-+  }
-+
-+  mMinimumDelay = aDelay;
-+
-+  if (mMode == Mode::None || mMode == Mode::Shutdown) {
-+    return;
-+  }
-+
-+  // Automatically reschedule when the minimum delay is changed.
-+  TimeStamp deadline(mDeadline);
-+  Cancel();
-+  Schedule(deadline);
-+}
-+
- NS_IMETHODIMP
- TimeoutExecutor::Run()
- {
-   // If the executor is canceled and then rescheduled its possible to get
-   // spurious executions here.  Ignore these unless our current mode matches.
-   if (mMode == Mode::Immediate) {
-     MaybeExecute();
-   }
 diff --git a/dom/base/TimeoutExecutor.h b/dom/base/TimeoutExecutor.h
 --- a/dom/base/TimeoutExecutor.h
 +++ b/dom/base/TimeoutExecutor.h
-@@ -16,16 +16,17 @@ namespace dom {
+@@ -51,35 +51,37 @@ class TimeoutExecutor final : public nsI
+   Mode mMode;
  
- class TimeoutExecutor final : public nsIRunnable
-                             , public nsITimerCallback
-                             , public nsINamed
- {
-   TimeoutManager* mOwner;
-   nsCOMPtr<nsITimer> mTimer;
-   TimeStamp mDeadline;
-+  TimeDuration mMinimumDelay;
+   ~TimeoutExecutor();
  
-   // Limits how far we allow timers to fire into the future from their
-   // deadline.  Starts off at zero, but is then adjusted when we start
-   // using nsITimer.  The nsITimer implementation may sometimes fire
-   // early and we should allow that to minimize additional wakeups.
-   TimeDuration mAllowedEarlyFiringTime;
+   nsresult
+   ScheduleImmediate(const TimeStamp& aDeadline, const TimeStamp& aNow);
  
-   // The TimeoutExecutor is repeatedly scheduled by the TimeoutManager
-@@ -74,16 +75,19 @@ public:
+   nsresult
+-  ScheduleDelayed(const TimeStamp& aDeadline, const TimeStamp& aNow);
++  ScheduleDelayed(const TimeStamp& aDeadline, const TimeStamp& aNow,
++                  const TimeDuration& aMinDelay);
+ 
+   nsresult
+-  Schedule(const TimeStamp& aDeadline);
++  Schedule(const TimeStamp& aDeadline, const TimeDuration& aMinDelay);
+ 
+   nsresult
+-  MaybeReschedule(const TimeStamp& aDeadline);
++  MaybeReschedule(const TimeStamp& aDeadline, const TimeDuration& aMinDelay);
+ 
+   void
+   MaybeExecute();
+ 
+ public:
+   explicit TimeoutExecutor(TimeoutManager* aOwner);
+ 
+   void
    Shutdown();
  
    nsresult
-   MaybeSchedule(const TimeStamp& aDeadline);
+-  MaybeSchedule(const TimeStamp& aDeadline);
++  MaybeSchedule(const TimeStamp& aDeadline,
++                const TimeDuration& aMinDelay = TimeDuration());
  
    void
    Cancel();
  
-+  void
-+  SetMinimumDelay(const TimeDuration& aDelay);
-+
    NS_DECL_ISUPPORTS
    NS_DECL_NSIRUNNABLE
    NS_DECL_NSITIMERCALLBACK
    NS_DECL_NSINAMED
- };
- 
- } // namespace dom
- } // namespace mozilla

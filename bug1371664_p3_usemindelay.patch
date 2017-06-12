@@ -1,12 +1,200 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  fecea921d7d8a14a1ebb757bbc1adbac17af29c2
-Bug 1371664 P3 Call TimeoutExecutor::SetMinimumDelay() from TimeoutManager::MaybeUpdateBackgroundState(). r=ehsan
+# Parent  3308043bd20e7410b61cc8cc44d010b22dad0ebb
+Bug 1371664 P3 Pass a minimum delay to TimeoutExecutor::MaybeSchedule() based on TimeoutManager::IsBackground(). r=ehsan
 
+diff --git a/dom/base/TimeoutExecutor.h b/dom/base/TimeoutExecutor.h
+--- a/dom/base/TimeoutExecutor.h
++++ b/dom/base/TimeoutExecutor.h
+@@ -70,18 +70,17 @@ class TimeoutExecutor final : public nsI
+ 
+ public:
+   explicit TimeoutExecutor(TimeoutManager* aOwner);
+ 
+   void
+   Shutdown();
+ 
+   nsresult
+-  MaybeSchedule(const TimeStamp& aDeadline,
+-                const TimeDuration& aMinDelay = TimeDuration());
++  MaybeSchedule(const TimeStamp& aDeadline, const TimeDuration& aMinDelay);
+ 
+   void
+   Cancel();
+ 
+   NS_DECL_ISUPPORTS
+   NS_DECL_NSIRUNNABLE
+   NS_DECL_NSITIMERCALLBACK
+   NS_DECL_NSINAMED
 diff --git a/dom/base/TimeoutManager.cpp b/dom/base/TimeoutManager.cpp
 --- a/dom/base/TimeoutManager.cpp
 +++ b/dom/base/TimeoutManager.cpp
-@@ -1153,16 +1153,22 @@ TimeoutManager::Thaw()
+@@ -172,16 +172,25 @@ TimeoutManager::DestroyFiringId(uint32_t
+ }
+ 
+ bool
+ TimeoutManager::IsValidFiringId(uint32_t aFiringId) const
+ {
+   return !IsInvalidFiringId(aFiringId);
+ }
+ 
++TimeDuration
++TimeoutManager::MinSchedulingDelay() const
++{
++  if (IsBackground()) {
++    return TimeDuration::FromMilliseconds(gMinBackgroundTimeoutValue);
++  }
++  return TimeDuration();
++}
++
+ bool
+ TimeoutManager::IsInvalidFiringId(uint32_t aFiringId) const
+ {
+   // Check the most common ways to invalidate a firing id first.
+   // These should be quite fast.
+   if (aFiringId == InvalidFiringId ||
+       mFiringIdStack.IsEmpty()) {
+     return true;
+@@ -419,17 +428,18 @@ TimeoutManager::SetTimeout(nsITimeoutHan
+ 
+   timeout->mWindow = &mWindow;
+ 
+   TimeDuration delta = TimeDuration::FromMilliseconds(realInterval);
+   timeout->SetWhenOrTimeRemaining(TimeStamp::Now(), delta);
+ 
+   // If we're not suspended, then set the timer.
+   if (!mWindow.IsSuspended()) {
+-    nsresult rv = mExecutor->MaybeSchedule(timeout->When());
++    nsresult rv = mExecutor->MaybeSchedule(timeout->When(),
++                                           MinSchedulingDelay());
+     if (NS_FAILED(rv)) {
+       return rv;
+     }
+   }
+ 
+   if (!aIsInterval) {
+     timeout->mNestingLevel = nestingLevel;
+   }
+@@ -530,17 +540,18 @@ TimeoutManager::ClearTimeout(int32_t aTi
+   }
+ 
+   // Stop the executor and restart it at the next soonest deadline.
+   mExecutor->Cancel();
+ 
+   OrderedTimeoutIterator iter(mNormalTimeouts, mTrackingTimeouts);
+   Timeout* nextTimeout = iter.Next();
+   if (nextTimeout) {
+-    MOZ_ALWAYS_SUCCEEDS(mExecutor->MaybeSchedule(nextTimeout->When()));
++    MOZ_ALWAYS_SUCCEEDS(mExecutor->MaybeSchedule(nextTimeout->When(),
++                                                 MinSchedulingDelay()));
+   }
+ }
+ 
+ void
+ TimeoutManager::RunTimeout(const TimeStamp& aNow, const TimeStamp& aTargetDeadline)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(!aNow.IsNull());
+   MOZ_DIAGNOSTIC_ASSERT(!aTargetDeadline.IsNull());
+@@ -648,17 +659,18 @@ TimeoutManager::RunTimeout(const TimeSta
+   // before we start executing any content script handlers.  If one
+   // of them spins the event loop the executor must already be scheduled
+   // in order for timeouts to fire properly.
+   if (!nextDeadline.IsNull()) {
+     // Note, we verified the window is not suspended at the top of
+     // method and the window should not have been suspended while
+     // executing the loop above since it doesn't call out to js.
+     MOZ_DIAGNOSTIC_ASSERT(!mWindow.IsSuspended());
+-    MOZ_ALWAYS_SUCCEEDS(mExecutor->MaybeSchedule(nextDeadline));
++    MOZ_ALWAYS_SUCCEEDS(mExecutor->MaybeSchedule(nextDeadline,
++                                                 MinSchedulingDelay()));
+   }
+ 
+   // Maybe the timeout that the event was fired for has been deleted
+   // and there are no others timeouts with deadlines that make them
+   // eligible for execution yet. Go away.
+   if (!numTimersToRun) {
+     return;
+   }
+@@ -772,17 +784,18 @@ TimeoutManager::RunTimeout(const TimeSta
+       if (elapsed >= totalTimeLimit) {
+         // We ran out of time.  Make sure to schedule the executor to
+         // run immediately for the next timer, if it exists.  Its possible,
+         // however, that the last timeout handler suspended the window.  If
+         // that happened then we must skip this step.
+         if (!mWindow.IsSuspended()) {
+           RefPtr<Timeout> timeout = runIter.Next();
+           if (timeout) {
+-            MOZ_ALWAYS_SUCCEEDS(mExecutor->MaybeSchedule(timeout->When()));
++            MOZ_ALWAYS_SUCCEEDS(mExecutor->MaybeSchedule(timeout->When(),
++                                                         MinSchedulingDelay()));
+           }
+         }
+         break;
+       }
+     }
+   }
+ }
+ 
+@@ -813,17 +826,18 @@ TimeoutManager::RescheduleTimeout(Timeou
+   }
+ 
+   aTimeout->SetWhenOrTimeRemaining(currentNow, delay);
+ 
+   if (mWindow.IsSuspended()) {
+     return true;
+   }
+ 
+-  nsresult rv = mExecutor->MaybeSchedule(aTimeout->When());
++  nsresult rv = mExecutor->MaybeSchedule(aTimeout->When(),
++                                         MinSchedulingDelay());
+   NS_ENSURE_SUCCESS(rv, false);
+ 
+   return true;
+ }
+ 
+ nsresult
+ TimeoutManager::ResetTimersForThrottleReduction()
+ {
+@@ -847,17 +861,17 @@ TimeoutManager::ResetTimersForThrottleRe
+   rv = mTrackingTimeouts.ResetTimersForThrottleReduction(aPreviousThrottleDelayMS,
+                                                          *this,
+                                                          Timeouts::SortBy::TimeWhen);
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   OrderedTimeoutIterator iter(mNormalTimeouts, mTrackingTimeouts);
+   Timeout* firstTimeout = iter.Next();
+   if (firstTimeout) {
+-    rv = mExecutor->MaybeSchedule(firstTimeout->When());
++    rv = mExecutor->MaybeSchedule(firstTimeout->When(), MinSchedulingDelay());
+     NS_ENSURE_SUCCESS(rv, rv);
+   }
+ 
+   return NS_OK;
+ }
+ 
+ nsresult
+ TimeoutManager::Timeouts::ResetTimersForThrottleReduction(int32_t aPreviousThrottleDelayMS,
+@@ -1107,17 +1121,18 @@ TimeoutManager::Resume()
+     aTimeout->SetWhenOrTimeRemaining(now, TimeDuration::FromMilliseconds(delay));
+ 
+     if (nextWakeUp.IsNull() || aTimeout->When() < nextWakeUp) {
+       nextWakeUp = aTimeout->When();
+     }
+   });
+ 
+   if (!nextWakeUp.IsNull()) {
+-    MOZ_ALWAYS_SUCCEEDS(mExecutor->MaybeSchedule(nextWakeUp));
++    MOZ_ALWAYS_SUCCEEDS(mExecutor->MaybeSchedule(nextWakeUp,
++                                                 MinSchedulingDelay()));
+   }
+ }
+ 
+ void
+ TimeoutManager::Freeze()
+ {
+   MOZ_LOG(gLog, LogLevel::Debug,
+           ("Freeze(TimeoutManager=%p)\n", this));
+@@ -1153,16 +1168,30 @@ TimeoutManager::Thaw()
  }
  
  void
@@ -16,11 +204,19 @@ diff --git a/dom/base/TimeoutManager.cpp b/dom/base/TimeoutManager.cpp
      ResetTimersForThrottleReduction();
    }
 +
-+  TimeDuration minDelay(0);
-+  if (IsBackground()) {
-+    minDelay = TimeDuration::FromMilliseconds(gMinBackgroundTimeoutValue);
++  // When the window moves to the background or foreground we should
++  // reschedule the TimeoutExecutor in case the MinSchedulingDelay()
++  // changed.  Only do this if the window is not suspended and we
++  // actually have a timeout.
++  if (!mWindow.IsSuspended()) {
++    OrderedTimeoutIterator iter(mNormalTimeouts, mTrackingTimeouts);
++    Timeout* nextTimeout = iter.Next();
++    if (nextTimeout) {
++      mExecutor->Cancel();
++      MOZ_ALWAYS_SUCCEEDS(mExecutor->MaybeSchedule(nextTimeout->When(),
++                                                   MinSchedulingDelay()));
++    }
 +  }
-+  mExecutor->SetMinimumDelay(minDelay);
  }
  
  bool
@@ -29,3 +225,26 @@ diff --git a/dom/base/TimeoutManager.cpp b/dom/base/TimeoutManager.cpp
    return mTrackingTimeouts.ForEachAbortable([&](Timeout* aTimeout) {
        return aTimeout->mTimeoutId == aTimeoutId;
      });
+diff --git a/dom/base/TimeoutManager.h b/dom/base/TimeoutManager.h
+--- a/dom/base/TimeoutManager.h
++++ b/dom/base/TimeoutManager.h
+@@ -132,16 +132,19 @@ private:
+   DestroyFiringId(uint32_t aFiringId);
+ 
+   bool
+   IsValidFiringId(uint32_t aFiringId) const;
+ 
+   bool
+   IsInvalidFiringId(uint32_t aFiringId) const;
+ 
++  TimeDuration
++  MinSchedulingDelay() const;
++
+ private:
+   struct Timeouts {
+     explicit Timeouts(const TimeoutManager& aManager)
+       : mManager(aManager)
+     {
+     }
+ 
+     // Insert aTimeout into the list, before all timeouts that would
