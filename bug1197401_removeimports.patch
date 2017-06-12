@@ -1,0 +1,3816 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  9eb9e6b53887119997909f0b5e773138b76d8c7e
+Bug 1197401 Remove the disabled HTML imports implementation. r=wchen
+
+diff --git a/dom/base/ImportManager.cpp b/dom/base/ImportManager.cpp
+deleted file mode 100644
+--- a/dom/base/ImportManager.cpp
++++ /dev/null
+@@ -1,748 +0,0 @@
+-/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+-/* vim: set ts=8 sts=2 et sw=2 tw=80: */
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-#include "ImportManager.h"
+-
+-#include "mozilla/dom/ScriptLoader.h"
+-#include "mozilla/EventListenerManager.h"
+-#include "HTMLLinkElement.h"
+-#include "nsContentPolicyUtils.h"
+-#include "nsContentUtils.h"
+-#include "nsIChannel.h"
+-#include "nsIContentPolicy.h"
+-#include "nsIContentSecurityPolicy.h"
+-#include "nsIDocument.h"
+-#include "nsIDOMDocument.h"
+-#include "nsIDOMEvent.h"
+-#include "nsIPrincipal.h"
+-#include "nsIScriptObjectPrincipal.h"
+-#include "nsNetUtil.h"
+-
+-//-----------------------------------------------------------------------------
+-// AutoError
+-//-----------------------------------------------------------------------------
+-
+-class AutoError {
+-public:
+-  explicit AutoError(mozilla::dom::ImportLoader* loader, bool scriptsBlocked = true)
+-    : mLoader(loader)
+-    , mPassed(false)
+-    , mScriptsBlocked(scriptsBlocked)
+-  {}
+-
+-  ~AutoError()
+-  {
+-    if (!mPassed) {
+-      mLoader->Error(mScriptsBlocked);
+-    }
+-  }
+-
+-  void Pass() { mPassed = true; }
+-
+-private:
+-  mozilla::dom::ImportLoader* mLoader;
+-  bool mPassed;
+-  bool mScriptsBlocked;
+-};
+-
+-namespace mozilla {
+-namespace dom {
+-
+-//-----------------------------------------------------------------------------
+-// ImportLoader::Updater
+-//-----------------------------------------------------------------------------
+-
+-void
+-ImportLoader::Updater::GetReferrerChain(nsINode* aNode,
+-                                        nsTArray<nsINode*>& aResult)
+-{
+-  // We fill up the array backward. First the last link: aNode.
+-  MOZ_ASSERT(mLoader->mLinks.Contains(aNode));
+-
+-  aResult.AppendElement(aNode);
+-  nsINode* node = aNode;
+-  RefPtr<ImportManager> manager = mLoader->Manager();
+-  for (ImportLoader* referrersLoader = manager->Find(node->OwnerDoc());
+-       referrersLoader;
+-       referrersLoader = manager->Find(node->OwnerDoc()))
+-  {
+-    // Then walking up the main referrer chain and append each link
+-    // to the array.
+-    node = referrersLoader->GetMainReferrer();
+-    MOZ_ASSERT(node);
+-    aResult.AppendElement(node);
+-  }
+-
+-  // The reversed order is more useful for consumers.
+-  // XXX: This should probably go to nsTArray or some generic utility
+-  // lib for our containers that we don't have... I would really like to
+-  // get rid of this part...
+-  uint32_t l = aResult.Length();
+-  for (uint32_t i = 0; i < l / 2; i++) {
+-    Swap(aResult[i], aResult[l - i - 1]);
+-  }
+-}
+-
+-bool
+-ImportLoader::Updater::ShouldUpdate(nsTArray<nsINode*>& aNewPath)
+-{
+-  if (mLoader->Manager()->GetNearestPredecessor(mLoader->GetMainReferrer()) !=
+-      mLoader->mBlockingPredecessor) {
+-    return true;
+-  }
+-  // Let's walk down on the main referrer chains of both the current main and
+-  // the new link, and find the last pair of links that are from the same
+-  // document. This is the junction point between the two referrer chain. Their
+-  // order in the subimport list of that document will determine if we have to
+-  // update the spanning tree or this new edge changes nothing in the script
+-  // execution order.
+-  nsTArray<nsINode*> oldPath;
+-  GetReferrerChain(mLoader->mLinks[mLoader->mMainReferrer], oldPath);
+-  uint32_t max = std::min(oldPath.Length(), aNewPath.Length());
+-  MOZ_ASSERT(max > 0);
+-  uint32_t lastCommonImportAncestor = 0;
+-
+-  for (uint32_t i = 0;
+-       i < max && oldPath[i]->OwnerDoc() == aNewPath[i]->OwnerDoc();
+-       i++)
+-  {
+-    lastCommonImportAncestor = i;
+-  }
+-
+-  MOZ_ASSERT(lastCommonImportAncestor < max);
+-  nsINode* oldLink = oldPath[lastCommonImportAncestor];
+-  nsINode* newLink = aNewPath[lastCommonImportAncestor];
+-
+-  if ((lastCommonImportAncestor == max - 1) &&
+-      newLink == oldLink ) {
+-    // If one chain contains the other entirely, then this is a simple cycle,
+-    // nothing to be done here.
+-    MOZ_ASSERT(oldPath.Length() != aNewPath.Length(),
+-               "This would mean that new link == main referrer link");
+-    return false;
+-  }
+-
+-  MOZ_ASSERT(aNewPath != oldPath,
+-             "How could this happen?");
+-  nsIDocument* doc = oldLink->OwnerDoc();
+-  MOZ_ASSERT(doc->HasSubImportLink(newLink));
+-  MOZ_ASSERT(doc->HasSubImportLink(oldLink));
+-
+-  return doc->IndexOfSubImportLink(newLink) < doc->IndexOfSubImportLink(oldLink);
+-}
+-
+-void
+-ImportLoader::Updater::UpdateMainReferrer(uint32_t aNewIdx)
+-{
+-  MOZ_ASSERT(aNewIdx < mLoader->mLinks.Length());
+-  nsINode* newMainReferrer = mLoader->mLinks[aNewIdx];
+-
+-  // This new link means we have to execute our scripts sooner...
+-  // Let's make sure that unblocking a loader does not trigger a script execution.
+-  // So we start with placing the new blockers and only then will we remove any
+-  // blockers.
+-  if (mLoader->IsBlocking()) {
+-    // Our import parent is changed, let's block the new one and later unblock
+-    // the old one.
+-    newMainReferrer->OwnerDoc()->
+-      ScriptLoader()->AddParserBlockingScriptExecutionBlocker();
+-    newMainReferrer->OwnerDoc()->BlockDOMContentLoaded();
+-  }
+-
+-  if (mLoader->mDocument) {
+-    // Our nearest predecessor has changed. So let's add the ScriptLoader to the
+-    // new one if there is any. And remove it from the old one.
+-    RefPtr<ImportManager> manager = mLoader->Manager();
+-    ScriptLoader* loader = mLoader->mDocument->ScriptLoader();
+-    ImportLoader*& pred = mLoader->mBlockingPredecessor;
+-    ImportLoader* newPred = manager->GetNearestPredecessor(newMainReferrer);
+-    if (pred) {
+-      if (newPred) {
+-        newPred->AddBlockedScriptLoader(loader);
+-      }
+-      pred->RemoveBlockedScriptLoader(loader);
+-    }
+-  }
+-
+-  if (mLoader->IsBlocking()) {
+-    mLoader->mImportParent->
+-      ScriptLoader()->RemoveParserBlockingScriptExecutionBlocker();
+-    mLoader->mImportParent->UnblockDOMContentLoaded();
+-  }
+-
+-  // Finally update mMainReferrer to point to the newly added link.
+-  mLoader->mMainReferrer = aNewIdx;
+-  mLoader->mImportParent = newMainReferrer->OwnerDoc();
+-}
+-
+-nsINode*
+-ImportLoader::Updater::NextDependant(nsINode* aCurrentLink,
+-                                     nsTArray<nsINode*>& aPath,
+-                                     NodeTable& aVisitedNodes, bool aSkipChildren)
+-{
+-  // Depth first graph traversal.
+-  if (!aSkipChildren) {
+-    // "first child"
+-    ImportLoader* loader = mLoader->Manager()->Find(aCurrentLink);
+-    if (loader && loader->GetDocument()) {
+-      nsINode* firstSubImport = loader->GetDocument()->GetSubImportLink(0);
+-      if (firstSubImport && !aVisitedNodes.Contains(firstSubImport)) {
+-        aPath.AppendElement(aCurrentLink);
+-        aVisitedNodes.PutEntry(firstSubImport);
+-        return firstSubImport;
+-      }
+-    }
+-  }
+-
+-  aPath.AppendElement(aCurrentLink);
+-  // "(parent's) next sibling"
+-  while(aPath.Length() > 1) {
+-    aCurrentLink = aPath[aPath.Length() - 1];
+-    aPath.RemoveElementAt(aPath.Length() - 1);
+-
+-    // Let's find the next "sibling"
+-    ImportLoader* loader =  mLoader->Manager()->Find(aCurrentLink->OwnerDoc());
+-    MOZ_ASSERT(loader && loader->GetDocument(), "How can this happend?");
+-    nsIDocument* doc = loader->GetDocument();
+-    MOZ_ASSERT(doc->HasSubImportLink(aCurrentLink));
+-    uint32_t idx = doc->IndexOfSubImportLink(aCurrentLink);
+-    nsINode* next = doc->GetSubImportLink(idx + 1);
+-    if (next) {
+-      // Note: If we found an already visited link that means the parent links has
+-      // closed the circle it's always the "first child" section that should find
+-      // the first already visited node. Let's just assert that.
+-      MOZ_ASSERT(!aVisitedNodes.Contains(next));
+-      aVisitedNodes.PutEntry(next);
+-      return next;
+-    }
+-  }
+-
+-  return nullptr;
+-}
+-
+-void
+-ImportLoader::Updater::UpdateDependants(nsINode* aNode,
+-                                        nsTArray<nsINode*>& aPath)
+-{
+-  NodeTable visitedNodes;
+-  nsINode* current = aNode;
+-  uint32_t initialLength = aPath.Length();
+-  bool neededUpdate = true;
+-  while ((current = NextDependant(current, aPath, visitedNodes, !neededUpdate))) {
+-    if (!current || aPath.Length() <= initialLength) {
+-      break;
+-    }
+-    ImportLoader* loader = mLoader->Manager()->Find(current);
+-    if (!loader) {
+-      continue;
+-    }
+-    Updater& updater = loader->mUpdater;
+-    neededUpdate = updater.ShouldUpdate(aPath);
+-    if (neededUpdate) {
+-      updater.UpdateMainReferrer(loader->mLinks.IndexOf(current));
+-    }
+-  }
+-}
+-
+-void
+-ImportLoader::Updater::UpdateSpanningTree(nsINode* aNode)
+-{
+-  if (mLoader->mReady || mLoader->mStopped) {
+-    // Scripts already executed, nothing to be done here.
+-    return;
+-  }
+-
+-  if (mLoader->mLinks.Length() == 1) {
+-    // If this is the first referrer, let's mark it.
+-    mLoader->mMainReferrer = 0;
+-    return;
+-  }
+-
+-  nsTArray<nsINode*> newReferrerChain;
+-  GetReferrerChain(aNode, newReferrerChain);
+-  if (ShouldUpdate(newReferrerChain)) {
+-    UpdateMainReferrer(mLoader->mLinks.Length() - 1);
+-    UpdateDependants(aNode, newReferrerChain);
+-  }
+-}
+-
+-//-----------------------------------------------------------------------------
+-// ImportLoader
+-//-----------------------------------------------------------------------------
+-
+-NS_INTERFACE_MAP_BEGIN(ImportLoader)
+-  NS_INTERFACE_MAP_ENTRY(nsIStreamListener)
+-  NS_INTERFACE_MAP_ENTRY(nsIRequestObserver)
+-  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(ImportLoader)
+-NS_INTERFACE_MAP_END
+-
+-NS_IMPL_CYCLE_COLLECTING_ADDREF(ImportLoader)
+-NS_IMPL_CYCLE_COLLECTING_RELEASE(ImportLoader)
+-
+-NS_IMPL_CYCLE_COLLECTION(ImportLoader,
+-                         mDocument,
+-                         mImportParent,
+-                         mLinks)
+-
+-ImportLoader::ImportLoader(nsIURI* aURI, nsIDocument* aImportParent)
+-  : mURI(aURI)
+-  , mImportParent(aImportParent)
+-  , mBlockingPredecessor(nullptr)
+-  , mReady(false)
+-  , mStopped(false)
+-  , mBlockingScripts(false)
+-  , mUpdater(this)
+-{
+-}
+-
+-void
+-ImportLoader::BlockScripts()
+-{
+-  MOZ_ASSERT(!mBlockingScripts);
+-  mImportParent->ScriptLoader()->AddParserBlockingScriptExecutionBlocker();
+-  mImportParent->BlockDOMContentLoaded();
+-  mBlockingScripts = true;
+-}
+-
+-void
+-ImportLoader::UnblockScripts()
+-{
+-  MOZ_ASSERT(mBlockingScripts);
+-  mImportParent->ScriptLoader()->RemoveParserBlockingScriptExecutionBlocker();
+-  mImportParent->UnblockDOMContentLoaded();
+-  for (uint32_t i = 0; i < mBlockedScriptLoaders.Length(); i++) {
+-    mBlockedScriptLoaders[i]->RemoveParserBlockingScriptExecutionBlocker();
+-  }
+-  mBlockedScriptLoaders.Clear();
+-  mBlockingScripts = false;
+-}
+-
+-void
+-ImportLoader::SetBlockingPredecessor(ImportLoader* aLoader)
+-{
+-  mBlockingPredecessor = aLoader;
+-}
+-
+-void
+-ImportLoader::DispatchEventIfFinished(nsINode* aNode)
+-{
+-  MOZ_ASSERT(!(mReady && mStopped));
+-  if (mReady) {
+-    DispatchLoadEvent(aNode);
+-  }
+-  if (mStopped) {
+-    DispatchErrorEvent(aNode);
+-  }
+-}
+-
+-void
+-ImportLoader::AddBlockedScriptLoader(ScriptLoader* aScriptLoader)
+-{
+-  if (mBlockedScriptLoaders.Contains(aScriptLoader)) {
+-    return;
+-  }
+-
+-  aScriptLoader->AddParserBlockingScriptExecutionBlocker();
+-
+-  // Let's keep track of the pending script loaders.
+-  mBlockedScriptLoaders.AppendElement(aScriptLoader);
+-}
+-
+-bool
+-ImportLoader::RemoveBlockedScriptLoader(ScriptLoader* aScriptLoader)
+-{
+-  aScriptLoader->RemoveParserBlockingScriptExecutionBlocker();
+-  return mBlockedScriptLoaders.RemoveElement(aScriptLoader);
+-}
+-
+-void
+-ImportLoader::AddLinkElement(nsINode* aNode)
+-{
+-  // If a new link element is added to the import tree that
+-  // refers to an import that is already finished loading or
+-  // stopped trying, we need to fire the corresponding event
+-  // on it.
+-  mLinks.AppendElement(aNode);
+-  mUpdater.UpdateSpanningTree(aNode);
+-  DispatchEventIfFinished(aNode);
+-}
+-
+-void
+-ImportLoader::RemoveLinkElement(nsINode* aNode)
+-{
+-  mLinks.RemoveElement(aNode);
+-}
+-
+-// Events has to be fired with a script runner, so mImport can
+-// be set on the link element before the load event is fired even
+-// if ImportLoader::Get returns an already loaded import and we
+-// fire the load event immediately on the new referring link element.
+-class AsyncEvent : public Runnable {
+-public:
+-  AsyncEvent(nsINode* aNode, bool aSuccess)
+-    : mNode(aNode)
+-    , mSuccess(aSuccess)
+-  {
+-    MOZ_ASSERT(mNode);
+-  }
+-
+-  NS_IMETHOD Run() override {
+-    return nsContentUtils::DispatchTrustedEvent(mNode->OwnerDoc(),
+-                                                mNode,
+-                                                mSuccess ? NS_LITERAL_STRING("load")
+-                                                         : NS_LITERAL_STRING("error"),
+-                                                /* aCanBubble = */ false,
+-                                                /* aCancelable = */ false);
+-  }
+-
+-private:
+-  nsCOMPtr<nsINode> mNode;
+-  bool mSuccess;
+-};
+-
+-void
+-ImportLoader::DispatchErrorEvent(nsINode* aNode)
+-{
+-  nsContentUtils::AddScriptRunner(new AsyncEvent(aNode, /* aSuccess = */ false));
+-}
+-
+-void
+-ImportLoader::DispatchLoadEvent(nsINode* aNode)
+-{
+-  nsContentUtils::AddScriptRunner(new AsyncEvent(aNode, /* aSuccess = */ true));
+-}
+-
+-void
+-ImportLoader::Done()
+-{
+-  mReady = true;
+-  uint32_t l = mLinks.Length();
+-  for (uint32_t i = 0; i < l; i++) {
+-    DispatchLoadEvent(mLinks[i]);
+-  }
+-  UnblockScripts();
+-  ReleaseResources();
+-}
+-
+-void
+-ImportLoader::Error(bool aUnblockScripts)
+-{
+-  mDocument = nullptr;
+-  mStopped = true;
+-  uint32_t l = mLinks.Length();
+-  for (uint32_t i = 0; i < l; i++) {
+-    DispatchErrorEvent(mLinks[i]);
+-  }
+-  if (aUnblockScripts) {
+-    UnblockScripts();
+-  }
+-  ReleaseResources();
+-}
+-
+-// Release all the resources we don't need after there is no more
+-// data available on the channel, and the parser is done.
+-void ImportLoader::ReleaseResources()
+-{
+-  mParserStreamListener = nullptr;
+-  mImportParent = nullptr;
+-}
+-
+-nsIPrincipal*
+-ImportLoader::Principal()
+-{
+-  MOZ_ASSERT(mImportParent);
+-  nsCOMPtr<nsIDocument> master = mImportParent->MasterDocument();
+-  nsCOMPtr<nsIScriptObjectPrincipal> sop = do_QueryInterface(master);
+-  MOZ_ASSERT(sop);
+-  return sop->GetPrincipal();
+-}
+-
+-void
+-ImportLoader::Open()
+-{
+-  AutoError ae(this, false);
+-
+-  nsCOMPtr<nsILoadGroup> loadGroup =
+-    mImportParent->MasterDocument()->GetDocumentLoadGroup();
+-
+-  nsCOMPtr<nsIChannel> channel;
+-  nsresult rv = NS_NewChannel(getter_AddRefs(channel),
+-                              mURI,
+-                              mImportParent,
+-                              nsILoadInfo::SEC_REQUIRE_CORS_DATA_INHERITS,
+-                              nsIContentPolicy::TYPE_SUBDOCUMENT,
+-                              loadGroup,
+-                              nullptr,  // aCallbacks
+-                              nsIRequest::LOAD_BACKGROUND);
+-
+-  NS_ENSURE_SUCCESS_VOID(rv);
+-  rv = channel->AsyncOpen2(this);
+-  NS_ENSURE_SUCCESS_VOID(rv);
+-
+-  BlockScripts();
+-  ae.Pass();
+-}
+-
+-NS_IMETHODIMP
+-ImportLoader::OnDataAvailable(nsIRequest* aRequest,
+-                              nsISupports* aContext,
+-                              nsIInputStream* aStream,
+-                              uint64_t aOffset,
+-                              uint32_t aCount)
+-{
+-  MOZ_ASSERT(mParserStreamListener);
+-
+-  AutoError ae(this);
+-  nsresult rv;
+-  nsCOMPtr<nsIChannel> channel = do_QueryInterface(aRequest, &rv);
+-  NS_ENSURE_SUCCESS(rv, rv);
+-
+-  rv = mParserStreamListener->OnDataAvailable(channel, aContext,
+-                                              aStream, aOffset,
+-                                              aCount);
+-  NS_ENSURE_SUCCESS(rv, rv);
+-  ae.Pass();
+-  return rv;
+-}
+-
+-NS_IMETHODIMP
+-ImportLoader::HandleEvent(nsIDOMEvent *aEvent)
+-{
+-#ifdef DEBUG
+-  nsAutoString type;
+-  aEvent->GetType(type);
+-  MOZ_ASSERT(type.EqualsLiteral("DOMContentLoaded"));
+-#endif
+-  Done();
+-  return NS_OK;
+-}
+-
+-NS_IMETHODIMP
+-ImportLoader::OnStopRequest(nsIRequest* aRequest,
+-                            nsISupports* aContext,
+-                            nsresult aStatus)
+-{
+-  // OnStartRequest throws a special error code to let us know that we
+-  // shouldn't do anything else.
+-  if (aStatus == NS_ERROR_DOM_ABORT_ERR) {
+-    // We failed in OnStartRequest, nothing more to do (we've already
+-    // dispatched an error event) just return here.
+-    MOZ_ASSERT(mStopped);
+-    return NS_OK;
+-  }
+-
+-  if (mParserStreamListener) {
+-    mParserStreamListener->OnStopRequest(aRequest, aContext, aStatus);
+-  }
+-
+-  if (!mDocument) {
+-    // If at this point we don't have a document, then the error was
+-    // already reported.
+-    return NS_ERROR_DOM_ABORT_ERR;
+-  }
+-
+-  nsCOMPtr<EventTarget> eventTarget = do_QueryInterface(mDocument);
+-  EventListenerManager* manager = eventTarget->GetOrCreateListenerManager();
+-  manager->AddEventListenerByType(this,
+-                                  NS_LITERAL_STRING("DOMContentLoaded"),
+-                                  TrustedEventsAtSystemGroupBubble());
+-  return NS_OK;
+-}
+-
+-NS_IMETHODIMP
+-ImportLoader::OnStartRequest(nsIRequest* aRequest, nsISupports* aContext)
+-{
+-  AutoError ae(this);
+-  nsIPrincipal* principal = Principal();
+-
+-  nsCOMPtr<nsIChannel> channel = do_QueryInterface(aRequest);
+-  if (!channel) {
+-    return NS_ERROR_DOM_ABORT_ERR;
+-  }
+-
+-  if (nsContentUtils::IsSystemPrincipal(principal)) {
+-    // We should never import non-system documents and run their scripts with system principal!
+-    nsCOMPtr<nsIPrincipal> channelPrincipal;
+-    nsContentUtils::GetSecurityManager()->GetChannelResultPrincipal(channel,
+-                                                                    getter_AddRefs(channelPrincipal));
+-    if (!nsContentUtils::IsSystemPrincipal(channelPrincipal)) {
+-      return NS_ERROR_FAILURE;
+-    }
+-  }
+-  channel->SetOwner(principal);
+-
+-  nsAutoCString type;
+-  channel->GetContentType(type);
+-  if (!type.EqualsLiteral("text/html")) {
+-    NS_WARNING("ImportLoader wrong content type");
+-    return NS_ERROR_DOM_ABORT_ERR;
+-  }
+-
+-  // The scope object is same for all the imports in an import tree,
+-  // let's get it form the import parent.
+-  nsCOMPtr<nsIGlobalObject> global = mImportParent->GetScopeObject();
+-  nsCOMPtr<nsIDOMDocument> importDoc;
+-  nsCOMPtr<nsIURI> baseURI = mImportParent->GetBaseURI();
+-  const nsAString& emptyStr = EmptyString();
+-  nsresult rv = NS_NewDOMDocument(getter_AddRefs(importDoc),
+-                                  emptyStr, emptyStr, nullptr, mURI,
+-                                  baseURI, principal, false, global,
+-                                  DocumentFlavorHTML);
+-  NS_ENSURE_SUCCESS(rv, NS_ERROR_DOM_ABORT_ERR);
+-
+-  // The imported document must know which master document it belongs to.
+-  mDocument = do_QueryInterface(importDoc);
+-  nsCOMPtr<nsIDocument> master = mImportParent->MasterDocument();
+-  mDocument->SetMasterDocument(master);
+-
+-  // We want to inherit the sandbox flags and fullscreen enabled flag
+-  // from the master document.
+-  mDocument->SetSandboxFlags(master->GetSandboxFlags());
+-
+-  // We have to connect the blank document we created with the channel we opened,
+-  // and create its own LoadGroup for it.
+-  nsCOMPtr<nsIStreamListener> listener;
+-  nsCOMPtr<nsILoadGroup> loadGroup;
+-  channel->GetLoadGroup(getter_AddRefs(loadGroup));
+-  nsCOMPtr<nsILoadGroup> newLoadGroup = do_CreateInstance(NS_LOADGROUP_CONTRACTID);
+-  NS_ENSURE_TRUE(newLoadGroup, NS_ERROR_OUT_OF_MEMORY);
+-  newLoadGroup->SetLoadGroup(loadGroup);
+-  rv = mDocument->StartDocumentLoad("import", channel, newLoadGroup,
+-                                    nullptr, getter_AddRefs(listener),
+-                                    true);
+-  NS_ENSURE_SUCCESS(rv, NS_ERROR_DOM_ABORT_ERR);
+-
+-  nsCOMPtr<nsIURI> originalURI;
+-  rv = channel->GetOriginalURI(getter_AddRefs(originalURI));
+-  NS_ENSURE_SUCCESS(rv, NS_ERROR_DOM_ABORT_ERR);
+-
+-  nsCOMPtr<nsIURI> URI;
+-  rv = channel->GetURI(getter_AddRefs(URI));
+-  NS_ENSURE_SUCCESS(rv, NS_ERROR_DOM_ABORT_ERR);
+-  MOZ_ASSERT(URI, "URI of a channel should never be null");
+-
+-  bool equals;
+-  rv = URI->Equals(originalURI, &equals);
+-  NS_ENSURE_SUCCESS(rv, NS_ERROR_DOM_ABORT_ERR);
+-
+-  if (!equals) {
+-    // In case of a redirection we must add the new URI to the import map.
+-    Manager()->AddLoaderWithNewURI(this, URI);
+-  }
+-
+-  // Let's start the parser.
+-  mParserStreamListener = listener;
+-  rv = listener->OnStartRequest(aRequest, aContext);
+-  NS_ENSURE_SUCCESS(rv, NS_ERROR_DOM_ABORT_ERR);
+-
+-  ae.Pass();
+-  return NS_OK;
+-}
+-
+-//-----------------------------------------------------------------------------
+-// ImportManager
+-//-----------------------------------------------------------------------------
+-
+-NS_IMPL_CYCLE_COLLECTION(ImportManager,
+-                         mImports)
+-
+-NS_INTERFACE_MAP_BEGIN(ImportManager)
+-  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(ImportManager)
+-NS_INTERFACE_MAP_END
+-
+-NS_IMPL_CYCLE_COLLECTING_ADDREF(ImportManager)
+-NS_IMPL_CYCLE_COLLECTING_RELEASE(ImportManager)
+-
+-already_AddRefed<ImportLoader>
+-ImportManager::Get(nsIURI* aURI, nsINode* aNode, nsIDocument* aOrigDocument)
+-{
+-  // Check if we have a loader for that URI, if not create one,
+-  // and start it up.
+-  RefPtr<ImportLoader> loader;
+-  mImports.Get(aURI, getter_AddRefs(loader));
+-  bool needToStart = false;
+-  if (!loader) {
+-    loader = new ImportLoader(aURI, aOrigDocument);
+-    mImports.Put(aURI, loader);
+-    needToStart = true;
+-  }
+-
+-  MOZ_ASSERT(loader);
+-  // Let's keep track of the sub imports links in each document. It will
+-  // be used later for scrip execution order calculation. (see UpdateSpanningTree)
+-  // NOTE: removing and adding back the link to the tree somewhere else will
+-  // NOT have an effect on script execution order.
+-  if (!aOrigDocument->HasSubImportLink(aNode)) {
+-    aOrigDocument->AddSubImportLink(aNode);
+-  }
+-
+-  loader->AddLinkElement(aNode);
+-
+-  if (needToStart) {
+-    loader->Open();
+-  }
+-
+-  return loader.forget();
+-}
+-
+-ImportLoader*
+-ImportManager::Find(nsIDocument* aImport)
+-{
+-  return mImports.GetWeak(aImport->GetDocumentURIObject());
+-}
+-
+-ImportLoader*
+-ImportManager::Find(nsINode* aLink)
+-{
+-  HTMLLinkElement* linkElement = static_cast<HTMLLinkElement*>(aLink);
+-  nsCOMPtr<nsIURI> uri = linkElement->GetHrefURI();
+-  return mImports.GetWeak(uri);
+-}
+-
+-void
+-ImportManager::AddLoaderWithNewURI(ImportLoader* aLoader, nsIURI* aNewURI)
+-{
+-  mImports.Put(aNewURI, aLoader);
+-}
+-
+-ImportLoader* ImportManager::GetNearestPredecessor(nsINode* aNode)
+-{
+-  // Return the previous link if there is any in the same document.
+-  nsIDocument* doc = aNode->OwnerDoc();
+-  int32_t idx = doc->IndexOfSubImportLink(aNode);
+-  MOZ_ASSERT(idx != -1, "aNode must be a sub import link of its owner document");
+-
+-  for (; idx > 0; idx--) {
+-    HTMLLinkElement* link =
+-      static_cast<HTMLLinkElement*>(doc->GetSubImportLink(idx - 1));
+-    nsCOMPtr<nsIURI> uri = link->GetHrefURI();
+-    RefPtr<ImportLoader> ret;
+-    mImports.Get(uri, getter_AddRefs(ret));
+-    // Only main referrer links are interesting.
+-    if (ret->GetMainReferrer() == link) {
+-      return ret;
+-    }
+-  }
+-
+-  if (idx == 0) {
+-    if (doc->IsMasterDocument()) {
+-      // If there is no previous one, and it was the master document, then
+-      // there is no predecessor.
+-      return nullptr;
+-    }
+-    // Else we find the main referrer of the import parent of the link's document.
+-    // And do a recursion.
+-    ImportLoader* owner = Find(doc);
+-    MOZ_ASSERT(owner);
+-    nsCOMPtr<nsINode> mainReferrer = owner->GetMainReferrer();
+-    return GetNearestPredecessor(mainReferrer);
+-  }
+-
+-  return nullptr;
+-}
+-
+-} // namespace dom
+-} // namespace mozilla
+diff --git a/dom/base/ImportManager.h b/dom/base/ImportManager.h
+deleted file mode 100644
+--- a/dom/base/ImportManager.h
++++ /dev/null
+@@ -1,283 +0,0 @@
+-/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+-/* vim: set ts=8 sts=2 et sw=2 tw=80: */
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-/*
+- *
+- * For each import tree there is one master document (the root) and one
+- * import manager. The import manager is a map of URI ImportLoader pairs.
+- * An ImportLoader is responsible for loading an import document from a
+- * given location, and sending out load or error events to all the link
+- * nodes that refer to it when it's done. For loading it opens up a
+- * channel, using the same CSP as the master document. It then creates a
+- * blank document, and starts parsing the data from the channel. When
+- * there is no more data on the channel we wait for the DOMContentLoaded
+- * event from the parsed document. For the duration of the loading
+- * process the scripts on the parent documents are blocked. When an error
+- * occurs, or the DOMContentLoaded event is received, the scripts on the
+- * parent document are unblocked and we emit the corresponding event on
+- * all the referrer link nodes. If a new link node is added to one of the
+- * DOM trees in the import tree that refers to an import that was already
+- * loaded, the already existing ImportLoader is being used (without
+- * loading the referred import document twice) and if necessary the
+- * load/error is emitted on it immediately.
+- *
+- * Ownership model:
+- *
+- * ImportDocument ----------------------------
+- *  ^                                        |
+- *  |                                        v
+- *  MasterDocument <- ImportManager <-ImportLoader
+- *  ^                                        ^
+- *  |                                        |
+- *  LinkElement <-----------------------------
+- *
+- */
+-
+-#ifndef mozilla_dom_ImportManager_h__
+-#define mozilla_dom_ImportManager_h__
+-
+-#include "nsTArray.h"
+-#include "nsCycleCollectionParticipant.h"
+-#include "nsIDOMEventListener.h"
+-#include "nsIStreamListener.h"
+-#include "nsIWeakReferenceUtils.h"
+-#include "nsRefPtrHashtable.h"
+-#include "nsURIHashKey.h"
+-#include "mozilla/dom/ScriptLoader.h"
+-
+-class nsIDocument;
+-class nsIPrincipal;
+-class nsINode;
+-class AutoError;
+-
+-namespace mozilla {
+-namespace dom {
+-
+-class ImportManager;
+-
+-typedef nsTHashtable<nsPtrHashKey<nsINode>> NodeTable;
+-
+-class ImportLoader final : public nsIStreamListener
+-                         , public nsIDOMEventListener
+-{
+-
+-  // A helper inner class to decouple the logic of updating the import graph
+-  // after a new import link has been found by one of the parsers.
+-  class Updater {
+-
+-  public:
+-    explicit Updater(ImportLoader* aLoader) : mLoader(aLoader)
+-    {}
+-
+-    // After a new link is added that refers to this import, we
+-    // have to update the spanning tree, since given this new link the
+-    // priority of this import might be higher in the scripts
+-    // execution order than before. It updates mMainReferrer, mImportParent,
+-    // the corresponding pending ScriptRunners, etc.
+-    // It also handles updating additional dependant loaders via the
+-    // UpdateDependants calls.
+-    // (NOTE: See GetMainReferrer about spanning tree.)
+-    void UpdateSpanningTree(nsINode* aNode);
+-
+-  private:
+-    // Returns an array of links that forms a referring chain from
+-    // the master document to this import. Each link in the array
+-    // is marked as main referrer in the list.
+-    void GetReferrerChain(nsINode* aNode, nsTArray<nsINode*>& aResult);
+-
+-    // Once we find a new referrer path to our import, we have to see if
+-    // it changes the load order hence we have to do an update on the graph.
+-    bool ShouldUpdate(nsTArray<nsINode*>& aNewPath);
+-    void UpdateMainReferrer(uint32_t newIdx);
+-
+-    // It's a depth first graph traversal algorithm, for UpdateDependants. The
+-    // nodes in the graph are the import link elements, and there is a directed
+-    // edge from link1 to link2 if link2 is a subimport in the import document
+-    // of link1.
+-    // If the ImportLoader that aCurrentLink points to didn't need to be updated
+-    // the algorithm skips its "children" (subimports). Note, that this graph can
+-    // also contain cycles, aVisistedLinks is used to track the already visited
+-    // links to avoid an infinite loop.
+-    // aPath - (in/out) the referrer link chain of aCurrentLink when called, and
+-    //                  of the next link when the function returns
+-    // aVisitedLinks - (in/out) list of links that the traversal already visited
+-    //                          (to handle cycles in the graph)
+-    // aSkipChildren - when aCurrentLink points to an import that did not need
+-    //                 to be updated, we can skip its sub-imports ('children')
+-    nsINode* NextDependant(nsINode* aCurrentLink,
+-                           nsTArray<nsINode*>& aPath,
+-                           NodeTable& aVisitedLinks, bool aSkipChildren);
+-
+-    // When we find a new link that changes the load order of the known imports,
+-    // we also have to check all the subimports of it, to see if they need an
+-    // update too. (see test_imports_nested_2.html)
+-    void UpdateDependants(nsINode* aNode, nsTArray<nsINode*>& aPath);
+-
+-    ImportLoader* mLoader;
+-  };
+-
+-  friend class ::AutoError;
+-  friend class ImportManager;
+-  friend class Updater;
+-
+-public:
+-  ImportLoader(nsIURI* aURI, nsIDocument* aOriginDocument);
+-
+-  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+-  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(ImportLoader, nsIStreamListener)
+-  NS_DECL_NSISTREAMLISTENER
+-  NS_DECL_NSIREQUESTOBSERVER
+-
+-  // We need to listen to DOMContentLoaded event to know when the document
+-  // is fully leaded.
+-  NS_IMETHOD HandleEvent(nsIDOMEvent *aEvent) override;
+-
+-  // Validation then opening and starting up the channel.
+-  void Open();
+-  void AddLinkElement(nsINode* aNode);
+-  void RemoveLinkElement(nsINode* aNode);
+-  bool IsReady() { return mReady; }
+-  bool IsStopped() { return mStopped; }
+-  bool IsBlocking() { return mBlockingScripts; }
+-
+-  ImportManager* Manager() {
+-    MOZ_ASSERT(mDocument || mImportParent, "One of them should be always set");
+-    return (mDocument ? mDocument : mImportParent)->ImportManager();
+-  }
+-
+-  // Simply getter for the import document. Can return a partially parsed
+-  // document if called too early.
+-  nsIDocument* GetDocument()
+-  {
+-    return mDocument;
+-  }
+-
+-  // Getter for the import document that is used in the spec. Returns
+-  // nullptr if the import is not yet ready.
+-  nsIDocument* GetImport()
+-  {
+-    if (!mReady) {
+-      return nullptr;
+-    }
+-    return mDocument;
+-  }
+-
+-  // There is only one referring link that is marked as primary link per
+-  // imports. This is the one that has to be taken into account when
+-  // scrip execution order is determined. Links marked as primary link form
+-  // a spanning tree in the import graph. (Eliminating the cycles and
+-  // multiple parents.) This spanning tree is recalculated every time
+-  // a new import link is added to the manager.
+-  nsINode* GetMainReferrer()
+-  {
+-    if (mLinks.IsEmpty()) {
+-      return nullptr;
+-    }
+-    return mLinks[mMainReferrer];
+-  }
+-
+-  // An import is not only blocked by its import children, but also
+-  // by its predecessors. It's enough to find the closest predecessor
+-  // and wait for that to run its scripts. We keep track of all the
+-  // ScriptRunners that are waiting for this import. NOTE: updating
+-  // the main referrer might change this list.
+-  void AddBlockedScriptLoader(ScriptLoader* aScriptLoader);
+-  bool RemoveBlockedScriptLoader(ScriptLoader* aScriptLoader);
+-  void SetBlockingPredecessor(ImportLoader* aLoader);
+-
+-private:
+-  ~ImportLoader() {}
+-
+-  // If a new referrer LinkElement was added, let's
+-  // see if we are already finished and if so fire
+-  // the right event.
+-  void DispatchEventIfFinished(nsINode* aNode);
+-
+-  // Dispatch event for a single referrer LinkElement.
+-  void DispatchErrorEvent(nsINode* aNode);
+-  void DispatchLoadEvent(nsINode* aNode);
+-
+-  // Must be called when an error has occured during load.
+-  void Error(bool aUnblockScripts);
+-
+-  // Must be called when the import document has been loaded successfully.
+-  void Done();
+-
+-  // When the reading from the channel and the parsing
+-  // of the document is done, we can release the resources
+-  // that we don't need any longer to hold on.
+-  void ReleaseResources();
+-
+-  // While the document is being loaded we must block scripts
+-  // on the import parent document.
+-  void BlockScripts();
+-  void UnblockScripts();
+-
+-  nsIPrincipal* Principal();
+-
+-  nsCOMPtr<nsIDocument> mDocument;
+-  nsCOMPtr<nsIURI> mURI;
+-  nsCOMPtr<nsIStreamListener> mParserStreamListener;
+-  nsCOMPtr<nsIDocument> mImportParent;
+-  ImportLoader* mBlockingPredecessor;
+-
+-  // List of the LinkElements that are referring to this import
+-  // we need to keep track of them so we can fire event on them.
+-  nsTArray<nsCOMPtr<nsINode>> mLinks;
+-
+-  // List of pending ScriptLoaders that are waiting for this import
+-  // to finish.
+-  nsTArray<RefPtr<ScriptLoader>> mBlockedScriptLoaders;
+-
+-  // There is always exactly one referrer link that is flagged as
+-  // the main referrer the primary link. This is the one that is
+-  // used in the script execution order calculation.
+-  // ("Branch" according to the spec.)
+-  uint32_t mMainReferrer;
+-  bool mReady;
+-  bool mStopped;
+-  bool mBlockingScripts;
+-  Updater mUpdater;
+-};
+-
+-class ImportManager final : public nsISupports
+-{
+-  typedef nsRefPtrHashtable<nsURIHashKey, ImportLoader> ImportMap;
+-
+-  ~ImportManager() {}
+-
+-public:
+-  ImportManager() {}
+-
+-  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+-  NS_DECL_CYCLE_COLLECTION_CLASS(ImportManager)
+-
+-  // Finds the ImportLoader that belongs to aImport in the map.
+-  ImportLoader* Find(nsIDocument* aImport);
+-
+-  // Find the ImportLoader aLink refers to.
+-  ImportLoader* Find(nsINode* aLink);
+-
+-  void AddLoaderWithNewURI(ImportLoader* aLoader, nsIURI* aNewURI);
+-
+-  // When a new import link is added, this getter either creates
+-  // a new ImportLoader for it, or returns an existing one if
+-  // it was already created and in the import map.
+-  already_AddRefed<ImportLoader> Get(nsIURI* aURI, nsINode* aNode,
+-                                     nsIDocument* aOriginDocument);
+-
+-  // It finds the predecessor for an import link node that runs its
+-  // scripts the latest among its predecessors.
+-  ImportLoader* GetNearestPredecessor(nsINode* aNode);
+-
+-private:
+-  ImportMap mImports;
+-};
+-
+-} // namespace dom
+-} // namespace mozilla
+-
+-#endif // mozilla_dom_ImportManager_h__
+diff --git a/dom/base/Link.cpp b/dom/base/Link.cpp
+--- a/dom/base/Link.cpp
++++ b/dom/base/Link.cpp
+@@ -105,18 +105,17 @@ Link::TryDNSPrefetchPreconnectOrPrefetch
+   if (!mElement->GetAttr(kNameSpaceID_None, nsGkAtoms::rel, rel)) {
+     return;
+   }
+ 
+   if (!nsContentUtils::PrefetchEnabled(mElement->OwnerDoc()->GetDocShell())) {
+     return;
+   }
+ 
+-  uint32_t linkTypes = nsStyleLinkElement::ParseLinkTypes(rel,
+-                         mElement->NodePrincipal());
++  uint32_t linkTypes = nsStyleLinkElement::ParseLinkTypes(rel);
+ 
+   if ((linkTypes & nsStyleLinkElement::ePREFETCH) ||
+       (linkTypes & nsStyleLinkElement::eNEXT)){
+     nsCOMPtr<nsIPrefetchService> prefetchService(do_GetService(NS_PREFETCHSERVICE_CONTRACTID));
+     if (prefetchService) {
+       nsCOMPtr<nsIURI> uri(GetURI());
+       if (uri) {
+         nsCOMPtr<nsIDOMNode> domNode = GetAsDOMNode(mElement);
+diff --git a/dom/base/moz.build b/dom/base/moz.build
+--- a/dom/base/moz.build
++++ b/dom/base/moz.build
+@@ -176,17 +176,16 @@ EXPORTS.mozilla.dom += [
+     'FormData.h',
+     'FragmentOrElement.h',
+     'FromParser.h',
+     'GroupedSHistory.h',
+     'IdleDeadline.h',
+     'IdleRequest.h',
+     'ImageEncoder.h',
+     'ImageTracker.h',
+-    'ImportManager.h',
+     'Link.h',
+     'Location.h',
+     'NameSpaceConstants.h',
+     'Navigator.h',
+     'NodeInfo.h',
+     'NodeInfoInlines.h',
+     'NodeIterator.h',
+     'PartialSHistory.h',
+@@ -249,17 +248,16 @@ UNIFIED_SOURCES += [
+     'EventSource.cpp',
+     'FormData.cpp',
+     'FragmentOrElement.cpp',
+     'GroupedSHistory.cpp',
+     'IdleDeadline.cpp',
+     'IdleRequest.cpp',
+     'ImageEncoder.cpp',
+     'ImageTracker.cpp',
+-    'ImportManager.cpp',
+     'Link.cpp',
+     'Location.cpp',
+     'Navigator.cpp',
+     'NodeInfo.cpp',
+     'NodeIterator.cpp',
+     'nsAtomListUtils.cpp',
+     'nsAttrAndChildArray.cpp',
+     'nsAttrValue.cpp',
+diff --git a/dom/base/nsContentSink.cpp b/dom/base/nsContentSink.cpp
+--- a/dom/base/nsContentSink.cpp
++++ b/dom/base/nsContentSink.cpp
+@@ -692,17 +692,17 @@ nsContentSink::ProcessLinkHeader(const n
+ 
+ nsresult
+ nsContentSink::ProcessLink(const nsSubstring& aAnchor, const nsSubstring& aHref,
+                            const nsSubstring& aRel, const nsSubstring& aTitle,
+                            const nsSubstring& aType, const nsSubstring& aMedia,
+                            const nsSubstring& aCrossOrigin)
+ {
+   uint32_t linkTypes =
+-    nsStyleLinkElement::ParseLinkTypes(aRel, mDocument->NodePrincipal());
++    nsStyleLinkElement::ParseLinkTypes(aRel);
+ 
+   // The link relation may apply to a different resource, specified
+   // in the anchor parameter. For the link relations supported so far,
+   // we simply abort if the link applies to a resource different to the
+   // one we've loaded
+   if (!LinkContextIsOurDocument(aAnchor)) {
+     return NS_OK;
+   }
+diff --git a/dom/base/nsContentUtils.cpp b/dom/base/nsContentUtils.cpp
+--- a/dom/base/nsContentUtils.cpp
++++ b/dom/base/nsContentUtils.cpp
+@@ -9973,25 +9973,22 @@ nsContentUtils::HttpsStateIsModern(nsIDo
+ /* static */ CustomElementDefinition*
+ nsContentUtils::LookupCustomElementDefinition(nsIDocument* aDoc,
+                                               const nsAString& aLocalName,
+                                               uint32_t aNameSpaceID,
+                                               const nsAString* aIs)
+ {
+   MOZ_ASSERT(aDoc);
+ 
+-  // To support imported document.
+-  nsCOMPtr<nsIDocument> doc = aDoc->MasterDocument();
+-
+   if (aNameSpaceID != kNameSpaceID_XHTML ||
+-      !doc->GetDocShell()) {
++      !aDoc->GetDocShell()) {
+     return nullptr;
+   }
+ 
+-  nsCOMPtr<nsPIDOMWindowInner> window(doc->GetInnerWindow());
++  nsCOMPtr<nsPIDOMWindowInner> window(aDoc->GetInnerWindow());
+   if (!window) {
+     return nullptr;
+   }
+ 
+   RefPtr<CustomElementRegistry> registry(window->CustomElements());
+   if (!registry) {
+     return nullptr;
+   }
+@@ -10006,19 +10003,16 @@ nsContentUtils::SetupCustomElement(Eleme
+   MOZ_ASSERT(aElement);
+ 
+   nsCOMPtr<nsIDocument> doc = aElement->OwnerDoc();
+ 
+   if (!doc) {
+     return;
+   }
+ 
+-  // To support imported document.
+-  doc = doc->MasterDocument();
+-
+   if (aElement->GetNameSpaceID() != kNameSpaceID_XHTML ||
+       !doc->GetDocShell()) {
+     return;
+   }
+ 
+   nsCOMPtr<nsPIDOMWindowInner> window(doc->GetInnerWindow());
+   if (!window) {
+     return;
+@@ -10036,24 +10030,21 @@ nsContentUtils::SetupCustomElement(Eleme
+ nsContentUtils::EnqueueLifecycleCallback(nsIDocument* aDoc,
+                                          nsIDocument::ElementCallbackType aType,
+                                          Element* aCustomElement,
+                                          LifecycleCallbackArgs* aArgs,
+                                          CustomElementDefinition* aDefinition)
+ {
+   MOZ_ASSERT(aDoc);
+ 
+-  // To support imported document.
+-  nsCOMPtr<nsIDocument> doc = aDoc->MasterDocument();
+-
+-  if (!doc->GetDocShell()) {
++  if (!aDoc->GetDocShell()) {
+     return;
+   }
+ 
+-  nsCOMPtr<nsPIDOMWindowInner> window(doc->GetInnerWindow());
++  nsCOMPtr<nsPIDOMWindowInner> window(aDoc->GetInnerWindow());
+   if (!window) {
+     return;
+   }
+ 
+   RefPtr<CustomElementRegistry> registry(window->CustomElements());
+   if (!registry) {
+     return;
+   }
+@@ -10064,25 +10055,22 @@ nsContentUtils::EnqueueLifecycleCallback
+ /* static */ void
+ nsContentUtils::GetCustomPrototype(nsIDocument* aDoc,
+                                    int32_t aNamespaceID,
+                                    nsIAtom* aAtom,
+                                    JS::MutableHandle<JSObject*> aPrototype)
+ {
+   MOZ_ASSERT(aDoc);
+ 
+-  // To support imported document.
+-  nsCOMPtr<nsIDocument> doc = aDoc->MasterDocument();
+-
+   if (aNamespaceID != kNameSpaceID_XHTML ||
+-      !doc->GetDocShell()) {
++      !aDoc->GetDocShell()) {
+     return;
+   }
+ 
+-  nsCOMPtr<nsPIDOMWindowInner> window(doc->GetInnerWindow());
++  nsCOMPtr<nsPIDOMWindowInner> window(aDoc->GetInnerWindow());
+   if (!window) {
+     return;
+   }
+ 
+   RefPtr<CustomElementRegistry> registry(window->CustomElements());
+   if (!registry) {
+     return;
+   }
+diff --git a/dom/base/nsDocument.cpp b/dom/base/nsDocument.cpp
+--- a/dom/base/nsDocument.cpp
++++ b/dom/base/nsDocument.cpp
+@@ -1771,18 +1771,16 @@ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_
+ 
+   // Traverse all nsDocument nsCOMPtrs.
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mParser)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mScriptGlobalObject)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mListenerManager)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mDOMStyleSheets)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mStyleSheetSetList)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mScriptLoader)
+-  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mMasterDocument)
+-  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mImportManager)
+ 
+   for (auto iter = tmp->mRadioGroups.Iter(); !iter.Done(); iter.Next()) {
+     nsRadioGroupStruct* radioGroup = iter.UserData();
+     NS_CYCLE_COLLECTION_NOTE_EDGE_NAME(
+       cb, "mRadioGroups entry->mSelectedRadioButton");
+     cb.NoteXPCOMChild(ToSupports(radioGroup->mSelectedRadioButton));
+ 
+     uint32_t i, count = radioGroup->mRadioButtons.Count();
+@@ -1820,18 +1818,16 @@ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mChildrenCollection)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mAnonymousContents)
+ 
+   // Traverse all our nsCOMArrays.
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mStyleSheets)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mOnDemandBuiltInUASheets)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mPreloadingImages)
+ 
+-  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mSubImportLinks)
+-
+   for (uint32_t i = 0; i < tmp->mFrameRequestCallbacks.Length(); ++i) {
+     NS_CYCLE_COLLECTION_NOTE_EDGE_NAME(cb, "mFrameRequestCallbacks[i]");
+     cb.NoteXPCOMChild(tmp->mFrameRequestCallbacks[i].mCallback);
+   }
+ 
+   // Traverse animation components
+   if (tmp->mAnimationController) {
+     tmp->mAnimationController->Traverse(&cb);
+@@ -1906,20 +1902,17 @@ NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(ns
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mMaybeEndOutermostXBLUpdateRunner)
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mDOMImplementation)
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mImageMaps)
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mCachedEncoder)
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mDocumentTimeline)
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mPendingAnimationTracker)
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mTemplateContentsOwner)
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mChildrenCollection)
+-  NS_IMPL_CYCLE_COLLECTION_UNLINK(mMasterDocument)
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mOrientationPendingPromise)
+-  NS_IMPL_CYCLE_COLLECTION_UNLINK(mImportManager)
+-  NS_IMPL_CYCLE_COLLECTION_UNLINK(mSubImportLinks)
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mFontFaceSet)
+ 
+   tmp->mParentDocument = nullptr;
+ 
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mPreloadingImages)
+ 
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mIntersectionObservers)
+ 
+@@ -3674,20 +3667,16 @@ nsDocument::GetBaseTarget(nsAString &aBa
+ 
+ void
+ nsDocument::SetDocumentCharacterSet(const nsACString& aCharSetID)
+ {
+   // XXX it would be a good idea to assert the sanity of the argument,
+   // but before we figure out what to do about non-Encoding Standard
+   // encodings in the charset menu and in mailnews, assertions are futile.
+   if (!mCharacterSet.Equals(aCharSetID)) {
+-    if (mMasterDocument && !aCharSetID.EqualsLiteral("UTF-8")) {
+-      // Imports are always UTF-8
+-      return;
+-    }
+     mCharacterSet = aCharSetID;
+ 
+     int32_t n = mCharSetObservers.Length();
+ 
+     for (int32_t i = 0; i < n; i++) {
+       nsIObserver* observer = mCharSetObservers.ElementAt(i);
+ 
+       observer->Observe(static_cast<nsIDocument *>(this), "charset",
+@@ -8173,19 +8162,16 @@ nsDocument::IsScriptEnabled()
+ {
+   // If this document is sandboxed without 'allow-scripts'
+   // script is not enabled
+   if (HasScriptsBlockedBySandbox()) {
+     return false;
+   }
+ 
+   nsCOMPtr<nsIScriptGlobalObject> globalObject = do_QueryInterface(GetInnerWindow());
+-  if (!globalObject && mMasterDocument) {
+-    globalObject = do_QueryInterface(mMasterDocument->GetInnerWindow());
+-  }
+   if (!globalObject || !globalObject->GetGlobalJSObject()) {
+     return false;
+   }
+ 
+   return xpc::Scriptability::Get(globalObject->GetGlobalJSObject()).Allowed();
+ }
+ 
+ nsRadioGroupStruct*
+diff --git a/dom/base/nsDocument.h b/dom/base/nsDocument.h
+--- a/dom/base/nsDocument.h
++++ b/dom/base/nsDocument.h
+@@ -61,17 +61,16 @@
+ #include "mozilla/dom/DOMImplementation.h"
+ #include "mozilla/dom/ScriptLoader.h"
+ #include "mozilla/dom/StyleSheetList.h"
+ #include "nsDataHashtable.h"
+ #include "mozilla/TimeStamp.h"
+ #include "mozilla/Attributes.h"
+ #include "nsIDOMXPathEvaluator.h"
+ #include "jsfriendapi.h"
+-#include "ImportManager.h"
+ #include "mozilla/LinkedList.h"
+ #include "CustomElementRegistry.h"
+ #include "mozilla/dom/Performance.h"
+ #include "mozilla/Maybe.h"
+ 
+ #define XML_DECLARATION_BITS_DECLARATION_EXISTS   (1 << 0)
+ #define XML_DECLARATION_BITS_ENCODING_EXISTS      (1 << 1)
+ #define XML_DECLARATION_BITS_STANDALONE_EXISTS    (1 << 2)
+@@ -1212,73 +1211,16 @@ public:
+   virtual already_AddRefed<Element> CreateElement(const nsAString& aTagName,
+                                                   const mozilla::dom::ElementCreationOptionsOrString& aOptions,
+                                                   ErrorResult& rv) override;
+   virtual already_AddRefed<Element> CreateElementNS(const nsAString& aNamespaceURI,
+                                                     const nsAString& aQualifiedName,
+                                                     const mozilla::dom::ElementCreationOptionsOrString& aOptions,
+                                                     mozilla::ErrorResult& rv) override;
+ 
+-  virtual nsIDocument* MasterDocument() override
+-  {
+-    return mMasterDocument ? mMasterDocument.get()
+-                           : this;
+-  }
+-
+-  virtual void SetMasterDocument(nsIDocument* master) override
+-  {
+-    MOZ_ASSERT(master);
+-    mMasterDocument = master;
+-  }
+-
+-  virtual bool IsMasterDocument() override
+-  {
+-    return !mMasterDocument;
+-  }
+-
+-  virtual mozilla::dom::ImportManager* ImportManager() override
+-  {
+-    if (mImportManager) {
+-      MOZ_ASSERT(!mMasterDocument, "Only the master document has ImportManager set");
+-      return mImportManager.get();
+-    }
+-
+-    if (mMasterDocument) {
+-      return mMasterDocument->ImportManager();
+-    }
+-
+-    // ImportManager is created lazily.
+-    // If the manager is not yet set it has to be the
+-    // master document and this is the first import in it.
+-    // Let's create a new manager.
+-    mImportManager = new mozilla::dom::ImportManager();
+-    return mImportManager.get();
+-  }
+-
+-  virtual bool HasSubImportLink(nsINode* aLink) override
+-  {
+-    return mSubImportLinks.Contains(aLink);
+-  }
+-
+-  virtual uint32_t IndexOfSubImportLink(nsINode* aLink) override
+-  {
+-    return mSubImportLinks.IndexOf(aLink);
+-  }
+-
+-  virtual void AddSubImportLink(nsINode* aLink) override
+-  {
+-    mSubImportLinks.AppendElement(aLink);
+-  }
+-
+-  virtual nsINode* GetSubImportLink(uint32_t aIdx) override
+-  {
+-    return aIdx < mSubImportLinks.Length() ? mSubImportLinks[aIdx].get()
+-                                           : nullptr;
+-  }
+-
+   virtual void UnblockDOMContentLoaded() override;
+ 
+ protected:
+   friend class nsNodeUtils;
+   friend class nsDocumentOnStack;
+ 
+   void IncreaseStackRefCnt()
+   {
+@@ -1676,20 +1618,16 @@ private:
+   mozilla::LayoutDeviceToScreenScale mScaleFloat;
+   mozilla::CSSToLayoutDeviceScale mPixelRatio;
+   bool mAutoSize, mAllowZoom, mAllowDoubleTapZoom, mValidScaleFloat, mValidMaxScale, mScaleStrEmpty, mWidthStrEmpty;
+   mozilla::CSSSize mViewportSize;
+ 
+   nsrefcnt mStackRefCnt;
+   bool mNeedsReleaseAfterStackRefCntRelease;
+ 
+-  nsCOMPtr<nsIDocument> mMasterDocument;
+-  RefPtr<mozilla::dom::ImportManager> mImportManager;
+-  nsTArray<nsCOMPtr<nsINode> > mSubImportLinks;
+-
+   // Set to true when the document is possibly controlled by the ServiceWorker.
+   // Used to prevent multiple requests to ServiceWorkerManager.
+   bool mMaybeServiceWorkerControlled;
+ 
+   // We lazily calculate declaration blocks for SVG elements
+   // with mapped attributes in Servo mode. This list contains all elements which
+   // need lazy resolution
+   nsTHashtable<nsPtrHashKey<nsSVGElement>> mLazySVGPresElements;
+diff --git a/dom/base/nsIDocument.h b/dom/base/nsIDocument.h
+--- a/dom/base/nsIDocument.h
++++ b/dom/base/nsIDocument.h
+@@ -136,17 +136,16 @@ class Element;
+ struct ElementCreationOptions;
+ struct ElementRegistrationOptions;
+ class Event;
+ class EventTarget;
+ class FontFaceSet;
+ class FrameRequestCallback;
+ struct FullscreenRequest;
+ class ImageTracker;
+-class ImportManager;
+ class HTMLBodyElement;
+ struct LifecycleCallbackArgs;
+ class Link;
+ class Location;
+ class MediaQueryList;
+ class GlobalObject;
+ class NodeFilter;
+ class NodeIterator;
+@@ -2839,28 +2838,16 @@ public:
+ 
+   // ParentNode
+   nsIHTMLCollection* Children();
+   uint32_t ChildElementCount();
+ 
+   virtual nsHTMLDocument* AsHTMLDocument() { return nullptr; }
+   virtual mozilla::dom::SVGDocument* AsSVGDocument() { return nullptr; }
+ 
+-  // The root document of the import tree. If this document is not an import
+-  // this will return the document itself.
+-  virtual nsIDocument* MasterDocument() = 0;
+-  virtual void SetMasterDocument(nsIDocument* master) = 0;
+-  virtual bool IsMasterDocument() = 0;
+-  virtual mozilla::dom::ImportManager* ImportManager() = 0;
+-  // We keep track of the order of sub imports were added to the document.
+-  virtual bool HasSubImportLink(nsINode* aLink) = 0;
+-  virtual uint32_t IndexOfSubImportLink(nsINode* aLink) = 0;
+-  virtual void AddSubImportLink(nsINode* aLink) = 0;
+-  virtual nsINode* GetSubImportLink(uint32_t aIdx) = 0;
+-
+   /*
+    * Given a node, get a weak reference to it and append that reference to
+    * mBlockedTrackingNodes. Can be used later on to look up a node in it.
+    * (e.g., by the UI)
+    */
+   void AddBlockedTrackingNode(nsINode *node)
+   {
+     if (!node) {
+diff --git a/dom/base/nsStyleLinkElement.cpp b/dom/base/nsStyleLinkElement.cpp
+--- a/dom/base/nsStyleLinkElement.cpp
++++ b/dom/base/nsStyleLinkElement.cpp
+@@ -123,88 +123,69 @@ nsStyleLinkElement::SetLineNumber(uint32
+ }
+ 
+ /* virtual */ uint32_t
+ nsStyleLinkElement::GetLineNumber()
+ {
+   return mLineNumber;
+ }
+ 
+-/* static */ bool
+-nsStyleLinkElement::IsImportEnabled()
+-{
+-  static bool sAdded = false;
+-  static bool sImportsEnabled;
+-  if (!sAdded) {
+-    // This part runs only once because of the static flag.
+-    Preferences::AddBoolVarCache(&sImportsEnabled,
+-                                 "dom.htmlimports.enabled",
+-                                 false);
+-    sAdded = true;
+-  }
+-
+-  return sImportsEnabled;
+-}
+-
+-static uint32_t ToLinkMask(const nsAString& aLink, nsIPrincipal* aPrincipal)
++static uint32_t ToLinkMask(const nsAString& aLink)
+ {
+   // Keep this in sync with sRelValues in HTMLLinkElement.cpp
+   if (aLink.EqualsLiteral("prefetch"))
+     return nsStyleLinkElement::ePREFETCH;
+   else if (aLink.EqualsLiteral("dns-prefetch"))
+     return nsStyleLinkElement::eDNS_PREFETCH;
+   else if (aLink.EqualsLiteral("stylesheet"))
+     return nsStyleLinkElement::eSTYLESHEET;
+   else if (aLink.EqualsLiteral("next"))
+     return nsStyleLinkElement::eNEXT;
+   else if (aLink.EqualsLiteral("alternate"))
+     return nsStyleLinkElement::eALTERNATE;
+-  else if (aLink.EqualsLiteral("import") &&
+-           nsStyleLinkElement::IsImportEnabled())
+-    return nsStyleLinkElement::eHTMLIMPORT;
+   else if (aLink.EqualsLiteral("preconnect"))
+     return nsStyleLinkElement::ePRECONNECT;
+   else if (aLink.EqualsLiteral("prerender"))
+     return nsStyleLinkElement::ePRERENDER;
+   else
+     return 0;
+ }
+ 
+-uint32_t nsStyleLinkElement::ParseLinkTypes(const nsAString& aTypes, nsIPrincipal* aPrincipal)
++uint32_t nsStyleLinkElement::ParseLinkTypes(const nsAString& aTypes)
+ {
+   uint32_t linkMask = 0;
+   nsAString::const_iterator start, done;
+   aTypes.BeginReading(start);
+   aTypes.EndReading(done);
+   if (start == done)
+     return linkMask;
+ 
+   nsAString::const_iterator current(start);
+   bool inString = !nsContentUtils::IsHTMLWhitespace(*current);
+   nsAutoString subString;
+-  
++
+   while (current != done) {
+     if (nsContentUtils::IsHTMLWhitespace(*current)) {
+       if (inString) {
+         nsContentUtils::ASCIIToLower(Substring(start, current), subString);
+-        linkMask |= ToLinkMask(subString, aPrincipal);
++        linkMask |= ToLinkMask(subString);
+         inString = false;
+       }
+     }
+     else {
+       if (!inString) {
+         start = current;
+         inString = true;
+       }
+     }
+     ++current;
+   }
+   if (inString) {
+     nsContentUtils::ASCIIToLower(Substring(start, current), subString);
+-    linkMask |= ToLinkMask(subString, aPrincipal);
++    linkMask |= ToLinkMask(subString);
+   }
+   return linkMask;
+ }
+ 
+ NS_IMETHODIMP
+ nsStyleLinkElement::UpdateStyleSheet(nsICSSLoaderObserver* aObserver,
+                                      bool* aWillNotify,
+                                      bool* aIsAlternate,
+diff --git a/dom/base/nsStyleLinkElement.h b/dom/base/nsStyleLinkElement.h
+--- a/dom/base/nsStyleLinkElement.h
++++ b/dom/base/nsStyleLinkElement.h
+@@ -57,29 +57,23 @@ public:
+   virtual uint32_t GetLineNumber() override;
+ 
+   enum RelValue {
+     ePREFETCH =     0x00000001,
+     eDNS_PREFETCH = 0x00000002,
+     eSTYLESHEET =   0x00000004,
+     eNEXT =         0x00000008,
+     eALTERNATE =    0x00000010,
+-    eHTMLIMPORT =   0x00000020,
+-    ePRECONNECT =   0x00000040,
+-    ePRERENDER =    0x00000080
++    ePRECONNECT =   0x00000020,
++    ePRERENDER =    0x00000040
+   };
+ 
+   // The return value is a bitwise or of 0 or more RelValues.
+-  // aPrincipal is used to check if HTML imports is enabled for the
+-  // provided principal.
+-  static uint32_t ParseLinkTypes(const nsAString& aTypes,
+-                                 nsIPrincipal* aPrincipal);
++  static uint32_t ParseLinkTypes(const nsAString& aTypes);
+ 
+-  static bool IsImportEnabled();
+-  
+   void UpdateStyleSheetInternal()
+   {
+     UpdateStyleSheetInternal(nullptr, nullptr);
+   }
+ protected:
+   /**
+    * @param aOldDocument should be non-null only if we're updating because we
+    *                     removed the node from the document.
+diff --git a/dom/html/HTMLLinkElement.cpp b/dom/html/HTMLLinkElement.cpp
+--- a/dom/html/HTMLLinkElement.cpp
++++ b/dom/html/HTMLLinkElement.cpp
+@@ -62,24 +62,22 @@ HTMLLinkElement::~HTMLLinkElement()
+ }
+ 
+ NS_IMPL_CYCLE_COLLECTION_CLASS(HTMLLinkElement)
+ 
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(HTMLLinkElement,
+                                                   nsGenericHTMLElement)
+   tmp->nsStyleLinkElement::Traverse(cb);
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mRelList)
+-  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mImportLoader)
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+ 
+ NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(HTMLLinkElement,
+                                                 nsGenericHTMLElement)
+   tmp->nsStyleLinkElement::Unlink();
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mRelList)
+-  NS_IMPL_CYCLE_COLLECTION_UNLINK(mImportLoader)
+ NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+ 
+ NS_IMPL_ADDREF_INHERITED(HTMLLinkElement, Element)
+ NS_IMPL_RELEASE_INHERITED(HTMLLinkElement, Element)
+ 
+ 
+ // QueryInterface implementation for HTMLLinkElement
+ NS_INTERFACE_TABLE_HEAD_CYCLE_COLLECTION_INHERITED(HTMLLinkElement)
+@@ -170,19 +168,16 @@ HTMLLinkElement::BindToTree(nsIDocument*
+ 
+   if (IsInComposedDoc()) {
+     TryDNSPrefetchPreconnectOrPrefetchOrPrerender();
+   }
+ 
+   void (HTMLLinkElement::*update)() = &HTMLLinkElement::UpdateStyleSheetInternal;
+   nsContentUtils::AddScriptRunner(NewRunnableMethod(this, update));
+ 
+-  void (HTMLLinkElement::*updateImport)() = &HTMLLinkElement::UpdateImport;
+-  nsContentUtils::AddScriptRunner(NewRunnableMethod(this, updateImport));
+-
+   CreateAndDispatchEvent(aDocument, NS_LITERAL_STRING("DOMLinkAdded"));
+ 
+   return rv;
+ }
+ 
+ void
+ HTMLLinkElement::LinkAdded()
+ {
+@@ -217,17 +212,16 @@ HTMLLinkElement::UnbindFromTree(bool aDe
+   // ShadowRoot.
+   ShadowRoot* oldShadowRoot = GetBindingParent() ?
+     GetBindingParent()->GetShadowRoot() : nullptr;
+ 
+   CreateAndDispatchEvent(oldDoc, NS_LITERAL_STRING("DOMLinkRemoved"));
+   nsGenericHTMLElement::UnbindFromTree(aDeep, aNullParent);
+ 
+   UpdateStyleSheetInternal(oldDoc, oldShadowRoot);
+-  UpdateImport();
+ }
+ 
+ bool
+ HTMLLinkElement::ParseAttribute(int32_t aNamespaceID,
+                                 nsIAtom* aAttribute,
+                                 const nsAString& aValue,
+                                 nsAttrValue& aResult)
+ {
+@@ -276,64 +270,16 @@ HTMLLinkElement::CreateAndDispatchEvent(
+ 
+   RefPtr<AsyncEventDispatcher> asyncDispatcher =
+     new AsyncEventDispatcher(this, aEventName, true, true);
+   // Always run async in order to avoid running script when the content
+   // sink isn't expecting it.
+   asyncDispatcher->PostDOMEvent();
+ }
+ 
+-void
+-HTMLLinkElement::UpdateImport()
+-{
+-  // 1. link node should be attached to the document.
+-  nsCOMPtr<nsIDocument> doc = GetUncomposedDoc();
+-  if (!doc) {
+-    // We might have been just removed from the document, so
+-    // let's remove ourself from the list of link nodes of
+-    // the import and reset mImportLoader.
+-    if (mImportLoader) {
+-      mImportLoader->RemoveLinkElement(this);
+-      mImportLoader = nullptr;
+-    }
+-    return;
+-  }
+-
+-  // 2. rel type should be import.
+-  nsAutoString rel;
+-  GetAttr(kNameSpaceID_None, nsGkAtoms::rel, rel);
+-  uint32_t linkTypes = nsStyleLinkElement::ParseLinkTypes(rel, NodePrincipal());
+-  if (!(linkTypes & eHTMLIMPORT)) {
+-    mImportLoader = nullptr;
+-    return;
+-  }
+-
+-  nsCOMPtr<nsIURI> uri = GetHrefURI();
+-  if (!uri) {
+-    mImportLoader = nullptr;
+-    return;
+-  }
+-
+-  if (!nsStyleLinkElement::IsImportEnabled()) {
+-    // For now imports are hidden behind a pref...
+-    return;
+-  }
+-
+-  RefPtr<ImportManager> manager = doc->ImportManager();
+-  MOZ_ASSERT(manager, "ImportManager should be created lazily when needed");
+-
+-  {
+-    // The load even might fire sooner than we could set mImportLoader so
+-    // we must use async event and a scriptBlocker here.
+-    nsAutoScriptBlocker scriptBlocker;
+-    // CORS check will happen at the start of the load.
+-    mImportLoader = manager->Get(uri, this, doc);
+-  }
+-}
+-
+ nsresult
+ HTMLLinkElement::BeforeSetAttr(int32_t aNameSpaceID, nsIAtom* aName,
+                                const nsAttrValueOrString* aValue, bool aNotify)
+ {
+   if (aNameSpaceID == kNameSpaceID_None &&
+       (aName == nsGkAtoms::href || aName == nsGkAtoms::rel)) {
+     CancelDNSPrefetch(HTML_LINK_DNS_PREFETCH_DEFERRED,
+                       HTML_LINK_DNS_PREFETCH_REQUESTED);
+@@ -368,29 +314,22 @@ HTMLLinkElement::AfterSetAttr(int32_t aN
+          aName == nsGkAtoms::rel ||
+          aName == nsGkAtoms::title ||
+          aName == nsGkAtoms::media ||
+          aName == nsGkAtoms::type)) {
+       bool dropSheet = false;
+       if (aName == nsGkAtoms::rel) {
+         nsAutoString value;
+         aValue->ToString(value);
+-        uint32_t linkTypes = nsStyleLinkElement::ParseLinkTypes(value,
+-                                                                NodePrincipal());
++        uint32_t linkTypes = nsStyleLinkElement::ParseLinkTypes(value);
+         if (GetSheet()) {
+           dropSheet = !(linkTypes & nsStyleLinkElement::eSTYLESHEET);
+-        } else if (linkTypes & eHTMLIMPORT) {
+-          UpdateImport();
+         }
+       }
+ 
+-      if (aName == nsGkAtoms::href) {
+-        UpdateImport();
+-      }
+-
+       if ((aName == nsGkAtoms::rel || aName == nsGkAtoms::href) &&
+           IsInComposedDoc()) {
+         TryDNSPrefetchPreconnectOrPrefetchOrPrerender();
+       }
+ 
+       UpdateStyleSheetInternal(nullptr, nullptr,
+                                dropSheet ||
+                                (aName == nsGkAtoms::title ||
+@@ -403,20 +342,16 @@ HTMLLinkElement::AfterSetAttr(int32_t aN
+     if (aNameSpaceID == kNameSpaceID_None) {
+       if (aName == nsGkAtoms::href ||
+           aName == nsGkAtoms::rel ||
+           aName == nsGkAtoms::title ||
+           aName == nsGkAtoms::media ||
+           aName == nsGkAtoms::type) {
+         UpdateStyleSheetInternal(nullptr, nullptr, true);
+       }
+-      if (aName == nsGkAtoms::href ||
+-          aName == nsGkAtoms::rel) {
+-        UpdateImport();
+-      }
+     }
+   }
+ 
+   return nsGenericHTMLElement::AfterSetAttr(aNameSpaceID, aName, aValue,
+                                             aOldValue, aNotify);
+ }
+ 
+ nsresult
+@@ -444,37 +379,32 @@ HTMLLinkElement::GetLinkTarget(nsAString
+   if (aTarget.IsEmpty()) {
+     GetBaseTarget(aTarget);
+   }
+ }
+ 
+ static const DOMTokenListSupportedToken sSupportedRelValues[] = {
+   // Keep this in sync with ToLinkMask in nsStyleLinkElement.cpp.
+   // "import" must come first because it's conditional.
+-  "import",
+   "prefetch",
+   "dns-prefetch",
+   "stylesheet",
+   "next",
+   "alternate",
+   "preconnect",
+   "icon",
+   "search",
+   nullptr
+ };
+ 
+ nsDOMTokenList* 
+ HTMLLinkElement::RelList()
+ {
+   if (!mRelList) {
+-    const DOMTokenListSupportedTokenArray relValues =
+-      nsStyleLinkElement::IsImportEnabled() ?
+-        sSupportedRelValues : &sSupportedRelValues[1];
+-
+-    mRelList = new nsDOMTokenList(this, nsGkAtoms::rel, relValues);
++    mRelList = new nsDOMTokenList(this, nsGkAtoms::rel, sSupportedRelValues);
+   }
+   return mRelList;
+ }
+ 
+ already_AddRefed<nsIURI>
+ HTMLLinkElement::GetHrefURI() const
+ {
+   return GetHrefURIForAnchors();
+@@ -503,17 +433,17 @@ HTMLLinkElement::GetStyleSheetInfo(nsASt
+   aTitle.Truncate();
+   aType.Truncate();
+   aMedia.Truncate();
+   *aIsScoped = false;
+   *aIsAlternate = false;
+ 
+   nsAutoString rel;
+   GetAttr(kNameSpaceID_None, nsGkAtoms::rel, rel);
+-  uint32_t linkTypes = nsStyleLinkElement::ParseLinkTypes(rel, NodePrincipal());
++  uint32_t linkTypes = nsStyleLinkElement::ParseLinkTypes(rel);
+   // Is it a stylesheet link?
+   if (!(linkTypes & nsStyleLinkElement::eSTYLESHEET)) {
+     return;
+   }
+ 
+   nsAutoString title;
+   GetAttr(kNameSpaceID_None, nsGkAtoms::title, title);
+   title.CompressWhitespace();
+@@ -568,16 +498,10 @@ HTMLLinkElement::SizeOfExcludingThis(moz
+ }
+ 
+ JSObject*
+ HTMLLinkElement::WrapNode(JSContext* aCx, JS::Handle<JSObject*> aGivenProto)
+ {
+   return HTMLLinkElementBinding::Wrap(aCx, this, aGivenProto);
+ }
+ 
+-already_AddRefed<nsIDocument>
+-HTMLLinkElement::GetImport()
+-{
+-  return mImportLoader ? RefPtr<nsIDocument>(mImportLoader->GetImport()).forget() : nullptr;
+-}
+-
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/html/HTMLLinkElement.h b/dom/html/HTMLLinkElement.h
+--- a/dom/html/HTMLLinkElement.h
++++ b/dom/html/HTMLLinkElement.h
+@@ -4,17 +4,16 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_HTMLLinkElement_h
+ #define mozilla_dom_HTMLLinkElement_h
+ 
+ #include "mozilla/Attributes.h"
+ #include "mozilla/dom/Link.h"
+-#include "ImportManager.h"
+ #include "nsGenericHTMLElement.h"
+ #include "nsIDOMHTMLLinkElement.h"
+ #include "nsStyleLinkElement.h"
+ 
+ namespace mozilla {
+ class EventChainPostVisitor;
+ class EventChainPreVisitor;
+ namespace dom {
+@@ -38,18 +37,16 @@ public:
+   NS_DECL_NSIDOMHTMLLINKELEMENT
+ 
+   // DOM memory reporter participant
+   NS_DECL_SIZEOF_EXCLUDING_THIS
+ 
+   void LinkAdded();
+   void LinkRemoved();
+ 
+-  void UpdateImport();
+-
+   // nsIDOMEventTarget
+   virtual nsresult GetEventTargetParent(
+                      EventChainPreVisitor& aVisitor) override;
+   virtual nsresult PostHandleEvent(
+                      EventChainPostVisitor& aVisitor) override;
+ 
+   // nsINode
+   virtual nsresult Clone(mozilla::dom::NodeInfo* aNodeInfo, nsINode** aResult,
+@@ -161,22 +158,16 @@ public:
+   {
+     GetEnumAttr(nsGkAtoms::referrerpolicy, EmptyCString().get(), aReferrer);
+   }
+   mozilla::net::ReferrerPolicy GetLinkReferrerPolicy() override
+   {
+     return GetReferrerPolicyAsEnum();
+   }
+ 
+-  already_AddRefed<nsIDocument> GetImport();
+-  already_AddRefed<ImportLoader> GetImportLoader()
+-  {
+-    return RefPtr<ImportLoader>(mImportLoader).forget();
+-  }
+-
+   virtual CORSMode GetCORSMode() const override;
+ 
+   virtual void NodeInfoChanged(nsIDocument* aOldDoc) final override
+   {
+     ClearHasPendingLinkUpdate();
+     nsGenericHTMLElement::NodeInfoChanged(aOldDoc);
+   }
+ 
+@@ -187,17 +178,14 @@ protected:
+   virtual already_AddRefed<nsIURI> GetStyleSheetURL(bool* aIsInline) override;
+   virtual void GetStyleSheetInfo(nsAString& aTitle,
+                                  nsAString& aType,
+                                  nsAString& aMedia,
+                                  bool* aIsScoped,
+                                  bool* aIsAlternate) override;
+ protected:
+   RefPtr<nsDOMTokenList> mRelList;
+-
+-private:
+-  RefPtr<ImportLoader> mImportLoader;
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_HTMLLinkElement_h
+diff --git a/dom/html/moz.build b/dom/html/moz.build
+--- a/dom/html/moz.build
++++ b/dom/html/moz.build
+@@ -6,17 +6,16 @@
+ 
+ with Files("**"):
+     BUG_COMPONENT = ("Core", "DOM")
+ 
+ DIRS += ['input']
+ 
+ MOCHITEST_MANIFESTS += [
+     'test/forms/mochitest.ini',
+-    'test/imports/mochitest.ini',
+     'test/mochitest.ini',
+ ]
+ 
+ MOCHITEST_CHROME_MANIFESTS += [
+     'test/chrome.ini',
+     'test/forms/chrome.ini',
+ ]
+ 
+diff --git a/dom/html/nsHTMLDocument.cpp b/dom/html/nsHTMLDocument.cpp
+--- a/dom/html/nsHTMLDocument.cpp
++++ b/dom/html/nsHTMLDocument.cpp
+@@ -526,18 +526,17 @@ nsHTMLDocument::StartDocumentLoad(const 
+ 
+   nsAutoCString contentType;
+   aChannel->GetContentType(contentType);
+ 
+   bool view = !strcmp(aCommand, "view") ||
+               !strcmp(aCommand, "external-resource");
+   bool viewSource = !strcmp(aCommand, "view-source");
+   bool asData = !strcmp(aCommand, kLoadAsData);
+-  bool import = !strcmp(aCommand, "import");
+-  if (!(view || viewSource || asData || import)) {
++  if (!(view || viewSource || asData)) {
+     MOZ_ASSERT(false, "Bad parser command");
+     return NS_ERROR_INVALID_ARG;
+   }
+ 
+   bool html = contentType.EqualsLiteral(TEXT_HTML);
+   bool xhtml = !html && (contentType.EqualsLiteral(APPLICATION_XHTML_XML) || contentType.EqualsLiteral(APPLICATION_WAPXHTML_XML));
+   bool plainText = !html && !xhtml && nsContentUtils::IsPlainTextType(contentType);
+   if (!(html || xhtml || plainText || viewSource)) {
+@@ -1471,17 +1470,17 @@ nsHTMLDocument::Open(JSContext* cx,
+                      const nsAString& aReplace,
+                      ErrorResult& rv)
+ {
+   // Implements the "When called with two arguments (or fewer)" steps here:
+   // https://html.spec.whatwg.org/multipage/webappapis.html#opening-the-input-stream
+ 
+   NS_ASSERTION(nsContentUtils::CanCallerAccess(static_cast<nsIDOMHTMLDocument*>(this)),
+                "XOW should have caught this!");
+-  if (!IsHTMLDocument() || mDisableDocWrite || !IsMasterDocument()) {
++  if (!IsHTMLDocument() || mDisableDocWrite) {
+     // No calling document.open() on XHTML
+     rv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+     return nullptr;
+   }
+ 
+   nsAutoCString contentType;
+   contentType.AssignLiteral("text/html");
+ 
+@@ -1889,17 +1888,17 @@ nsresult
+ nsHTMLDocument::WriteCommon(JSContext *cx,
+                             const nsAString& aText,
+                             bool aNewlineTerminate)
+ {
+   mTooDeepWriteRecursion =
+     (mWriteLevel > NS_MAX_DOCUMENT_WRITE_DEPTH || mTooDeepWriteRecursion);
+   NS_ENSURE_STATE(!mTooDeepWriteRecursion);
+ 
+-  if (!IsHTMLDocument() || mDisableDocWrite || !IsMasterDocument()) {
++  if (!IsHTMLDocument() || mDisableDocWrite) {
+     // No calling document.write*() on XHTML!
+ 
+     return NS_ERROR_DOM_INVALID_STATE_ERR;
+   }
+ 
+   if (mParserAborted) {
+     // Hixie says aborting the parser doesn't undefine the insertion point.
+     // However, since we null out mParser in that case, we track the
+diff --git a/dom/html/test/file_imports_basics.html b/dom/html/test/file_imports_basics.html
+deleted file mode 100644
+--- a/dom/html/test/file_imports_basics.html
++++ /dev/null
+@@ -1,22 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-  <head>
+-  </head>
+-  <body>
+-    <div id="foo">bar</div>
+-    <script>
+-      counter++;
+-      var importDone = true;
+-      is(document.currentScript.ownerDocument.getElementById("foo").textContent, "bar",
+-         "currentScript.ownerDocument works in imported document,");
+-      try{
+-        document.currentScript.ownerDocument.open();
+-        document.currentScript.ownerDocument.write("<h1>This should not show up!</h1>");
+-        document.currentScript.ownerDocument.close();
+-        ok(false, "document.write should have thrown (import)")
+-      } catch (e) {
+-        ok(true, "document.write has thrown (import)")
+-      }
+-    </script>
+-  </body>
+-</html>
+\ No newline at end of file
+diff --git a/dom/html/test/file_imports_redirect.html b/dom/html/test/file_imports_redirect.html
+deleted file mode 100644
+--- a/dom/html/test/file_imports_redirect.html
++++ /dev/null
+@@ -1,5 +0,0 @@
+-<!DOCTYPE html>
+-<html>
+-<body>
+-</body>
+-</html>
+diff --git a/dom/html/test/file_imports_redirect.html^headers^ b/dom/html/test/file_imports_redirect.html^headers^
+deleted file mode 100644
+--- a/dom/html/test/file_imports_redirect.html^headers^
++++ /dev/null
+@@ -1,2 +0,0 @@
+-HTTP 301 Moved Permanently
+-Location: http://mochi.test:8888/tests/dom/html/test/file_imports_redirected.html
+diff --git a/dom/html/test/file_imports_redirected.html b/dom/html/test/file_imports_redirected.html
+deleted file mode 100644
+--- a/dom/html/test/file_imports_redirected.html
++++ /dev/null
+@@ -1,6 +0,0 @@
+-<!DOCTYPE html>
+-<html>
+-<body>
+-<script> var redirected = true; </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/file_CSP_sandbox.html b/dom/html/test/imports/file_CSP_sandbox.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_CSP_sandbox.html
++++ /dev/null
+@@ -1,7 +0,0 @@
+-<!DOCTYPE html>
+-<head>
+-</head>
+-<body>
+-  <link rel="import" href="file_CSP_sandbox_import.html" id="import"></link>
+-</body>
+-
+diff --git a/dom/html/test/imports/file_CSP_sandbox_import.html b/dom/html/test/imports/file_CSP_sandbox_import.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_CSP_sandbox_import.html
++++ /dev/null
+@@ -1,9 +0,0 @@
+-<!DOCTYPE html>
+-<head>
+-</head>
+-<body>
+-<script>
+-  var scriptExecuted = true;
+-</script>
+-</body>
+-
+diff --git a/dom/html/test/imports/file_blocking_DOMContentLoaded_A.html b/dom/html/test/imports/file_blocking_DOMContentLoaded_A.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_blocking_DOMContentLoaded_A.html
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-<head>
+-  <script>
+-    order.push("AS0");
+-  </script>
+-  <link rel="import" href="file_blocking_DOMContentLoaded_B.html" onload="loaded()" onerror="failed()"></link>
+-</head>
+-<body>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/file_blocking_DOMContentLoaded_B.html b/dom/html/test/imports/file_blocking_DOMContentLoaded_B.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_blocking_DOMContentLoaded_B.html
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-<head>
+-  <script>
+-    order.push("BS0");
+-  </script>
+-  <link rel="import" href="file_blocking_DOMContentLoaded_C.html" onload="loaded()" onerror="failed()"></link>
+-</head>
+-<body>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/file_blocking_DOMContentLoaded_C.html b/dom/html/test/imports/file_blocking_DOMContentLoaded_C.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_blocking_DOMContentLoaded_C.html
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-<head>
+-  <script>
+-    order.push("CS0");
+-  </script>
+-  <link rel="import" href="file_blocking_DOMContentLoaded_D.html" onload="loaded()" onerror="failed()"></link>
+-</head>
+-<body>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/file_blocking_DOMContentLoaded_D.html b/dom/html/test/imports/file_blocking_DOMContentLoaded_D.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_blocking_DOMContentLoaded_D.html
++++ /dev/null
+@@ -1,10 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-<head>
+-  <script>
+-    order.push("DS0");
+-  </script>
+-</head>
+-<body>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/file_cycle_1_A.html b/dom/html/test/imports/file_cycle_1_A.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_cycle_1_A.html
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-<head>
+-  <link rel="import" href="file_cycle_1_B.html" onload="loaded()" onerror="failed()"></link>
+-</head>
+-<body>
+-  <script>
+-    order.push("A");
+-  </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/file_cycle_1_B.html b/dom/html/test/imports/file_cycle_1_B.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_cycle_1_B.html
++++ /dev/null
+@@ -1,12 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-<head>
+-  <link rel="import" href="file_cycle_1_C.html" onload="loaded()" onerror="failed()"></link>
+-  <link rel="import" href="file_cycle_1_A.html" onload="loaded()" onerror="failed()"></link>
+-</head>
+-<body>
+-  <script>
+-    order.push("B");
+-  </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/file_cycle_1_C.html b/dom/html/test/imports/file_cycle_1_C.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_cycle_1_C.html
++++ /dev/null
+@@ -1,12 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-<head>
+-  <link rel="import" href="file_cycle_1_B.html" onload="loaded()" onerror="failed()"></link>
+-  <link rel="import" href="file_cycle_1_A.html" onload="loaded()" onerror="failed()"></link>
+-</head>
+-<body>
+-  <script>
+-    order.push("C");
+-  </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/file_cycle_2_A.html b/dom/html/test/imports/file_cycle_2_A.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_cycle_2_A.html
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-<head>
+-  <link rel="import" href="file_cycle_2_B.html" onload="loaded()" onerror="failed()"></link>
+-</head>
+-<body>
+-  <script>
+-    order.push("A");
+-  </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/file_cycle_2_B.html b/dom/html/test/imports/file_cycle_2_B.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_cycle_2_B.html
++++ /dev/null
+@@ -1,13 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-<head>
+-  <link rel="import" href="file_cycle_2_A.html" onload="loaded()" onerror="failed()"></link>
+-  <link rel="import" href="file_cycle_2_C.html" onload="loaded()" onerror="failed()"></link>
+-  <link rel="import" href="file_cycle_2_D.html" onload="loaded()" onerror="failed()"></link>
+-</head>
+-<body>
+-  <script>
+-    order.push("B");
+-  </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/file_cycle_2_C.html b/dom/html/test/imports/file_cycle_2_C.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_cycle_2_C.html
++++ /dev/null
+@@ -1,10 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-<head>
+-</head>
+-<body>
+-  <script>
+-    order.push("C");
+-  </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/file_cycle_2_D.html b/dom/html/test/imports/file_cycle_2_D.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_cycle_2_D.html
++++ /dev/null
+@@ -1,10 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-<head>
+-</head>
+-<body>
+-  <script>
+-    order.push("D");
+-  </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/file_cycle_3_A.html b/dom/html/test/imports/file_cycle_3_A.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_cycle_3_A.html
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-<head>
+-  <link rel="import" href="file_cycle_3_C.html" onload="loaded()" onerror="failed()"></link>
+-</head>
+-<body>
+-  <script>
+-    order.push("A");
+-  </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/file_cycle_3_B.html b/dom/html/test/imports/file_cycle_3_B.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_cycle_3_B.html
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-<head>
+-  <link rel="import" href="file_cycle_3_C.html" onload="loaded()" onerror="failed()"></link>
+-</head>
+-<body>
+-  <script>
+-    order.push("B");
+-  </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/file_cycle_3_C.html b/dom/html/test/imports/file_cycle_3_C.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_cycle_3_C.html
++++ /dev/null
+@@ -1,12 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-<head>
+-  <link rel="import" href="file_cycle_3_A.html" onload="loaded()" onerror="failed()"></link>
+-  <link rel="import" href="file_cycle_3_B.html" onload="loaded()" onerror="failed()"></link>
+-</head>
+-<body>
+-  <script>
+-    order.push("C");
+-  </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/file_cycle_4_A.html b/dom/html/test/imports/file_cycle_4_A.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_cycle_4_A.html
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-<head>
+-  <link rel="import" href="file_cycle_4_B.html" onload="loaded()" onerror="failed()"></link>
+-</head>
+-<body>
+-  <script>
+-    order.push("A");
+-  </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/file_cycle_4_B.html b/dom/html/test/imports/file_cycle_4_B.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_cycle_4_B.html
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-<head>
+-  <link rel="import" href="file_cycle_4_C.html" onload="loaded()" onerror="failed()"></link>
+-</head>
+-<body>
+-  <script>
+-    order.push("B");
+-  </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/file_cycle_4_C.html b/dom/html/test/imports/file_cycle_4_C.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_cycle_4_C.html
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-<head>
+-  <link rel="import" href="file_cycle_4_D.html" onload="loaded()" onerror="failed()"></link>
+-</head>
+-<body>
+-  <script>
+-    order.push("C");
+-  </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/file_cycle_4_D.html b/dom/html/test/imports/file_cycle_4_D.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_cycle_4_D.html
++++ /dev/null
+@@ -1,12 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-<head>
+-  <link rel="import" href="file_cycle_4_B.html" onload="loaded()" onerror="failed()"></link>
+-  <link rel="import" href="file_cycle_4_E.html" onload="loaded()" onerror="failed()"></link>
+-</head>
+-<body>
+-  <script>
+-    order.push("D");
+-  </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/file_cycle_4_E.html b/dom/html/test/imports/file_cycle_4_E.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_cycle_4_E.html
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-<head>
+-  <link rel="import" href="file_cycle_4_C.html" onload="loaded()" onerror="failed()"></link>
+-</head>
+-<body>
+-  <script>
+-    order.push("E");
+-  </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/file_element_upgrade.html b/dom/html/test/imports/file_element_upgrade.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_element_upgrade.html
++++ /dev/null
+@@ -1,15 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-<head>
+-</head>
+-<body>
+-  <x-foo></x-foo>
+-  <script>
+-    var prototype = Object.create(HTMLElement.prototype);
+-    prototype.createdCallback = function() {
+-      createdCallbackCalled = true;
+-    }
+-    document.registerElement('x-foo', {prototype: prototype});
+-  </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/file_encoding.html b/dom/html/test/imports/file_encoding.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_encoding.html
++++ /dev/null
+@@ -1,5 +0,0 @@
+-<!DOCTYPE html>
+-<head>
+-<meta charset="EUC-KR">
+-</head>
+-<body>Ignore my encoding</body>
+\ No newline at end of file
+diff --git a/dom/html/test/imports/file_importA1.html b/dom/html/test/imports/file_importA1.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_importA1.html
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-  <head>
+-    <link rel="import" href="file_importA2.html" id="A2" onload="loaded()" onerror="failed()"></link>
+-  </head>
+-  <body>
+-    <script>
+-      order.push("A1");
+-    </script>
+-  </body>
+-</html>
+\ No newline at end of file
+diff --git a/dom/html/test/imports/file_importA2.html b/dom/html/test/imports/file_importA2.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_importA2.html
++++ /dev/null
+@@ -1,10 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-  <head>
+-  </head>
+-  <body>
+-    <script>
+-      order.push("A2");
+-    </script>
+-  </body>
+-</html>
+\ No newline at end of file
+diff --git a/dom/html/test/imports/file_importB1.html b/dom/html/test/imports/file_importB1.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_importB1.html
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-  <head>
+-    <link rel="import" href="file_importB2.html" id="B2" onload="loaded()" onerror="failed()"></link>
+-  </head>
+-  <body>
+-    <script>
+-      order.push("B1");
+-    </script>
+-  </body>
+-</html>
+\ No newline at end of file
+diff --git a/dom/html/test/imports/file_importB2.html b/dom/html/test/imports/file_importB2.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_importB2.html
++++ /dev/null
+@@ -1,10 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-  <head>
+-  </head>
+-  <body>
+-    <script>
+-      order.push("B2");
+-    </script>
+-  </body>
+-</html>
+\ No newline at end of file
+diff --git a/dom/html/test/imports/file_importC1.html b/dom/html/test/imports/file_importC1.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_importC1.html
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-  <head>
+-    <link rel="import" href="file_importC2.html" onload="loaded()" onerror="failed()"></link>
+-  </head>
+-  <body>
+-    <script>
+-      order.push("C1");
+-    </script>
+-  </body>
+-</html>
+\ No newline at end of file
+diff --git a/dom/html/test/imports/file_importC10.html b/dom/html/test/imports/file_importC10.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_importC10.html
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-  <head>
+-    <link rel="import" href="file_importE.html" onload="loaded()" onerror="failed()"></link>
+-  </head>
+-  <body>
+-    <script>
+-      order.push("C10");
+-    </script>
+-  </body>
+-</html>
+\ No newline at end of file
+diff --git a/dom/html/test/imports/file_importC2.html b/dom/html/test/imports/file_importC2.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_importC2.html
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-  <head>
+-    <link rel="import" href="file_importC3.html" onload="loaded()" onerror="failed()"></link>
+-  </head>
+-  <body>
+-    <script>
+-      order.push("C2");
+-    </script>
+-  </body>
+-</html>
+\ No newline at end of file
+diff --git a/dom/html/test/imports/file_importC3.html b/dom/html/test/imports/file_importC3.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_importC3.html
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-  <head>
+-    <link rel="import" href="file_importC4.html" onload="loaded()" onerror="failed()"></link>
+-  </head>
+-  <body>
+-    <script>
+-      order.push("C3");
+-    </script>
+-  </body>
+-</html>
+\ No newline at end of file
+diff --git a/dom/html/test/imports/file_importC4.html b/dom/html/test/imports/file_importC4.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_importC4.html
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-  <head>
+-    <link rel="import" href="file_importC5.html" onload="loaded()" onerror="failed()"></link>
+-  </head>
+-  <body>
+-    <script>
+-      order.push("C4");
+-    </script>
+-  </body>
+-</html>
+\ No newline at end of file
+diff --git a/dom/html/test/imports/file_importC5.html b/dom/html/test/imports/file_importC5.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_importC5.html
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-  <head>
+-    <link rel="import" href="file_importC6.html" onload="loaded()" onerror="failed()"></link>
+-  </head>
+-  <body>
+-    <script>
+-      order.push("C5");
+-    </script>
+-  </body>
+-</html>
+\ No newline at end of file
+diff --git a/dom/html/test/imports/file_importC6.html b/dom/html/test/imports/file_importC6.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_importC6.html
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-  <head>
+-    <link rel="import" href="file_importC7.html" onload="loaded()" onerror="failed()"></link>
+-  </head>
+-  <body>
+-    <script>
+-      order.push("C6");
+-    </script>
+-  </body>
+-</html>
+\ No newline at end of file
+diff --git a/dom/html/test/imports/file_importC7.html b/dom/html/test/imports/file_importC7.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_importC7.html
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-  <head>
+-    <link rel="import" href="file_importC8.html" onload="loaded()" onerror="failed()"></link>
+-  </head>
+-  <body>
+-    <script>
+-      order.push("C7");
+-    </script>
+-  </body>
+-</html>
+\ No newline at end of file
+diff --git a/dom/html/test/imports/file_importC8.html b/dom/html/test/imports/file_importC8.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_importC8.html
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-  <head>
+-    <link rel="import" href="file_importC9.html" onload="loaded()" onerror="failed()"></link>
+-  </head>
+-  <body>
+-    <script>
+-      order.push("C8");
+-    </script>
+-  </body>
+-</html>
+\ No newline at end of file
+diff --git a/dom/html/test/imports/file_importC9.html b/dom/html/test/imports/file_importC9.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_importC9.html
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-  <head>
+-    <link rel="import" href="file_importC10.html" onload="loaded()" onerror="failed()"></link>
+-  </head>
+-  <body>
+-    <script>
+-      order.push("C9");
+-    </script>
+-  </body>
+-</html>
+\ No newline at end of file
+diff --git a/dom/html/test/imports/file_importD.html b/dom/html/test/imports/file_importD.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_importD.html
++++ /dev/null
+@@ -1,8 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-  <body>
+-    <script>
+-      order.push("D");
+-    </script>
+-  </body>
+-</html>
+\ No newline at end of file
+diff --git a/dom/html/test/imports/file_importE.html b/dom/html/test/imports/file_importE.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_importE.html
++++ /dev/null
+@@ -1,11 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en-US">
+-  <head>
+-    <link rel="import" href="file_importD.html" onload="loaded()" onerror="failed()"></link>
+-  </head>
+-  <body>
+-    <script>
+-      order.push("E");
+-    </script>
+-  </body>
+-</html>
+\ No newline at end of file
+diff --git a/dom/html/test/imports/file_simple_import.html b/dom/html/test/imports/file_simple_import.html
+deleted file mode 100644
+--- a/dom/html/test/imports/file_simple_import.html
++++ /dev/null
+@@ -1,4 +0,0 @@
+-<!DOCTYPE html>
+-<head>
+-</head>
+-<body>Simple import</body>
+\ No newline at end of file
+diff --git a/dom/html/test/imports/mochitest.ini b/dom/html/test/imports/mochitest.ini
+deleted file mode 100644
+--- a/dom/html/test/imports/mochitest.ini
++++ /dev/null
+@@ -1,52 +0,0 @@
+-[DEFAULT]
+-support-files =
+-  file_importA1.html
+-  file_importA2.html
+-  file_importB1.html
+-  file_importB2.html
+-  file_importC1.html
+-  file_importC2.html
+-  file_importC3.html
+-  file_importC4.html
+-  file_importC5.html
+-  file_importC6.html
+-  file_importC7.html
+-  file_importC8.html
+-  file_importC9.html
+-  file_importC10.html
+-  file_importD.html
+-  file_importE.html
+-  file_cycle_1_A.html
+-  file_cycle_1_B.html
+-  file_cycle_1_C.html
+-  file_cycle_2_A.html
+-  file_cycle_2_B.html
+-  file_cycle_2_C.html
+-  file_cycle_2_D.html
+-  file_cycle_3_A.html
+-  file_cycle_3_B.html
+-  file_cycle_3_C.html
+-  file_cycle_4_A.html
+-  file_cycle_4_B.html
+-  file_cycle_4_C.html
+-  file_cycle_4_D.html
+-  file_cycle_4_E.html
+-  file_encoding.html
+-  file_simple_import.html
+-  file_blocking_DOMContentLoaded_A.html
+-  file_blocking_DOMContentLoaded_B.html
+-  file_blocking_DOMContentLoaded_C.html
+-  file_blocking_DOMContentLoaded_D.html
+-  file_element_upgrade.html
+-  file_CSP_sandbox.html
+-  file_CSP_sandbox_import.html
+-
+-[test_cycle_1.html]
+-[test_cycle_2.html]
+-[test_cycle_3.html]
+-[test_cycle_4.html]
+-[test_blocking_DOMContentLoaded.html]
+-[test_encoding.html]
+-[test_defaultView.html]
+-[test_element_upgrade.html]
+-[test_CSP_sandbox.html]
+diff --git a/dom/html/test/imports/test_CSP_sandbox.html b/dom/html/test/imports/test_CSP_sandbox.html
+deleted file mode 100644
+--- a/dom/html/test/imports/test_CSP_sandbox.html
++++ /dev/null
+@@ -1,26 +0,0 @@
+-<!DOCTYPE HTML>
+-<html>
+-<!--
+-https://bugzilla.mozilla.org/show_bug.cgi?id=1106713
+--->
+-<head>
+-  <title>Test for Bug 1106713</title>
+-  <script type="text/javascript" src="/tests/SimpleTest/SimpleTest.js"></script>
+-  <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css" />
+-  <meta http-equiv="Content-Type" content="text/html;charset=utf-8">
+-</head>
+-<body>
+-  <a target="_blank" href="https://bugzilla.mozilla.org/show_bug.cgi?id=1106713">Mozilla Bug 1106713</a>
+-  <script type="text/javascript">
+-    SimpleTest.waitForExplicitFinish();
+-    function go() {
+-      var ifr = document.getElementById('iframe1').contentWindow;
+-      ok(!ifr.scriptExecuted, "script is not allowed to run");
+-      SimpleTest.finish();
+-    }
+-
+-  </script>
+-  <iframe src='file_CSP_sandbox.html' sandbox="allow-same-origin" onload="go()" id="iframe1"></iframe>
+-</body>
+-</html>
+-
+diff --git a/dom/html/test/imports/test_blocking_DOMContentLoaded.html b/dom/html/test/imports/test_blocking_DOMContentLoaded.html
+deleted file mode 100644
+--- a/dom/html/test/imports/test_blocking_DOMContentLoaded.html
++++ /dev/null
+@@ -1,36 +0,0 @@
+-<!DOCTYPE HTML>
+-<html>
+-<!--
+-https://bugzilla.mozilla.org/show_bug.cgi?id=1093028
+--->
+-<head>
+-  <title>Test for Bug 1093028</title>
+-  <script type="text/javascript" src="/tests/SimpleTest/SimpleTest.js"></script>
+-  <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css" />
+-  <meta http-equiv="Content-Type" content="text/html;charset=utf-8">
+-</head>
+-<body>
+-  <a target="_blank" href="https://bugzilla.mozilla.org/show_bug.cgi?id=1093028">Mozilla Bug 1093028</a>
+-  <script type="text/javascript">
+-    SimpleTest.waitForExplicitFinish();
+-    var counter = 0;
+-    var fcounter = 0;
+-    var order = [];
+-    function loaded() {
+-      counter++;
+-    }
+-    function failed() {
+-      fcounter++;
+-    }
+-  </script>
+-  <link rel="import" href="file_blocking_DOMContentLoaded_A.html" onload="loaded()" onerror="failed()"></link>
+-  <script type="text/javascript">
+-    is(counter, 4, "Imports are loaded");
+-    is(fcounter, 0, "No error in imports");
+-    var expected = ["AS0","BS0","CS0","DS0"];
+-    for (i in expected)
+-      is(order[i], expected[i], "import " + i + " should be " + expected[i]);
+-    SimpleTest.finish();
+-  </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/test_cycle_1.html b/dom/html/test/imports/test_cycle_1.html
+deleted file mode 100644
+--- a/dom/html/test/imports/test_cycle_1.html
++++ /dev/null
+@@ -1,36 +0,0 @@
+-<!DOCTYPE HTML>
+-<html>
+-<!--
+-https://bugzilla.mozilla.org/show_bug.cgi?id=1061469
+--->
+-<head>
+-  <title>Test for Bug 1061469</title>
+-  <script type="text/javascript" src="/tests/SimpleTest/SimpleTest.js"></script>
+-  <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css" />
+-  <meta http-equiv="Content-Type" content="text/html;charset=utf-8">
+-</head>
+-<body>
+-  <a target="_blank" href="https://bugzilla.mozilla.org/show_bug.cgi?id=1061469">Mozilla Bug 1061469</a>
+-  <script type="text/javascript">
+-    SimpleTest.waitForExplicitFinish();
+-    var counter = 0;
+-    var fcounter = 0;
+-    var order = [];
+-    function loaded() {
+-      counter++;
+-    }
+-    function failed() {
+-      fcounter++;
+-    }
+-  </script>
+-  <link rel="import" href="file_cycle_1_A.html" onload="loaded()" onerror="failed()"></link>
+-  <script type="text/javascript">
+-    is(counter, 6, "Imports are loaded");
+-    is(fcounter, 0, "No error in imports");
+-    var expected = ["C","B","A"];
+-    for (i in expected)
+-      is(order[i], expected[i], "import " + i + " should be " + expected[i]);
+-    SimpleTest.finish();
+-  </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/test_cycle_2.html b/dom/html/test/imports/test_cycle_2.html
+deleted file mode 100644
+--- a/dom/html/test/imports/test_cycle_2.html
++++ /dev/null
+@@ -1,36 +0,0 @@
+-<!DOCTYPE HTML>
+-<html>
+-<!--
+-https://bugzilla.mozilla.org/show_bug.cgi?id=1061469
+--->
+-<head>
+-  <title>Test for Bug 1061469</title>
+-  <script type="text/javascript" src="/tests/SimpleTest/SimpleTest.js"></script>
+-  <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css" />
+-  <meta http-equiv="Content-Type" content="text/html;charset=utf-8">
+-</head>
+-<body>
+-  <a target="_blank" href="https://bugzilla.mozilla.org/show_bug.cgi?id=1061469">Mozilla Bug 1061469</a>
+-  <script type="text/javascript">
+-    SimpleTest.waitForExplicitFinish();
+-    var counter = 0;
+-    var fcounter = 0;
+-    var order = [];
+-    function loaded() {
+-      counter++;
+-    }
+-    function failed() {
+-      fcounter++;
+-    }
+-  </script>
+-  <link rel="import" href="file_cycle_2_A.html" onload="loaded()" onerror="failed()"></link>
+-  <script type="text/javascript">
+-    is(counter, 5, "Imports are loaded");
+-    is(fcounter, 0, "No error in imports");
+-    var expected = ["C","D","B","A"];
+-    for (i in expected)
+-      is(order[i], expected[i], "import " + i + " should be " + expected[i]);
+-    SimpleTest.finish();
+-  </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/test_cycle_3.html b/dom/html/test/imports/test_cycle_3.html
+deleted file mode 100644
+--- a/dom/html/test/imports/test_cycle_3.html
++++ /dev/null
+@@ -1,37 +0,0 @@
+-<!DOCTYPE HTML>
+-<html>
+-<!--
+-https://bugzilla.mozilla.org/show_bug.cgi?id=1061469
+--->
+-<head>
+-  <title>Test for Bug 1061469</title>
+-  <script type="text/javascript" src="/tests/SimpleTest/SimpleTest.js"></script>
+-  <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css" />
+-  <meta http-equiv="Content-Type" content="text/html;charset=utf-8">
+-</head>
+-<body>
+-  <a target="_blank" href="https://bugzilla.mozilla.org/show_bug.cgi?id=1061469">Mozilla Bug 1061469</a>
+-  <script type="text/javascript">
+-    SimpleTest.waitForExplicitFinish();
+-    var counter = 0;
+-    var fcounter = 0;
+-    var order = [];
+-    function loaded() {
+-      counter++;
+-    }
+-    function failed() {
+-      fcounter++;
+-    }
+-  </script>
+-  <link rel="import" href="file_cycle_3_A.html" onload="loaded()" onerror="failed()"></link>
+-  <link rel="import" href="file_cycle_3_B.html" onload="loaded()" onerror="failed()"></link>
+-  <script type="text/javascript">
+-    is(counter, 6, "Imports are loaded");
+-    is(fcounter, 0, "No error in imports");
+-    var expected = ["B","C","A"];
+-    for (i in expected)
+-      is(order[i], expected[i], "import " + i + " should be " + expected[i]);
+-    SimpleTest.finish();
+-  </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/test_cycle_4.html b/dom/html/test/imports/test_cycle_4.html
+deleted file mode 100644
+--- a/dom/html/test/imports/test_cycle_4.html
++++ /dev/null
+@@ -1,37 +0,0 @@
+-<!DOCTYPE HTML>
+-<html>
+-<!--
+-https://bugzilla.mozilla.org/show_bug.cgi?id=1061469
+--->
+-<head>
+-  <title>Test for Bug 1061469</title>
+-  <script type="text/javascript" src="/tests/SimpleTest/SimpleTest.js"></script>
+-  <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css" />
+-  <meta http-equiv="Content-Type" content="text/html;charset=utf-8">
+-</head>
+-<body>
+-  <a target="_blank" href="https://bugzilla.mozilla.org/show_bug.cgi?id=1061469">Mozilla Bug 1061469</a>
+-  <script type="text/javascript">
+-    SimpleTest.waitForExplicitFinish();
+-    var counter = 0;
+-    var fcounter = 0;
+-    var order = [];
+-    function loaded() {
+-      counter++;
+-    }
+-    function failed() {
+-      fcounter++;
+-    }
+-  </script>
+-  <link rel="import" href="file_cycle_4_A.html" onload="loaded()" onerror="failed()"></link>
+-  <link rel="import" href="file_cycle_4_D.html" onload="loaded()" onerror="failed()"></link>
+-  <script type="text/javascript">
+-    is(counter, 8, "Imports are loaded");
+-    is(fcounter, 0, "No error in imports");
+-    var expected = ["E","D","C","B","A"];
+-    for (i in expected)
+-      is(order[i], expected[i], "import " + i + " should be " + expected[i]);
+-    SimpleTest.finish();
+-  </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/test_defaultView.html b/dom/html/test/imports/test_defaultView.html
+deleted file mode 100644
+--- a/dom/html/test/imports/test_defaultView.html
++++ /dev/null
+@@ -1,31 +0,0 @@
+-<!DOCTYPE HTML>
+-<html>
+-<!--
+-https://bugzilla.mozilla.org/show_bug.cgi?id=1061469
+--->
+-<head>
+-  <title>Test for Bug 1061469</title>
+-  <script type="text/javascript" src="/tests/SimpleTest/SimpleTest.js"></script>
+-  <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css" />
+-  <meta http-equiv="Content-Type" content="text/html;charset=utf-8">
+-</head>
+-<body>
+-  <a target="_blank" href="https://bugzilla.mozilla.org/show_bug.cgi?id=1061469">Mozilla Bug 1061469</a>
+-  <script type="text/javascript">
+-    SimpleTest.waitForExplicitFinish();
+-    var success = false;
+-    function loaded() {
+-      success = true;
+-    }
+-    function failed() {
+-      ok(false, "Import loading failed");
+-    }
+-  </script>
+-  <link rel="import" href="file_simple_import.html" id="import" onload="loaded()" onerror="failed()"></link>
+-  <script type="text/javascript">
+-    document.defaultView;
+-    is(document.getElementById("import").import.defaultView, null, "defaultView is always null for imports");
+-    SimpleTest.finish();
+-  </script>
+-</body>
+-</html>
+\ No newline at end of file
+diff --git a/dom/html/test/imports/test_element_upgrade.html b/dom/html/test/imports/test_element_upgrade.html
+deleted file mode 100644
+--- a/dom/html/test/imports/test_element_upgrade.html
++++ /dev/null
+@@ -1,34 +0,0 @@
+-<!DOCTYPE HTML>
+-<html>
+-<!--
+-https://bugzilla.mozilla.org/show_bug.cgi?id=1081107
+--->
+-<head>
+-  <title>Test for Bug 1081107</title>
+-  <script type="text/javascript" src="/tests/SimpleTest/SimpleTest.js"></script>
+-  <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css" />
+-  <meta http-equiv="Content-Type" content="text/html;charset=utf-8">
+-</head>
+-<body>
+-  <a target="_blank" href="https://bugzilla.mozilla.org/show_bug.cgi?id=1081107">Mozilla Bug 1081107</a>
+-  <script type="text/javascript">
+-    SimpleTest.waitForExplicitFinish();
+-    var counter = 0;
+-    var fcounter = 0;
+-    var createdCallbackCalled = false;
+-    function loaded() {
+-      counter++;
+-    }
+-    function failed() {
+-      fcounter++;
+-    }
+-  </script>
+-  <link rel="import" href="file_element_upgrade.html" onload="loaded()" onerror="failed()"></link>
+-  <script type="text/javascript">
+-    is(counter, 1, "Imports are loaded");
+-    is(fcounter, 0, "No error in imports");
+-    ok(createdCallbackCalled, "custom element in import has been upgraded");
+-    SimpleTest.finish();
+-  </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/imports/test_encoding.html b/dom/html/test/imports/test_encoding.html
+deleted file mode 100644
+--- a/dom/html/test/imports/test_encoding.html
++++ /dev/null
+@@ -1,30 +0,0 @@
+-<!DOCTYPE HTML>
+-<html>
+-<!--
+-https://bugzilla.mozilla.org/show_bug.cgi?id=1061469
+--->
+-<head>
+-  <title>Test for Bug 1061469</title>
+-  <script type="text/javascript" src="/tests/SimpleTest/SimpleTest.js"></script>
+-  <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css" />
+-  <meta http-equiv="Content-Type" content="text/html;charset=utf-8">
+-</head>
+-<body>
+-  <a target="_blank" href="https://bugzilla.mozilla.org/show_bug.cgi?id=1061469">Mozilla Bug 1061469</a>
+-  <script type="text/javascript">
+-    SimpleTest.waitForExplicitFinish();
+-    var success = false;
+-    function loaded() {
+-      success = true;
+-    }
+-    function failed() {
+-      ok(false, "Import loading failed");
+-    }
+-  </script>
+-  <link rel="import" href="file_encoding.html" id="import" onload="loaded()" onerror="failed()"></link>
+-  <script type="text/javascript">
+-    is(document.getElementById("import").import.characterSet, "UTF-8", "characterSet should be UTF-8 for imports");
+-    SimpleTest.finish();
+-  </script>
+-</body>
+-</html>
+\ No newline at end of file
+diff --git a/dom/html/test/mochitest.ini b/dom/html/test/mochitest.ini
+--- a/dom/html/test/mochitest.ini
++++ b/dom/html/test/mochitest.ini
+@@ -160,20 +160,16 @@ support-files =
+   file_iframe_sandbox_top_navigation_pass.html
+   file_iframe_sandbox_window_form_fail.html
+   file_iframe_sandbox_window_form_pass.html
+   file_iframe_sandbox_window_navigation_fail.html
+   file_iframe_sandbox_window_navigation_pass.html
+   file_iframe_sandbox_window_top_navigation_pass.html
+   file_iframe_sandbox_window_top_navigation_fail.html
+   file_iframe_sandbox_worker.js
+-  file_imports_basics.html
+-  file_imports_redirect.html
+-  file_imports_redirect.html^headers^
+-  file_imports_redirected.html
+   file_srcdoc-2.html
+   file_srcdoc.html
+   file_window_open_close_outer.html
+   file_window_open_close_inner.html
+   formSubmission_chrome.js
+   form_submit_server.sjs
+   formData_worker.js
+   formData_test.js
+@@ -494,21 +490,16 @@ tags = openwindow
+ tags = openwindow
+ skip-if = toolkit == 'android' # bug 939642
+ [test_iframe_sandbox_redirect.html]
+ [test_iframe_sandbox_refresh.html]
+ [test_iframe_sandbox_same_origin.html]
+ [test_iframe_sandbox_workers.html]
+ [test_img_attributes_reflection.html]
+ [test_imageSrcSet.html]
+-[test_imports_basics.html]
+-[test_imports_redirect.html]
+-[test_imports_nonhttp.html]
+-[test_imports_nested.html]
+-[test_imports_nested_2.html]
+ [test_li_attributes_reflection.html]
+ [test_link_attributes_reflection.html]
+ [test_link_sizes.html]
+ [test_map_attributes_reflection.html]
+ [test_meta_attributes_reflection.html]
+ [test_mod_attributes_reflection.html]
+ [test_named_options.html]
+ [test_nested_invalid_fieldsets.html]
+diff --git a/dom/html/test/test_imports_basics.html b/dom/html/test/test_imports_basics.html
+deleted file mode 100644
+--- a/dom/html/test/test_imports_basics.html
++++ /dev/null
+@@ -1,68 +0,0 @@
+-<!DOCTYPE HTML>
+-<html>
+-<!--
+-https://bugzilla.mozilla.org/show_bug.cgi?id=877072
+--->
+-<head>
+-  <title>Test for Bug 877072</title>
+-  <script type="text/javascript" src="/tests/SimpleTest/SimpleTest.js"></script>
+-  <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css" />
+-  <meta http-equiv="Content-Type" content="text/html;charset=utf-8">
+-</head>
+-<body>
+-  <a target="_blank" href="https://bugzilla.mozilla.org/show_bug.cgi?id=877072">Mozilla Bug 877072</a>
+-
+-  <script type="text/javascript">
+-    SimpleTest.waitForExplicitFinish();
+-    var loadEventFired = false;
+-    var errorEventFired = false;
+-    var counter = 0;
+-    function loaded() {
+-      loadEventFired = true;
+-    }
+-    function failed() {
+-      errorEventFired = true;
+-    }
+-  </script>
+-
+-  <link rel="import" href="file_imports_basics.html" id="import1" onload="loaded()" onerror="failed()"></link>
+-
+-  <script type="text/javascript">
+-    ok(importDone, "Script of the imported document runned before this script");
+-    ok(loadEventFired, "Load eventhandler works");
+-    ok(!errorEventFired, "There were no error event fired");
+-
+-    var import1 = document.getElementById("import1").import;
+-    is(import1.getElementById("foo").textContent, "bar",
+-       "import property of link import works");
+-
+-    try{
+-      import1.open();
+-      import1.write("<h1>This should not show up!</h1>");
+-      import1.close();
+-    } catch (e) {
+-      ok(true, "import.open/write should throw");
+-    }
+-
+-    // Let's add dynamically a new link import with the same URI
+-    var link = document.createElement("link");
+-    link.setAttribute("id", "inserted");
+-    link.setAttribute("rel", "import");
+-    link.setAttribute("href", "file_imports_basics.html");
+-    function loaded2() {
+-      ok(true, "Load event is fired for link import that refers to an already loaded import");
+-      is(counter, 1, "Adding another link referring to the same import, does not load it twice");
+-      is(document.getElementById("inserted").import.getElementById("foo").textContent, "bar",
+-         "import property of dynamic link import works");
+-      SimpleTest.finish();
+-    };
+-    link.setAttribute("onload", "loaded2()");
+-    function failed2() {
+-      ok(false, "You should not reach this code");
+-      SimpleTest.finish();
+-    };
+-    link.setAttribute("onerror", "failed2()");
+-    document.body.appendChild(link);
+-  </script>
+-</body>
+-</html>
+\ No newline at end of file
+diff --git a/dom/html/test/test_imports_nested.html b/dom/html/test/test_imports_nested.html
+deleted file mode 100644
+--- a/dom/html/test/test_imports_nested.html
++++ /dev/null
+@@ -1,41 +0,0 @@
+-<!DOCTYPE HTML>
+-<html>
+-<!--
+-https://bugzilla.mozilla.org/show_bug.cgi?id=877072
+--->
+-<head>
+-  <title>Test for Bug 877072</title>
+-  <script type="text/javascript" src="/tests/SimpleTest/SimpleTest.js"></script>
+-  <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css" />
+-  <meta http-equiv="Content-Type" content="text/html;charset=utf-8">
+-</head>
+-<body>
+-  <a target="_blank" href="https://bugzilla.mozilla.org/show_bug.cgi?id=877072">Mozilla Bug 877072</a>
+-
+-  <script type="text/javascript">
+-    SimpleTest.waitForExplicitFinish();
+-    var counter = 0;
+-    var fcounter = 0;
+-    var order = [];
+-    function loaded() {
+-      counter++;
+-    }
+-    function failed() {
+-      fcounter++;
+-    }
+-  </script>
+-
+-  <link rel="import" href="imports/file_importA1.html" id="A1" onload="loaded()" onerror="failed()"></link>
+-  <link rel="import" href="imports/file_importB1.html" id="B1" onload="loaded()" onerror="failed()"></link>
+-  <link rel="import" href="imports/file_importB2.html" id="B2_2" onload="loaded()" onerror="failed()"></link>
+-
+-  <script type="text/javascript">
+-    is(counter, 5, "Imports are loaded");
+-    is(fcounter, 0, "No error in imports");
+-    var expected = ["A2", "A1", "B2", "B1"];
+-    for (i in expected)
+-      is(order[i], expected[i], "import " + i + " should be " + expected[i]);
+-    SimpleTest.finish();
+-  </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/test_imports_nested_2.html b/dom/html/test/test_imports_nested_2.html
+deleted file mode 100644
+--- a/dom/html/test/test_imports_nested_2.html
++++ /dev/null
+@@ -1,56 +0,0 @@
+-<!DOCTYPE HTML>
+-<html>
+-<!--
+-https://bugzilla.mozilla.org/show_bug.cgi?id=877072
+--->
+-<head>
+-  <title>Test for Bug 877072</title>
+-  <script type="text/javascript" src="/tests/SimpleTest/SimpleTest.js"></script>
+-  <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css" />
+-  <meta http-equiv="Content-Type" content="text/html;charset=utf-8">
+-</head>
+-<body>
+-  <a target="_blank" href="https://bugzilla.mozilla.org/show_bug.cgi?id=877072">Mozilla Bug 877072</a>
+-
+-  <script type="text/javascript">
+-    SimpleTest.waitForExplicitFinish();
+-    var counter = 0;
+-    var fcounter = 0;
+-    var order = [];
+-    function loaded() {
+-      counter++;
+-    }
+-    function failed() {
+-      fcounter++;
+-    }
+-  </script>
+-
+-<!--
+-
+-Master -> c1 -> ... -> C10
+-|  |                    |
+-|  - - -> D             |
+-|         ^             |
+-|         |             |
+- - - - -> E < - - - - - -
+-
+-This test is for testing ImportLoader::UpdateDependants.Because of the long
+-chain to C10, it's very likely that C10->E will be the last edge the ImportLoaders
+-find. At that point it won't only have to update E but also its subimport D.
+-
+--->
+-
+-  <link rel="import" href="imports/file_importC1.html" onload="loaded()" onerror="failed()"></link>
+-  <link rel="import" href="imports/file_importD.html" onload="loaded()" onerror="failed()"></link>
+-  <link rel="import" href="imports/file_importE.html" onload="loaded()" onerror="failed()"></link>
+-
+-  <script type="text/javascript">
+-    is(counter, 14, "Imports are loaded"); // 12 imports but 14 link imports...
+-    is(fcounter, 0, "No error in imports");
+-    var expected = ["D", "E", "C10", "C9", "C8", "C7", "C6", "C5", "C4", "C3", "C2", "C1"];
+-    for (i in expected)
+-      is(order[i], expected[i], "import " + i + " should be " + expected[i]);
+-    SimpleTest.finish();
+-  </script>
+-</body>
+-</html>
+diff --git a/dom/html/test/test_imports_nonhttp.html b/dom/html/test/test_imports_nonhttp.html
+deleted file mode 100644
+--- a/dom/html/test/test_imports_nonhttp.html
++++ /dev/null
+@@ -1,56 +0,0 @@
+-<!DOCTYPE HTML>
+-<html>
+-<!--
+-https://bugzilla.mozilla.org/show_bug.cgi?id=1016875
+--->
+-<head>
+-  <title>Test for Bug 1016875</title>
+-  <script type="text/javascript" src="/tests/SimpleTest/SimpleTest.js"></script>
+-  <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css" />
+-  <meta http-equiv="Content-Type" content="text/html;charset=utf-8">
+-</head>
+-<body>
+-  <a target="_blank" href="https://bugzilla.mozilla.org/show_bug.cgi?id=1016875">Mozilla Bug 1016875</a>
+-
+-  <script type="text/javascript">
+-    //<![CDATA[
+-    SimpleTest.waitForExplicitFinish();
+-    var counter = 0;
+-    function loaded() {
+-      if ( counter++ == 1 ) {
+-        ok(document.getElementById("import1").import.getElementById("div1"),
+-           "import document was loaded");
+-        ok(document.getElementById("import2").import.getElementById("div1"),
+-           "import document was loaded");
+-        SimpleTest.finish();
+-      }
+-    }
+-    function failed() {
+-      ok(false, "Import should not have failed")
+-      SimpleTest.finish();
+-    }
+-    var link = document.createElement("link");
+-    link.setAttribute("id", "import1");
+-    link.setAttribute("rel", "import");
+-    var stringDoc = "<!DOCTYPE html><html><body><div id='div1'></div></body></html>";
+-    var encoded = btoa(stringDoc);
+-    var dataurl = "data:text/html;base64," + encoded;
+-    link.setAttribute("href", dataurl);
+-    link.onload = loaded;
+-    link.onerror = failed;
+-    document.body.appendChild(link);
+-
+-    var link = document.createElement("link");
+-    link.setAttribute("id", "import2");
+-    link.setAttribute("rel", "import");
+-    var blob = new Blob([stringDoc], {type : 'text/html'});
+-    var objectURL = URL.createObjectURL(blob);
+-    link.setAttribute("href", objectURL);
+-    link.onload = loaded;
+-    link.onerror = failed;
+-    document.body.appendChild(link);
+-    //]]>
+-  </script>
+-
+-</body>
+-</html>
+diff --git a/dom/html/test/test_imports_redirect.html b/dom/html/test/test_imports_redirect.html
+deleted file mode 100644
+--- a/dom/html/test/test_imports_redirect.html
++++ /dev/null
+@@ -1,39 +0,0 @@
+-<!DOCTYPE HTML>
+-<html>
+-<!--
+-https://bugzilla.mozilla.org/show_bug.cgi?id=1016875
+--->
+-<head>
+-  <title>Test for Bug 1016875</title>
+-  <script type="text/javascript" src="/tests/SimpleTest/SimpleTest.js"></script>
+-  <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css" />
+-  <meta http-equiv="Content-Type" content="text/html;charset=utf-8">
+-</head>
+-<body>
+-  <a target="_blank" href="https://bugzilla.mozilla.org/show_bug.cgi?id=1016875">Mozilla Bug 1016875</a>
+-
+-  <script type="text/javascript">
+-    SimpleTest.waitForExplicitFinish();
+-    var loadEventFired = false;
+-    var errorEventFired = false;
+-    var counter = 0;
+-    function loaded() {
+-      loadEventFired = true;
+-    }
+-    function failed() {
+-      errorEventFired = true;
+-    }
+-  </script>
+-
+-  <link rel="import" href="http://mochi.test:8888/tests/dom/html/test/file_imports_redirect.html" id="import" onload="loaded()" onerror="failed()"></link>
+-
+-  <script type="text/javascript">
+-    ok(loadEventFired, "Load event was fired");
+-    ok(!errorEventFired, "Error event was not fired, redirection worked");
+-    ok(redirected, "Script of the target of redirection was executed");
+-
+-    SimpleTest.finish();
+-  </script>
+-
+-</body>
+-</html>
+diff --git a/dom/script/ScriptLoader.cpp b/dom/script/ScriptLoader.cpp
+--- a/dom/script/ScriptLoader.cpp
++++ b/dom/script/ScriptLoader.cpp
+@@ -49,17 +49,16 @@
+ #include "nsIContentSecurityPolicy.h"
+ #include "mozilla/Logging.h"
+ #include "nsCRT.h"
+ #include "nsContentCreatorFunctions.h"
+ #include "nsProxyRelease.h"
+ #include "nsSandboxFlags.h"
+ #include "nsContentTypeParser.h"
+ #include "nsINetworkPredictor.h"
+-#include "ImportManager.h"
+ #include "mozilla/dom/EncodingUtils.h"
+ #include "mozilla/ConsoleReportCollector.h"
+ 
+ #include "mozilla/AsyncEventDispatcher.h"
+ #include "mozilla/Attributes.h"
+ #include "mozilla/Telemetry.h"
+ #include "mozilla/TimeStamp.h"
+ #include "mozilla/Unused.h"
+@@ -397,22 +396,16 @@ ScriptLoader::CreateModuleScript(ModuleL
+ 
+   bool oldProcessingScriptTag = context->GetProcessingScriptTag();
+   context->SetProcessingScriptTag(true);
+ 
+   nsresult rv;
+   {
+     // Update our current script.
+     AutoCurrentScriptUpdater scriptUpdater(this, aRequest->mElement);
+-    Maybe<AutoCurrentScriptUpdater> masterScriptUpdater;
+-    nsCOMPtr<nsIDocument> master = mDocument->MasterDocument();
+-    if (master != mDocument) {
+-      masterScriptUpdater.emplace(master->ScriptLoader(),
+-                                  aRequest->mElement);
+-    }
+ 
+     JSContext* cx = aes.cx();
+     JS::Rooted<JSObject*> module(cx);
+ 
+     if (aRequest->mWasCompiledOMT) {
+       module = JS::FinishOffThreadModule(cx, aRequest->mOffThreadToken);
+       aRequest->mOffThreadToken = nullptr;
+       rv = module ? NS_OK : NS_ERROR_FAILURE;
+@@ -859,17 +852,17 @@ ScriptLoader::StartLoad(ScriptLoadReques
+   if (aRequest->mElement) {
+     context = do_QueryInterface(aRequest->mElement);
+   }
+   else {
+     context = mDocument;
+   }
+ 
+   nsCOMPtr<nsILoadGroup> loadGroup = mDocument->GetDocumentLoadGroup();
+-  nsCOMPtr<nsPIDOMWindowOuter> window = mDocument->MasterDocument()->GetWindow();
++  nsCOMPtr<nsPIDOMWindowOuter> window = mDocument->GetWindow();
+   NS_ENSURE_TRUE(window, NS_ERROR_NULL_POINTER);
+   nsIDocShell* docshell = window->GetDocShell();
+   nsCOMPtr<nsIInterfaceRequestor> prompter(do_QueryInterface(docshell));
+ 
+   nsSecurityFlags securityFlags;
+   if (aRequest->IsModuleRequest()) {
+     // According to the spec, module scripts have different behaviour to classic
+     // scripts and always use CORS.
+@@ -1691,33 +1684,33 @@ ScriptLoader::ProcessRequest(ScriptLoadR
+   }
+ 
+   aRequest->mElement->BeginEvaluating();
+ 
+   FireScriptAvailable(NS_OK, aRequest);
+ 
+   // The window may have gone away by this point, in which case there's no point
+   // in trying to run the script.
+-  nsCOMPtr<nsIDocument> master = mDocument->MasterDocument();
++
+   {
+     // Try to perform a microtask checkpoint
+     nsAutoMicroTask mt;
+   }
+ 
+-  nsPIDOMWindowInner* pwin = master->GetInnerWindow();
++  nsPIDOMWindowInner* pwin = mDocument->GetInnerWindow();
+   bool runScript = !!pwin;
+   if (runScript) {
+     nsContentUtils::DispatchTrustedEvent(scriptElem->OwnerDoc(),
+                                          scriptElem,
+                                          NS_LITERAL_STRING("beforescriptexecute"),
+                                          true, true, &runScript);
+   }
+ 
+   // Inner window could have gone away after firing beforescriptexecute
+-  pwin = master->GetInnerWindow();
++  pwin = mDocument->GetInnerWindow();
+   if (!pwin) {
+     runScript = false;
+   }
+ 
+   nsresult rv = NS_OK;
+   if (runScript) {
+     if (doc) {
+       doc->BeginEvaluatingExternalScript();
+@@ -1782,18 +1775,17 @@ ScriptLoader::FireScriptEvaluated(nsresu
+   }
+ 
+   aRequest->FireScriptEvaluated(aResult);
+ }
+ 
+ already_AddRefed<nsIScriptGlobalObject>
+ ScriptLoader::GetScriptGlobalObject()
+ {
+-  nsCOMPtr<nsIDocument> master = mDocument->MasterDocument();
+-  nsPIDOMWindowInner* pwin = master->GetInnerWindow();
++  nsPIDOMWindowInner* pwin = mDocument->GetInnerWindow();
+   if (!pwin) {
+     return nullptr;
+   }
+ 
+   nsCOMPtr<nsIScriptGlobalObject> globalObject = do_QueryInterface(pwin);
+   NS_ASSERTION(globalObject, "windows must be global objects");
+ 
+   // and make sure we are setup for this type of script.
+@@ -2051,27 +2043,16 @@ ScriptLoader::EvaluateScript(ScriptLoadR
+                                globalObject->GetGlobalJSObject());
+ 
+   bool oldProcessingScriptTag = context->GetProcessingScriptTag();
+   context->SetProcessingScriptTag(true);
+   nsresult rv;
+   {
+     // Update our current script.
+     AutoCurrentScriptUpdater scriptUpdater(this, aRequest->mElement);
+-    Maybe<AutoCurrentScriptUpdater> masterScriptUpdater;
+-    nsCOMPtr<nsIDocument> master = mDocument->MasterDocument();
+-    if (master != mDocument) {
+-      // If this script belongs to an import document, it will be
+-      // executed in the context of the master document. During the
+-      // execution currentScript of the master should refer to this
+-      // script. So let's update the mCurrentScript of the ScriptLoader
+-      // of the master document too.
+-      masterScriptUpdater.emplace(master->ScriptLoader(),
+-                                  aRequest->mElement);
+-    }
+ 
+     if (aRequest->IsModuleRequest()) {
+       // When a module is already loaded, it is not feched a second time and the
+       // mDataType of the request might remain set to DataType::Unknown.
+       MOZ_ASSERT(!aRequest->IsBytecode());
+       LOG(("ScriptLoadRequest (%p): Evaluate Module", aRequest));
+       ModuleLoadRequest* request = aRequest->AsModuleRequest();
+       MOZ_ASSERT(request->mModuleScript);
+@@ -2441,52 +2422,16 @@ ScriptLoader::ReadyToExecuteParserBlocki
+     ScriptLoader* ancestor = doc->ScriptLoader();
+     if (!ancestor->SelfReadyToExecuteParserBlockingScripts() &&
+         ancestor->AddPendingChildLoader(this)) {
+       AddParserBlockingScriptExecutionBlocker();
+       return false;
+     }
+   }
+ 
+-  if (mDocument && !mDocument->IsMasterDocument()) {
+-    RefPtr<ImportManager> im = mDocument->ImportManager();
+-    RefPtr<ImportLoader> loader = im->Find(mDocument);
+-    MOZ_ASSERT(loader, "How can we have an import document without a loader?");
+-
+-    // The referring link that counts in the execution order calculation
+-    // (in spec: flagged as branch)
+-    nsCOMPtr<nsINode> referrer = loader->GetMainReferrer();
+-    MOZ_ASSERT(referrer, "There has to be a main referring link for each imports");
+-
+-    // Import documents are blocked by their import predecessors. We need to
+-    // wait with script execution until all the predecessors are done.
+-    // Technically it means we have to wait for the last one to finish,
+-    // which is the neares one to us in the order.
+-    RefPtr<ImportLoader> lastPred = im->GetNearestPredecessor(referrer);
+-    if (!lastPred) {
+-      // If there is no predecessor we can run.
+-      return true;
+-    }
+-
+-    nsCOMPtr<nsIDocument> doc = lastPred->GetDocument();
+-    if (lastPred->IsBlocking() || !doc ||
+-        !doc->ScriptLoader()->SelfReadyToExecuteParserBlockingScripts()) {
+-      // Document has not been created yet or it was created but not ready.
+-      // Either case we are blocked by it. The ImportLoader will take care
+-      // of blocking us, and adding the pending child loader to the blocking
+-      // ScriptLoader when it's possible (at this point the blocking loader
+-      // might not have created the document/ScriptLoader)
+-      lastPred->AddBlockedScriptLoader(this);
+-      // As more imports are parsed, this can change, let's cache what we
+-      // blocked, so it can be later updated if needed (see: ImportLoader::Updater).
+-      loader->SetBlockingPredecessor(lastPred);
+-      return false;
+-    }
+-  }
+-
+   return true;
+ }
+ 
+ /* static */ nsresult
+ ScriptLoader::ConvertToUTF16(nsIChannel* aChannel, const uint8_t* aData,
+                              uint32_t aLength, const nsAString& aHintCharset,
+                              nsIDocument* aDocument,
+                              char16_t*& aBufOut, size_t& aLengthOut)
+diff --git a/dom/webidl/HTMLLinkElement.webidl b/dom/webidl/HTMLLinkElement.webidl
+--- a/dom/webidl/HTMLLinkElement.webidl
++++ b/dom/webidl/HTMLLinkElement.webidl
+@@ -41,19 +41,13 @@ partial interface HTMLLinkElement {
+   [SetterThrows, Pure]
+            attribute DOMString charset;
+   [SetterThrows, Pure]
+            attribute DOMString rev;
+   [SetterThrows, Pure]
+            attribute DOMString target;
+ };
+ 
+-// http://w3c.github.io/webcomponents/spec/imports/#interface-import
+-partial interface HTMLLinkElement {
+-    [Func="nsDocument::IsWebComponentsEnabled"]
+-    readonly attribute Document? import;
+-};
+-
+ // https://w3c.github.io/webappsec/specs/subresourceintegrity/#htmllinkelement-1
+ partial interface HTMLLinkElement {
+   [SetterThrows]
+   attribute DOMString integrity;
+ };
+diff --git a/testing/profiles/prefs_general.js b/testing/profiles/prefs_general.js
+--- a/testing/profiles/prefs_general.js
++++ b/testing/profiles/prefs_general.js
+@@ -55,17 +55,16 @@ user_pref("app.update.staging.enabled", 
+ user_pref("app.update.url.android", "");
+ // Make sure GMPInstallManager won't hit the network.
+ user_pref("media.gmp-manager.url.override", "http://%(server)s/dummy-gmp-manager.xml");
+ user_pref("media.gmp-manager.updateEnabled", false);
+ user_pref("dom.w3c_touch_events.enabled", 1);
+ user_pref("layout.accessiblecaret.enabled_on_touch", false);
+ user_pref("dom.webcomponents.enabled", true);
+ user_pref("dom.webcomponents.customelements.enabled", true);
+-user_pref("dom.htmlimports.enabled", true);
+ // Existing tests assume there is no font size inflation.
+ user_pref("font.size.inflation.emPerLine", 0);
+ user_pref("font.size.inflation.minTwips", 0);
+ // Disable the caret blinking so we get stable snapshot
+ user_pref("ui.caretBlinkTime", -1);
+ 
+ // AddonManager tests require that the experiments provider be present.
+ user_pref("experiments.supported", true);
+diff --git a/testing/web-platform/meta/html-imports/document/document-method-changes.html.ini b/testing/web-platform/meta/html-imports/document/document-method-changes.html.ini
+new file mode 100644
+--- /dev/null
++++ b/testing/web-platform/meta/html-imports/document/document-method-changes.html.ini
+@@ -0,0 +1,4 @@
++[document-method-changes.html]
++  type: testharness
++  [Throws an InvalidStateError exception if the Document is an import: From the master document]
++    expected: FAIL
+diff --git a/testing/web-platform/meta/html-imports/fetching/already-in-import-map.html.ini b/testing/web-platform/meta/html-imports/fetching/already-in-import-map.html.ini
+new file mode 100644
+--- /dev/null
++++ b/testing/web-platform/meta/html-imports/fetching/already-in-import-map.html.ini
+@@ -0,0 +1,4 @@
++[already-in-import-map.html]
++  type: testharness
++  [If LOCATION is already in the import map, let IMPORT be the imported document for LOCATION and stop. (2)]
++    expected: FAIL
+diff --git a/testing/web-platform/meta/html-imports/fetching/loading-attempt.html.ini b/testing/web-platform/meta/html-imports/fetching/loading-attempt.html.ini
+new file mode 100644
+--- /dev/null
++++ b/testing/web-platform/meta/html-imports/fetching/loading-attempt.html.ini
+@@ -0,0 +1,15 @@
++[loading-attempt.html]
++  type: testharness
++  expected: TIMEOUT
++
++  [The loading attempt must be considered successful if IMPORT is not null on the algorithm completion, and failed otherwise. (1)]
++    expected: FAIL
++
++  [The loading attempt must be considered successful if IMPORT is not null on the algorithm completion, and failed otherwise. (2)]
++    expected: FAIL
++
++  [The loading attempt must be considered successful if IMPORT is not null on the algorithm completion, and failed otherwise. (3)]
++    expected: TIMEOUT
++
++  [Every import that is not marked as async delays the load event in the Document.]
++    expected: NOTRUN
+diff --git a/testing/web-platform/meta/html-imports/html-link-element/import-attribute.html.ini b/testing/web-platform/meta/html-imports/html-link-element/import-attribute.html.ini
+new file mode 100644
+--- /dev/null
++++ b/testing/web-platform/meta/html-imports/html-link-element/import-attribute.html.ini
+@@ -0,0 +1,14 @@
++[import-attribute.html]
++  type: testharness
++
++  [The import attribute must return null if the link element is not in a Document.]
++    expected: FAIL
++
++  [The attribute must return the imported document for the import.]
++    expected: FAIL
++
++  [The same object must be returned each time.]
++    expected: FAIL
++
++  [The import attribute must return null if the link does not represent an import.]
++    expected: FAIL
+diff --git a/testing/web-platform/meta/service-workers/service-worker/fetch-request-html-imports.https.html.ini b/testing/web-platform/meta/service-workers/service-worker/fetch-request-html-imports.https.html.ini
+--- a/testing/web-platform/meta/service-workers/service-worker/fetch-request-html-imports.https.html.ini
++++ b/testing/web-platform/meta/service-workers/service-worker/fetch-request-html-imports.https.html.ini
+@@ -1,15 +1,5 @@
+ [fetch-request-html-imports.https.html]
+   type: testharness
+-  disabled:
+-    if debug: https://bugzilla.mozilla.org/show_bug.cgi?id=1367072
+-  expected:
+-    if debug and not e10s and (os == "linux") and (version == "Ubuntu 16.04") and (processor == "x86") and (bits == 32): CRASH
+-    if debug and e10s and (os == "linux") and (version == "Ubuntu 16.04") and (processor == "x86_64") and (bits == 64): TIMEOUT
+-    if debug and not e10s and (os == "win") and (version == "6.1.7601") and (processor == "x86") and (bits == 32): CRASH
+-    if debug and e10s and (os == "linux") and (version == "Ubuntu 16.04") and (processor == "x86") and (bits == 32): TIMEOUT
+-    if debug and e10s and (os == "win") and (version == "6.1.7601") and (processor == "x86") and (bits == 32): TIMEOUT
+-    if debug and not e10s and (os == "win") and (version == "6.2.9200") and (processor == "x86_64") and (bits == 64): CRASH
+-    if debug and not e10s and (os == "linux") and (version == "Ubuntu 16.04") and (processor == "x86_64") and (bits == 64): CRASH
+   [Verify the FetchEvent for HTMLImports]
+     expected: FAIL
+ 
