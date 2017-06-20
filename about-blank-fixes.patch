@@ -76,7 +76,27 @@ diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
    // If we have no tree owner, that means that we've been detached from the
    // docshell tree (this is distinct from having no parent dochshell, which
    // is the case for root docshells). It would be nice to simply disallow
-@@ -11505,17 +11542,19 @@ nsDocShell::DoChannelLoad(nsIChannel* aC
+@@ -5812,16 +5849,19 @@ nsDocShell::Destroy()
+       const char* msg = mItemType == typeContent ?
+         NS_WEBNAVIGATION_DESTROY : NS_CHROME_WEBNAVIGATION_DESTROY;
+       serv->NotifyObservers(GetAsSupports(this), msg, nullptr);
+     }
+   }
+ 
+   mIsBeingDestroyed = true;
+ 
++  // Break the cycle with the initial client, if present.
++  mInitialClientSource = nullptr;
++
+   // Make sure we don't record profile timeline markers anymore
+   SetRecordProfileTimelineMarkers(false);
+ 
+   // Remove our pref observers
+   if (mObserveErrorPages) {
+     mObserveErrorPages = false;
+   }
+ 
+@@ -11505,17 +11545,19 @@ nsDocShell::DoChannelLoad(nsIChannel* aC
    uint32_t openFlags = 0;
    if (mLoadType == LOAD_LINK) {
      openFlags |= nsIURILoader::IS_CONTENT_PREFERRED;
@@ -97,7 +117,7 @@ diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
    return NS_OK;
  }
  
-@@ -14849,16 +14888,22 @@ nsDocShell::InFrameSwap()
+@@ -14849,16 +14891,22 @@ nsDocShell::InFrameSwap()
      if (shell->mInFrameSwap) {
        return true;
      }
@@ -427,3 +447,334 @@ diff --git a/dom/clients/manager/ClientChannelHelper.h b/dom/clients/manager/Cli
  } // namespace mozilla
  
  #endif // _mozilla_dom_ClientChannelHelper_h
+diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSource.cpp
+--- a/dom/clients/manager/ClientSource.cpp
++++ b/dom/clients/manager/ClientSource.cpp
+@@ -84,19 +84,50 @@ ClientSource::SnapshotWindowState(Client
+   }
+ 
+   *aStateOut = ClientState(ClientWindowState(doc->VisibilityState(),
+                                              doc->LastFocusTime(), focused));
+ 
+   return NS_OK;
+ }
+ 
++WorkerPrivate*
++ClientSource::GetWorkerPrivate() const
++{
++  NS_ASSERT_OWNINGTHREAD(ClientSource);
++  if (!mOwner.is<WorkerPrivate*>()) {
++    return nullptr;
++  }
++  return mOwner.as<WorkerPrivate*>();
++}
++
++nsIDocShell*
++ClientSource::GetDocShell() const
++{
++  NS_ASSERT_OWNINGTHREAD(ClientSource);
++  if (!mOwner.is<nsCOMPtr<nsIDocShell>>()) {
++    return nullptr;
++  }
++  return mOwner.as<nsCOMPtr<nsIDocShell>>();
++}
++
++void
++ClientSource::MaybeCreateInitialDocument()
++{
++  nsIDocShell* docshell = GetDocShell();
++  if (docshell) {
++    // Force the create of the initial document if it does not exist yet.
++    Unused << docshell->GetDocument();
++  }
++}
++
+ ClientSource::ClientSource(ClientManager* aManager,
+                            const ClientSourceConstructorArgs& aArgs)
+   : mManager(aManager)
++  , mOwner(AsVariant(Nothing()))
+   , mClientInfo(aArgs.id(), aArgs.type(), aArgs.principalInfo(), aArgs.creationTime())
+ {
+   MOZ_ASSERT(mManager);
+ }
+ 
+ void
+ ClientSource::Activate(PClientManagerChild* aActor)
+ {
+@@ -124,42 +155,32 @@ ClientSource::~ClientSource()
+ {
+   Shutdown();
+ }
+ 
+ nsPIDOMWindowInner*
+ ClientSource::GetInnerWindow() const
+ {
+   NS_ASSERT_OWNINGTHREAD(ClientSource);
+-  if (mOwner.isNothing() || !mOwner.ref().is<RefPtr<nsPIDOMWindowInner>>()) {
++  if (!mOwner.is<RefPtr<nsPIDOMWindowInner>>()) {
+     return nullptr;
+   }
+-  return mOwner.ref().as<RefPtr<nsPIDOMWindowInner>>();
+-}
+-
+-WorkerPrivate*
+-ClientSource::GetWorkerPrivate() const
+-{
+-  NS_ASSERT_OWNINGTHREAD(ClientSource);
+-  if (mOwner.isNothing() || !mOwner.ref().is<WorkerPrivate*>()) {
+-    return nullptr;
+-  }
+-  return mOwner.ref().as<WorkerPrivate*>();
++  return mOwner.as<RefPtr<nsPIDOMWindowInner>>();
+ }
+ 
+ void
+ ClientSource::WorkerExecutionReady(WorkerPrivate* aWorkerPrivate)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(aWorkerPrivate);
+   aWorkerPrivate->AssertIsOnWorkerThread();
+ 
+   // Its safe to store the WorkerPrivate* here because the ClientSource
+   // is explicitly destroyed by WorkerPrivate before exiting its run loop.
+-  MOZ_DIAGNOSTIC_ASSERT(mOwner.isNothing());
+-  mOwner.emplace(AsVariant(aWorkerPrivate));
++  MOZ_DIAGNOSTIC_ASSERT(mOwner.is<Nothing>());
++  mOwner = AsVariant(aWorkerPrivate);
+ 
+   ClientSourceExecutionReadyArgs args(
+     aWorkerPrivate->GetLocationInfo().mHref,
+     FrameType::None);
+ 
+   ExecutionReady(args);
+ }
+ 
+@@ -199,23 +220,55 @@ ClientSource::WindowExecutionReady(nsPID
+   }
+ 
+   ClientSourceExecutionReadyArgs args(spec, frameType);
+   ExecutionReady(args);
+ 
+   // We should either be setting a window execution ready for the
+   // first time or setting the same window execution ready again.
+   // The secondary calls are due to initial about:blank replacement.
+-  MOZ_DIAGNOSTIC_ASSERT(mOwner.isNothing() ||
++  MOZ_DIAGNOSTIC_ASSERT(mOwner.is<Nothing>() ||
++                        mOwner.is<nsCOMPtr<nsIDocShell>>() ||
+                         GetInnerWindow() == aInnerWindow);
+ 
+   // This creates a cycle with the window.  It is broken when
+   // nsGlobalWindow::FreeInnerObjects() deletes the ClientSource.
+-  mOwner.reset();
+-  mOwner.emplace(AsVariant(RefPtr<nsPIDOMWindowInner>(aInnerWindow)));
++  mOwner = AsVariant(RefPtr<nsPIDOMWindowInner>(aInnerWindow));
++
++  return NS_OK;
++}
++
++nsresult
++ClientSource::DocShellExecutionReady(nsIDocShell* aDocShell)
++{
++  MOZ_ASSERT(NS_IsMainThread());
++  MOZ_DIAGNOSTIC_ASSERT(aDocShell);
++
++  nsPIDOMWindowOuter* outer = aDocShell->GetWindow();
++  if (NS_WARN_IF(!outer)) {
++    return NS_ERROR_UNEXPECTED;
++  }
++
++  // TODO: dedupe this with WindowExecutionReady
++  FrameType frameType = FrameType::Top_level;
++  if (!outer->IsTopLevelWindow()) {
++    frameType = FrameType::Nested;
++  } else if(outer->HadOriginalOpener()) {
++    frameType = FrameType::Auxiliary;
++  }
++
++  ClientSourceExecutionReadyArgs args(NS_LITERAL_CSTRING("about:blank"),
++                                      frameType);
++  ExecutionReady(args);
++
++  MOZ_DIAGNOSTIC_ASSERT(mOwner.is<Nothing>());
++
++  // This creates a cycle with the docshell.  It is broken when
++  // nsDocShell::Destroy() deletes the ClientSource.
++  mOwner = AsVariant(nsCOMPtr<nsIDocShell>(aDocShell));
+ 
+   return NS_OK;
+ }
+ 
+ void
+ ClientSource::Freeze()
+ {
+   MaybeExecute([](PClientSourceChild* aActor) {
+@@ -304,27 +357,37 @@ ClientSource::Focus(const ClientFocusArg
+   RefPtr<ClientOpPromise> ref;
+ 
+   if (mClientInfo.Type() != ClientType::Window) {
+     ref = ClientOpPromise::CreateAndReject(NS_ERROR_DOM_NOT_SUPPORTED_ERR,
+                                            __func__);
+     return ref.forget();
+   }
+ 
+-  nsPIDOMWindowInner* window = GetInnerWindow();
+-  if (!window) {
++  nsPIDOMWindowOuter* outer = nullptr;
++
++  nsPIDOMWindowInner* inner = GetInnerWindow();
++  if (inner) {
++    outer = inner->GetOuterWindow();
++  } else {
++    nsIDocShell* docshell = GetDocShell();
++    if (docshell) {
++      outer = docshell->GetWindow();
++    }
++  }
++
++  if (!outer) {
+     ref = ClientOpPromise::CreateAndReject(NS_ERROR_DOM_INVALID_STATE_ERR,
+                                            __func__);
+     return ref.forget();
+   }
+ 
+   MOZ_ASSERT(NS_IsMainThread());
+ 
+-  nsresult rv =
+-    nsContentUtils::DispatchFocusChromeEvent(window->GetOuterWindow());
++  nsresult rv = nsContentUtils::DispatchFocusChromeEvent(outer);
+   if (NS_FAILED(rv)) {
+     ref = ClientOpPromise::CreateAndReject(rv, __func__);
+     return ref.forget();
+   }
+ 
+   ClientState state;
+   rv = SnapshotState(&state);
+   if (NS_FAILED(rv)) {
+@@ -356,16 +419,19 @@ ClientSource::PostMessage(const ClientPo
+ 
+   StructuredCloneData clonedData;
+   clonedData.BorrowFromClonedMessageDataForBackgroundChild(aArgs.clonedData());
+ 
+   RefPtr<ServiceWorkerContainer> target;
+   nsCOMPtr<nsIGlobalObject> globalObject;
+   if (mClientInfo.Type() == ClientType::Window) {
+     MOZ_ASSERT(NS_IsMainThread());
++    // We don't need to force the creation of the about:blank document
++    // here because there is no postMessage listener.  If a listener
++    // was registered then the document will already be created.
+     nsPIDOMWindowInner* window = GetInnerWindow();
+     if (window) {
+       globalObject = nsGlobalWindow::Cast(window);
+       RefPtr<Navigator> navigator =
+         static_cast<Navigator*>(window->GetNavigator());
+       if (navigator) {
+         target = navigator->ServiceWorker();
+       }
+@@ -558,16 +624,17 @@ nsresult
+ ClientSource::SnapshotState(ClientState* aStateOut)
+ {
+   NS_ASSERT_OWNINGTHREAD(ClientSource);
+   MOZ_DIAGNOSTIC_ASSERT(aStateOut);
+ 
+   // TODO: Handle state on reserved client where no window/workerprivate yet.
+ 
+   if (mClientInfo.Type() == ClientType::Window) {
++    MaybeCreateInitialDocument();
+     nsresult rv = SnapshotWindowState(aStateOut);
+     if (NS_FAILED(rv)) {
+       return rv;
+     }
+     return NS_OK;
+   }
+ 
+   *aStateOut = ClientState(ClientWorkerState());
+diff --git a/dom/clients/manager/ClientSource.h b/dom/clients/manager/ClientSource.h
+--- a/dom/clients/manager/ClientSource.h
++++ b/dom/clients/manager/ClientSource.h
+@@ -11,16 +11,17 @@
+ #include "mozilla/dom/ServiceWorkerDescriptor.h"
+ #include "mozilla/Variant.h"
+ #include "ClientOpPromise.h"
+ 
+ #ifdef XP_WIN
+ #undef PostMessage
+ #endif
+ 
++class nsIDocShell;
+ class nsPIDOMWindowInner;
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ class ClientClaimArgs;
+ class ClientControlledArgs;
+ class ClientFocusArgs;
+@@ -43,53 +44,64 @@ class ClientSource final : public Client
+ {
+   friend class ClientManager;
+   friend class ClientSourceChild;
+ 
+   NS_DECL_OWNINGTHREAD
+ 
+   RefPtr<ClientManager> mManager;
+ 
+-  Maybe<Variant<RefPtr<nsPIDOMWindowInner>,
+-                mozilla::dom::workers::WorkerPrivate*>> mOwner;
++  Variant<Nothing,
++          RefPtr<nsPIDOMWindowInner>,
++          nsCOMPtr<nsIDocShell>,
++          mozilla::dom::workers::WorkerPrivate*> mOwner;
+ 
+   ClientInfo mClientInfo;
+   Maybe<ServiceWorkerDescriptor> mController;
+ 
+   void
+   Shutdown();
+ 
+   void
+   ExecutionReady(const ClientSourceExecutionReadyArgs& aArgs);
+ 
+   nsresult
+   SnapshotWindowState(ClientState* aStateOut);
+ 
++  mozilla::dom::workers::WorkerPrivate*
++  GetWorkerPrivate() const;
++
++  nsIDocShell*
++  GetDocShell() const;
++
++  void
++  MaybeCreateInitialDocument();
++
+   // Private methods called by ClientManager
+   ClientSource(ClientManager* aManager,
+                const ClientSourceConstructorArgs& aArgs);
+ 
+   void
+   Activate(PClientManagerChild* aActor);
+ 
+ public:
+   ~ClientSource();
+ 
+   nsPIDOMWindowInner*
+   GetInnerWindow() const;
+ 
+-  mozilla::dom::workers::WorkerPrivate*
+-  GetWorkerPrivate() const;
+-
+   void
+   WorkerExecutionReady(mozilla::dom::workers::WorkerPrivate* aWorkerPrivate);
+ 
+   nsresult
+   WindowExecutionReady(nsPIDOMWindowInner* aInnerWindow);
+ 
++  nsresult
++  DocShellExecutionReady(nsIDocShell* aDocShell);
++
+   void
+   Freeze();
+ 
+   void
+   Thaw();
+ 
+   const ClientInfo&
+   Info() const;
