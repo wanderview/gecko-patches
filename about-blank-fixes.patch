@@ -25,7 +25,7 @@ diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
  #include "mozilla/dom/ScreenOrientation.h"
  #include "mozilla/dom/ToJSValue.h"
  #include "mozilla/dom/PermissionMessageUtils.h"
-@@ -3313,16 +3316,50 @@ nsDocShell::GetParent(nsIDocShellTreeIte
+@@ -3313,16 +3316,52 @@ nsDocShell::GetParent(nsIDocShellTreeIte
  already_AddRefed<nsDocShell>
  nsDocShell::GetParentDocshell()
  {
@@ -36,6 +36,8 @@ diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
  void
 +nsDocShell::EnsureInnerWindowOrInitialClientSource()
 +{
++  MOZ_DIAGNOSTIC_ASSERT(!mInitialClientSource);
++
 +  if (mScriptGlobal && mScriptGlobal->GetExtantDoc()) {
 +    MOZ_DIAGNOSTIC_ASSERT(mScriptGlobal->GetCurrentInnerWindowInternal()->GetClientInfo().isSome());
 +    return;
@@ -44,7 +46,7 @@ diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
 +  mInitialClientSource = ClientManager::CreateSource(ClientType::Window,
 +                                                     GetInheritedPrincipal(false));
 +
-+  // TODO: Mark the initial client as execution ready, but owned by the docshell.
++  mInitialClientSource->DocShellExecutionReady(this);
 +}
 +
 +Maybe<ClientInfo>
@@ -76,7 +78,7 @@ diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
    // If we have no tree owner, that means that we've been detached from the
    // docshell tree (this is distinct from having no parent dochshell, which
    // is the case for root docshells). It would be nice to simply disallow
-@@ -5812,16 +5849,19 @@ nsDocShell::Destroy()
+@@ -5812,16 +5851,19 @@ nsDocShell::Destroy()
        const char* msg = mItemType == typeContent ?
          NS_WEBNAVIGATION_DESTROY : NS_CHROME_WEBNAVIGATION_DESTROY;
        serv->NotifyObservers(GetAsSupports(this), msg, nullptr);
@@ -96,7 +98,28 @@ diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
      mObserveErrorPages = false;
    }
  
-@@ -11505,17 +11545,19 @@ nsDocShell::DoChannelLoad(nsIChannel* aC
+@@ -7644,16 +7686,20 @@ nsDocShell::EndPageLoad(nsIWebProgress* 
+         internalLoadGroup->OnEndPageLoad(aChannel);
+       }
+     }
+   }
+ 
+   // Timing is picked up by the window, we don't need it anymore
+   mTiming = nullptr;
+ 
++  // Make sure to discard the initial Client if we never created the initial
++  // about:blank document.
++  mInitialClientSource.reset();
++
+   // clean up reload state for meta charset
+   if (eCharsetReloadRequested == mCharsetReloadState) {
+     mCharsetReloadState = eCharsetReloadStopOrigional;
+   } else {
+     mCharsetReloadState = eCharsetReloadInit;
+   }
+ 
+   // Save a pointer to the currently-loading history entry.
+@@ -11505,17 +11551,19 @@ nsDocShell::DoChannelLoad(nsIChannel* aC
    uint32_t openFlags = 0;
    if (mLoadType == LOAD_LINK) {
      openFlags |= nsIURILoader::IS_CONTENT_PREFERRED;
@@ -117,7 +140,7 @@ diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
    return NS_OK;
  }
  
-@@ -14849,16 +14891,22 @@ nsDocShell::InFrameSwap()
+@@ -14849,16 +14897,22 @@ nsDocShell::InFrameSwap()
      if (shell->mInFrameSwap) {
        return true;
      }
@@ -289,7 +312,48 @@ diff --git a/docshell/base/nsIDocShell.idl b/docshell/base/nsIDocShell.idl
 diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 --- a/dom/base/nsGlobalWindow.cpp
 +++ b/dom/base/nsGlobalWindow.cpp
-@@ -3512,17 +3512,27 @@ nsGlobalWindow::EnsureClientSource()
+@@ -2438,16 +2438,18 @@ NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(ns
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mIntlUtils)
+ #endif
+ 
+   tmp->UnlinkHostObjectURIs();
+ 
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mIdleRequestExecutor)
+   tmp->DisableIdleCallbackRequests();
+ 
++  tmp->mClientSource.reset();
++
+   NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER
+ NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+ 
+ #ifdef DEBUG
+ void
+ nsGlobalWindow::RiskyUnlink()
+ {
+   NS_CYCLE_COLLECTION_INNERNAME.Unlink(this);
+@@ -3496,33 +3498,51 @@ nsGlobalWindow::InnerSetNewDocument(JSCo
+ nsresult
+ nsGlobalWindow::EnsureClientSource()
+ {
+   MOZ_DIAGNOSTIC_ASSERT(IsInnerWindow());
+   MOZ_DIAGNOSTIC_ASSERT(mDoc);
+ 
+   bool newClientSource = false;
+ 
+-  nsCOMPtr<nsILoadInfo> loadInfo;
+   nsCOMPtr<nsIChannel> channel = mDoc->GetChannel();
+-  if (channel) {
+-    loadInfo = channel->GetLoadInfo();
+-  }
+-
+-  // Try to get the reserved client from the loading document
++  nsCOMPtr<nsILoadInfo> loadInfo = channel ? channel->GetLoadInfo() : nullptr;
++
++  // Try to get the reserved client from the LoadInfo.  A Client is
++  // reserved at the start of the channel load if there is not an
++  // initial about:blank document that will be reused.  It is also
++  // created if the channel load encounters a cross-origin redirect.
+   if (loadInfo) {
      UniquePtr<ClientSource> reservedClient = loadInfo->TakeReservedClient();
      if (reservedClient) {
        mClientSource.reset();
@@ -300,16 +364,24 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
  
 -  // If we don't have a reserved client we need to create one now
 +  // We don't have a LoadInfo reserved client, but maybe we should
-+  // be inheriting an initial one from the docshell.
-+  if (!mClientSource && mDoc->IsInitialDocument()) {
++  // be inheriting an initial one from the docshell.  This means
++  // that the docshell started the channel load before creating the
++  // initial about:blank document.  This is an optimization, though,
++  // and it created an initial Client as a placeholder for the document.
++  // In this case we want to inherit this placeholder Client here.
++  if (!mClientSource) {
 +    nsIDocShell* docshell = GetDocShell();
 +    if (docshell) {
 +      mClientSource = docshell->TakeInitialClientSource();
++      if (mClientSource) {
++        newClientSource = true;
++      }
 +    }
 +  }
 +
 +  // If we don't have a reserved client or an initial client, then create
-+  // one now.
++  // one now.  For example, this can happen if the docshell creates the
++  // initial about:blank document before it starts the channel load.
    if (!mClientSource) {
      mClientSource = ClientManager::CreateSource(ClientType::Window,
                                                  mDoc->NodePrincipal());
@@ -318,6 +390,25 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
      }
      newClientSource = true;
    }
+@@ -3534,16 +3554,18 @@ nsGlobalWindow::EnsureClientSource()
+   if (loadInfo) {
+     const Maybe<ServiceWorkerDescriptor>& controller =
+       loadInfo->GetController();
+     if (controller.isSome()) {
+       mClientSource->SetController(controller.ref());
+     }
+   }
+ 
++  // Its possible that we got a client just after being frozen in
++  // the bfcache.  In that case freeze the client immediately.
+   if (newClientSource && IsFrozen()) {
+     mClientSource->Freeze();
+   }
+ 
+   return NS_OK;
+ }
+ 
+ nsresult
 diff --git a/dom/clients/manager/ClientChannelHelper.cpp b/dom/clients/manager/ClientChannelHelper.cpp
 --- a/dom/clients/manager/ClientChannelHelper.cpp
 +++ b/dom/clients/manager/ClientChannelHelper.cpp
