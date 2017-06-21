@@ -1,11 +1,11 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  464b2a3c25aa1065760d9ecbb0870bca4a66c62e
+# Parent  2b07ef4f3381eafab2183a46704bed50800bede3
 
 diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
 --- a/docshell/base/nsDocShell.cpp
 +++ b/docshell/base/nsDocShell.cpp
-@@ -8,16 +8,17 @@
+@@ -8,16 +8,21 @@
  
  #include <algorithm>
  
@@ -15,6 +15,10 @@ diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
  #include "mozilla/BasePrincipal.h"
  #include "mozilla/Casting.h"
 +#include "mozilla/dom/ClientChannelHelper.h"
++#include "mozilla/dom/ClientHandle.h"
++#include "mozilla/dom/ClientInfo.h"
++#include "mozilla/dom/ClientManager.h"
++#include "mozilla/dom/ClientSource.h"
  #include "mozilla/dom/ContentChild.h"
  #include "mozilla/dom/Element.h"
  #include "mozilla/dom/PendingGlobalHistoryEntry.h"
@@ -23,7 +27,170 @@ diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
  #include "mozilla/dom/ScreenOrientation.h"
  #include "mozilla/dom/ToJSValue.h"
  #include "mozilla/dom/PermissionMessageUtils.h"
-@@ -11539,16 +11540,20 @@ nsDocShell::DoChannelLoad(nsIChannel* aC
+@@ -3315,16 +3320,101 @@ nsDocShell::GetParent(nsIDocShellTreeIte
+ already_AddRefed<nsDocShell>
+ nsDocShell::GetParentDocshell()
+ {
+   nsCOMPtr<nsIDocShell> docshell = do_QueryInterface(GetAsSupports(mParent));
+   return docshell.forget().downcast<nsDocShell>();
+ }
+ 
+ void
++nsDocShell::MaybeCreateInitialClientSource(nsIPrincipal* aPrincipal)
++{
++  // If there is an existing document then there is no need to create
++  // a client for a future initial about:blank document.
++  if (mScriptGlobal && mScriptGlobal->GetExtantDoc()) {
++    MOZ_DIAGNOSTIC_ASSERT(mScriptGlobal->GetCurrentInnerWindowInternal()->GetClientInfo().isSome());
++    MOZ_DIAGNOSTIC_ASSERT(!mInitialClientSource);
++    return;
++  }
++
++  // Don't recreate the initial client source.  We call this multiple times
++  // when DoChannelLoad() is called before CreateAboutBlankContentViewer.
++  if (mInitialClientSource) {
++    return;
++  }
++
++  // Don't pre-allocate the client when we are sandboxed.  The inherited
++  // principal does not take sandboxing into account.
++  // TODO: Refactor sandboxing principal code out so we can use it here.
++  if (!aPrincipal && (mSandboxFlags & SANDBOXED_ORIGIN)) {
++    return;
++  }
++
++  nsIPrincipal* principal = aPrincipal ? aPrincipal
++                                       : GetInheritedPrincipal(false);
++
++  // Sometimes there is no principal available when we are called from
++  // CreateAboutBlankContentViewer.  For example, sometimes the principal
++  // is only extracted from the load context after the document is created
++  // in nsDocument::ResetToURI().  Ideally we would do something similar
++  // here, but for now lets just avoid the issue by not preallocating the
++  // client.
++  if (!principal) {
++    return;
++  }
++
++  mInitialClientSource = ClientManager::CreateSource(ClientType::Window,
++                                                     principal);
++
++  // Mark the initial client as execution ready, but owned by the docshell.
++  // If the client is actually used this will cause ClientSource to force
++  // the creation of the initial about:blank by calling nsDocShell::GetDocument().
++  mInitialClientSource->DocShellExecutionReady(this);
++
++  // Next, check to see if the parent is controlled.
++  nsCOMPtr<nsIDocShell> parent = GetParentDocshell();
++  nsPIDOMWindowOuter* parentOuter = parent ? parent->GetWindow() : nullptr;
++  nsPIDOMWindowInner* parentInner = parentOuter ? parentOuter->GetCurrentInnerWindow() : nullptr;
++  if (!parentInner) {
++    return;
++  }
++
++  Maybe<ServiceWorkerDescriptor> controller(parentInner->GetController());
++  if (controller.isNothing()) {
++    return;
++  }
++
++  // If the parent is controlled then propagate that controller to the
++  // initial about:blank client as well.
++  RefPtr<ClientHandle> handle =
++    ClientManager::CreateHandle(mInitialClientSource->Info());
++  RefPtr<GenericPromise> ref = handle->Control(controller.ref());
++}
++
++Maybe<ClientInfo>
++nsDocShell::GetInitialClientInfo() const
++{
++  if (mInitialClientSource) {
++    Maybe<ClientInfo> result;
++    result.emplace(mInitialClientSource->Info());
++    return Move(result);
++  }
++
++  nsGlobalWindow* innerWindow =
++    mScriptGlobal ? mScriptGlobal->GetCurrentInnerWindowInternal() : nullptr;
++  nsIDocument* doc = innerWindow ? innerWindow->GetExtantDoc() : nullptr;
++
++  if (!doc || !doc->IsInitialDocument()) {
++    return Maybe<ClientInfo>();
++  }
++
++  return innerWindow->GetClientInfo();
++}
++
++void
+ nsDocShell::RecomputeCanExecuteScripts()
+ {
+   bool old = mCanExecuteScripts;
+   RefPtr<nsDocShell> parent = GetParentDocshell();
+ 
+   // If we have no tree owner, that means that we've been detached from the
+   // docshell tree (this is distinct from having no parent dochshell, which
+   // is the case for root docshells). It would be nice to simply disallow
+@@ -5826,16 +5916,19 @@ nsDocShell::Destroy()
+       const char* msg = mItemType == typeContent ?
+         NS_WEBNAVIGATION_DESTROY : NS_CHROME_WEBNAVIGATION_DESTROY;
+       serv->NotifyObservers(GetAsSupports(this), msg, nullptr);
+     }
+   }
+ 
+   mIsBeingDestroyed = true;
+ 
++  // Break the cycle with the initial client, if present.
++  mInitialClientSource = nullptr;
++
+   // Make sure we don't record profile timeline markers anymore
+   SetRecordProfileTimelineMarkers(false);
+ 
+   // Remove our pref observers
+   if (mObserveErrorPages) {
+     mObserveErrorPages = false;
+   }
+ 
+@@ -7658,16 +7751,20 @@ nsDocShell::EndPageLoad(nsIWebProgress* 
+         internalLoadGroup->OnEndPageLoad(aChannel);
+       }
+     }
+   }
+ 
+   // Timing is picked up by the window, we don't need it anymore
+   mTiming = nullptr;
+ 
++  // Make sure to discard the initial Client if we never created the initial
++  // about:blank document.
++  mInitialClientSource.reset();
++
+   // clean up reload state for meta charset
+   if (eCharsetReloadRequested == mCharsetReloadState) {
+     mCharsetReloadState = eCharsetReloadStopOrigional;
+   } else {
+     mCharsetReloadState = eCharsetReloadInit;
+   }
+ 
+   // Save a pointer to the currently-loading history entry.
+@@ -8153,16 +8250,19 @@ nsDocShell::CreateAboutBlankContentViewe
+       if (aPrincipal) {
+         principal = NullPrincipal::CreateWithInheritedAttributes(aPrincipal);
+       } else {
+         principal = NullPrincipal::CreateWithInheritedAttributes(this);
+       }
+     } else {
+       principal = aPrincipal;
+     }
++
++    MaybeCreateInitialClientSource(principal);
++
+     // generate (about:blank) document to load
+     docFactory->CreateBlankDocument(mLoadGroup, principal,
+                                     getter_AddRefs(blankDoc));
+     if (blankDoc) {
+       // Hack: set the base URI manually, since this document never
+       // got Reset() with a channel.
+       blankDoc->SetBaseURI(aBaseURI);
+ 
+@@ -11539,16 +11639,22 @@ nsDocShell::DoChannelLoad(nsIChannel* aC
  
    uint32_t openFlags = 0;
    if (mLoadType == LOAD_LINK) {
@@ -33,7 +200,9 @@ diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
      openFlags |= nsIURILoader::DONT_RETARGET;
    }
 +
-+  rv = AddClientChannelHelperToChannel(this, aChannel);
++  MaybeCreateInitialClientSource();
++
++  rv = AddClientChannelHelper(this, aChannel, GetInitialClientInfo());
 +  NS_ENSURE_SUCCESS(rv, rv);
 +
    rv = aURILoader->OpenURI(aChannel, openFlags, this);
@@ -44,6 +213,174 @@ diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
  
  nsresult
  nsDocShell::ScrollToAnchor(bool aCurHasRef, bool aNewHasRef,
+@@ -14891,16 +14997,22 @@ nsDocShell::InFrameSwap()
+     if (shell->mInFrameSwap) {
+       return true;
+     }
+     shell = shell->GetParentDocshell();
+   } while (shell);
+   return false;
+ }
+ 
++UniquePtr<ClientSource>
++nsDocShell::TakeInitialClientSource()
++{
++  return Move(mInitialClientSource);
++}
++
+ NS_IMETHODIMP
+ nsDocShell::IssueWarning(uint32_t aWarning, bool aAsError)
+ {
+   if (mContentViewer) {
+     nsCOMPtr<nsIDocument> doc = mContentViewer->GetDocument();
+     if (doc) {
+       doc->WarnOnceAbout(nsIDocument::DeprecatedOperations(aWarning), aAsError);
+     }
+diff --git a/docshell/base/nsDocShell.h b/docshell/base/nsDocShell.h
+--- a/docshell/base/nsDocShell.h
++++ b/docshell/base/nsDocShell.h
+@@ -14,16 +14,17 @@
+ #include "nsIBaseWindow.h"
+ #include "nsINetworkInterceptController.h"
+ #include "nsIScrollable.h"
+ #include "nsITextScroll.h"
+ #include "nsIContentViewerContainer.h"
+ #include "nsIDOMStorageManager.h"
+ #include "nsDocLoader.h"
+ #include "mozilla/BasePrincipal.h"
++#include "mozilla/Maybe.h"
+ #include "mozilla/UniquePtr.h"
+ #include "mozilla/WeakPtr.h"
+ #include "mozilla/TimeStamp.h"
+ #include "GeckoProfiler.h"
+ #include "mozilla/dom/ProfileTimelineMarkerBinding.h"
+ #include "mozilla/LinkedList.h"
+ #include "jsapi.h"
+ 
+@@ -59,16 +60,18 @@
+ #include "prtime.h"
+ #include "nsRect.h"
+ #include "Units.h"
+ #include "nsIDeprecationWarner.h"
+ 
+ namespace mozilla {
+ enum class TaskCategory;
+ namespace dom {
++class ClientInfo;
++class ClientSource;
+ class EventTarget;
+ class PendingGlobalHistoryEntry;
+ typedef uint32_t ScreenOrientationInternal;
+ } // namespace dom
+ } // namespace mozilla
+ 
+ class nsDocShell;
+ class nsDOMNavigationTiming;
+@@ -269,16 +272,19 @@ public:
+   void NotifyAsyncPanZoomStopped();
+ 
+   void SetInFrameSwap(bool aInSwap)
+   {
+     mInFrameSwap = aInSwap;
+   }
+   bool InFrameSwap();
+ 
++  virtual mozilla::UniquePtr<mozilla::dom::ClientSource>
++  TakeInitialClientSource() override;
++
+ private:
+   bool CanSetOriginAttributes();
+ 
+ public:
+   const mozilla::OriginAttributes&
+   GetOriginAttributes()
+   {
+     return mOriginAttributes;
+@@ -736,16 +742,19 @@ protected:
+ 
+   nsIChannel* GetCurrentDocChannel();
+ 
+   bool ShouldBlockLoadingForBackButton();
+ 
+   // Convenience method for getting our parent docshell. Can return null
+   already_AddRefed<nsDocShell> GetParentDocshell();
+ 
++  void MaybeCreateInitialClientSource(nsIPrincipal* aPrincipal = nullptr);
++  mozilla::Maybe<mozilla::dom::ClientInfo> GetInitialClientInfo() const;
++
+ protected:
+   nsresult GetCurScrollPos(int32_t aScrollOrientation, int32_t* aCurPos);
+   nsresult SetCurScrollPosEx(int32_t aCurHorizontalPos,
+                              int32_t aCurVerticalPos);
+ 
+   // Override the parent setter from nsDocLoader
+   virtual nsresult SetDocLoaderParent(nsDocLoader* aLoader) override;
+ 
+@@ -1044,16 +1053,18 @@ private:
+   nsTObserverArray<nsWeakPtr> mReflowObservers;
+   nsTObserverArray<nsWeakPtr> mScrollObservers;
+   nsCString mOriginalUriString;
+   nsWeakPtr mOpener;
+   mozilla::OriginAttributes mOriginAttributes;
+ 
+   mozilla::UniquePtr<mozilla::dom::PendingGlobalHistoryEntry> mPrerenderGlobalHistory;
+ 
++  mozilla::UniquePtr<mozilla::dom::ClientSource> mInitialClientSource;
++
+   // A depth count of how many times NotifyRunToCompletionStart
+   // has been called without a matching NotifyRunToCompletionStop.
+   uint32_t mJSRunToCompletionDepth;
+ 
+   // Whether or not touch events are overridden. Possible values are defined
+   // as constants in the nsIDocShell.idl file.
+   uint32_t mTouchEventsOverride;
+ 
+diff --git a/docshell/base/nsIDocShell.idl b/docshell/base/nsIDocShell.idl
+--- a/docshell/base/nsIDocShell.idl
++++ b/docshell/base/nsIDocShell.idl
+@@ -6,18 +6,25 @@
+ 
+ #include "domstubs.idl"
+ #include "nsIDocShellTreeItem.idl"
+ #include "nsIRequest.idl"
+ 
+ %{ C++
+ #include "js/TypeDecls.h"
+ #include "mozilla/Maybe.h"
++#include "mozilla/UniquePtr.h"
+ class nsPresContext;
+ class nsIPresShell;
++
++namespace mozilla {
++namespace dom {
++class ClientSource;
++} // namespace dom
++} // namespace mozilla
+ %}
+ 
+ /**
+  * The nsIDocShell interface.
+  */
+ 
+ [ptr] native nsPresContext(nsPresContext);
+ [ptr] native nsIPresShell(nsIPresShell);
+@@ -1143,9 +1150,16 @@ interface nsIDocShell : nsIDocShellTreeI
+    * Attribute that determines whether tracking protection is enabled.
+    */
+   attribute boolean useTrackingProtection;
+ 
+  /**
+   * Fire a dummy location change event asynchronously.
+   */
+   [noscript] void dispatchLocationChangeEvent();
++
++
++%{ C++
++  virtual mozilla::UniquePtr<mozilla::dom::ClientSource>
++  TakeInitialClientSource() = 0;
++%}
++
+ };
 diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 --- a/dom/base/nsGlobalWindow.cpp
 +++ b/dom/base/nsGlobalWindow.cpp
@@ -87,7 +424,26 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
  }
  
  //*****************************************************************************
-@@ -3297,24 +3303,32 @@ nsGlobalWindow::SetNewDocument(nsIDocume
+@@ -2434,16 +2440,18 @@ NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(ns
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mIntlUtils)
+ #endif
+ 
+   tmp->UnlinkHostObjectURIs();
+ 
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mIdleRequestExecutor)
+   tmp->DisableIdleCallbackRequests();
+ 
++  tmp->mClientSource.reset();
++
+   NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER
+ NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+ 
+ #ifdef DEBUG
+ void
+ nsGlobalWindow::RiskyUnlink()
+ {
+   NS_CYCLE_COLLECTION_INNERNAME.Unlink(this);
+@@ -3297,24 +3305,32 @@ nsGlobalWindow::SetNewDocument(nsIDocume
          newInnerWindow->mDoc = aDocument;
  
          // The storage objects contain the URL of the window. We have to
@@ -120,7 +476,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
      nsCOMPtr<nsIJARChannel> jarChannel = do_QueryInterface(aDocument->GetChannel());
      if (jarChannel && jarChannel->GetIsUnsafe()) {
        xpc::Scriptability::Get(newInnerGlobal).Block();
-@@ -3476,16 +3490,83 @@ nsGlobalWindow::InnerSetNewDocument(JSCo
+@@ -3476,16 +3492,112 @@ nsGlobalWindow::InnerSetNewDocument(JSCo
  
    Telemetry::Accumulate(Telemetry::INNERWINDOWS_WITH_MUTATION_LISTENERS,
                          mMutationBits ? 1 : 0);
@@ -137,13 +493,13 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 +
 +  bool newClientSource = false;
 +
-+  nsCOMPtr<nsILoadInfo> loadInfo;
 +  nsCOMPtr<nsIChannel> channel = mDoc->GetChannel();
-+  if (channel) {
-+    loadInfo = channel->GetLoadInfo();
-+  }
++  nsCOMPtr<nsILoadInfo> loadInfo = channel ? channel->GetLoadInfo() : nullptr;
 +
-+  // Try to get the reserved client from the loading document
++  // Try to get the reserved client from the LoadInfo.  A Client is
++  // reserved at the start of the channel load if there is not an
++  // initial about:blank document that will be reused.  It is also
++  // created if the channel load encounters a cross-origin redirect.
 +  if (loadInfo) {
 +    UniquePtr<ClientSource> reservedClient = loadInfo->TakeReservedClient();
 +    if (reservedClient) {
@@ -153,7 +509,34 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 +    }
 +  }
 +
-+  // If we don't have a reserved client we need to create one now
++  // We don't have a LoadInfo reserved client, but maybe we should
++  // be inheriting an initial one from the docshell.  This means
++  // that the docshell started the channel load before creating the
++  // initial about:blank document.  This is an optimization, though,
++  // and it created an initial Client as a placeholder for the document.
++  // In this case we want to inherit this placeholder Client here.
++  if (!mClientSource) {
++    nsIDocShell* docshell = GetDocShell();
++    if (docshell) {
++      mClientSource = docshell->TakeInitialClientSource();
++      if (mClientSource) {
++        newClientSource = true;
++      }
++    }
++  }
++
++  // If we don't have a reserved client or an initial client, then create
++  // one now.  This can happen in certain cases where we avoid preallocating
++  // the client in the docshell.  This mainly occurs in situations where
++  // the principal is not clearly inherited from the parent; e.g. sandboxed
++  // iframes, window.open(), etc.
++  // TODO: We may not be marking initial about:blank documents created
++  //       this way as controlled by a service worker properly.  The
++  //       controller should be coming from the same place as the inheritted
++  //       principal.  We do this in docshell, but as mentioned we aren't
++  //       smart enough to handle all cases yet.  For example, a
++  //       window.open() with new URL should inherit the controller from
++  //       the opener, but we probably don't handle that yet.
 +  if (!mClientSource) {
 +    mClientSource = ClientManager::CreateSource(ClientType::Window,
 +                                                mDoc->NodePrincipal());
@@ -175,6 +558,8 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 +    }
 +  }
 +
++  // Its possible that we got a client just after being frozen in
++  // the bfcache.  In that case freeze the client immediately.
 +  if (newClientSource && IsFrozen()) {
 +    mClientSource->Freeze();
 +  }
@@ -204,7 +589,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
  
    if (aDocShell == mDocShell) {
      return;
-@@ -4383,16 +4464,34 @@ nsPIDOMWindowInner::Thaw()
+@@ -4383,16 +4495,34 @@ nsPIDOMWindowInner::Thaw()
  }
  
  void
@@ -239,7 +624,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
      return false;
    }
    auto outer = GetOuterWindow();
-@@ -12588,16 +12687,19 @@ nsGlobalWindow::FreezeInternal()
+@@ -12588,16 +12718,19 @@ nsGlobalWindow::FreezeInternal()
    MOZ_ASSERT(mSuspendDepth >= mFreezeDepth);
    if (mFreezeDepth != 1) {
      return;
@@ -259,7 +644,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
  nsGlobalWindow::Thaw()
  {
    MOZ_ASSERT(NS_IsMainThread());
-@@ -12617,16 +12719,19 @@ nsGlobalWindow::ThawInternal()
+@@ -12617,16 +12750,19 @@ nsGlobalWindow::ThawInternal()
  
    MOZ_ASSERT(mFreezeDepth != 0);
    mFreezeDepth -= 1;
@@ -279,7 +664,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
  }
  
  bool
-@@ -12725,16 +12830,53 @@ nsGlobalWindow::CallOnChildren(Method aM
+@@ -12725,16 +12861,53 @@ nsGlobalWindow::CallOnChildren(Method aM
      if (!mDoc || !frame || mDoc != frame->OwnerDoc() || !inner) {
        continue;
      }
@@ -1377,7 +1762,7 @@ diff --git a/dom/clients/manager/ClientChannelHelper.cpp b/dom/clients/manager/C
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientChannelHelper.cpp
-@@ -0,0 +1,232 @@
+@@ -0,0 +1,229 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1389,6 +1774,7 @@ new file mode 100644
 +#include "ClientManager.h"
 +#include "ClientSource.h"
 +#include "MainThreadUtils.h"
++#include "mozilla/ipc/BackgroundUtils.h"
 +#include "nsContentUtils.h"
 +#include "nsIAsyncVerifyRedirectCallback.h"
 +#include "nsIChannel.h"
@@ -1399,6 +1785,8 @@ new file mode 100644
 +
 +namespace mozilla {
 +namespace dom {
++
++using mozilla::ipc::PrincipalInfoToPrincipal;
 +
 +namespace {
 +
@@ -1528,7 +1916,8 @@ new file mode 100644
 +} // anonymous namespace
 +
 +nsresult
-+AddClientChannelHelperToChannel(nsIDocShell* aDocShell, nsIChannel* aChannel)
++AddClientChannelHelper(nsIDocShell* aDocShell, nsIChannel* aChannel,
++                       Maybe<ClientInfo>&& aInitialClientInfo)
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
 +
@@ -1548,23 +1937,16 @@ new file mode 100644
 +    return rv;
 +  }
 +
-+  Maybe<ClientInfo> initialClientInfo;
-+  nsPIDOMWindowOuter* outerWindow = aDocShell->GetWindow();
-+  if (outerWindow) {
-+    nsPIDOMWindowInner* innerWindow = outerWindow->GetCurrentInnerWindow();
-+    if (innerWindow) {
-+      nsIDocument* doc = innerWindow->GetExtantDoc();
-+      if (doc && doc->IsInitialDocument()) {
-+        nsIPrincipal* initialPrincipal = doc->NodePrincipal();
++  Maybe<ClientInfo> initialClientInfo(Move(aInitialClientInfo));
++  if (initialClientInfo.isSome()) {
++    nsCOMPtr<nsIPrincipal> initialPrincipal =
++      PrincipalInfoToPrincipal(initialClientInfo.ref().PrincipalInfo(), nullptr);
 +
-+        // This should match the checking in
-+        // nsGlobalWindow::WouldReuseInnerWindow().
-+        bool equals = false;
-+        rv = initialPrincipal->Equals(channelPrincipal, &equals);
-+        if (NS_SUCCEEDED(rv) && equals) {
-+          initialClientInfo = innerWindow->GetClientInfo();
-+        }
-+      }
++    bool equals = false;
++    rv = initialPrincipal ? initialPrincipal->Equals(channelPrincipal, &equals)
++                          : NS_ERROR_FAILURE;
++    if (NS_FAILED(rv) || !equals) {
++      initialClientInfo.reset();
 +    }
 +  }
 +
@@ -1614,7 +1996,7 @@ diff --git a/dom/clients/manager/ClientChannelHelper.h b/dom/clients/manager/Cli
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientChannelHelper.h
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,27 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1623,6 +2005,7 @@ new file mode 100644
 +#ifndef _mozilla_dom_ClientChannelHelper_h
 +#define _mozilla_dom_ClientChannelHelper_h
 +
++#include "mozilla/Maybe.h"
 +#include "nsError.h"
 +
 +class nsIChannel;
@@ -1631,8 +2014,11 @@ new file mode 100644
 +namespace mozilla {
 +namespace dom {
 +
++class ClientInfo;
++
 +nsresult
-+AddClientChannelHelperToChannel(nsIDocShell* aDocShell, nsIChannel* aChannel);
++AddClientChannelHelper(nsIDocShell* aDocShell, nsIChannel* aChannel,
++                       Maybe<ClientInfo>&& aInitialClientInfo);
 +
 +} // namespace dom
 +} // namespace mozilla
@@ -4574,7 +4960,7 @@ new file mode 100644
 +
 +  ~OpenWindowRunnable()
 +  {
-+    NS_ReleaseOnMainThread(mSourceProcess.forget());
++    NS_ReleaseOnMainThreadSystemGroup(mSourceProcess.forget());
 +  }
 +
 +public:
@@ -5931,7 +6317,7 @@ diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSo
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientSource.cpp
-@@ -0,0 +1,578 @@
+@@ -0,0 +1,647 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -6023,9 +6409,42 @@ new file mode 100644
 +  return NS_OK;
 +}
 +
++WorkerPrivate*
++ClientSource::GetWorkerPrivate() const
++{
++  NS_ASSERT_OWNINGTHREAD(ClientSource);
++  if (!mOwner.is<WorkerPrivate*>()) {
++    return nullptr;
++  }
++  return mOwner.as<WorkerPrivate*>();
++}
++
++nsIDocShell*
++ClientSource::GetDocShell() const
++{
++  NS_ASSERT_OWNINGTHREAD(ClientSource);
++  if (!mOwner.is<nsCOMPtr<nsIDocShell>>()) {
++    return nullptr;
++  }
++  return mOwner.as<nsCOMPtr<nsIDocShell>>();
++}
++
++void
++ClientSource::MaybeCreateInitialDocument()
++{
++  nsIDocShell* docshell = GetDocShell();
++  if (docshell) {
++    // Force the create of the initial document if it does not exist yet.
++    Unused << docshell->GetDocument();
++
++    MOZ_DIAGNOSTIC_ASSERT(GetInnerWindow());
++  }
++}
++
 +ClientSource::ClientSource(ClientManager* aManager,
 +                           const ClientSourceConstructorArgs& aArgs)
 +  : mManager(aManager)
++  , mOwner(AsVariant(Nothing()))
 +  , mClientInfo(aArgs.id(), aArgs.type(), aArgs.principalInfo(), aArgs.creationTime())
 +{
 +  MOZ_ASSERT(mManager);
@@ -6063,20 +6482,10 @@ new file mode 100644
 +ClientSource::GetInnerWindow() const
 +{
 +  NS_ASSERT_OWNINGTHREAD(ClientSource);
-+  if (mOwner.isNothing() || !mOwner.ref().is<RefPtr<nsPIDOMWindowInner>>()) {
++  if (!mOwner.is<RefPtr<nsPIDOMWindowInner>>()) {
 +    return nullptr;
 +  }
-+  return mOwner.ref().as<RefPtr<nsPIDOMWindowInner>>();
-+}
-+
-+WorkerPrivate*
-+ClientSource::GetWorkerPrivate() const
-+{
-+  NS_ASSERT_OWNINGTHREAD(ClientSource);
-+  if (mOwner.isNothing() || !mOwner.ref().is<WorkerPrivate*>()) {
-+    return nullptr;
-+  }
-+  return mOwner.ref().as<WorkerPrivate*>();
++  return mOwner.as<RefPtr<nsPIDOMWindowInner>>();
 +}
 +
 +void
@@ -6087,8 +6496,8 @@ new file mode 100644
 +
 +  // Its safe to store the WorkerPrivate* here because the ClientSource
 +  // is explicitly destroyed by WorkerPrivate before exiting its run loop.
-+  MOZ_DIAGNOSTIC_ASSERT(mOwner.isNothing());
-+  mOwner.emplace(AsVariant(aWorkerPrivate));
++  MOZ_DIAGNOSTIC_ASSERT(mOwner.is<Nothing>());
++  mOwner = AsVariant(aWorkerPrivate);
 +
 +  ClientSourceExecutionReadyArgs args(
 +    aWorkerPrivate->GetLocationInfo().mHref,
@@ -6138,13 +6547,45 @@ new file mode 100644
 +  // We should either be setting a window execution ready for the
 +  // first time or setting the same window execution ready again.
 +  // The secondary calls are due to initial about:blank replacement.
-+  MOZ_DIAGNOSTIC_ASSERT(mOwner.isNothing() ||
++  MOZ_DIAGNOSTIC_ASSERT(mOwner.is<Nothing>() ||
++                        mOwner.is<nsCOMPtr<nsIDocShell>>() ||
 +                        GetInnerWindow() == aInnerWindow);
 +
 +  // This creates a cycle with the window.  It is broken when
 +  // nsGlobalWindow::FreeInnerObjects() deletes the ClientSource.
-+  mOwner.reset();
-+  mOwner.emplace(AsVariant(RefPtr<nsPIDOMWindowInner>(aInnerWindow)));
++  mOwner = AsVariant(RefPtr<nsPIDOMWindowInner>(aInnerWindow));
++
++  return NS_OK;
++}
++
++nsresult
++ClientSource::DocShellExecutionReady(nsIDocShell* aDocShell)
++{
++  MOZ_ASSERT(NS_IsMainThread());
++  MOZ_DIAGNOSTIC_ASSERT(aDocShell);
++
++  nsPIDOMWindowOuter* outer = aDocShell->GetWindow();
++  if (NS_WARN_IF(!outer)) {
++    return NS_ERROR_UNEXPECTED;
++  }
++
++  // TODO: dedupe this with WindowExecutionReady
++  FrameType frameType = FrameType::Top_level;
++  if (!outer->IsTopLevelWindow()) {
++    frameType = FrameType::Nested;
++  } else if(outer->HadOriginalOpener()) {
++    frameType = FrameType::Auxiliary;
++  }
++
++  ClientSourceExecutionReadyArgs args(NS_LITERAL_CSTRING("about:blank"),
++                                      frameType);
++  ExecutionReady(args);
++
++  MOZ_DIAGNOSTIC_ASSERT(mOwner.is<Nothing>());
++
++  // This creates a cycle with the docshell.  It is broken when
++  // nsDocShell::Destroy() deletes the ClientSource.
++  mOwner = AsVariant(nsCOMPtr<nsIDocShell>(aDocShell));
 +
 +  return NS_OK;
 +}
@@ -6243,8 +6684,19 @@ new file mode 100644
 +    return ref.forget();
 +  }
 +
-+  nsPIDOMWindowInner* window = GetInnerWindow();
-+  if (!window) {
++  nsPIDOMWindowOuter* outer = nullptr;
++
++  nsPIDOMWindowInner* inner = GetInnerWindow();
++  if (inner) {
++    outer = inner->GetOuterWindow();
++  } else {
++    nsIDocShell* docshell = GetDocShell();
++    if (docshell) {
++      outer = docshell->GetWindow();
++    }
++  }
++
++  if (!outer) {
 +    ref = ClientOpPromise::CreateAndReject(NS_ERROR_DOM_INVALID_STATE_ERR,
 +                                           __func__);
 +    return ref.forget();
@@ -6252,8 +6704,7 @@ new file mode 100644
 +
 +  MOZ_ASSERT(NS_IsMainThread());
 +
-+  nsresult rv =
-+    nsContentUtils::DispatchFocusChromeEvent(window->GetOuterWindow());
++  nsresult rv = nsContentUtils::DispatchFocusChromeEvent(outer);
 +  if (NS_FAILED(rv)) {
 +    ref = ClientOpPromise::CreateAndReject(rv, __func__);
 +    return ref.forget();
@@ -6295,6 +6746,9 @@ new file mode 100644
 +  nsCOMPtr<nsIGlobalObject> globalObject;
 +  if (mClientInfo.Type() == ClientType::Window) {
 +    MOZ_ASSERT(NS_IsMainThread());
++    // We don't need to force the creation of the about:blank document
++    // here because there is no postMessage listener.  If a listener
++    // was registered then the document will already be created.
 +    nsPIDOMWindowInner* window = GetInnerWindow();
 +    if (window) {
 +      globalObject = nsGlobalWindow::Cast(window);
@@ -6497,6 +6951,7 @@ new file mode 100644
 +  // TODO: Handle state on reserved client where no window/workerprivate yet.
 +
 +  if (mClientInfo.Type() == ClientType::Window) {
++    MaybeCreateInitialDocument();
 +    nsresult rv = SnapshotWindowState(aStateOut);
 +    if (NS_FAILED(rv)) {
 +      return rv;
@@ -6514,7 +6969,7 @@ diff --git a/dom/clients/manager/ClientSource.h b/dom/clients/manager/ClientSour
 new file mode 100644
 --- /dev/null
 +++ b/dom/clients/manager/ClientSource.h
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,143 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -6533,6 +6988,7 @@ new file mode 100644
 +#undef PostMessage
 +#endif
 +
++class nsIDocShell;
 +class nsPIDOMWindowInner;
 +
 +namespace mozilla {
@@ -6565,8 +7021,10 @@ new file mode 100644
 +
 +  RefPtr<ClientManager> mManager;
 +
-+  Maybe<Variant<RefPtr<nsPIDOMWindowInner>,
-+                mozilla::dom::workers::WorkerPrivate*>> mOwner;
++  Variant<Nothing,
++          RefPtr<nsPIDOMWindowInner>,
++          nsCOMPtr<nsIDocShell>,
++          mozilla::dom::workers::WorkerPrivate*> mOwner;
 +
 +  ClientInfo mClientInfo;
 +  Maybe<ServiceWorkerDescriptor> mController;
@@ -6579,6 +7037,15 @@ new file mode 100644
 +
 +  nsresult
 +  SnapshotWindowState(ClientState* aStateOut);
++
++  mozilla::dom::workers::WorkerPrivate*
++  GetWorkerPrivate() const;
++
++  nsIDocShell*
++  GetDocShell() const;
++
++  void
++  MaybeCreateInitialDocument();
 +
 +  // Private methods called by ClientManager
 +  ClientSource(ClientManager* aManager,
@@ -6593,14 +7060,14 @@ new file mode 100644
 +  nsPIDOMWindowInner*
 +  GetInnerWindow() const;
 +
-+  mozilla::dom::workers::WorkerPrivate*
-+  GetWorkerPrivate() const;
-+
 +  void
 +  WorkerExecutionReady(mozilla::dom::workers::WorkerPrivate* aWorkerPrivate);
 +
 +  nsresult
 +  WindowExecutionReady(nsPIDOMWindowInner* aInnerWindow);
++
++  nsresult
++  DocShellExecutionReady(nsIDocShell* aDocShell);
 +
 +  void
 +  Freeze();
@@ -8207,7 +8674,7 @@ diff --git a/dom/console/moz.build b/dom/console/moz.build
 diff --git a/dom/fetch/Fetch.cpp b/dom/fetch/Fetch.cpp
 --- a/dom/fetch/Fetch.cpp
 +++ b/dom/fetch/Fetch.cpp
-@@ -29,16 +29,17 @@
+@@ -31,16 +31,17 @@
  #include "mozilla/dom/Headers.h"
  #include "mozilla/dom/MutableBlobStreamListener.h"
  #include "mozilla/dom/Promise.h"
@@ -8224,43 +8691,6 @@ diff --git a/dom/fetch/Fetch.cpp b/dom/fetch/Fetch.cpp
  #include "FetchObserver.h"
  #include "InternalRequest.h"
  #include "InternalResponse.h"
- 
-diff --git a/dom/fetch/Fetch.h b/dom/fetch/Fetch.h
---- a/dom/fetch/Fetch.h
-+++ b/dom/fetch/Fetch.h
-@@ -15,32 +15,32 @@
- #include "nsError.h"
- #include "nsProxyRelease.h"
- #include "nsString.h"
- 
- #include "mozilla/DebugOnly.h"
- #include "mozilla/ErrorResult.h"
- #include "mozilla/dom/Promise.h"
- #include "mozilla/dom/RequestBinding.h"
--#include "mozilla/dom/workers/bindings/WorkerHolder.h"
- 
- class nsIGlobalObject;
- class nsIEventTarget;
- 
- namespace mozilla {
- namespace dom {
- 
- class BlobOrArrayBufferViewOrArrayBufferOrFormDataOrURLSearchParamsOrUSVString;
- class BlobImpl;
- class InternalRequest;
- class OwningBlobOrArrayBufferViewOrArrayBufferOrFormDataOrURLSearchParamsOrUSVString;
- class RequestOrUSVString;
- enum class CallerType : uint32_t;
- 
- namespace workers {
-+class WorkerHolder;
- class WorkerPrivate;
- } // namespace workers
- 
- already_AddRefed<Promise>
- FetchRequest(nsIGlobalObject* aGlobal, const RequestOrUSVString& aInput,
-              const RequestInit& aInit, CallerType aCallerType,
-              ErrorResult& aRv);
  
 diff --git a/dom/indexedDB/ActorsParent.cpp b/dom/indexedDB/ActorsParent.cpp
 --- a/dom/indexedDB/ActorsParent.cpp
@@ -9324,25 +9754,7 @@ diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEven
 diff --git a/dom/workers/ServiceWorkerEvents.h b/dom/workers/ServiceWorkerEvents.h
 --- a/dom/workers/ServiceWorkerEvents.h
 +++ b/dom/workers/ServiceWorkerEvents.h
-@@ -10,16 +10,17 @@
- #include "mozilla/dom/Event.h"
- #include "mozilla/dom/ExtendableEventBinding.h"
- #include "mozilla/dom/ExtendableMessageEventBinding.h"
- #include "mozilla/dom/FetchEventBinding.h"
- #include "mozilla/dom/File.h"
- #include "mozilla/dom/Promise.h"
- #include "mozilla/dom/Response.h"
- #include "mozilla/dom/workers/bindings/ServiceWorker.h"
-+#include "mozilla/dom/workers/Workers.h"
- 
- #include "nsProxyRelease.h"
- #include "nsContentUtils.h"
- 
- class nsIInterceptedChannel;
- 
- namespace mozilla {
- namespace dom {
-@@ -263,17 +264,17 @@ public:
+@@ -264,17 +264,17 @@ public:
    }
  };
  
@@ -10440,7 +10852,7 @@ diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPri
  NS_IMPL_CYCLE_COLLECTION_UNROOT_NATIVE(ServiceWorkerPrivate, Release)
  
  // Tracks the "dom.disable_open_click_delay" preference.  Modified on main
-@@ -467,29 +470,28 @@ public:
+@@ -470,29 +473,28 @@ public:
  
      return NS_OK;
    }
@@ -10473,7 +10885,7 @@ diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPri
      JS::Rooted<JS::Value> messageData(aCx);
      nsCOMPtr<nsIGlobalObject> sgo = aWorkerPrivate->GlobalScope();
      ErrorResult rv;
-@@ -498,26 +500,24 @@ public:
+@@ -501,26 +503,24 @@ public:
        return true;
      }
  
@@ -10501,7 +10913,7 @@ diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPri
      if (NS_WARN_IF(rv.Failed())) {
        rv.SuppressException();
        return false;
-@@ -533,17 +533,17 @@ public:
+@@ -536,17 +536,17 @@ public:
  };
  
  } // anonymous namespace
@@ -10520,7 +10932,7 @@ diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPri
      return rv.StealNSResult();
    }
  
-@@ -552,17 +552,17 @@ ServiceWorkerPrivate::SendMessageEvent(J
+@@ -555,17 +555,17 @@ ServiceWorkerPrivate::SendMessageEvent(J
    rv = nsContentUtils::CreateJSValueFromSequenceOfObject(aCx, aTransferable,
                                                           &transferable);
    if (NS_WARN_IF(rv.Failed())) {
@@ -10539,7 +10951,7 @@ diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPri
  
    if (!runnable->Dispatch()) {
      return NS_ERROR_FAILURE;
-@@ -1315,24 +1315,24 @@ class FetchEventRunnable : public Extend
+@@ -1319,24 +1319,24 @@ class FetchEventRunnable : public Extend
  public:
    FetchEventRunnable(WorkerPrivate* aWorkerPrivate,
                       KeepAliveToken* aKeepAliveToken,
@@ -10566,7 +10978,7 @@ diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPri
      // By default we set it to same-origin since normal HTTP fetches always
      // send credentials to same-origin websites unless explicitly forbidden.
      , mRequestCredentials(RequestCredentials::Same_origin)
-@@ -1579,17 +1579,20 @@ private:
+@@ -1583,17 +1583,20 @@ private:
  
      MOZ_ASSERT_IF(internalReq->IsNavigationRequest(),
                    request->Redirect() == RequestRedirect::Manual);
@@ -10588,7 +11000,7 @@ diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPri
      if (NS_WARN_IF(result.Failed())) {
        result.SuppressException();
        return false;
-@@ -1625,18 +1628,17 @@ private:
+@@ -1629,18 +1632,17 @@ private:
  
  NS_IMPL_ISUPPORTS_INHERITED(FetchEventRunnable, WorkerRunnable, nsIHttpHeaderVisitor)
  
@@ -10608,8 +11020,8 @@ diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPri
      return NS_ERROR_FAILURE;
    }
  
-@@ -1691,17 +1693,17 @@ ServiceWorkerPrivate::SendFetchEvent(nsI
-     new nsMainThreadPtrHolder<ServiceWorkerRegistrationInfo>(registration, false));
+@@ -1697,17 +1699,17 @@ ServiceWorkerPrivate::SendFetchEvent(nsI
+       "ServiceWorkerRegistrationInfo", registration, false));
  
    RefPtr<KeepAliveToken> token = CreateEventKeepAliveToken();
  
@@ -10627,7 +11039,7 @@ diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPri
    if (mInfo->State() == ServiceWorkerState::Activating) {
      mPendingFunctionalEvents.AppendElement(r.forget());
      return NS_OK;
-@@ -1763,17 +1765,26 @@ ServiceWorkerPrivate::SpawnWorkerIfNeede
+@@ -1769,17 +1771,26 @@ ServiceWorkerPrivate::SpawnWorkerIfNeede
  
    if (NS_WARN_IF(NS_FAILED(rv))) {
      return rv;
@@ -10655,7 +11067,7 @@ diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPri
    // ServiceWorker's scope then we could deadlock the load.
    info.mLoadFlags = mInfo->GetLoadFlags() |
                      nsIChannel::LOAD_BYPASS_SERVICE_WORKER;
-@@ -1831,17 +1842,17 @@ ServiceWorkerPrivate::SpawnWorkerIfNeede
+@@ -1837,17 +1848,17 @@ ServiceWorkerPrivate::SpawnWorkerIfNeede
    jsapi.Init();
    ErrorResult error;
    NS_ConvertUTF8toUTF16 scriptSpec(mInfo->ScriptSpec());
@@ -10674,7 +11086,7 @@ diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPri
    RenewKeepAliveToken(aWhy);
  
    if (aNewWorkerCreated) {
-@@ -1901,25 +1912,58 @@ ServiceWorkerPrivate::TerminateWorker()
+@@ -1907,25 +1918,58 @@ ServiceWorkerPrivate::TerminateWorker()
  void
  ServiceWorkerPrivate::NoteDeadServiceWorkerInfo()
  {
@@ -10847,7 +11259,7 @@ diff --git a/dom/workers/ServiceWorkerRegistrationInfo.cpp b/dom/workers/Service
                              false /* success */);
  
    nsMainThreadPtrHandle<ServiceWorkerRegistrationInfo> handle(
-     new nsMainThreadPtrHolder<ServiceWorkerRegistrationInfo>(this));
+     new nsMainThreadPtrHolder<ServiceWorkerRegistrationInfo>(
 diff --git a/dom/workers/WorkerHolderToken.cpp b/dom/workers/WorkerHolderToken.cpp
 new file mode 100644
 --- /dev/null
@@ -11137,7 +11549,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
    mPrincipalIsSystem = aOther.mPrincipalIsSystem;
    mStorageAllowed = aOther.mStorageAllowed;
    mServiceWorkersTestingInWindow = aOther.mServiceWorkersTestingInWindow;
-@@ -5049,16 +5055,18 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
+@@ -5050,16 +5056,18 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
        }
  
        // If we're supposed to die then we should exit the loop.
@@ -11156,7 +11568,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
            MutexAutoLock lock(mMutex);
  
            mStatus = Dead;
-@@ -5209,16 +5217,95 @@ WorkerPrivate::DispatchToMainThread(alre
+@@ -5210,16 +5218,95 @@ WorkerPrivate::DispatchToMainThread(alre
  
  nsIEventTarget*
  WorkerPrivate::ControlEventTarget()
@@ -11252,7 +11664,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
    // periodically (PERIODIC_GC_TIMER_DELAY_SEC) while the worker is running.
    // Once the worker goes idle we set a short (IDLE_GC_TIMER_DELAY_SEC) timer to
    // run a shrinking GC. If the worker receives more messages then the short
-@@ -5547,16 +5634,20 @@ WorkerPrivate::ClearDebuggerEventQueue()
+@@ -5548,16 +5635,20 @@ WorkerPrivate::ClearDebuggerEventQueue()
  
  bool
  WorkerPrivate::FreezeInternal()
@@ -11273,7 +11685,7 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
  
    return true;
  }
-@@ -5568,16 +5659,21 @@ WorkerPrivate::ThawInternal()
+@@ -5569,16 +5660,21 @@ WorkerPrivate::ThawInternal()
  
    NS_ASSERTION(mFrozen, "Not yet frozen!");
  
@@ -12085,7 +12497,7 @@ diff --git a/ipc/ipdl/sync-messages.ini b/ipc/ipdl/sync-messages.ini
 diff --git a/modules/libpref/init/all.js b/modules/libpref/init/all.js
 --- a/modules/libpref/init/all.js
 +++ b/modules/libpref/init/all.js
-@@ -5729,10 +5729,17 @@ pref("layers.advanced.outline-layers", 2
+@@ -5729,16 +5729,23 @@ pref("layers.advanced.outline-layers", 2
  pref("layers.advanced.solid-color", 2);
  pref("layers.advanced.table", 2);
  pref("layers.advanced.text-layers", 2);
@@ -12101,8 +12513,14 @@ diff --git a/modules/libpref/init/all.js b/modules/libpref/init/all.js
 +// this can be removed.
 +pref("dom.clients.openwindow_favors_same_process", true);
 +
- // Open noopener links in a new process
- pref("dom.noopener.newprocess.enabled", true);
+ // When a crash happens, whether to include heap regions of the crash context
+ // in the minidump. Enabled by default on nightly and aurora.
+ #ifdef RELEASE_OR_BETA
+ pref("toolkit.crashreporter.include_context_heap", false);
+ #else
+ pref("toolkit.crashreporter.include_context_heap", true);
+ #endif
+ 
 diff --git a/netwerk/base/LoadInfo.cpp b/netwerk/base/LoadInfo.cpp
 --- a/netwerk/base/LoadInfo.cpp
 +++ b/netwerk/base/LoadInfo.cpp
@@ -12397,6 +12815,144 @@ diff --git a/netwerk/base/nsILoadInfo.idl b/netwerk/base/nsILoadInfo.idl
 +  GetController() const = 0;
 +%}
  };
+diff --git a/testing/web-platform/meta/MANIFEST.json b/testing/web-platform/meta/MANIFEST.json
+--- a/testing/web-platform/meta/MANIFEST.json
++++ b/testing/web-platform/meta/MANIFEST.json
+@@ -64813,16 +64813,36 @@
+      {}
+     ]
+    ],
+    "service-workers/service-worker/resources/404.py": [
+     [
+      {}
+     ]
+    ],
++   "service-workers/service-worker/resources/about-blank-replacement-frame.html": [
++    [
++     {}
++    ]
++   ],
++   "service-workers/service-worker/resources/about-blank-replacement-ping-frame.html": [
++    [
++     {}
++    ]
++   ],
++   "service-workers/service-worker/resources/about-blank-replacement-popup-frame.html": [
++    [
++     {}
++    ]
++   ],
++   "service-workers/service-worker/resources/about-blank-replacement-worker.js": [
++    [
++     {}
++    ]
++   ],
+    "service-workers/service-worker/resources/appcache-ordering.install.html": [
+     [
+      {}
+     ]
+    ],
+    "service-workers/service-worker/resources/appcache-ordering.is-appcached.html": [
+     [
+      {}
+@@ -126881,16 +126901,24 @@
+     ]
+    ],
+    "service-workers/service-worker/ServiceWorkerGlobalScope/update.https.html": [
+     [
+      "/service-workers/service-worker/ServiceWorkerGlobalScope/update.https.html",
+      {}
+     ]
+    ],
++   "service-workers/service-worker/about-blank-replacement.https.html": [
++    [
++     "/service-workers/service-worker/about-blank-replacement.https.html",
++     {
++      "timeout": "long"
++     }
++    ]
++   ],
+    "service-workers/service-worker/activate-event-after-install-state-change.https.html": [
+     [
+      "/service-workers/service-worker/activate-event-after-install-state-change.https.html",
+      {}
+     ]
+    ],
+    "service-workers/service-worker/activation-after-registration.https.html": [
+     [
+@@ -192593,17 +192621,17 @@
+    "3fabcfa40caf9c66bc74bcd83663eddb0f385051",
+    "support"
+   ],
+   "interfaces/webrtc-pc.idl": [
+    "4f94c4236168ed722f71d81bd957e0da72b29c71",
+    "support"
+   ],
+   "intersection-observer/bounding-box.html": [
+-   "0deef078368d11e2a55ef0988d50f548587a4c57",
++   "a3ac1b70ba26234b7c968055171e652f3a8a14d8",
+    "testharness"
+   ],
+   "intersection-observer/client-rect.html": [
+    "acec9a4f59ebee1840950cf766a45676490eef84",
+    "testharness"
+   ],
+   "intersection-observer/containing-block.html": [
+    "8bdf6fa6a3ee09130981bf83728aa9f61a6ebc54",
+@@ -213000,16 +213028,20 @@
+   "service-workers/service-worker/ServiceWorkerGlobalScope/unregister.https.html": [
+    "9fe4c10b921a84dc086cea47d48bb34fdbb28eee",
+    "testharness"
+   ],
+   "service-workers/service-worker/ServiceWorkerGlobalScope/update.https.html": [
+    "f574c7a96a1ca766445cd0b427b9963b18c62795",
+    "testharness"
+   ],
++  "service-workers/service-worker/about-blank-replacement.https.html": [
++   "d764525c6fe7f6a15aee3f8c99bee20e34560173",
++   "testharness"
++  ],
+   "service-workers/service-worker/activate-event-after-install-state-change.https.html": [
+    "9d1971d9b5dcb52a14a0d2313065e27766c0489a",
+    "testharness"
+   ],
+   "service-workers/service-worker/activation-after-registration.https.html": [
+    "913c58ba58de077b82d0ec9cc21258610b26fe97",
+    "testharness"
+   ],
+@@ -213536,16 +213568,32 @@
+   "service-workers/service-worker/resource-timing.https.html": [
+    "587060940cb25ff8072fa83cb41d538a73320ca6",
+    "testharness"
+   ],
+   "service-workers/service-worker/resources/404.py": [
+    "567d0a7de3ef54adaa8339bb04632a2ecfcc57a5",
+    "support"
+   ],
++  "service-workers/service-worker/resources/about-blank-replacement-frame.html": [
++   "7b0b74e54ff0f673964cd71c27a120a801e81393",
++   "support"
++  ],
++  "service-workers/service-worker/resources/about-blank-replacement-ping-frame.html": [
++   "ce59e1fac0a1801b99c5adab964b31eaefe473e6",
++   "support"
++  ],
++  "service-workers/service-worker/resources/about-blank-replacement-popup-frame.html": [
++   "e0c2045a646bb4aa2b7cc5eec36cd9419ed56bd6",
++   "support"
++  ],
++  "service-workers/service-worker/resources/about-blank-replacement-worker.js": [
++   "53ce81249094bcc3b23e4185b701263e3c0148ec",
++   "support"
++  ],
+   "service-workers/service-worker/resources/appcache-ordering.install.html": [
+    "2fbe9f464383783774f08276b8e2cc7103fee83c",
+    "support"
+   ],
+   "service-workers/service-worker/resources/appcache-ordering.is-appcached.html": [
+    "4e7b85b7e2d9dbcd6def515b856db51020b54595",
+    "support"
+   ],
 diff --git a/testing/web-platform/meta/service-workers/service-worker/clients-matchall-client-types.https.html.ini b/testing/web-platform/meta/service-workers/service-worker/clients-matchall-client-types.https.html.ini
 deleted file mode 100644
 --- a/testing/web-platform/meta/service-workers/service-worker/clients-matchall-client-types.https.html.ini
@@ -12407,3 +12963,315 @@ deleted file mode 100644
 -  [Verify matchAll() with window and sharedworker client types]
 -    expected: FAIL
 -
+diff --git a/testing/web-platform/tests/service-workers/service-worker/about-blank-replacement.https.html b/testing/web-platform/tests/service-workers/service-worker/about-blank-replacement.https.html
+new file mode 100644
+--- /dev/null
++++ b/testing/web-platform/tests/service-workers/service-worker/about-blank-replacement.https.html
+@@ -0,0 +1,102 @@
++<!DOCTYPE html>
++<title>Service Worker: about:blank replacement handling</title>
++<meta name=timeout content=long>
++<script src="/resources/testharness.js"></script>
++<script src="/resources/testharnessreport.js"></script>
++<script src="/common/get-host-info.sub.js"></script>
++<script src="resources/test-helpers.sub.js"></script>
++<body>
++<script>
++const worker = 'resources/about-blank-replacement-worker.js';
++
++// Helper routine that creates an iframe that internally has some kind
++// of nested window.  The nested window could be another iframe or
++// it could be a popup window.
++function createFrameWithNestedWindow(url) {
++  return new Promise(resolve => {
++    let frame = document.createElement('iframe');
++    frame.src = url;
++    document.body.appendChild(frame);
++
++    window.addEventListener('message', function onMsg(evt) {
++      if (evt.data.type !== 'NESTED_LOADED') {
++        return;
++      }
++      window.removeEventListener('message', onMsg);
++      resolve(frame);
++    });
++  });
++}
++
++// Helper routine to request the given worker find the client with
++// the specified URL using the clients.matchAll() API.
++function getClientIdByURL(worker, url) {
++  return new Promise(resolve => {
++    navigator.serviceWorker.addEventListener('message', function onMsg(evt) {
++      if (evt.data.type !== 'GET_CLIENT_ID') {
++        return;
++      }
++      navigator.serviceWorker.removeEventListener('message', onMsg);
++      resolve(evt.data.result);
++    });
++    worker.postMessage({ type: 'GET_CLIENT_ID', url: url.toString() });
++  });
++}
++
++async function doAsyncTest(t, scope, extraSearchParams) {
++  let reg = await service_worker_unregister_and_register(t, worker, scope);
++  await wait_for_state(t, reg.installing, 'activated');
++
++  // Load the scope as a frame.  We expect this in turn to have a nested
++  // iframe.  The service worker will intercept the load of the nested
++  // iframe and populate its body with the client ID of the initial
++  // about:blank document it sees via clients.matchAll().
++  let frame = await createFrameWithNestedWindow(scope);
++  let initialResult = frame.contentWindow.nested().document.body.textContent;
++  assert_false(initialResult.startsWith('failure:'), `result: ${initialResult}`);
++
++  // Next, ask the service worker to find the final client ID for the fully
++  // loaded nested frame.
++  let nestedURL = new URL(scope, window.location);
++  nestedURL.searchParams.set('nested', true);
++  extraSearchParams = extraSearchParams || {};
++  for (let p in extraSearchParams) {
++    nestedURL.searchParams.set(p, extraSearchParams[p]);
++  }
++  let finalResult = await getClientIdByURL(reg.active, nestedURL);
++  assert_false(finalResult.startsWith('failure:'), `result: ${finalResult}`);
++
++  // The initial about:blank client and the final loaded client should have
++  // the same ID value.
++  assert_equals(initialResult, finalResult, 'client ID values should match');
++
++  frame.remove();
++  await service_worker_unregister_and_done(t, scope);
++}
++
++promise_test(async function(t) {
++  // Execute a test where the nested frame is simple loaded normally.
++  await doAsyncTest(t, 'resources/about-blank-replacement-frame.html');
++}, 'Initial about:blank is controlled, exposed to clients.matchAll(), and ' +
++   'matches final Client.');
++
++promise_test(async function(t) {
++  // Execute a test where the nested frame is modified immediately by
++  // its parent.  In this case we add a message listener so the service
++  // worker can ping the client to verify its existence.  This ping-pong
++  // check is performed during the initial load and when verifying the
++  // final loaded client.
++  await doAsyncTest(t, 'resources/about-blank-replacement-ping-frame.html',
++                    { 'ping': true });
++}, 'Initial about:blank modified by parent is controlled, exposed to ' +
++   'clients.matchAll(), and matches final Client.');
++
++promise_test(async function(t) {
++  // Execute a test where the nested window is a popup window instead of
++  // an iframe.  This should behave the same as the simple iframe case.
++  await doAsyncTest(t, 'resources/about-blank-replacement-popup-frame.html');
++}, 'Popup initial about:blank is controlled, exposed to clients.matchAll(), and ' +
++   'matches final Client.');
++
++</script>
++</body>
+diff --git a/testing/web-platform/tests/service-workers/service-worker/resources/about-blank-replacement-frame.html b/testing/web-platform/tests/service-workers/service-worker/resources/about-blank-replacement-frame.html
+new file mode 100644
+--- /dev/null
++++ b/testing/web-platform/tests/service-workers/service-worker/resources/about-blank-replacement-frame.html
+@@ -0,0 +1,22 @@
++<!doctype html>
++<html>
++<body>
++<script>
++function nestedLoaded() {
++  parent.postMessage({ type: 'NESTED_LOADED' }, '*');
++}
++</script>
++<iframe src="?nested=true" id="nested" onload="nestedLoaded()"></iframe>
++<script>
++// Helper routine to make it slightly easier for our parent to find
++// the nested frame.
++function nested() {
++  return document.getElementById('nested').contentWindow;
++}
++
++// NOTE: Make sure not to touch the iframe directly here.  We want to
++//       test the case where the initial about:blank document is not
++//       directly accessed before load.
++</script>
++</body>
++</html>
+diff --git a/testing/web-platform/tests/service-workers/service-worker/resources/about-blank-replacement-ping-frame.html b/testing/web-platform/tests/service-workers/service-worker/resources/about-blank-replacement-ping-frame.html
+new file mode 100644
+--- /dev/null
++++ b/testing/web-platform/tests/service-workers/service-worker/resources/about-blank-replacement-ping-frame.html
+@@ -0,0 +1,32 @@
++<!doctype html>
++<html>
++<body>
++<script>
++function nestedLoaded() {
++  parent.postMessage({ type: 'NESTED_LOADED' }, '*');
++}
++</script>
++<iframe src="?nested=true&ping=true" id="nested" onload="nestedLoaded()"></iframe>
++<script>
++// Helper routine to make it slightly easier for our parent to find
++// the nested frame.
++function nested() {
++  return document.getElementById('nested').contentWindow;
++}
++
++// This modifies the nested iframe immediately and does not wait for it to
++// load.  This effectively modifies the global for the initial about:blank
++// document.  Any modifications made here should be preserved after the
++// frame loads because the global should be re-used.
++let win = nested();
++win.navigator.serviceWorker.addEventListener('message', evt => {
++  if (evt.data.type === 'PING') {
++    evt.source.postMessage({
++      type: 'PONG',
++      location: win.location.toString()
++    });
++  }
++});
++</script>
++</body>
++</html>
+diff --git a/testing/web-platform/tests/service-workers/service-worker/resources/about-blank-replacement-popup-frame.html b/testing/web-platform/tests/service-workers/service-worker/resources/about-blank-replacement-popup-frame.html
+new file mode 100644
+--- /dev/null
++++ b/testing/web-platform/tests/service-workers/service-worker/resources/about-blank-replacement-popup-frame.html
+@@ -0,0 +1,19 @@
++<!doctype html>
++<html>
++<body>
++<script>
++function nestedLoaded() {
++  parent.postMessage({ type: 'NESTED_LOADED' }, '*');
++}
++
++let popup = window.open('?nested=true');
++popup.onload = nestedLoaded;
++
++// Helper routine to make it slightly easier for our parent to find
++// the nested popup window.
++function nested() {
++  return popup;
++}
++</script>
++</body>
++</html>
+diff --git a/testing/web-platform/tests/service-workers/service-worker/resources/about-blank-replacement-worker.js b/testing/web-platform/tests/service-workers/service-worker/resources/about-blank-replacement-worker.js
+new file mode 100644
+--- /dev/null
++++ b/testing/web-platform/tests/service-workers/service-worker/resources/about-blank-replacement-worker.js
+@@ -0,0 +1,112 @@
++// Helper routine to delay the nested frame load until we are done interacting
++// with the initial about:blank client.
++let resolveDelayed;
++function delayedResponse() {
++  return new Promise(resolve => {
++    resolveDelayed = resolve;
++  });
++}
++
++// Helper routine to find a client that matches a particular URL.  Note, we
++// require that Client to be controlled to avoid false matches with other
++// about:blank windows the browser might have.  The initial about:blank should
++// inherit the controller from its parent.
++async function getClientByURL(url) {
++  let list = await clients.matchAll();
++  for (client of list) {
++    if (client.url === url) {
++      return client;
++    }
++  }
++}
++
++// Helper routine to perform a ping-pong with the given target client.  We
++// expect the Client to respond with its location URL.
++async function pingPong(target) {
++  function waitForPong() {
++    return new Promise(resolve => {
++      self.addEventListener('message', function onMessage(evt) {
++        if (evt.data.type === 'PONG') {
++          resolve(evt.data.location);
++        }
++      });
++    });
++  }
++
++  target.postMessage({ type: 'PING' })
++  return await waitForPong(target);
++}
++
++addEventListener('fetch', async evt => {
++  let url = new URL(evt.request.url);
++  if (!url.searchParams.get('nested')) {
++    return;
++  }
++
++  // Delay the load of the nested frame so we can examine the Client
++  // representing the window while it has the initial about:blank document.
++  evt.respondWith(delayedResponse());
++
++  // Find the initial about:blank document.
++  let client = await getClientByURL('about:blank');
++  if (!client) {
++    resolveDelayed(new Response('failure: could not find about:blank client'));
++    return;
++  }
++
++  // If the nested frame is configured to support a ping-pong, then
++  // ping it now to verify its message listener exists.  We also
++  // verify the Client's idea of its own location URL while we are doing
++  // this.
++  if (url.searchParams.get('ping')) {
++    let loc = await pingPong(client);
++    if (loc !== 'about:blank') {
++      resolveDelayed(new Response(`failure: got location {$loc}, expected about:blank`));
++      return;
++    }
++  }
++
++  // Finally, allow the nested frame to complete loading.  We place the
++  // Client ID we found for the initial about:blank in the body.
++  resolveDelayed(new Response(client.id));
++});
++
++addEventListener('message', evt => {
++  if (evt.data.type !== 'GET_CLIENT_ID') {
++    return;
++  }
++
++  evt.waitUntil(async function() {
++    let url = new URL(evt.data.url);
++
++    // Find the given Client by its URL.
++    let client = await getClientByURL(evt.data.url);
++    if (!client) {
++      evt.source.postMessage({
++        type: 'GET_CLIENT_ID',
++        result: `failure: could not find ${evt.data.url} client`
++      });
++      return;
++    }
++
++    // If the Client supports a ping-pong, then do it now to verify
++    // the message listener exists and its location matches the
++    // Client object.
++    if (url.searchParams.get('ping')) {
++      let loc = await pingPong(client);
++      if (loc !== evt.data.url) {
++        evt.source.postMessage({
++          type: 'GET_CLIENT_ID',
++          result: `failure: got location ${loc}, expected ${evt.data.url}`
++        });
++        return;
++      }
++    }
++
++    // Finally, send the client ID back.
++    evt.source.postMessage({
++      type: 'GET_CLIENT_ID',
++      result: client.id
++    });
++  }());
++});
