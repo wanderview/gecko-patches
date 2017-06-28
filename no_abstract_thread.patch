@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  905629dcb9f0483dc08ad4a582e6f53a5cfef15c
+# Parent  a1af2b0a5af9275aadc2b4c4d151bd5477e1c556
 
 diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
 --- a/docshell/base/nsDocShell.cpp
@@ -922,6 +922,205 @@ diff --git a/dom/clients/manager/ClientNavigateOpChild.h b/dom/clients/manager/C
    void
    ActorDestroy(ActorDestroyReason aReason) override;
  
+diff --git a/dom/clients/manager/ClientOpenWindowOpChild.cpp b/dom/clients/manager/ClientOpenWindowOpChild.cpp
+--- a/dom/clients/manager/ClientOpenWindowOpChild.cpp
++++ b/dom/clients/manager/ClientOpenWindowOpChild.cpp
+@@ -1,17 +1,17 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "ClientOpenWindowOpChild.h"
+ #include "ClientOpenWindowUtils.h"
+-#include "mozilla/AbstractThread.h"
++#include "mozilla/SystemGroup.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ already_AddRefed<ClientOpPromise>
+ ClientOpenWindowOpChild::DoOpenWindow(const ClientOpenWindowArgs& aArgs)
+ {
+   RefPtr<ClientOpPromise> ref =
+@@ -24,17 +24,17 @@ ClientOpenWindowOpChild::ActorDestroy(Ac
+ {
+   mPromiseRequestHolder.DisconnectIfExists();
+ }
+ 
+ void
+ ClientOpenWindowOpChild::Init(const ClientOpenWindowArgs& aArgs)
+ {
+   RefPtr<ClientOpPromise> promise = DoOpenWindow(aArgs);
+-  promise->Then(AbstractThread::GetCurrent(), __func__,
++  promise->Then(SystemGroup::EventTargetFor(TaskCategory::Other), __func__,
+     [this] (const ClientOpResult& aResult) {
+       mPromiseRequestHolder.Complete();
+       PClientOpenWindowOpChild::Send__delete__(this, aResult);
+     }, [this] (nsresult aResult) {
+       mPromiseRequestHolder.Complete();
+       PClientOpenWindowOpChild::Send__delete__(this, aResult);
+     })->Track(mPromiseRequestHolder);
+ }
+diff --git a/dom/clients/manager/ClientOpenWindowUtils.cpp b/dom/clients/manager/ClientOpenWindowUtils.cpp
+--- a/dom/clients/manager/ClientOpenWindowUtils.cpp
++++ b/dom/clients/manager/ClientOpenWindowUtils.cpp
+@@ -300,17 +300,17 @@ WaitForLoad(const ClientOpenWindowArgs& 
+   rv = webProgress->AddProgressListener(listener,
+                                         nsIWebProgress::NOTIFY_STATE_DOCUMENT);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     promise->Reject(rv, __func__);
+     return;
+   }
+ 
+   // Hold the listener alive until the promise settles
+-  ref->Then(AbstractThread::GetCurrent(), __func__,
++  ref->Then(aOuterWindow->EventTargetFor(TaskCategory::Other), __func__,
+     [listener] (const ClientOpResult& aResult) { },
+     [listener] (nsresult aResult) { });
+ }
+ 
+ #ifdef MOZ_WIDGET_ANDROID
+ 
+ class LaunchObserver final : public nsIObserver
+ {
+@@ -397,17 +397,17 @@ ClientOpenWindowInCurrentProcess(const C
+   nsresult rv = OpenWindow(aArgs, getter_AddRefs(outerWindow));
+ 
+ #ifdef MOZ_WIDGET_ANDROID
+   // If we get the NOT_AVAILABLE error that means the browser is still
+   // launching on android.  Use the observer we created above to wait
+   // until the launch completes and then try to open the window again.
+   if (rv == NS_ERROR_NOT_AVAILABLE && launchObserver) {
+     RefPtr<GenericPromise> p = launchObserver->Promise();
+-    p->Then(AbstractThread::GetCurrent(), __func__,
++    p->Then(outerWindow->EventTargetFor(TaskCategory::Other), __func__,
+       [aArgs, promise] (bool aResult) {
+         nsCOMPtr<nsPIDOMWindowOuter> outerWindow;
+         nsresult rv = OpenWindow(aArgs, getter_AddRefs(outerWindow));
+         if (NS_WARN_IF(NS_FAILED(rv))) {
+           promise->Reject(rv, __func__);
+         }
+ 
+         WaitForLoad(aArgs, outerWindow, promise);
+diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSource.cpp
+--- a/dom/clients/manager/ClientSource.cpp
++++ b/dom/clients/manager/ClientSource.cpp
+@@ -589,17 +589,17 @@ ClientSource::Claim(const ClientClaimArg
+     ref = ClientOpPromise::CreateAndResolve(NS_OK, __func__);
+     return ref.forget();
+   }
+ 
+   RefPtr<ClientOpPromise::Private> outerPromise =
+     new ClientOpPromise::Private(__func__);
+ 
+   RefPtr<GenericPromise> p = swm->MaybeClaimClient(doc, swd);
+-  p->Then(AbstractThread::GetCurrent(), __func__,
++  p->Then(innerWindow->EventTargetFor(TaskCategory::Other), __func__,
+     [outerPromise] (bool aResult) {
+       outerPromise->Resolve(NS_OK, __func__);
+     }, [outerPromise] (nsresult aResult) {
+       outerPromise->Reject(aResult, __func__);
+     });
+ 
+   ref = outerPromise;
+   return ref.forget();
+@@ -638,10 +638,33 @@ ClientSource::SnapshotState(ClientState*
+     }
+     return NS_OK;
+   }
+ 
+   *aStateOut = ClientState(ClientWorkerState());
+   return NS_OK;
+ }
+ 
++nsISerialEventTarget*
++ClientSource::EventTargetFor(TaskCategory aCat) const
++{
++  nsPIDOMWindowInner* innerWindow = GetInnerWindow();
++  if (innerWindow) {
++    return innerWindow->EventTargetFor(aCat);
++  }
++
++  WorkerPrivate* workerPrivate = GetWorkerPrivate();
++  if (workerPrivate) {
++    nsCOMPtr<nsISerialEventTarget> target = workerPrivate->GetEventTarget();
++    return target;
++  }
++
++  nsIDocShell* docshell = GetDocShell();
++  nsPIDOMWindowOuter* outerWindow = docshell ? docshell->GetWindow() : nullptr;
++  if (outerWindow) {
++    return outerWindow->EventTargetFor(aCat);
++  }
++
++  return SystemGroup::EventTargetFor(aCat);
++}
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/clients/manager/ClientSource.h b/dom/clients/manager/ClientSource.h
+--- a/dom/clients/manager/ClientSource.h
++++ b/dom/clients/manager/ClientSource.h
+@@ -4,16 +4,17 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ #ifndef _mozilla_dom_ClientSource_h
+ #define _mozilla_dom_ClientSource_h
+ 
+ #include "mozilla/dom/ClientInfo.h"
+ #include "mozilla/dom/ClientThing.h"
+ #include "mozilla/dom/ServiceWorkerDescriptor.h"
++#include "mozilla/TaskCategory.h"
+ #include "mozilla/Variant.h"
+ #include "ClientOpPromise.h"
+ 
+ #ifdef XP_WIN
+ #undef PostMessage
+ #endif
+ 
+ class nsIDocShell;
+@@ -130,14 +131,17 @@ public:
+   already_AddRefed<ClientOpPromise>
+   Claim(const ClientClaimArgs& aArgs);
+ 
+   already_AddRefed<ClientOpPromise>
+   GetInfoAndState(const ClientGetInfoAndStateArgs& aArgs);
+ 
+   nsresult
+   SnapshotState(ClientState* aStateOut);
++
++  nsISerialEventTarget*
++  EventTargetFor(TaskCategory aCat) const;
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // _mozilla_dom_ClientSource_h
+diff --git a/dom/clients/manager/ClientSourceOpChild.cpp b/dom/clients/manager/ClientSourceOpChild.cpp
+--- a/dom/clients/manager/ClientSourceOpChild.cpp
++++ b/dom/clients/manager/ClientSourceOpChild.cpp
+@@ -30,17 +30,17 @@ ClientSourceOpChild::DoSourceOp(Method a
+     return;
+   }
+ 
+   RefPtr<ClientOpPromise> p = (source->*aMethod)(aArgs);
+ 
+   // Capturing `this` is safe here because we disconnect the promise in
+   // ActorDestroy() which ensures neither lambda is called if the actor
+   // is destroyed before the source operation completes.
+-  p->Then(AbstractThread::GetCurrent(), __func__,
++  p->Then(source->EventTargetFor(TaskCategory::Other), __func__,
+     [this, aArgs] (const mozilla::dom::ClientOpResult& aResult) {
+       mPromiseRequestHolder.Complete();
+       Unused << PClientSourceOpChild::Send__delete__(this, aResult);
+     }, [this] (nsresult aRv) {
+       mPromiseRequestHolder.Complete();
+       Unused << PClientSourceOpChild::Send__delete__(this, aRv);
+     })->Track(mPromiseRequestHolder);
+ }
 diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
 --- a/dom/workers/ServiceWorkerManager.cpp
 +++ b/dom/workers/ServiceWorkerManager.cpp
