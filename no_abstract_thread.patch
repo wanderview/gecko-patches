@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  a1af2b0a5af9275aadc2b4c4d151bd5477e1c556
+# Parent  92ea32de0b095565374c937f347458c85e1746da
 
 diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
 --- a/docshell/base/nsDocShell.cpp
@@ -58,7 +58,7 @@ diff --git a/dom/clients/api/Client.cpp b/dom/clients/api/Client.cpp
  
    RefPtr<ClientStatePromise> innerPromise = mHandle->Focus();
 -  innerPromise->Then(AbstractThread::GetCurrent(), __func__,
-+  innerPromise->Then(GetCurrentThreadSerialEventTarget(), __func__,
++  innerPromise->Then(mGlobal->EventTargetFor(TaskCategory::Other), __func__,
      [self, outerPromise] (const ClientState& aResult) {
        RefPtr<Client> newClient =
          new Client(self->mGlobal, ClientInfoAndState(self->mData->info(), aResult.ToIPC()));
@@ -67,6 +67,24 @@ diff --git a/dom/clients/api/Client.cpp b/dom/clients/api/Client.cpp
        outerPromise->MaybeReject(aResult);
      });
  
+@@ -221,16 +222,17 @@ Client::Navigate(const nsAString& aURL, 
+     }
+   }
+ 
+   RefPtr<Client> self = this;
+ 
+   ClientNavigateArgs args(mData->info(), NS_ConvertUTF16toUTF8(aURL), baseURL);
+ 
+   StartClientManagerOp(&ClientManager::Navigate, args,
++    mGlobal->EventTargetFor(TaskCategory::Other),
+     [self, outerPromise] (const ClientOpResult& aResult) {
+       if (aResult.type() != ClientOpResult::TClientInfoAndState) {
+         outerPromise->MaybeResolve(JS::NullHandleValue);
+         return;
+       }
+       RefPtr<Client> newClient =
+         new Client(self->mGlobal, aResult.get_ClientInfoAndState());
+       outerPromise->MaybeResolve(newClient);
 diff --git a/dom/clients/api/ClientDOMUtil.h b/dom/clients/api/ClientDOMUtil.h
 --- a/dom/clients/api/ClientDOMUtil.h
 +++ b/dom/clients/api/ClientDOMUtil.h
@@ -88,7 +106,21 @@ diff --git a/dom/clients/api/ClientDOMUtil.h b/dom/clients/api/ClientDOMUtil.h
  class nsIGlobalObject;
  
  namespace mozilla {
-@@ -32,17 +31,17 @@ StartClientManagerOp(Func aFunc, const A
+@@ -20,29 +19,30 @@ namespace dom {
+ class ClientEndPoint;
+ 
+ nsresult
+ ClientGetEndPoint(nsIGlobalObject* aGlobal, ClientEndPoint* aEndPointOut);
+ 
+ // TODO: Add a ClientHandle version of this wrapper for Client methods.
+ template<typename Func, typename Arg, typename Resolve, typename Reject>
+ void
+-StartClientManagerOp(Func aFunc, const Arg& aArg, Resolve aResolve, Reject aReject)
++StartClientManagerOp(Func aFunc, const Arg& aArg, nsISerialEventTarget* aTarget,
++                     Resolve aResolve, Reject aReject)
+ {
+   using mozilla::dom::workers::Closing;
+   using mozilla::dom::workers::GetCurrentThreadWorkerPrivate;
    using mozilla::dom::workers::WorkerHolderToken;
  
    RefPtr<WorkerHolderToken> token;
@@ -96,9 +128,10 @@ diff --git a/dom/clients/api/ClientDOMUtil.h b/dom/clients/api/ClientDOMUtil.h
      token = WorkerHolderToken::Create(GetCurrentThreadWorkerPrivate(), Closing);
    }
  
-   RefPtr<ClientOpPromise> promise = aFunc(aArg);
+-  RefPtr<ClientOpPromise> promise = aFunc(aArg);
 -  promise->Then(AbstractThread::GetCurrent(), __func__,
-+  promise->Then(GetCurrentThreadSerialEventTarget(), __func__,
++  RefPtr<ClientOpPromise> promise = aFunc(aArg, aTarget);
++  promise->Then(aTarget, __func__,
      [aResolve, token](const ClientOpResult& aResult) {
        if (token && token->IsShuttingDown()) {
          return;
@@ -110,17 +143,24 @@ diff --git a/dom/clients/api/ClientDOMUtil.h b/dom/clients/api/ClientDOMUtil.h
 diff --git a/dom/clients/api/Clients.cpp b/dom/clients/api/Clients.cpp
 --- a/dom/clients/api/Clients.cpp
 +++ b/dom/clients/api/Clients.cpp
-@@ -84,17 +84,17 @@ Clients::Get(const nsAString& aClientID,
+@@ -81,20 +81,23 @@ Clients::Get(const nsAString& aClientID,
+   }
+ 
+   const PrincipalInfo& principalInfo =
      endpoint.type() == ClientEndPoint::TIPCServiceWorkerDescriptor
        ? endpoint.get_IPCServiceWorkerDescriptor().principalInfo()
        : endpoint.get_IPCClientInfo().principalInfo();
  
    nsCOMPtr<nsIGlobalObject> global = mGlobal;
++  nsCOMPtr<nsISerialEventTarget> target =
++    mGlobal->EventTargetFor(TaskCategory::Other);
  
    RefPtr<ClientOpPromise> innerPromise =
-     ClientManager::GetInfoAndState(ClientGetInfoAndStateArgs(id, principalInfo));
+-    ClientManager::GetInfoAndState(ClientGetInfoAndStateArgs(id, principalInfo));
 -  innerPromise->Then(AbstractThread::GetCurrent(), __func__,
-+  innerPromise->Then(GetCurrentThreadSerialEventTarget(), __func__,
++    ClientManager::GetInfoAndState(ClientGetInfoAndStateArgs(id, principalInfo),
++                                   target);
++  innerPromise->Then(target, __func__,
      [outerPromise, global] (const ClientOpResult& aResult) {
        outerPromise->MaybeResolve(
          new Client(global, aResult.get_ClientInfoAndState()));
@@ -129,6 +169,60 @@ diff --git a/dom/clients/api/Clients.cpp b/dom/clients/api/Clients.cpp
      });
  
    return outerPromise.forget();
+@@ -155,16 +158,17 @@ Clients::MatchAll(const ClientQueryOptio
+   nsCOMPtr<nsIGlobalObject> global = mGlobal;
+ 
+   // We don't expose this reserved clients yet
+   const bool includeReserved = false;
+   ClientMatchAllArgs args(endpoint, aOptions.mType,
+                           aOptions.mIncludeUncontrolled,
+                           includeReserved);
+   StartClientManagerOp(&ClientManager::MatchAll, args,
++    mGlobal->EventTargetFor(TaskCategory::Other),
+     [outerPromise, global] (const ClientOpResult& aResult) {
+       nsTArray<RefPtr<Client>> clientList;
+       for (const ClientInfoAndState& value : aResult.get_ClientList().values()) {
+         clientList.AppendElement(new Client(global, value));
+       }
+       clientList.Sort(MatchAllComparator());
+       outerPromise->MaybeResolve(clientList);
+     }, [outerPromise] (nsresult aResult) {
+@@ -224,16 +228,17 @@ Clients::OpenWindow(const nsAString& aUR
+     outerPromise->MaybeReject(NS_ERROR_DOM_INVALID_ACCESS_ERR);
+     return outerPromise.forget();
+   }
+ 
+   nsCOMPtr<nsIGlobalObject> global = mGlobal;
+ 
+   ClientOpenWindowArgs args(principalInfo, NS_ConvertUTF16toUTF8(aURL), baseURL);
+   StartClientManagerOp(&ClientManager::OpenWindow, args,
++    mGlobal->EventTargetFor(TaskCategory::Other),
+     [outerPromise, global] (const ClientOpResult& aResult) {
+       if (aResult.type() != ClientOpResult::TClientInfoAndState) {
+         outerPromise->MaybeResolve(JS::NullHandleValue);
+         return;
+       }
+       RefPtr<Client> client =
+         new Client(global, aResult.get_ClientInfoAndState());
+       outerPromise->MaybeResolve(client);
+@@ -270,16 +275,17 @@ Clients::Claim(ErrorResult& aRv)
+ 
+   if (serviceWorker.state() != ServiceWorkerState::Activating &&
+       serviceWorker.state() != ServiceWorkerState::Activated) {
+     aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+     return outerPromise.forget();
+   }
+ 
+   StartClientManagerOp(&ClientManager::Claim, ClientClaimArgs(serviceWorker),
++    mGlobal->EventTargetFor(TaskCategory::Other),
+     [outerPromise] (const ClientOpResult& aResult) {
+       outerPromise->MaybeResolveWithUndefined();
+     }, [outerPromise] (nsresult aResult) {
+       outerPromise->MaybeReject(aResult);
+     });
+ 
+   return outerPromise.forget();
+ }
 diff --git a/dom/clients/manager/ClientHandle.cpp b/dom/clients/manager/ClientHandle.cpp
 --- a/dom/clients/manager/ClientHandle.cpp
 +++ b/dom/clients/manager/ClientHandle.cpp
@@ -398,7 +492,7 @@ diff --git a/dom/clients/manager/ClientHandleParent.h b/dom/clients/manager/Clie
 diff --git a/dom/clients/manager/ClientManager.cpp b/dom/clients/manager/ClientManager.cpp
 --- a/dom/clients/manager/ClientManager.cpp
 +++ b/dom/clients/manager/ClientManager.cpp
-@@ -158,47 +158,54 @@ ClientManager::CreateSourceInternal(Clie
+@@ -158,47 +158,51 @@ ClientManager::CreateSourceInternal(Clie
    } else {
      mPendingSourceList.AppendElement(source.get());
    }
@@ -412,16 +506,13 @@ diff --git a/dom/clients/manager/ClientManager.cpp b/dom/clients/manager/ClientM
 +                                    nsISerialEventTarget* aSerialEventTarget)
  {
    NS_ASSERT_OWNINGTHREAD(ClientManager);
++  MOZ_DIAGNOSTIC_ASSERT(aSerialEventTarget);
  
    if (IsShutdown()) {
      return nullptr;
    }
  
 -  RefPtr<ClientHandle> handle = new ClientHandle(this, aClientInfo);
-+  if (!aSerialEventTarget) {
-+    aSerialEventTarget = GetCurrentThreadSerialEventTarget();
-+  }
-+
 +  RefPtr<ClientHandle> handle = new ClientHandle(this, aSerialEventTarget,
 +                                                 aClientInfo);
  
@@ -457,7 +548,7 @@ diff --git a/dom/clients/manager/ClientManager.cpp b/dom/clients/manager/ClientM
      if (!aActor->SendPClientManagerOpConstructor(actor, aArgs)) {
        // Constructor failure will reject promise via ActorDestroy()
        return;
-@@ -330,56 +337,57 @@ UniquePtr<ClientSource>
+@@ -330,56 +334,62 @@ UniquePtr<ClientSource>
  ClientManager::CreateSource(ClientType aType, const PrincipalInfo& aPrincipal)
  {
    RefPtr<ClientManager> mgr = GetOrCreateForCurrentThread();
@@ -472,52 +563,74 @@ diff --git a/dom/clients/manager/ClientManager.cpp b/dom/clients/manager/ClientM
  {
    RefPtr<ClientManager> mgr = GetOrCreateForCurrentThread();
 -  return mgr->CreateHandleInternal(aClientInfo);
+-}
+-
+-// static
+-already_AddRefed<ClientOpPromise>
+-ClientManager::MatchAll(const ClientMatchAllArgs& aArgs)
+-{
+-  RefPtr<ClientManager> mgr = GetOrCreateForCurrentThread();
+-  return mgr->StartOp(aArgs);
+-}
+-
+-// static
+-already_AddRefed<ClientOpPromise>
+-ClientManager::Claim(const ClientClaimArgs& aArgs)
+-{
+-  RefPtr<ClientManager> mgr = GetOrCreateForCurrentThread();
+-  return mgr->StartOp(aArgs);
 +  return mgr->CreateHandleInternal(aClientInfo, aSerialEventTarget);
  }
  
  // static
  already_AddRefed<ClientOpPromise>
- ClientManager::MatchAll(const ClientMatchAllArgs& aArgs)
+-ClientManager::GetInfoAndState(const ClientGetInfoAndStateArgs& aArgs)
++ClientManager::MatchAll(const ClientMatchAllArgs& aArgs,
++                        nsISerialEventTarget* aTarget)
  {
    RefPtr<ClientManager> mgr = GetOrCreateForCurrentThread();
 -  return mgr->StartOp(aArgs);
-+  return mgr->StartOp(aArgs, GetCurrentThreadSerialEventTarget());
++  return mgr->StartOp(aArgs, aTarget);
  }
  
  // static
  already_AddRefed<ClientOpPromise>
- ClientManager::Claim(const ClientClaimArgs& aArgs)
+-ClientManager::Navigate(const ClientNavigateArgs& aArgs)
++ClientManager::Claim(const ClientClaimArgs& aArgs,
++                     nsISerialEventTarget* aTarget)
  {
    RefPtr<ClientManager> mgr = GetOrCreateForCurrentThread();
 -  return mgr->StartOp(aArgs);
-+  return mgr->StartOp(aArgs, GetCurrentThreadSerialEventTarget());
++  return mgr->StartOp(aArgs, aTarget);
  }
  
  // static
  already_AddRefed<ClientOpPromise>
- ClientManager::GetInfoAndState(const ClientGetInfoAndStateArgs& aArgs)
+-ClientManager::OpenWindow(const ClientOpenWindowArgs& aArgs)
++ClientManager::GetInfoAndState(const ClientGetInfoAndStateArgs& aArgs,
++                               nsISerialEventTarget* aTarget)
  {
    RefPtr<ClientManager> mgr = GetOrCreateForCurrentThread();
 -  return mgr->StartOp(aArgs);
-+  return mgr->StartOp(aArgs, GetCurrentThreadSerialEventTarget());
- }
- 
- // static
- already_AddRefed<ClientOpPromise>
- ClientManager::Navigate(const ClientNavigateArgs& aArgs)
- {
-   RefPtr<ClientManager> mgr = GetOrCreateForCurrentThread();
--  return mgr->StartOp(aArgs);
-+  return mgr->StartOp(aArgs, GetCurrentThreadSerialEventTarget());
- }
- 
- // static
- already_AddRefed<ClientOpPromise>
- ClientManager::OpenWindow(const ClientOpenWindowArgs& aArgs)
- {
-   RefPtr<ClientManager> mgr = GetOrCreateForCurrentThread();
--  return mgr->StartOp(aArgs);
-+  return mgr->StartOp(aArgs, GetCurrentThreadSerialEventTarget());
++  return mgr->StartOp(aArgs, aTarget);
++}
++
++// static
++already_AddRefed<ClientOpPromise>
++ClientManager::Navigate(const ClientNavigateArgs& aArgs,
++                        nsISerialEventTarget* aTarget)
++{
++  RefPtr<ClientManager> mgr = GetOrCreateForCurrentThread();
++  return mgr->StartOp(aArgs, aTarget);
++}
++
++// static
++already_AddRefed<ClientOpPromise>
++ClientManager::OpenWindow(const ClientOpenWindowArgs& aArgs,
++                          nsISerialEventTarget* aTarget)
++{
++  RefPtr<ClientManager> mgr = GetOrCreateForCurrentThread();
++  return mgr->StartOp(aArgs, aTarget);
  }
  
  } // namespace dom
@@ -550,7 +663,7 @@ diff --git a/dom/clients/manager/ClientManager.h b/dom/clients/manager/ClientMan
    void
    ForgetSource(ClientSource* aSource);
  
-@@ -85,17 +87,18 @@ public:
+@@ -85,32 +87,34 @@ public:
  
    static UniquePtr<ClientSource>
    CreateSource(ClientType aType, nsIPrincipal* aPrincipal);
@@ -560,16 +673,39 @@ diff --git a/dom/clients/manager/ClientManager.h b/dom/clients/manager/ClientMan
  
    static already_AddRefed<ClientHandle>
 -  CreateHandle(const ClientInfo& aClientInfo);
+-
+-  static already_AddRefed<ClientOpPromise>
+-  MatchAll(const ClientMatchAllArgs& aArgs);
 +  CreateHandle(const ClientInfo& aClientInfo,
 +               nsISerialEventTarget* aSerialEventTarget);
  
    static already_AddRefed<ClientOpPromise>
-   MatchAll(const ClientMatchAllArgs& aArgs);
+-  Claim(const ClientClaimArgs& aArgs);
++  MatchAll(const ClientMatchAllArgs& aArgs, nsISerialEventTarget* aTarget);
  
    static already_AddRefed<ClientOpPromise>
-   Claim(const ClientClaimArgs& aArgs);
+-  GetInfoAndState(const ClientGetInfoAndStateArgs& aArgs);
++  Claim(const ClientClaimArgs& aArgs, nsISerialEventTarget* aTarget);
  
    static already_AddRefed<ClientOpPromise>
+-  Navigate(const ClientNavigateArgs& aArgs);
++  GetInfoAndState(const ClientGetInfoAndStateArgs& aArgs,
++                  nsISerialEventTarget* aTarget);
+ 
+   static already_AddRefed<ClientOpPromise>
+-  OpenWindow(const ClientOpenWindowArgs& aArgs);
++  Navigate(const ClientNavigateArgs& aArgs, nsISerialEventTarget* aTarget);
++
++  static already_AddRefed<ClientOpPromise>
++  OpenWindow(const ClientOpenWindowArgs& aArgs, nsISerialEventTarget* aTarget);
+ 
+   NS_INLINE_DECL_REFCOUNTING(mozilla::dom::ClientManager)
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // _mozilla_dom_ClientManager_h
 diff --git a/dom/clients/manager/ClientManagerOpParent.cpp b/dom/clients/manager/ClientManagerOpParent.cpp
 --- a/dom/clients/manager/ClientManagerOpParent.cpp
 +++ b/dom/clients/manager/ClientManagerOpParent.cpp
@@ -678,7 +814,7 @@ diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/
      RefPtr<PromiseListHolder> kungFuDeathGrip = this;
 -    mResultPromise->Then(AbstractThread::GetCurrent(), __func__,
 +    mResultPromise->Then(
-+      SystemGroup::EventTargetFor(TaskCategory::Other), __func__,
++      GetCurrentThreadSerialEventTarget(), __func__,
        [kungFuDeathGrip] (const ClientOpResult& aResult) { },
        [kungFuDeathGrip] (nsresult aResult) { });
  
@@ -696,7 +832,7 @@ diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/
      RefPtr<PromiseListHolder> self(this);
 -    mPromiseList.LastElement()->Then(mTarget, __func__,
 +    mPromiseList.LastElement()->Then(
-+      SystemGroup::EventTargetFor(TaskCategory::Other), __func__,
++      GetCurrentThreadSerialEventTarget(), __func__,
        [self] (const ClientOpResult& aResult) {
          // TODO: This is pretty clunky.  Try to figure out a better
          //       wait for MatchAll() and Claim() to share this code

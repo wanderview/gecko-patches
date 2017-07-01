@@ -1,0 +1,359 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  6a1ad8323a42576942cc548a278da48c32eeed14
+
+diff --git a/dom/clients/api/Client.cpp b/dom/clients/api/Client.cpp
+--- a/dom/clients/api/Client.cpp
++++ b/dom/clients/api/Client.cpp
+@@ -2,16 +2,17 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "Client.h"
+ 
+ #include "ClientDOMUtil.h"
++#include "mozilla/AutoThreadMozPromiseRequestHolder.h"
+ #include "mozilla/dom/ClientHandle.h"
+ #include "mozilla/dom/ClientIPCTypes.h"
+ #include "mozilla/dom/ClientManager.h"
+ #include "mozilla/dom/ClientState.h"
+ #include "mozilla/dom/Promise.h"
+ #include "mozilla/dom/WorkerPrivate.h"
+ #include "mozilla/dom/WorkerScope.h"
+ #include "nsIGlobalObject.h"
+@@ -131,18 +132,30 @@ Client::PostMessage(JSContext* aCx, JS::
+   }
+ 
+   ClientEndPoint endpoint;
+   aRv = ClientGetEndPoint(mGlobal, &endpoint);
+   if (aRv.Failed()) {
+     return;
+   }
+ 
++  RefPtr<AutoThreadMozPromiseRequestHolder<GenericPromise>> holder =
++    AutoThreadMozPromiseRequestHolder<GenericPromise>::Create();
++  if (!holder) {
++    return;
++  }
++
+   EnsureHandle();
+-  RefPtr<GenericPromise> p = mHandle->PostMessage(data, endpoint);
++  RefPtr<GenericPromise> innerPromise = mHandle->PostMessage(data, endpoint);
++  innerPromise->Then(mGlobal->EventTargetFor(TaskCategory::Other), __func__,
++    [holder] (bool aResult) {
++      holder->RequestHolder().Complete();
++    }, [holder] (nsresult aResult) {
++      holder->RequestHolder().Complete();
++    }).Track(holder->RequestHolder());
+ }
+ 
+ VisibilityState
+ Client::GetVisibilityState() const
+ {
+   return mData->state().get_IPCClientWindowState().visibilityState();
+ }
+ 
+@@ -177,29 +190,38 @@ Client::Focus(ErrorResult& aRv)
+     interactionAllowed = false;
+   }
+ 
+   if (!interactionAllowed) {
+     outerPromise->MaybeReject(NS_ERROR_DOM_INVALID_ACCESS_ERR);
+     return outerPromise.forget();
+   }
+ 
++  RefPtr<AutoThreadMozPromiseRequestHolder<ClientStatePromise>> holder =
++    AutoThreadMozPromiseRequestHolder<ClientStatePromise>::Create();
++  if (!holder) {
++    outerPromise->MaybeReject(NS_ERROR_DOM_INVALID_STATE_ERR);
++    return outerPromise.forget();
++  }
++
+   EnsureHandle();
+ 
+   RefPtr<Client> self = this;
+ 
+   RefPtr<ClientStatePromise> innerPromise = mHandle->Focus();
+   innerPromise->Then(mGlobal->EventTargetFor(TaskCategory::Other), __func__,
+-    [self, outerPromise] (const ClientState& aResult) {
++    [self, outerPromise, holder] (const ClientState& aResult) {
++      holder->RequestHolder().Complete();
+       RefPtr<Client> newClient =
+         new Client(self->mGlobal, ClientInfoAndState(self->mData->info(), aResult.ToIPC()));
+       outerPromise->MaybeResolve(newClient);
+-    }, [self, outerPromise] (nsresult aResult) {
++    }, [self, outerPromise, holder] (nsresult aResult) {
++      holder->RequestHolder().Complete();
+       outerPromise->MaybeReject(aResult);
+-    });
++    }).Track(holder->RequestHolder());
+ 
+   return outerPromise.forget();
+ }
+ 
+ already_AddRefed<Promise>
+ Client::Navigate(const nsAString& aURL, ErrorResult& aRv)
+ {
+   RefPtr<Promise> outerPromise = Promise::Create(mGlobal, aRv);
+diff --git a/dom/clients/api/ClientDOMUtil.h b/dom/clients/api/ClientDOMUtil.h
+--- a/dom/clients/api/ClientDOMUtil.h
++++ b/dom/clients/api/ClientDOMUtil.h
+@@ -1,16 +1,17 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ #ifndef _mozilla_dom_ClientDOMUtil_h
+ #define _mozilla_dom_ClientDOMUtil_h
+ 
++#include "mozilla/AutoThreadMozPromiseRequestHolder.h"
+ #include "mozilla/dom/ClientIPCTypes.h"
+ #include "mozilla/dom/ClientOpPromise.h"
+ #include "mozilla/dom/WorkerPrivate.h"
+ #include "mozilla/dom/workers/bindings/WorkerHolderToken.h"
+ 
+ class nsIGlobalObject;
+ 
+ namespace mozilla {
+@@ -22,36 +23,30 @@ nsresult
+ ClientGetEndPoint(nsIGlobalObject* aGlobal, ClientEndPoint* aEndPointOut);
+ 
+ // TODO: Add a ClientHandle version of this wrapper for Client methods.
+ template<typename Func, typename Arg, typename Resolve, typename Reject>
+ void
+ StartClientManagerOp(Func aFunc, const Arg& aArg, nsISerialEventTarget* aTarget,
+                      Resolve aResolve, Reject aReject)
+ {
+-  using mozilla::dom::workers::Closing;
+-  using mozilla::dom::workers::GetCurrentThreadWorkerPrivate;
+-  using mozilla::dom::workers::WorkerHolderToken;
+-
+-  RefPtr<WorkerHolderToken> token;
+-  if (!NS_IsMainThread()) {
+-    token = WorkerHolderToken::Create(GetCurrentThreadWorkerPrivate(), Closing);
++  RefPtr<AutoThreadMozPromiseRequestHolder<ClientOpPromise>> holder =
++    AutoThreadMozPromiseRequestHolder<ClientOpPromise>::Create();
++  if (!holder) {
++    aReject(NS_ERROR_DOM_INVALID_STATE_ERR);
++    return;
+   }
+ 
+   RefPtr<ClientOpPromise> promise = aFunc(aArg, aTarget);
+   promise->Then(aTarget, __func__,
+-    [aResolve, token](const ClientOpResult& aResult) {
+-      if (token && token->IsShuttingDown()) {
+-        return;
+-      }
++    [aResolve, holder](const ClientOpResult& aResult) {
++      holder->RequestHolder().Complete();
+       aResolve(aResult);
+-    }, [aReject, token](nsresult aResult) {
+-      if (token && token->IsShuttingDown()) {
+-        return;
+-      }
++    }, [aReject, holder](nsresult aResult) {
++      holder->RequestHolder().Complete();
+       aReject(aResult);
+-    });
++    }).Track(holder->RequestHolder());
+ }
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // _mozilla_dom_ClientDOMUtil_h
+diff --git a/dom/clients/api/Clients.cpp b/dom/clients/api/Clients.cpp
+--- a/dom/clients/api/Clients.cpp
++++ b/dom/clients/api/Clients.cpp
+@@ -75,35 +75,44 @@ Clients::Get(const nsAString& aClientID,
+   if (NS_FAILED(rv)) {
+     // If we can't get an endpoint then we don't have a recognizeable
+     // principal and we won't effectively match anything.  Resolve
+     // undefined indicating "not found".
+     outerPromise->MaybeResolveWithUndefined();
+     return outerPromise.forget();
+   }
+ 
++  RefPtr<AutoThreadMozPromiseRequestHolder<ClientOpPromise>> holder =
++    AutoThreadMozPromiseRequestHolder<ClientOpPromise>::Create();
++  if (!holder) {
++    outerPromise->MaybeReject(NS_ERROR_DOM_INVALID_STATE_ERR);
++    return outerPromise.forget();
++  }
++
+   const PrincipalInfo& principalInfo =
+     endpoint.type() == ClientEndPoint::TIPCServiceWorkerDescriptor
+       ? endpoint.get_IPCServiceWorkerDescriptor().principalInfo()
+       : endpoint.get_IPCClientInfo().principalInfo();
+ 
+   nsCOMPtr<nsIGlobalObject> global = mGlobal;
+   nsCOMPtr<nsISerialEventTarget> target =
+     mGlobal->EventTargetFor(TaskCategory::Other);
+ 
+   RefPtr<ClientOpPromise> innerPromise =
+     ClientManager::GetInfoAndState(ClientGetInfoAndStateArgs(id, principalInfo),
+                                    target);
+   innerPromise->Then(target, __func__,
+-    [outerPromise, global] (const ClientOpResult& aResult) {
++    [outerPromise, global, holder] (const ClientOpResult& aResult) {
++      holder->RequestHolder().Complete();
+       outerPromise->MaybeResolve(
+         new Client(global, aResult.get_ClientInfoAndState()));
+-    }, [outerPromise] (nsresult aResult) {
++    }, [outerPromise, holder] (nsresult aResult) {
++      holder->RequestHolder().Complete();
+       outerPromise->MaybeResolveWithUndefined();
+-    });
++    }).Track(holder->RequestHolder());
+ 
+   return outerPromise.forget();
+ }
+ 
+ namespace {
+ 
+ class MatchAllComparator final
+ {
+diff --git a/dom/workers/AutoThreadMozPromiseRequestHolder.cpp b/dom/workers/AutoThreadMozPromiseRequestHolder.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/workers/AutoThreadMozPromiseRequestHolder.cpp
+@@ -0,0 +1,7 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "AutoThreadMozPromiseRequestHolder.h"
+diff --git a/dom/workers/AutoThreadMozPromiseRequestHolder.h b/dom/workers/AutoThreadMozPromiseRequestHolder.h
+new file mode 100644
+--- /dev/null
++++ b/dom/workers/AutoThreadMozPromiseRequestHolder.h
+@@ -0,0 +1,82 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_workers_AutoThreadMozPromiseRequestHolder_h
++#define mozilla_dom_workers_AutoThreadMozPromiseRequestHolder_h
++
++#include "mozilla/MozPromise.h"
++#include "mozilla/dom/WorkerPrivate.h"
++#include "mozilla/dom/workers/bindings/WorkerHolder.h"
++
++namespace mozilla {
++
++template<typename PromiseType>
++class AutoThreadMozPromiseRequestHolder
++{
++  typedef mozilla::dom::workers::Status Status;
++  typedef mozilla::dom::workers::WorkerHolder WorkerHolder;
++  typedef mozilla::dom::workers::WorkerPrivate WorkerPrivate;
++
++  MozPromiseRequestHolder<PromiseType> mRequestHolder;
++
++  class WorkerAutoThreadMozPromiseRequestHolder final : public AutoThreadMozPromiseRequestHolder<PromiseType>
++                                                      , public WorkerHolder
++  {
++    ~WorkerAutoThreadMozPromiseRequestHolder() = default;
++
++  public:
++    bool
++    Notify(Status aStatus) override
++    {
++      AutoThreadMozPromiseRequestHolder<PromiseType>::RequestHolder().DisconnectIfExists();
++      return true;
++    }
++  };
++
++  virtual ~AutoThreadMozPromiseRequestHolder() = default;
++
++public:
++  static
++  already_AddRefed<AutoThreadMozPromiseRequestHolder<PromiseType>>
++  Create()
++  {
++    RefPtr<AutoThreadMozPromiseRequestHolder<PromiseType>> ref;
++
++    if (NS_IsMainThread()) {
++      ref = new AutoThreadMozPromiseRequestHolder<PromiseType>();
++      return ref.forget();
++    }
++
++    WorkerPrivate* workerPrivate =
++      mozilla::dom::workers::GetCurrentThreadWorkerPrivate();
++    if (!workerPrivate) {
++      ref = new AutoThreadMozPromiseRequestHolder<PromiseType>();
++      return ref.forget();
++    }
++
++    RefPtr<WorkerAutoThreadMozPromiseRequestHolder> workerRef =
++      new WorkerAutoThreadMozPromiseRequestHolder();
++    if(!workerRef->HoldWorker(workerPrivate, mozilla::dom::workers::Closing)) {
++      workerRef->RequestHolder().Complete();
++      return nullptr;
++    }
++
++    ref = workerRef.forget();
++    return ref.forget();
++  }
++
++  MozPromiseRequestHolder<PromiseType>&
++  RequestHolder()
++  {
++    return mRequestHolder;
++  }
++
++  NS_INLINE_DECL_REFCOUNTING(AutoThreadMozPromiseRequestHolder<PromiseType>)
++};
++
++} // namespace mozilla
++
++#endif // mozilla_dom_workers_AutoThreadMozPromiseRequestHolder_h
+diff --git a/dom/workers/moz.build b/dom/workers/moz.build
+--- a/dom/workers/moz.build
++++ b/dom/workers/moz.build
+@@ -3,16 +3,20 @@
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ with Files("**"):
+     BUG_COMPONENT = ("Core", "DOM: Workers")
+ 
+ # Public stuff.
++EXPORTS.mozilla += [
++    'AutoThreadMozPromiseRequestHolder.h',
++]
++
+ EXPORTS.mozilla.dom += [
+     'FileReaderSync.h',
+     'ServiceWorkerCommon.h',
+     'ServiceWorkerContainer.h',
+     'ServiceWorkerDescriptor.h',
+     'ServiceWorkerEvents.h',
+     'ServiceWorkerIPCUtils.h',
+     'ServiceWorkerRegistrar.h',
+@@ -45,16 +49,17 @@ EXPORTS.mozilla.dom.workers.bindings += 
+ XPIDL_MODULE = 'dom_workers'
+ 
+ XPIDL_SOURCES += [
+     'nsIWorkerDebugger.idl',
+     'nsIWorkerDebuggerManager.idl',
+ ]
+ 
+ UNIFIED_SOURCES += [
++    'AutoThreadMozPromiseRequestHolder.cpp',
+     'ChromeWorkerScope.cpp',
+     'FileReaderSync.cpp',
+     'Principal.cpp',
+     'RegisterBindings.cpp',
+     'RuntimeService.cpp',
+     'ScriptLoader.cpp',
+     'ServiceWorker.cpp',
+     'ServiceWorkerContainer.cpp',
