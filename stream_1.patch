@@ -1,0 +1,1058 @@
+# HG changeset patch
+# User Andrea Marchesini <amarchesini@mozilla.com>
+# Parent  cc135d19d966f2d3fb6c00e77a615c5ca3f0fc05
+Bug 1128959 - Implement the WHATWG Streams spec - part 1 - WebIDL Bindings, r?bz
+
+diff --git a/dom/bindings/Codegen.py b/dom/bindings/Codegen.py
+--- a/dom/bindings/Codegen.py
++++ b/dom/bindings/Codegen.py
+@@ -1144,17 +1144,20 @@ class CGHeaders(CGWrapper):
+                 if unrolled.isSpiderMonkeyInterface():
+                     bindingHeaders.add("jsfriendapi.h")
+                     if jsImplementedDescriptors:
+                         # Since we can't forward-declare typed array types
+                         # (because they're typedefs), we have to go ahead and
+                         # just include their header if we need to have functions
+                         # taking references to them declared in that header.
+                         headerSet = declareIncludes
+-                    headerSet.add("mozilla/dom/TypedArray.h")
++                    if unrolled.isReadableStream():
++                        headerSet.add("mozilla/dom/ReadableStream.h")
++                    else:
++                        headerSet.add("mozilla/dom/TypedArray.h")
+                 else:
+                     try:
+                         typeDesc = config.getDescriptor(unrolled.inner.identifier.name)
+                     except NoSuchDescriptorError:
+                         return
+                     # Dictionaries with interface members rely on the
+                     # actual class definition of that interface member
+                     # being visible in the binding header, because they
+@@ -1359,17 +1362,20 @@ def UnionTypes(unionTypes, config):
+                 f = f.unroll()
+                 if f.isPromise():
+                     headers.add("mozilla/dom/Promise.h")
+                     # We need ToJSValue to do the Promise to JS conversion.
+                     headers.add("mozilla/dom/ToJSValue.h")
+                 elif f.isInterface():
+                     if f.isSpiderMonkeyInterface():
+                         headers.add("jsfriendapi.h")
+-                        headers.add("mozilla/dom/TypedArray.h")
++                        if f.isReadableStream():
++                            headers.add("mozilla/dom/ReadableStream.h")
++                        else:
++                            headers.add("mozilla/dom/TypedArray.h")
+                     else:
+                         try:
+                             typeDesc = config.getDescriptor(f.inner.identifier.name)
+                         except NoSuchDescriptorError:
+                             return
+                         if typeDesc.interface.isCallback() or isSequence:
+                             # Callback interfaces always use strong refs, so
+                             # we need to include the right header to be able
+@@ -1451,17 +1457,20 @@ def UnionConversions(unionTypes, config)
+                 f = f.unroll()
+                 if f.isPromise():
+                     headers.add("mozilla/dom/Promise.h")
+                     # We need ToJSValue to do the Promise to JS conversion.
+                     headers.add("mozilla/dom/ToJSValue.h")
+                 elif f.isInterface():
+                     if f.isSpiderMonkeyInterface():
+                         headers.add("jsfriendapi.h")
+-                        headers.add("mozilla/dom/TypedArray.h")
++                        if f.isReadableStream():
++                            headers.add("mozilla/dom/ReadableStream.h")
++                        else:
++                            headers.add("mozilla/dom/TypedArray.h")
+                     elif f.inner.isExternal():
+                         try:
+                             typeDesc = config.getDescriptor(f.inner.identifier.name)
+                         except NoSuchDescriptorError:
+                             return
+                         headers.add(typeDesc.headerFile)
+                     else:
+                         headers.add(CGHeaders.getDeclarationFilename(f.inner))
+@@ -5717,18 +5726,18 @@ def getJSToNativeConversionInfo(type, de
+         return JSToNativeConversionInfo(templateBody,
+                                         declType=declType,
+                                         holderType=holderType,
+                                         dealWithOptional=isOptional)
+ 
+     if type.isSpiderMonkeyInterface():
+         assert not isEnforceRange and not isClamp
+         name = type.unroll().name  # unroll() because it may be nullable
+-        arrayType = CGGeneric(name)
+-        declType = arrayType
++        interfaceType = CGGeneric(name)
++        declType = interfaceType
+         if type.nullable():
+             declType = CGTemplatedType("Nullable", declType)
+             objRef = "${declName}.SetValue()"
+         else:
+             objRef = "${declName}"
+ 
+         # Again, this is a bit strange since we are actually building a
+         # template string here. ${objRef} and $*{badType} below are filled in
+@@ -5742,32 +5751,33 @@ def getJSToNativeConversionInfo(type, de
+             objRef=objRef,
+             badType=onFailureBadType(failureCode, type.name).define())
+         template = wrapObjectTemplate(template, type, "${declName}.SetNull();\n",
+                                       failureCode)
+         if not isMember:
+             # This is a bit annoying.  In a union we don't want to have a
+             # holder, since unions don't support that.  But if we're optional we
+             # want to have a holder, so that the callee doesn't see
+-            # Optional<RootedTypedArray<ArrayType> >.  So do a holder if we're
+-            # optional and use a RootedTypedArray otherwise.
++            # Optional<RootedSpiderMonkeyInterface<InterfaceType>>.  So do a
++            # holder if we're optional and use a RootedSpiderMonkeyInterface
++            # otherwise.
+             if isOptional:
+-                holderType = CGTemplatedType("TypedArrayRooter", arrayType)
++                holderType = CGTemplatedType("SpiderMonkeyInterfaceRooter", interfaceType)
+                 # If our typed array is nullable, this will set the Nullable to
+                 # be not-null, but that's ok because we make an explicit
+                 # SetNull() call on it as needed if our JS value is actually
+                 # null.  XXXbz Because "Maybe" takes const refs for constructor
+                 # arguments, we can't pass a reference here; have to pass a
+                 # pointer.
+                 holderArgs = "cx, &%s" % objRef
+                 declArgs = None
+             else:
+                 holderType = None
+                 holderArgs = None
+-                declType = CGTemplatedType("RootedTypedArray", declType)
++                declType = CGTemplatedType("RootedSpiderMonkeyInterface", declType)
+                 declArgs = "cx"
+         else:
+             holderType = None
+             holderArgs = None
+             declArgs = None
+         return JSToNativeConversionInfo(template,
+                                         declType=declType,
+                                         holderType=holderType,
+@@ -6504,17 +6514,17 @@ class CGArgumentConverter(CGThing):
+ 
+ def getMaybeWrapValueFuncForType(type):
+     # Callbacks might actually be DOM objects; nothing prevents a page from
+     # doing that.
+     if type.isCallback() or type.isCallbackInterface() or type.isObject():
+         if type.nullable():
+             return "MaybeWrapObjectOrNullValue"
+         return "MaybeWrapObjectValue"
+-    # Spidermonkey interfaces are never DOM objects.  Neither are sequences or
++    # SpiderMonkey interfaces are never DOM objects.  Neither are sequences or
+     # dictionaries, since those are always plain JS objects.
+     if type.isSpiderMonkeyInterface() or type.isDictionary() or type.isSequence():
+         if type.nullable():
+             return "MaybeWrapNonDOMObjectOrNullValue"
+         return "MaybeWrapNonDOMObjectValue"
+     if type.isAny():
+         return "MaybeWrapValue"
+ 
+@@ -13993,17 +14003,17 @@ class ForwardDeclarationBuilder:
+         if t.isGeckoInterface():
+             name = t.inner.identifier.name
+             try:
+                 desc = config.getDescriptor(name)
+                 self.add(desc.nativeType)
+             except NoSuchDescriptorError:
+                 pass
+ 
+-        # Note: Spidermonkey interfaces are typedefs, so can't be
++        # Note: SpiderMonkey interfaces are typedefs, so can't be
+         # forward-declared
+         elif t.isPromise():
+             self.addInMozillaDom("Promise")
+         elif t.isCallback():
+             self.addInMozillaDom(t.callback.identifier.name)
+         elif t.isDictionary():
+             self.addInMozillaDom(t.inner.identifier.name, isStruct=True)
+         elif t.isCallbackInterface():
+diff --git a/dom/bindings/ReadableStream.h b/dom/bindings/ReadableStream.h
+new file mode 100644
+--- /dev/null
++++ b/dom/bindings/ReadableStream.h
+@@ -0,0 +1,28 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
++ * You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_ReadableStream_h
++#define mozilla_dom_ReadableStream_h
++
++#include "mozilla/dom/SpiderMonkeyInterface.h"
++
++namespace mozilla {
++namespace dom {
++
++struct ReadableStream : public SpiderMonkeyInterfaceObjectStorage
++{
++  inline bool Init(JSObject* obj)
++  {
++    MOZ_ASSERT(!inited());
++    mImplObj = mWrappedObj = js::UnwrapReadableStream(obj);
++    return inited();
++  }
++};
++
++} // namespace dom
++} // namespace mozilla
++
++#endif /* mozilla_dom_ReadableStream_h */
+diff --git a/dom/bindings/SpiderMonkeyInterface.h b/dom/bindings/SpiderMonkeyInterface.h
+new file mode 100644
+--- /dev/null
++++ b/dom/bindings/SpiderMonkeyInterface.h
+@@ -0,0 +1,144 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
++ * You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_SpiderMonkeyInterface_h
++#define mozilla_dom_SpiderMonkeyInterface_h
++
++#include "jsapi.h"
++#include "jsfriendapi.h"
++#include "js/TracingAPI.h"
++
++namespace mozilla {
++namespace dom {
++
++/*
++ * Class that just handles the JSObject storage and tracing for spidermonkey
++ * interfaces
++ */
++struct SpiderMonkeyInterfaceObjectStorage
++{
++protected:
++  JSObject* mImplObj;
++  JSObject* mWrappedObj;
++
++  SpiderMonkeyInterfaceObjectStorage()
++    : mImplObj(nullptr),
++      mWrappedObj(nullptr)
++  {
++  }
++
++  SpiderMonkeyInterfaceObjectStorage(SpiderMonkeyInterfaceObjectStorage&& aOther)
++    : mImplObj(aOther.mImplObj),
++      mWrappedObj(aOther.mWrappedObj)
++  {
++    aOther.mImplObj = nullptr;
++    aOther.mWrappedObj = nullptr;
++  }
++
++public:
++  inline void TraceSelf(JSTracer* trc)
++  {
++    JS::UnsafeTraceRoot(trc, &mImplObj, "SpiderMonkeyInterfaceObjectStorage.mImplObj");
++    JS::UnsafeTraceRoot(trc, &mWrappedObj, "SpiderMonkeyInterfaceObjectStorage.mWrappedObj");
++  }
++
++  inline bool inited() const
++  {
++    return !!mImplObj;
++  }
++
++  inline bool WrapIntoNewCompartment(JSContext* cx)
++  {
++    return JS_WrapObject(cx,
++      JS::MutableHandle<JSObject*>::fromMarkedLocation(&mWrappedObj));
++  }
++
++  inline JSObject *Obj() const
++  {
++    MOZ_ASSERT(inited());
++    return mWrappedObj;
++  }
++
++private:
++  SpiderMonkeyInterfaceObjectStorage(const SpiderMonkeyInterfaceObjectStorage&) = delete;
++};
++
++// A class for rooting an existing SpiderMonkey Interface struct
++template<typename InterfaceType>
++class MOZ_RAII SpiderMonkeyInterfaceRooter : private JS::CustomAutoRooter
++{
++public:
++  template <typename CX>
++  SpiderMonkeyInterfaceRooter(const CX& cx,
++                              InterfaceType* aInterface MOZ_GUARD_OBJECT_NOTIFIER_PARAM)
++    : JS::CustomAutoRooter(cx MOZ_GUARD_OBJECT_NOTIFIER_PARAM_TO_PARENT),
++      mInterface(aInterface)
++  {
++  }
++
++  virtual void trace(JSTracer* trc) override
++  {
++    mInterface->TraceSelf(trc);
++  }
++
++private:
++  SpiderMonkeyInterfaceObjectStorage* const mInterface;
++};
++
++// And a specialization for dealing with nullable SpiderMonkey interfaces
++template<typename Inner> struct Nullable;
++template<typename InterfaceType>
++class MOZ_RAII SpiderMonkeyInterfaceRooter<Nullable<InterfaceType>> :
++    private JS::CustomAutoRooter
++{
++public:
++  template <typename CX>
++  SpiderMonkeyInterfaceRooter(const CX& cx,
++                              Nullable<InterfaceType>* aInterface MOZ_GUARD_OBJECT_NOTIFIER_PARAM)
++    : JS::CustomAutoRooter(cx MOZ_GUARD_OBJECT_NOTIFIER_PARAM_TO_PARENT),
++      mInterface(aInterface)
++  {
++  }
++
++  virtual void trace(JSTracer* trc) override
++  {
++    if (!mInterface->IsNull()) {
++      mInterface->Value().TraceSelf(trc);
++    }
++  }
++
++private:
++  Nullable<InterfaceType>* const mInterface;
++};
++
++// Class for easily setting up a rooted SpiderMonkey interface object on the
++// stack
++template<typename InterfaceType>
++class MOZ_RAII RootedSpiderMonkeyInterface final : public InterfaceType,
++                                                   private SpiderMonkeyInterfaceRooter<InterfaceType>
++{
++public:
++  template <typename CX>
++  explicit RootedSpiderMonkeyInterface(const CX& cx MOZ_GUARD_OBJECT_NOTIFIER_PARAM)
++    : InterfaceType(),
++      SpiderMonkeyInterfaceRooter<InterfaceType>(cx, this
++                                                 MOZ_GUARD_OBJECT_NOTIFIER_PARAM_TO_PARENT)
++  {
++  }
++
++  template <typename CX>
++  RootedSpiderMonkeyInterface(const CX& cx, JSObject* obj MOZ_GUARD_OBJECT_NOTIFIER_PARAM)
++    : InterfaceType(obj),
++      SpiderMonkeyInterfaceRooter<InterfaceType>(cx, this
++                                                 MOZ_GUARD_OBJECT_NOTIFIER_PARAM_TO_PARENT)
++  {
++  }
++};
++
++} // namespace dom
++} // namespace mozilla
++
++#endif /* mozilla_dom_SpiderMonkeyInterface_h */
+diff --git a/dom/bindings/TypedArray.h b/dom/bindings/TypedArray.h
+--- a/dom/bindings/TypedArray.h
++++ b/dom/bindings/TypedArray.h
+@@ -2,83 +2,49 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+  * You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_TypedArray_h
+ #define mozilla_dom_TypedArray_h
+ 
+-#include "jsapi.h"
+-#include "jsfriendapi.h"
+-#include "js/RootingAPI.h"
+-#include "js/TracingAPI.h"
+ #include "mozilla/Attributes.h"
+ #include "mozilla/Move.h"
+ #include "mozilla/dom/BindingDeclarations.h"
++#include "mozilla/dom/SpiderMonkeyInterface.h"
+ #include "nsWrapperCache.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ /*
+- * Class that just handles the JSObject storage and tracing for typed arrays
+- */
+-struct TypedArrayObjectStorage : AllTypedArraysBase {
+-protected:
+-  JSObject* mTypedObj;
+-  JSObject* mWrappedObj;
+-
+-  TypedArrayObjectStorage()
+-    : mTypedObj(nullptr),
+-      mWrappedObj(nullptr)
+-  {
+-  }
+-
+-  TypedArrayObjectStorage(TypedArrayObjectStorage&& aOther)
+-    : mTypedObj(aOther.mTypedObj),
+-      mWrappedObj(aOther.mWrappedObj)
+-  {
+-    aOther.mTypedObj = nullptr;
+-    aOther.mWrappedObj = nullptr;
+-  }
+-
+-public:
+-  inline void TraceSelf(JSTracer* trc)
+-  {
+-    JS::UnsafeTraceRoot(trc, &mTypedObj, "TypedArray.mTypedObj");
+-    JS::UnsafeTraceRoot(trc, &mWrappedObj, "TypedArray.mWrappedObj");
+-  }
+-
+-private:
+-  TypedArrayObjectStorage(const TypedArrayObjectStorage&) = delete;
+-};
+-
+-/*
+  * Various typed array classes for argument conversion.  We have a base class
+  * that has a way of initializing a TypedArray from an existing typed array, and
+  * a subclass of the base class that supports creation of a relevant typed array
+  * or array buffer object.
+  */
+ template<typename T,
+          JSObject* UnwrapArray(JSObject*),
+          void GetLengthAndDataAndSharedness(JSObject*, uint32_t*, bool*, T**)>
+-struct TypedArray_base : public TypedArrayObjectStorage {
++struct TypedArray_base : public SpiderMonkeyInterfaceObjectStorage,
++                         AllTypedArraysBase
++{
+   typedef T element_type;
+ 
+   TypedArray_base()
+     : mData(nullptr),
+       mLength(0),
+       mShared(false),
+       mComputed(false)
+   {
+   }
+ 
+   TypedArray_base(TypedArray_base&& aOther)
+-    : TypedArrayObjectStorage(Move(aOther)),
++    : SpiderMonkeyInterfaceObjectStorage(Move(aOther)),
+       mData(aOther.mData),
+       mLength(aOther.mLength),
+       mShared(aOther.mShared),
+       mComputed(aOther.mComputed)
+   {
+     aOther.mData = nullptr;
+     aOther.mLength = 0;
+     aOther.mShared = false;
+@@ -90,24 +56,20 @@ private:
+   mutable uint32_t mLength;
+   mutable bool mShared;
+   mutable bool mComputed;
+ 
+ public:
+   inline bool Init(JSObject* obj)
+   {
+     MOZ_ASSERT(!inited());
+-    mTypedObj = mWrappedObj = UnwrapArray(obj);
++    mImplObj = mWrappedObj = UnwrapArray(obj);
+     return inited();
+   }
+ 
+-  inline bool inited() const {
+-    return !!mTypedObj;
+-  }
+-
+   // About shared memory:
+   //
+   // Any DOM TypedArray as well as any DOM ArrayBufferView can map the
+   // memory of either a JS ArrayBuffer or a JS SharedArrayBuffer.  If
+   // the TypedArray maps a SharedArrayBuffer the Length() and Data()
+   // accessors on the DOM view will return zero and nullptr; to get
+   // the actual length and data, call the LengthAllowShared() and
+   // DataAllowShared() accessors instead.
+@@ -168,32 +130,21 @@ public:
+     return mLength;
+   }
+ 
+   inline uint32_t LengthAllowShared() const {
+     MOZ_ASSERT(mComputed);
+     return mLength;
+   }
+ 
+-  inline JSObject *Obj() const {
+-    MOZ_ASSERT(inited());
+-    return mWrappedObj;
+-  }
+-
+-  inline bool WrapIntoNewCompartment(JSContext* cx)
+-  {
+-    return JS_WrapObject(cx,
+-      JS::MutableHandle<JSObject*>::fromMarkedLocation(&mWrappedObj));
+-  }
+-
+   inline void ComputeLengthAndData() const
+   {
+     MOZ_ASSERT(inited());
+     MOZ_ASSERT(!mComputed);
+-    GetLengthAndDataAndSharedness(mTypedObj, &mLength, &mShared, &mData);
++    GetLengthAndDataAndSharedness(mImplObj, &mLength, &mShared, &mData);
+     mComputed = true;
+   }
+ 
+ private:
+   TypedArray_base(const TypedArray_base&) = delete;
+ };
+ 
+ template<typename T,
+@@ -358,83 +309,12 @@ class TypedArrayCreator
+     {
+       return TypedArrayType::Create(aCx, mArray.Length(), mArray.Elements());
+     }
+ 
+   private:
+     const ArrayType& mArray;
+ };
+ 
+-// A class for rooting an existing TypedArray struct
+-template<typename ArrayType>
+-class MOZ_RAII TypedArrayRooter : private JS::CustomAutoRooter
+-{
+-public:
+-  template <typename CX>
+-  TypedArrayRooter(const CX& cx,
+-                   ArrayType* aArray MOZ_GUARD_OBJECT_NOTIFIER_PARAM) :
+-    JS::CustomAutoRooter(cx MOZ_GUARD_OBJECT_NOTIFIER_PARAM_TO_PARENT),
+-    mArray(aArray)
+-  {
+-  }
+-
+-  virtual void trace(JSTracer* trc) override
+-  {
+-    mArray->TraceSelf(trc);
+-  }
+-
+-private:
+-  TypedArrayObjectStorage* const mArray;
+-};
+-
+-// And a specialization for dealing with nullable typed arrays
+-template<typename Inner> struct Nullable;
+-template<typename ArrayType>
+-class MOZ_RAII TypedArrayRooter<Nullable<ArrayType> > :
+-    private JS::CustomAutoRooter
+-{
+-public:
+-  template <typename CX>
+-  TypedArrayRooter(const CX& cx,
+-                   Nullable<ArrayType>* aArray MOZ_GUARD_OBJECT_NOTIFIER_PARAM) :
+-    JS::CustomAutoRooter(cx MOZ_GUARD_OBJECT_NOTIFIER_PARAM_TO_PARENT),
+-    mArray(aArray)
+-  {
+-  }
+-
+-  virtual void trace(JSTracer* trc) override
+-  {
+-    if (!mArray->IsNull()) {
+-      mArray->Value().TraceSelf(trc);
+-    }
+-  }
+-
+-private:
+-  Nullable<ArrayType>* const mArray;
+-};
+-
+-// Class for easily setting up a rooted typed array object on the stack
+-template<typename ArrayType>
+-class MOZ_RAII RootedTypedArray final : public ArrayType,
+-                                        private TypedArrayRooter<ArrayType>
+-{
+-public:
+-  template <typename CX>
+-  explicit RootedTypedArray(const CX& cx MOZ_GUARD_OBJECT_NOTIFIER_PARAM) :
+-    ArrayType(),
+-    TypedArrayRooter<ArrayType>(cx, this
+-                                MOZ_GUARD_OBJECT_NOTIFIER_PARAM_TO_PARENT)
+-  {
+-  }
+-
+-  template <typename CX>
+-  RootedTypedArray(const CX& cx, JSObject* obj MOZ_GUARD_OBJECT_NOTIFIER_PARAM) :
+-    ArrayType(obj),
+-    TypedArrayRooter<ArrayType>(cx, this
+-                                MOZ_GUARD_OBJECT_NOTIFIER_PARAM_TO_PARENT)
+-  {
+-  }
+-};
+-
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif /* mozilla_dom_TypedArray_h */
+diff --git a/dom/bindings/moz.build b/dom/bindings/moz.build
+--- a/dom/bindings/moz.build
++++ b/dom/bindings/moz.build
+@@ -39,19 +39,21 @@ EXPORTS.mozilla.dom += [
+     'Errors.msg',
+     'Exceptions.h',
+     'FakeString.h',
+     'IterableIterator.h',
+     'JSSlots.h',
+     'NonRefcountedDOMObject.h',
+     'Nullable.h',
+     'PrimitiveConversions.h',
++    'ReadableStream.h',
+     'Record.h',
+     'RootedDictionary.h',
+     'SimpleGlobalObject.h',
++    'SpiderMonkeyInterface.h',
+     'StructuredClone.h',
+     'ToJSValue.h',
+     'TypedArray.h',
+     'UnionMember.h',
+     'WebIDLGlobalNameHash.h',
+     'XrayExpandoClass.h',
+ ]
+ 
+diff --git a/dom/bindings/parser/WebIDL.py b/dom/bindings/parser/WebIDL.py
+--- a/dom/bindings/parser/WebIDL.py
++++ b/dom/bindings/parser/WebIDL.py
+@@ -2063,16 +2063,19 @@ class IDLType(IDLObject):
+         return self.name == "Void"
+ 
+     def isSequence(self):
+         return False
+ 
+     def isRecord(self):
+         return False
+ 
++    def isReadableStream(self):
++        return False
++
+     def isArrayBuffer(self):
+         return False
+ 
+     def isArrayBufferView(self):
+         return False
+ 
+     def isSharedArrayBuffer(self):
+         return False
+@@ -2090,22 +2093,22 @@ class IDLType(IDLObject):
+         """ Returns a boolean indicating whether this type is an 'interface'
+             type that is implemented in Gecko. At the moment, this returns
+             true for all interface types that are not types from the TypedArray
+             spec."""
+         return self.isInterface() and not self.isSpiderMonkeyInterface()
+ 
+     def isSpiderMonkeyInterface(self):
+         """ Returns a boolean indicating whether this type is an 'interface'
+-            type that is implemented in Spidermonkey.  At the moment, this
+-            only returns true for the types from the TypedArray spec. """
++            type that is implemented in SpiderMonkey. """
+         return self.isInterface() and (self.isArrayBuffer() or
+                                        self.isArrayBufferView() or
+                                        self.isSharedArrayBuffer() or
+-                                       self.isTypedArray())
++                                       self.isTypedArray() or
++                                       self.isReadableStream())
+ 
+     def isDictionary(self):
+         return False
+ 
+     def isInterface(self):
+         return False
+ 
+     def isAny(self):
+@@ -2288,16 +2291,19 @@ class IDLNullableType(IDLParametrizedTyp
+         return False
+ 
+     def isSequence(self):
+         return self.inner.isSequence()
+ 
+     def isRecord(self):
+         return self.inner.isRecord()
+ 
++    def isReadableStream(self):
++        return self.inner.isReadableStream()
++
+     def isArrayBuffer(self):
+         return self.inner.isArrayBuffer()
+ 
+     def isArrayBufferView(self):
+         return self.inner.isArrayBufferView()
+ 
+     def isSharedArrayBuffer(self):
+         return self.inner.isSharedArrayBuffer()
+@@ -2647,16 +2653,19 @@ class IDLTypedefType(IDLType):
+         return self.inner.isVoid()
+ 
+     def isSequence(self):
+         return self.inner.isSequence()
+ 
+     def isRecord(self):
+         return self.inner.isRecord()
+ 
++    def isReadableStream(self):
++        return self.inner.isReadableStream()
++
+     def isDictionary(self):
+         return self.inner.isDictionary()
+ 
+     def isArrayBuffer(self):
+         return self.inner.isArrayBuffer()
+ 
+     def isArrayBufferView(self):
+         return self.inner.isArrayBufferView()
+@@ -2961,17 +2970,18 @@ class IDLBuiltinType(IDLType):
+         'Int8Array',
+         'Uint8Array',
+         'Uint8ClampedArray',
+         'Int16Array',
+         'Uint16Array',
+         'Int32Array',
+         'Uint32Array',
+         'Float32Array',
+-        'Float64Array'
++        'Float64Array',
++        'ReadableStream',
+         )
+ 
+     TagLookup = {
+         Types.byte: IDLType.Tags.int8,
+         Types.octet: IDLType.Tags.uint8,
+         Types.short: IDLType.Tags.int16,
+         Types.unsigned_short: IDLType.Tags.uint16,
+         Types.long: IDLType.Tags.int32,
+@@ -2996,17 +3006,18 @@ class IDLBuiltinType(IDLType):
+         Types.Int8Array: IDLType.Tags.interface,
+         Types.Uint8Array: IDLType.Tags.interface,
+         Types.Uint8ClampedArray: IDLType.Tags.interface,
+         Types.Int16Array: IDLType.Tags.interface,
+         Types.Uint16Array: IDLType.Tags.interface,
+         Types.Int32Array: IDLType.Tags.interface,
+         Types.Uint32Array: IDLType.Tags.interface,
+         Types.Float32Array: IDLType.Tags.interface,
+-        Types.Float64Array: IDLType.Tags.interface
++        Types.Float64Array: IDLType.Tags.interface,
++        Types.ReadableStream: IDLType.Tags.interface,
+     }
+ 
+     def __init__(self, location, name, type):
+         IDLType.__init__(self, location, name)
+         self.builtin = True
+         self._typeTag = type
+ 
+     def isPrimitive(self):
+@@ -3043,24 +3054,28 @@ class IDLBuiltinType(IDLType):
+ 
+     def isSharedArrayBuffer(self):
+         return self._typeTag == IDLBuiltinType.Types.SharedArrayBuffer
+ 
+     def isTypedArray(self):
+         return (self._typeTag >= IDLBuiltinType.Types.Int8Array and
+                 self._typeTag <= IDLBuiltinType.Types.Float64Array)
+ 
++    def isReadableStream(self):
++        return self._typeTag == IDLBuiltinType.Types.ReadableStream
++
+     def isInterface(self):
+         # TypedArray things are interface types per the TypedArray spec,
+         # but we handle them as builtins because SpiderMonkey implements
+         # all of it internally.
+         return (self.isArrayBuffer() or
+                 self.isArrayBufferView() or
+                 self.isSharedArrayBuffer() or
+-                self.isTypedArray())
++                self.isTypedArray() or
++                self.isReadableStream())
+ 
+     def isNonCallbackInterface(self):
+         # All the interfaces we can be are non-callback
+         return self.isInterface()
+ 
+     def isFloat(self):
+         return (self._typeTag == IDLBuiltinType.Types.float or
+                 self._typeTag == IDLBuiltinType.Types.double or
+@@ -3120,16 +3135,17 @@ class IDLBuiltinType(IDLType):
+         return (other.isPrimitive() or other.isString() or other.isEnum() or
+                 other.isCallback() or other.isDictionary() or
+                 other.isSequence() or other.isRecord() or other.isDate() or
+                 (other.isInterface() and (
+                  # ArrayBuffer is distinguishable from everything
+                  # that's not an ArrayBuffer or a callback interface
+                  (self.isArrayBuffer() and not other.isArrayBuffer()) or
+                  (self.isSharedArrayBuffer() and not other.isSharedArrayBuffer()) or
++                 (self.isReadableStream() and not other.isReadableStream()) or
+                  # ArrayBufferView is distinguishable from everything
+                  # that's not an ArrayBufferView or typed array.
+                  (self.isArrayBufferView() and not other.isArrayBufferView() and
+                   not other.isTypedArray()) or
+                  # Typed arrays are distinguishable from everything
+                  # except ArrayBufferView and the same type of typed
+                  # array
+                  (self.isTypedArray() and not other.isArrayBufferView() and not
+@@ -3229,17 +3245,20 @@ BuiltinTypes = {
+     IDLBuiltinType.Types.Uint32Array:
+         IDLBuiltinType(BuiltinLocation("<builtin type>"), "Uint32Array",
+                        IDLBuiltinType.Types.Uint32Array),
+     IDLBuiltinType.Types.Float32Array:
+         IDLBuiltinType(BuiltinLocation("<builtin type>"), "Float32Array",
+                        IDLBuiltinType.Types.Float32Array),
+     IDLBuiltinType.Types.Float64Array:
+         IDLBuiltinType(BuiltinLocation("<builtin type>"), "Float64Array",
+-                       IDLBuiltinType.Types.Float64Array)
++                       IDLBuiltinType.Types.Float64Array),
++    IDLBuiltinType.Types.ReadableStream:
++        IDLBuiltinType(BuiltinLocation("<builtin type>"), "ReadableStream",
++                       IDLBuiltinType.Types.ReadableStream),
+ }
+ 
+ 
+ integerTypeSizes = {
+     IDLBuiltinType.Types.byte: (-128, 127),
+     IDLBuiltinType.Types.octet:  (0, 255),
+     IDLBuiltinType.Types.short: (-32768, 32767),
+     IDLBuiltinType.Types.unsigned_short: (0, 65535),
+@@ -5284,17 +5303,18 @@ class Tokenizer(object):
+         "<": "LT",
+         ">": "GT",
+         "ArrayBuffer": "ARRAYBUFFER",
+         "SharedArrayBuffer": "SHAREDARRAYBUFFER",
+         "or": "OR",
+         "maplike": "MAPLIKE",
+         "setlike": "SETLIKE",
+         "iterable": "ITERABLE",
+-        "namespace": "NAMESPACE"
++        "namespace": "NAMESPACE",
++        "ReadableStream": "READABLESTREAM",
+         }
+ 
+     tokens.extend(keywords.values())
+ 
+     def t_error(self, t):
+         raise WebIDLError("Unrecognized Input",
+                           [Location(lexer=self.lexer,
+                                     lineno=self.lexer.lineno,
+@@ -6472,24 +6492,27 @@ class Parser(Tokenizer):
+         """
+         p[0] = []
+ 
+     def p_NonAnyType(self, p):
+         """
+             NonAnyType : PrimitiveType Null
+                        | ARRAYBUFFER Null
+                        | SHAREDARRAYBUFFER Null
++                       | READABLESTREAM Null
+                        | OBJECT Null
+         """
+         if p[1] == "object":
+             type = BuiltinTypes[IDLBuiltinType.Types.object]
+         elif p[1] == "ArrayBuffer":
+             type = BuiltinTypes[IDLBuiltinType.Types.ArrayBuffer]
+         elif p[1] == "SharedArrayBuffer":
+             type = BuiltinTypes[IDLBuiltinType.Types.SharedArrayBuffer]
++        elif p[1] == "ReadableStream":
++            type = BuiltinTypes[IDLBuiltinType.Types.ReadableStream]
+         else:
+             type = BuiltinTypes[p[1]]
+ 
+         p[0] = self.handleNullable(type, p[2])
+ 
+     def p_NonAnyTypeStringType(self, p):
+         """
+             NonAnyType : StringType Null
+diff --git a/dom/canvas/CanvasRenderingContext2D.cpp b/dom/canvas/CanvasRenderingContext2D.cpp
+--- a/dom/canvas/CanvasRenderingContext2D.cpp
++++ b/dom/canvas/CanvasRenderingContext2D.cpp
+@@ -5956,33 +5956,33 @@ CanvasRenderingContext2D::FillRuleChange
+     mPath = nullptr;
+   }
+ }
+ 
+ void
+ CanvasRenderingContext2D::PutImageData(ImageData& aImageData, double aDx,
+                                        double aDy, ErrorResult& aError)
+ {
+-  RootedTypedArray<Uint8ClampedArray> arr(RootingCx());
++  RootedSpiderMonkeyInterface<Uint8ClampedArray> arr(RootingCx());
+   DebugOnly<bool> inited = arr.Init(aImageData.GetDataObject());
+   MOZ_ASSERT(inited);
+ 
+   aError = PutImageData_explicit(JS::ToInt32(aDx), JS::ToInt32(aDy),
+                                 aImageData.Width(), aImageData.Height(),
+                                 &arr, false, 0, 0, 0, 0);
+ }
+ 
+ void
+ CanvasRenderingContext2D::PutImageData(ImageData& aImageData, double aDx,
+                                        double aDy, double aDirtyX,
+                                        double aDirtyY, double aDirtyWidth,
+                                        double aDirtyHeight,
+                                        ErrorResult& aError)
+ {
+-  RootedTypedArray<Uint8ClampedArray> arr(RootingCx());
++  RootedSpiderMonkeyInterface<Uint8ClampedArray> arr(RootingCx());
+   DebugOnly<bool> inited = arr.Init(aImageData.GetDataObject());
+   MOZ_ASSERT(inited);
+ 
+   aError = PutImageData_explicit(JS::ToInt32(aDx), JS::ToInt32(aDy),
+                                 aImageData.Width(), aImageData.Height(),
+                                 &arr, true,
+                                 JS::ToInt32(aDirtyX),
+                                 JS::ToInt32(aDirtyY),
+diff --git a/dom/canvas/WebGLTextureUpload.cpp b/dom/canvas/WebGLTextureUpload.cpp
+--- a/dom/canvas/WebGLTextureUpload.cpp
++++ b/dom/canvas/WebGLTextureUpload.cpp
+@@ -450,33 +450,33 @@ ValidateTexOrSubImage(WebGLContext* webg
+ }
+ 
+ void
+ WebGLTexture::TexImage(const char* funcName, TexImageTarget target, GLint level,
+                        GLenum internalFormat, GLsizei width, GLsizei height,
+                        GLsizei depth, GLint border, const webgl::PackingInfo& pi,
+                        const TexImageSource& src)
+ {
+-    dom::RootedTypedArray<dom::Uint8ClampedArray> scopedArr(dom::RootingCx());
++    dom::RootedSpiderMonkeyInterface<dom::Uint8ClampedArray> scopedArr(dom::RootingCx());
+     const auto blob = ValidateTexOrSubImage(mContext, funcName, target, width, height,
+                                             depth, border, pi, src, &scopedArr);
+     if (!blob)
+         return;
+ 
+     TexImage(funcName, target, level, internalFormat, pi, blob.get());
+ }
+ 
+ void
+ WebGLTexture::TexSubImage(const char* funcName, TexImageTarget target, GLint level,
+                           GLint xOffset, GLint yOffset, GLint zOffset, GLsizei width,
+                           GLsizei height, GLsizei depth,
+                           const webgl::PackingInfo& pi, const TexImageSource& src)
+ {
+     const GLint border = 0;
+-    dom::RootedTypedArray<dom::Uint8ClampedArray> scopedArr(dom::RootingCx());
++    dom::RootedSpiderMonkeyInterface<dom::Uint8ClampedArray> scopedArr(dom::RootingCx());
+     const auto blob = ValidateTexOrSubImage(mContext, funcName, target, width, height,
+                                             depth, border, pi, src, &scopedArr);
+     if (!blob)
+         return;
+ 
+     if (!blob->HasData()) {
+         mContext->ErrorInvalidValue("%s: Source must not be null.", funcName);
+         return;
+diff --git a/dom/crypto/WebCryptoTask.cpp b/dom/crypto/WebCryptoTask.cpp
+--- a/dom/crypto/WebCryptoTask.cpp
++++ b/dom/crypto/WebCryptoTask.cpp
+@@ -1442,26 +1442,26 @@ public:
+     return true;
+   }
+ 
+   void SetKeyData(JSContext* aCx, JS::Handle<JSObject*> aKeyData)
+   {
+     mDataIsJwk = false;
+ 
+     // Try ArrayBuffer
+-    RootedTypedArray<ArrayBuffer> ab(aCx);
++    RootedSpiderMonkeyInterface<ArrayBuffer> ab(aCx);
+     if (ab.Init(aKeyData)) {
+       if (!mKeyData.Assign(ab)) {
+         mEarlyRv = NS_ERROR_DOM_OPERATION_ERR;
+       }
+       return;
+     }
+ 
+     // Try ArrayBufferView
+-    RootedTypedArray<ArrayBufferView> abv(aCx);
++    RootedSpiderMonkeyInterface<ArrayBufferView> abv(aCx);
+     if (abv.Init(aKeyData)) {
+       if (!mKeyData.Assign(abv)) {
+         mEarlyRv = NS_ERROR_DOM_OPERATION_ERR;
+       }
+       return;
+     }
+ 
+     // Try JWK
+diff --git a/dom/network/TCPSocketParent.cpp b/dom/network/TCPSocketParent.cpp
+--- a/dom/network/TCPSocketParent.cpp
++++ b/dom/network/TCPSocketParent.cpp
+@@ -279,17 +279,17 @@ TCPSocketParent::RecvData(const Sendable
+ 
+   switch (aData.type()) {
+     case SendableData::TArrayOfuint8_t: {
+       AutoSafeJSContext autoCx;
+       JS::Rooted<JS::Value> val(autoCx);
+       const nsTArray<uint8_t>& buffer = aData.get_ArrayOfuint8_t();
+       bool ok = IPC::DeserializeArrayBuffer(autoCx, buffer, &val);
+       NS_ENSURE_TRUE(ok, IPC_OK());
+-      RootedTypedArray<ArrayBuffer> data(autoCx);
++      RootedSpiderMonkeyInterface<ArrayBuffer> data(autoCx);
+       data.Init(&val.toObject());
+       Optional<uint32_t> byteLength(buffer.Length());
+       mSocket->SendWithTrackingNumber(autoCx, data, 0, byteLength, aTrackingNumber, rv);
+       break;
+     }
+ 
+     case SendableData::TnsCString: {
+       const nsCString& strData = aData.get_nsCString();
+diff --git a/dom/xhr/XMLHttpRequestMainThread.cpp b/dom/xhr/XMLHttpRequestMainThread.cpp
+--- a/dom/xhr/XMLHttpRequestMainThread.cpp
++++ b/dom/xhr/XMLHttpRequestMainThread.cpp
+@@ -2895,17 +2895,17 @@ XMLHttpRequestMainThread::Send(nsIVarian
+ 
+     // ArrayBuffer?
+     JS::RootingContext* rootingCx = RootingCx();
+     JS::Rooted<JS::Value> realVal(rootingCx);
+ 
+     nsresult rv = aVariant->GetAsJSVal(&realVal);
+     if (NS_SUCCEEDED(rv) && !realVal.isPrimitive()) {
+       JS::Rooted<JSObject*> obj(rootingCx, realVal.toObjectOrNull());
+-      RootedTypedArray<ArrayBuffer> buf(rootingCx);
++      RootedSpiderMonkeyInterface<ArrayBuffer> buf(rootingCx);
+       if (buf.Init(obj)) {
+         BodyExtractor<const ArrayBuffer> body(&buf);
+         return SendInternal(&body);
+       }
+     }
+   } else if (dataType == nsIDataType::VTYPE_VOID ||
+            dataType == nsIDataType::VTYPE_EMPTY) {
+     return SendInternal(nullptr);
+diff --git a/js/src/builtin/Stream.cpp b/js/src/builtin/Stream.cpp
+--- a/js/src/builtin/Stream.cpp
++++ b/js/src/builtin/Stream.cpp
+@@ -5465,8 +5465,16 @@ ReadableStream::tee(JSContext* cx, Handl
+ MOZ_MUST_USE NativeObject*
+ ReadableStream::getReader(JSContext* cx, Handle<ReadableStream*> stream,
+                           JS::ReadableStreamReaderMode mode)
+ {
+     if (mode == JS::ReadableStreamReaderMode::Default)
+         return CreateReadableStreamDefaultReader(cx, stream);
+     return CreateReadableStreamBYOBReader(cx, stream);
+ }
++
++JS_FRIEND_API(JSObject*)
++js::UnwrapReadableStream(JSObject* obj)
++{
++    if (JSObject* unwrapped = CheckedUnwrap(obj))
++        return unwrapped->is<ReadableStream>() ? unwrapped : nullptr;
++    return nullptr;
++}
+diff --git a/js/src/jsfriendapi.h b/js/src/jsfriendapi.h
+--- a/js/src/jsfriendapi.h
++++ b/js/src/jsfriendapi.h
+@@ -1852,16 +1852,19 @@ extern JS_FRIEND_API(JSObject*)
+ UnwrapArrayBuffer(JSObject* obj);
+ 
+ extern JS_FRIEND_API(JSObject*)
+ UnwrapArrayBufferView(JSObject* obj);
+ 
+ extern JS_FRIEND_API(JSObject*)
+ UnwrapSharedArrayBuffer(JSObject* obj);
+ 
++extern JS_FRIEND_API(JSObject*)
++UnwrapReadableStream(JSObject* obj);
++
+ 
+ namespace detail {
+ 
+ extern JS_FRIEND_DATA(const Class* const) Int8ArrayClassPtr;
+ extern JS_FRIEND_DATA(const Class* const) Uint8ArrayClassPtr;
+ extern JS_FRIEND_DATA(const Class* const) Uint8ClampedArrayClassPtr;
+ extern JS_FRIEND_DATA(const Class* const) Int16ArrayClassPtr;
+ extern JS_FRIEND_DATA(const Class* const) Uint16ArrayClassPtr;

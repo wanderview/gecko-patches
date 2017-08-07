@@ -1,0 +1,545 @@
+# HG changeset patch
+# User Andrea Marchesini <amarchesini@mozilla.com>
+# Parent  b7f1a67953a1b8707dac0a7b55f504fc64448cd2
+
+diff --git a/dom/base/nsContentUtils.cpp b/dom/base/nsContentUtils.cpp
+--- a/dom/base/nsContentUtils.cpp
++++ b/dom/base/nsContentUtils.cpp
+@@ -36,16 +36,18 @@
+ #include "mozilla/AutoTimelineMarker.h"
+ #include "mozilla/Base64.h"
+ #include "mozilla/CheckedInt.h"
+ #include "mozilla/DebugOnly.h"
+ #include "mozilla/LoadInfo.h"
+ #include "mozilla/dom/ContentChild.h"
+ #include "mozilla/dom/CustomElementRegistry.h"
+ #include "mozilla/dom/DocumentFragment.h"
++#include "mozilla/dom/DOMException.h"
++#include "mozilla/dom/DOMExceptionBinding.h"
+ #include "mozilla/dom/DOMTypes.h"
+ #include "mozilla/dom/Element.h"
+ #include "mozilla/dom/FileSystemSecurity.h"
+ #include "mozilla/dom/FileBlobImpl.h"
+ #include "mozilla/dom/HTMLInputElement.h"
+ #include "mozilla/dom/HTMLMediaElement.h"
+ #include "mozilla/dom/HTMLTemplateElement.h"
+ #include "mozilla/dom/HTMLContentElement.h"
+@@ -10722,8 +10724,78 @@ NS_IMPL_ISUPPORTS(nsContentUtils::UserIn
+ nsContentUtils::IsOverridingWindowName(const nsAString& aName)
+ {
+   return !aName.IsEmpty() &&
+     !aName.LowerCaseEqualsLiteral("_blank") &&
+     !aName.LowerCaseEqualsLiteral("_top") &&
+     !aName.LowerCaseEqualsLiteral("_parent") &&
+     !aName.LowerCaseEqualsLiteral("_self");
+ }
++
++/* static */ void
++nsContentUtils::ExtractErrorValues(JSContext* aCx,
++                                   JS::Handle<JS::Value> aValue,
++                                   nsACString& aSourceSpecOut,
++                                   uint32_t* aLineOut,
++                                   uint32_t* aColumnOut,
++                                   nsString& aMessageOut)
++{
++  MOZ_ASSERT(aLineOut);
++  MOZ_ASSERT(aColumnOut);
++
++  if (aValue.isObject()) {
++    JS::Rooted<JSObject*> obj(aCx, &aValue.toObject());
++    RefPtr<dom::DOMException> domException;
++
++    // Try to process as an Error object.  Use the file/line/column values
++    // from the Error as they will be more specific to the root cause of
++    // the problem.
++    JSErrorReport* err = obj ? JS_ErrorFromException(aCx, obj) : nullptr;
++    if (err) {
++      // Use xpc to extract the error message only.  We don't actually send
++      // this report anywhere.
++      RefPtr<xpc::ErrorReport> report = new xpc::ErrorReport();
++      report->Init(err,
++                   "<unknown>", // toString result
++                   false,       // chrome
++                   0);          // window ID
++
++      if (!report->mFileName.IsEmpty()) {
++        CopyUTF16toUTF8(report->mFileName, aSourceSpecOut);
++        *aLineOut = report->mLineNumber;
++        *aColumnOut = report->mColumn;
++      }
++      aMessageOut.Assign(report->mErrorMsg);
++    }
++
++    // Next, try to unwrap the rejection value as a DOMException.
++    else if(NS_SUCCEEDED(UNWRAP_OBJECT(DOMException, obj, domException))) {
++
++      nsAutoString filename;
++      domException->GetFilename(aCx, filename);
++      if (!filename.IsEmpty()) {
++        CopyUTF16toUTF8(filename, aSourceSpecOut);
++        *aLineOut = domException->LineNumber(aCx);
++        *aColumnOut = domException->ColumnNumber();
++      }
++
++      domException->GetName(aMessageOut);
++      aMessageOut.AppendLiteral(": ");
++
++      nsAutoString message;
++      domException->GetMessageMoz(message);
++      aMessageOut.Append(message);
++    }
++  }
++
++  // If we could not unwrap a specific error type, then perform default safe
++  // string conversions on primitives.  Objects will result in "[Object]"
++  // unfortunately.
++  if (aMessageOut.IsEmpty()) {
++    nsAutoJSString jsString;
++    if (jsString.init(aCx, aValue)) {
++      aMessageOut = jsString;
++    } else {
++      JS_ClearPendingException(aCx);
++    }
++  }
++}
++
+diff --git a/dom/base/nsContentUtils.h b/dom/base/nsContentUtils.h
+--- a/dom/base/nsContentUtils.h
++++ b/dom/base/nsContentUtils.h
+@@ -1078,16 +1078,21 @@ public:
+ 
+   /**
+    * Helper function that generates a UUID.
+    */
+   static nsresult GenerateUUIDInPlace(nsID& aUUID);
+ 
+   static bool PrefetchPreloadEnabled(nsIDocShell* aDocShell);
+ 
++  static void
++  ExtractErrorValues(JSContext* aCx, JS::Handle<JS::Value> aValue,
++                     nsACString& aSourceSpecOut, uint32_t *aLineOut,
++                     uint32_t *aColumnOut, nsString& aMessageOut);
++
+   /**
+    * Fill (with the parameters given) the localized string named |aKey| in
+    * properties file |aFile|.
+    */
+ private:
+   static nsresult FormatLocalizedString(PropertiesFile aFile,
+                                         const char* aKey,
+                                         const char16_t** aParams,
+diff --git a/dom/fetch/Fetch.h b/dom/fetch/Fetch.h
+--- a/dom/fetch/Fetch.h
++++ b/dom/fetch/Fetch.h
+@@ -206,17 +206,17 @@ public:
+   // Note that JSContext is used only if there is a ReadableStream (this can
+   // happen because the body is a ReadableStream or because attribute body has
+   // already been used by content). If something goes wrong using
+   // ReadableStream, errors will be reported via ErrorResult and not as JS
+   // exceptions in JSContext. This is done in order to have a centralized error
+   // reporting way.
+   //
+   // Exceptions generated when reading from the ReadableStream are directly sent
+-  // to the Console (NOTE FOR THE REVIEWER: this is part of patch 16)
++  // to the Console.
+   void
+   SetBodyUsed(JSContext* aCx, ErrorResult& aRv);
+ 
+   const nsCString&
+   MimeType() const
+   {
+     return mMimeType;
+   }
+diff --git a/dom/fetch/FetchStreamReader.cpp b/dom/fetch/FetchStreamReader.cpp
+--- a/dom/fetch/FetchStreamReader.cpp
++++ b/dom/fetch/FetchStreamReader.cpp
+@@ -2,16 +2,21 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "FetchStreamReader.h"
+ #include "InternalResponse.h"
+ #include "mozilla/dom/PromiseBinding.h"
++#include "mozilla/SystemGroup.h"
++#include "mozilla/TaskCategory.h"
++#include "nsContentUtils.h"
++#include "nsIScriptError.h"
++#include "nsPIDOMWindow.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ using namespace workers;
+ 
+ namespace {
+ 
+@@ -292,13 +297,62 @@ FetchStreamReader::WriteBuffer()
+ 
+   return NS_OK;
+ }
+ 
+ void
+ FetchStreamReader::RejectedCallback(JSContext* aCx,
+                                     JS::Handle<JS::Value> aValue)
+ {
++  ReportErrorToConsole(aCx, aValue);
+   CloseAndRelease(NS_ERROR_FAILURE);
+ }
+ 
++void
++FetchStreamReader::ReportErrorToConsole(JSContext* aCx,
++                                        JS::Handle<JS::Value> aValue)
++{
++  nsCString sourceSpec;
++  uint32_t line = 0;
++  uint32_t column = 0;
++  nsString valueString;
++
++  nsContentUtils::ExtractErrorValues(aCx, aValue, sourceSpec, &line,
++                                     &column, valueString);
++
++  nsTArray<nsString> params;
++  params.AppendElement(valueString);
++
++  RefPtr<ConsoleReportCollector> reporter = new ConsoleReportCollector();
++  reporter->AddConsoleReport(nsIScriptError::errorFlag,
++                             NS_LITERAL_CSTRING("ReadableStreamReader.read"),
++                             nsContentUtils::eDOM_PROPERTIES,
++                             sourceSpec, line, column,
++                             NS_LITERAL_CSTRING("ReadableStreamReadingFailed"),
++                             params);
++
++  uint64_t innerWindowId = 0;
++
++  if (NS_IsMainThread()) {
++    nsCOMPtr<nsPIDOMWindowInner> window = do_QueryInterface(mGlobal);
++    if (window) {
++      innerWindowId = window->WindowID();
++    }
++    reporter->FlushReportsToConsole(innerWindowId);
++    return;
++  }
++
++  WorkerPrivate* workerPrivate = GetWorkerPrivateFromContext(aCx);
++  if (workerPrivate) {
++    innerWindowId = workerPrivate->WindowID();
++  }
++
++  RefPtr<Runnable> r = NS_NewRunnableFunction(
++    "FetchStreamReader::ReportErrorToConsole",
++    [reporter, innerWindowId] () {
++      reporter->FlushReportsToConsole(innerWindowId);
++    });
++
++  workerPrivate->DispatchToMainThread(r.forget());
++}
++
+ } // dom namespace
+ } // mozilla namespace
+diff --git a/dom/fetch/FetchStreamReader.h b/dom/fetch/FetchStreamReader.h
+--- a/dom/fetch/FetchStreamReader.h
++++ b/dom/fetch/FetchStreamReader.h
+@@ -50,16 +50,19 @@ public:
+ 
+ private:
+   explicit FetchStreamReader(nsIGlobalObject* aGlobal);
+   ~FetchStreamReader();
+ 
+   nsresult
+   WriteBuffer();
+ 
++  void
++  ReportErrorToConsole(JSContext* aCx, JS::Handle<JS::Value> aValue);
++
+   nsCOMPtr<nsIGlobalObject> mGlobal;
+   nsCOMPtr<nsIEventTarget> mOwningEventTarget;
+ 
+   nsCOMPtr<nsIAsyncOutputStream> mPipeOut;
+ 
+   UniquePtr<workers::WorkerHolder> mWorkerHolder;
+ 
+   JS::Heap<JSObject*> mReader;
+diff --git a/dom/locales/en-US/chrome/dom/dom.properties b/dom/locales/en-US/chrome/dom/dom.properties
+--- a/dom/locales/en-US/chrome/dom/dom.properties
++++ b/dom/locales/en-US/chrome/dom/dom.properties
+@@ -343,8 +343,10 @@ ScriptSourceInvalidUri=‘%S’ attribut
+ # LOCALIZATION NOTE: Do not translate "<script>".
+ ScriptSourceLoadFailed=Loading failed for the <script> with source “%S”.
+ # LOCALIZATION NOTE: Do not translate "<script>".
+ ScriptSourceMalformed=<script> source URI is malformed: “%S”.
+ # LOCALIZATION NOTE: Do not translate "<script>".
+ ScriptSourceNotAllowed=<script> source URI is not allowed in this document: “%S”.
+ # LOCALIZATION NOTE: %1$S is the invalid property value and %2$S is the property name.
+ InvalidKeyframePropertyValue=Keyframe property value “%1$S” is invalid according to the syntax for “%2$S”.
++# LOCALIZATION NOTE: Do not translate "ReadableStream".
++ReadableStreamReadingFailed=Failed to read data from the ReadableStream: “%S”.
+diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEvents.cpp
+--- a/dom/workers/ServiceWorkerEvents.cpp
++++ b/dom/workers/ServiceWorkerEvents.cpp
+@@ -2,16 +2,17 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "ServiceWorkerEvents.h"
+ 
+ #include "nsAutoPtr.h"
++#include "nsContentUtils.h"
+ #include "nsIConsoleReportCollector.h"
+ #include "nsIHttpChannelInternal.h"
+ #include "nsINetworkInterceptController.h"
+ #include "nsIOutputStream.h"
+ #include "nsIScriptError.h"
+ #include "nsITimedChannel.h"
+ #include "mozilla/Encoding.h"
+ #include "nsContentPolicyUtils.h"
+@@ -25,18 +26,16 @@
+ #include "nsQueryObject.h"
+ #include "ServiceWorkerClient.h"
+ #include "ServiceWorkerManager.h"
+ 
+ #include "mozilla/ErrorResult.h"
+ #include "mozilla/LoadInfo.h"
+ #include "mozilla/Preferences.h"
+ #include "mozilla/dom/BodyUtil.h"
+-#include "mozilla/dom/DOMException.h"
+-#include "mozilla/dom/DOMExceptionBinding.h"
+ #include "mozilla/dom/FetchEventBinding.h"
+ #include "mozilla/dom/MessagePort.h"
+ #include "mozilla/dom/PromiseNativeHandler.h"
+ #include "mozilla/dom/PushEventBinding.h"
+ #include "mozilla/dom/PushMessageDataBinding.h"
+ #include "mozilla/dom/PushUtil.h"
+ #include "mozilla/dom/Request.h"
+ #include "mozilla/dom/TypedArray.h"
+@@ -409,86 +408,16 @@ void RespondWithCopyComplete(void* aClos
+   WorkerPrivate* worker = GetCurrentThreadWorkerPrivate();
+   if (worker) {
+     MOZ_ALWAYS_SUCCEEDS(worker->DispatchToMainThread(event.forget()));
+   } else {
+     MOZ_ALWAYS_SUCCEEDS(NS_DispatchToMainThread(event.forget()));
+   }
+ }
+ 
+-namespace {
+-
+-void
+-ExtractErrorValues(JSContext* aCx, JS::Handle<JS::Value> aValue,
+-                  nsACString& aSourceSpecOut, uint32_t *aLineOut,
+-                  uint32_t *aColumnOut, nsString& aMessageOut)
+-{
+-  MOZ_ASSERT(aLineOut);
+-  MOZ_ASSERT(aColumnOut);
+-
+-  if (aValue.isObject()) {
+-    JS::Rooted<JSObject*> obj(aCx, &aValue.toObject());
+-    RefPtr<DOMException> domException;
+-
+-    // Try to process as an Error object.  Use the file/line/column values
+-    // from the Error as they will be more specific to the root cause of
+-    // the problem.
+-    JSErrorReport* err = obj ? JS_ErrorFromException(aCx, obj) : nullptr;
+-    if (err) {
+-      // Use xpc to extract the error message only.  We don't actually send
+-      // this report anywhere.
+-      RefPtr<xpc::ErrorReport> report = new xpc::ErrorReport();
+-      report->Init(err,
+-                   "<unknown>", // toString result
+-                   false,       // chrome
+-                   0);          // window ID
+-
+-      if (!report->mFileName.IsEmpty()) {
+-        CopyUTF16toUTF8(report->mFileName, aSourceSpecOut);
+-        *aLineOut = report->mLineNumber;
+-        *aColumnOut = report->mColumn;
+-      }
+-      aMessageOut.Assign(report->mErrorMsg);
+-    }
+-
+-    // Next, try to unwrap the rejection value as a DOMException.
+-    else if(NS_SUCCEEDED(UNWRAP_OBJECT(DOMException, obj, domException))) {
+-
+-      nsAutoString filename;
+-      domException->GetFilename(aCx, filename);
+-      if (!filename.IsEmpty()) {
+-        CopyUTF16toUTF8(filename, aSourceSpecOut);
+-        *aLineOut = domException->LineNumber(aCx);
+-        *aColumnOut = domException->ColumnNumber();
+-      }
+-
+-      domException->GetName(aMessageOut);
+-      aMessageOut.AppendLiteral(": ");
+-
+-      nsAutoString message;
+-      domException->GetMessageMoz(message);
+-      aMessageOut.Append(message);
+-    }
+-  }
+-
+-  // If we could not unwrap a specific error type, then perform default safe
+-  // string conversions on primitives.  Objects will result in "[Object]"
+-  // unfortunately.
+-  if (aMessageOut.IsEmpty()) {
+-    nsAutoJSString jsString;
+-    if (jsString.init(aCx, aValue)) {
+-      aMessageOut = jsString;
+-    } else {
+-      JS_ClearPendingException(aCx);
+-    }
+-  }
+-}
+-
+-} // anonymous namespace
+-
+ class MOZ_STACK_CLASS AutoCancel
+ {
+   RefPtr<RespondWithHandler> mOwner;
+   nsCString mSourceSpec;
+   uint32_t mLine;
+   uint32_t mColumn;
+   nsCString mMessageName;
+   nsTArray<nsString> mParams;
+@@ -601,32 +530,34 @@ RespondWithHandler::ResolvedCallback(JSC
+ 
+   if (!aValue.isObject()) {
+     NS_WARNING("FetchEvent::RespondWith was passed a promise resolved to a non-Object value");
+ 
+     nsCString sourceSpec;
+     uint32_t line = 0;
+     uint32_t column = 0;
+     nsString valueString;
+-    ExtractErrorValues(aCx, aValue, sourceSpec, &line, &column, valueString);
++    nsContentUtils::ExtractErrorValues(aCx, aValue, sourceSpec, &line, &column,
++                                       valueString);
+ 
+     autoCancel.SetCancelMessageAndLocation(sourceSpec, line, column,
+                                            NS_LITERAL_CSTRING("InterceptedNonResponseWithURL"),
+                                            mRequestURL, valueString);
+     return;
+   }
+ 
+   RefPtr<Response> response;
+   nsresult rv = UNWRAP_OBJECT(Response, &aValue.toObject(), response);
+   if (NS_FAILED(rv)) {
+     nsCString sourceSpec;
+     uint32_t line = 0;
+     uint32_t column = 0;
+     nsString valueString;
+-    ExtractErrorValues(aCx, aValue, sourceSpec, &line, &column, valueString);
++    nsContentUtils::ExtractErrorValues(aCx, aValue, sourceSpec, &line, &column,
++                                       valueString);
+ 
+     autoCancel.SetCancelMessageAndLocation(sourceSpec, line, column,
+                                            NS_LITERAL_CSTRING("InterceptedNonResponseWithURL"),
+                                            mRequestURL, valueString);
+     return;
+   }
+ 
+   WorkerPrivate* worker = GetCurrentThreadWorkerPrivate();
+@@ -766,17 +697,18 @@ RespondWithHandler::RejectedCallback(JSC
+ {
+   nsCString sourceSpec = mRespondWithScriptSpec;
+   uint32_t line = mRespondWithLineNumber;
+   uint32_t column = mRespondWithColumnNumber;
+   nsString valueString;
+ 
+   mInterceptedChannel->SetFinishResponseStart(TimeStamp::Now());
+ 
+-  ExtractErrorValues(aCx, aValue, sourceSpec, &line, &column, valueString);
++  nsContentUtils::ExtractErrorValues(aCx, aValue, sourceSpec, &line, &column,
++                                     valueString);
+ 
+   ::AsyncLog(mInterceptedChannel, sourceSpec, line, column,
+              NS_LITERAL_CSTRING("InterceptionRejectedResponseWithURL"),
+              mRequestURL, valueString);
+ 
+   CancelRequest(NS_ERROR_INTERCEPTION_FAILED);
+ }
+ 
+@@ -912,17 +844,18 @@ public:
+ 
+   void RejectedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue) override
+   {
+     mWorkerPrivate->AssertIsOnWorkerThread();
+ 
+     nsCString spec;
+     uint32_t line = 0;
+     uint32_t column = 0;
+-    ExtractErrorValues(aCx, aValue, spec, &line, &column, mRejectValue);
++    nsContentUtils::ExtractErrorValues(aCx, aValue, spec, &line, &column,
++                                       mRejectValue);
+ 
+     // only use the extracted location if we found one
+     if (!spec.IsEmpty()) {
+       mSourceSpec = spec;
+       mLine = line;
+       mColumn = column;
+     }
+ 
+diff --git a/dom/workers/test/serviceworkers/fetch/fetch_tests.js b/dom/workers/test/serviceworkers/fetch/fetch_tests.js
+--- a/dom/workers/test/serviceworkers/fetch/fetch_tests.js
++++ b/dom/workers/test/serviceworkers/fetch/fetch_tests.js
+@@ -144,16 +144,24 @@ fetchXHR('readable-stream-locked.txt', f
+ fetchXHR('readable-stream-with-exception.txt', function(xhr) {
+   my_ok(false, "This should not be called!");
+   finish();
+ }, function() {
+   my_ok(true, "The exception has been correctly handled!");
+   finish();
+ });
+ 
++fetchXHR('readable-stream-with-exception2.txt', function(xhr) {
++  my_ok(false, "This should not be called!");
++  finish();
++}, function() {
++  my_ok(true, "The exception has been correctly handled!");
++  finish();
++});
++
+ fetchXHR('readable-stream-already-consumed.txt', function(xhr) {
+   my_ok(false, "This should not be called!");
+   finish();
+ }, function() {
+   my_ok(true, "The exception has been correctly handled!");
+   finish();
+ });
+ 
+diff --git a/dom/workers/test/serviceworkers/fetch_event_worker.js b/dom/workers/test/serviceworkers/fetch_event_worker.js
+--- a/dom/workers/test/serviceworkers/fetch_event_worker.js
++++ b/dom/workers/test/serviceworkers/fetch_event_worker.js
+@@ -132,16 +132,32 @@ onfetch = function(ev) {
+           start(controller) {},
+           pull() {
+             throw "EXCEPTION!";
+           }
+         })
+     ));
+   }
+ 
++  else if (ev.request.url.includes("readable-stream-with-exception2.txt")) {
++    ev.respondWith(
++      new Response(
++        new ReadableStream({
++          _controller: null,
++          _count: 0,
++
++          start(controller) { this._controller = controller; },
++          pull() {
++            if (++this._count == 5) { throw "EXCEPTION 2!"; }
++            this._controller.enqueue(new Uint8Array([this._count]));
++          }
++        })
++    ));
++  }
++
+   else if (ev.request.url.includes("readable-stream-already-consumed.txt")) {
+     let r = new Response(
+         new ReadableStream({
+           start(controller) {
+             controller.enqueue(new Uint8Array([0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x21]));
+             controller.close();
+           }
+         }));

@@ -1,0 +1,1392 @@
+# HG changeset patch
+# User Andrea Marchesini <amarchesini@mozilla.com>
+# Parent  489db23ef91688f158d8f1f8dcfa9b9ce664a9c5
+Bug 1128959 - Implement the WHATWG Streams spec - part 12 - starting body consuming and passing the JSContext down from the binding entrypoints to where the ReadableStream could be read, r?bz
+
+This patch does 2 things:
+
+. when SetBodyUsed() is called, the pump for the stream reading is activated.
+
+. Just because of the reading of the stream could end up executing JS code, we
+  need to pass the JSContext in the correct state down to SetBodyUsed.
+
+diff --git a/dom/bindings/Bindings.conf b/dom/bindings/Bindings.conf
+--- a/dom/bindings/Bindings.conf
++++ b/dom/bindings/Bindings.conf
+@@ -107,21 +107,23 @@ DOMInterfaces = {
+     'headerFile': 'BatteryManager.h'
+ },
+ 
+ 'BoxObject': {
+     'resultNotAddRefed': ['element'],
+ },
+ 
+ 'Cache': {
+-    'implicitJSContext': [ 'add', 'addAll' ],
++    'implicitJSContext': [ 'add', 'addAll', 'match', 'matchAll', 'put',
++                           'delete', 'keys' ],
+     'nativeType': 'mozilla::dom::cache::Cache',
+ },
+ 
+ 'CacheStorage': {
++    'implicitJSContext': [ 'match' ],
+     'nativeType': 'mozilla::dom::cache::CacheStorage',
+ },
+ 
+ 'CanvasRenderingContext2D': {
+     'implicitJSContext': [
+         'createImageData', 'getImageData'
+     ],
+     'binaryNames': {
+diff --git a/dom/cache/AutoUtils.cpp b/dom/cache/AutoUtils.cpp
+--- a/dom/cache/AutoUtils.cpp
++++ b/dom/cache/AutoUtils.cpp
+@@ -285,19 +285,19 @@ MatchInPutList(InternalRequest* aRequest
+   }
+ 
+   return false;
+ }
+ 
+ } // namespace
+ 
+ void
+-AutoChildOpArgs::Add(InternalRequest* aRequest, BodyAction aBodyAction,
+-                     SchemeAction aSchemeAction, Response& aResponse,
+-                     ErrorResult& aRv)
++AutoChildOpArgs::Add(JSContext* aCx, InternalRequest* aRequest,
++                     BodyAction aBodyAction, SchemeAction aSchemeAction,
++                     Response& aResponse, ErrorResult& aRv)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(!mSent);
+ 
+   switch(mOpArgs.type()) {
+     case CacheOpArgs::TCachePutAllArgs:
+     {
+       CachePutAllArgs& args = mOpArgs.get_CachePutAllArgs();
+ 
+@@ -325,17 +325,17 @@ AutoChildOpArgs::Add(InternalRequest* aR
+       // error we remove it.
+       CacheRequestResponse& pair = *args.requestResponseList().AppendElement();
+       pair.request().body() = void_t();
+       pair.response().body() = void_t();
+ 
+       mTypeUtils->ToCacheRequest(pair.request(), aRequest, aBodyAction,
+                                  aSchemeAction, mStreamCleanupList, aRv);
+       if (!aRv.Failed()) {
+-        mTypeUtils->ToCacheResponse(pair.response(), aResponse,
++        mTypeUtils->ToCacheResponse(aCx, pair.response(), aResponse,
+                                     mStreamCleanupList, aRv);
+       }
+ 
+       if (aRv.Failed()) {
+         CleanupChild(pair.request().body(), Delete);
+         args.requestResponseList().RemoveElementAt(
+           args.requestResponseList().Length() - 1);
+       }
+diff --git a/dom/cache/AutoUtils.h b/dom/cache/AutoUtils.h
+--- a/dom/cache/AutoUtils.h
++++ b/dom/cache/AutoUtils.h
+@@ -51,17 +51,17 @@ public:
+   typedef TypeUtils::SchemeAction SchemeAction;
+ 
+   AutoChildOpArgs(TypeUtils* aTypeUtils, const CacheOpArgs& aOpArgs,
+                   uint32_t aEntryCount);
+   ~AutoChildOpArgs();
+ 
+   void Add(InternalRequest* aRequest, BodyAction aBodyAction,
+            SchemeAction aSchemeAction, ErrorResult& aRv);
+-  void Add(InternalRequest* aRequest, BodyAction aBodyAction,
++  void Add(JSContext* aCx, InternalRequest* aRequest, BodyAction aBodyAction,
+            SchemeAction aSchemeAction, Response& aResponse, ErrorResult& aRv);
+ 
+   const CacheOpArgs& SendAsOpArgs();
+ 
+ private:
+   TypeUtils* mTypeUtils;
+   CacheOpArgs mOpArgs;
+   nsTArray<UniquePtr<mozilla::ipc::AutoIPCStream>> mStreamCleanupList;
+diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
+--- a/dom/cache/Cache.cpp
++++ b/dom/cache/Cache.cpp
+@@ -197,17 +197,20 @@ public:
+ 
+       responseList.AppendElement(Move(response));
+     }
+ 
+     MOZ_DIAGNOSTIC_ASSERT(mRequestList.Length() == responseList.Length());
+ 
+     // Now store the unwrapped Response list in the Cache.
+     ErrorResult result;
+-    RefPtr<Promise> put = mCache->PutAll(mRequestList, responseList, result);
++    // TODO: Here we use the JSContext as received by the ResolvedCallback, and
++    // its state could be the wrong one. The spec doesn't say anything
++    // about it, yet (bug 1384006)
++    RefPtr<Promise> put = mCache->PutAll(aCx, mRequestList, responseList, result);
+     if (NS_WARN_IF(result.Failed())) {
+       // TODO: abort the fetch requests we have running (bug 1157434)
+       mPromise->MaybeReject(result);
+       return;
+     }
+ 
+     // Chain the Cache::Put() promise to the original promise returned to
+     // the content script.
+@@ -258,27 +261,28 @@ Cache::Cache(nsIGlobalObject* aGlobal, C
+   , mActor(aActor)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(mGlobal);
+   MOZ_DIAGNOSTIC_ASSERT(mActor);
+   mActor->SetListener(this);
+ }
+ 
+ already_AddRefed<Promise>
+-Cache::Match(const RequestOrUSVString& aRequest,
++Cache::Match(JSContext* aCx, const RequestOrUSVString& aRequest,
+              const CacheQueryOptions& aOptions, ErrorResult& aRv)
+ {
+   if (NS_WARN_IF(!mActor)) {
+     aRv.Throw(NS_ERROR_UNEXPECTED);
+     return nullptr;
+   }
+ 
+   CacheChild::AutoLock actorLock(mActor);
+ 
+-  RefPtr<InternalRequest> ir = ToInternalRequest(aRequest, IgnoreBody, aRv);
++  RefPtr<InternalRequest> ir =
++    ToInternalRequest(aCx, aRequest, IgnoreBody, aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return nullptr;
+   }
+ 
+   CacheQueryParams params;
+   ToCacheQueryParams(params, aOptions);
+ 
+   AutoChildOpArgs args(this, CacheMatchArgs(CacheRequest(), params), 1);
+@@ -287,34 +291,34 @@ Cache::Match(const RequestOrUSVString& a
+   if (NS_WARN_IF(aRv.Failed())) {
+     return nullptr;
+   }
+ 
+   return ExecuteOp(args, aRv);
+ }
+ 
+ already_AddRefed<Promise>
+-Cache::MatchAll(const Optional<RequestOrUSVString>& aRequest,
++Cache::MatchAll(JSContext* aCx, const Optional<RequestOrUSVString>& aRequest,
+                 const CacheQueryOptions& aOptions, ErrorResult& aRv)
+ {
+   if (NS_WARN_IF(!mActor)) {
+     aRv.Throw(NS_ERROR_UNEXPECTED);
+     return nullptr;
+   }
+ 
+   CacheChild::AutoLock actorLock(mActor);
+ 
+   CacheQueryParams params;
+   ToCacheQueryParams(params, aOptions);
+ 
+   AutoChildOpArgs args(this, CacheMatchAllArgs(void_t(), params), 1);
+ 
+   if (aRequest.WasPassed()) {
+-    RefPtr<InternalRequest> ir = ToInternalRequest(aRequest.Value(),
+-                                                     IgnoreBody, aRv);
++    RefPtr<InternalRequest> ir = ToInternalRequest(aCx, aRequest.Value(),
++                                                   IgnoreBody, aRv);
+     if (aRv.Failed()) {
+       return nullptr;
+     }
+ 
+     args.Add(ir, IgnoreBody, IgnoreInvalidScheme, aRv);
+     if (aRv.Failed()) {
+       return nullptr;
+     }
+@@ -404,62 +408,63 @@ Cache::AddAll(JSContext* aContext,
+ 
+     requestList.AppendElement(Move(request));
+   }
+ 
+   return AddAll(global, Move(requestList), aCallerType, aRv);
+ }
+ 
+ already_AddRefed<Promise>
+-Cache::Put(const RequestOrUSVString& aRequest, Response& aResponse,
+-           ErrorResult& aRv)
++Cache::Put(JSContext* aCx, const RequestOrUSVString& aRequest,
++           Response& aResponse, ErrorResult& aRv)
+ {
+   if (NS_WARN_IF(!mActor)) {
+     aRv.Throw(NS_ERROR_UNEXPECTED);
+     return nullptr;
+   }
+ 
+   CacheChild::AutoLock actorLock(mActor);
+ 
+   if (NS_WARN_IF(!IsValidPutRequestMethod(aRequest, aRv))) {
+     return nullptr;
+   }
+ 
+   if (!IsValidPutResponseStatus(aResponse, PutStatusPolicy::Default, aRv)) {
+     return nullptr;
+   }
+ 
+-  RefPtr<InternalRequest> ir = ToInternalRequest(aRequest, ReadBody, aRv);
++  RefPtr<InternalRequest> ir = ToInternalRequest(aCx, aRequest, ReadBody, aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return nullptr;
+   }
+ 
+   AutoChildOpArgs args(this, CachePutAllArgs(), 1);
+ 
+-  args.Add(ir, ReadBody, TypeErrorOnInvalidScheme,
++  args.Add(aCx, ir, ReadBody, TypeErrorOnInvalidScheme,
+            aResponse, aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return nullptr;
+   }
+ 
+   return ExecuteOp(args, aRv);
+ }
+ 
+ already_AddRefed<Promise>
+-Cache::Delete(const RequestOrUSVString& aRequest,
++Cache::Delete(JSContext* aCx, const RequestOrUSVString& aRequest,
+               const CacheQueryOptions& aOptions, ErrorResult& aRv)
+ {
+   if (NS_WARN_IF(!mActor)) {
+     aRv.Throw(NS_ERROR_UNEXPECTED);
+     return nullptr;
+   }
+ 
+   CacheChild::AutoLock actorLock(mActor);
+ 
+-  RefPtr<InternalRequest> ir = ToInternalRequest(aRequest, IgnoreBody, aRv);
++  RefPtr<InternalRequest> ir =
++    ToInternalRequest(aCx, aRequest, IgnoreBody, aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return nullptr;
+   }
+ 
+   CacheQueryParams params;
+   ToCacheQueryParams(params, aOptions);
+ 
+   AutoChildOpArgs args(this, CacheDeleteArgs(CacheRequest(), params), 1);
+@@ -468,34 +473,34 @@ Cache::Delete(const RequestOrUSVString& 
+   if (NS_WARN_IF(aRv.Failed())) {
+     return nullptr;
+   }
+ 
+   return ExecuteOp(args, aRv);
+ }
+ 
+ already_AddRefed<Promise>
+-Cache::Keys(const Optional<RequestOrUSVString>& aRequest,
++Cache::Keys(JSContext* aCx, const Optional<RequestOrUSVString>& aRequest,
+             const CacheQueryOptions& aOptions, ErrorResult& aRv)
+ {
+   if (NS_WARN_IF(!mActor)) {
+     aRv.Throw(NS_ERROR_UNEXPECTED);
+     return nullptr;
+   }
+ 
+   CacheChild::AutoLock actorLock(mActor);
+ 
+   CacheQueryParams params;
+   ToCacheQueryParams(params, aOptions);
+ 
+   AutoChildOpArgs args(this, CacheKeysArgs(void_t(), params), 1);
+ 
+   if (aRequest.WasPassed()) {
+-    RefPtr<InternalRequest> ir = ToInternalRequest(aRequest.Value(),
+-                                                     IgnoreBody, aRv);
++    RefPtr<InternalRequest> ir =
++      ToInternalRequest(aCx, aRequest.Value(), IgnoreBody, aRv);
+     if (NS_WARN_IF(aRv.Failed())) {
+       return nullptr;
+     }
+ 
+     args.Add(ir, IgnoreBody, IgnoreInvalidScheme, aRv);
+     if (NS_WARN_IF(aRv.Failed())) {
+       return nullptr;
+     }
+@@ -646,34 +651,35 @@ Cache::AddAll(const GlobalObject& aGloba
+     return nullptr;
+   }
+   fetchPromise->AppendNativeHandler(handler);
+ 
+   return promise.forget();
+ }
+ 
+ already_AddRefed<Promise>
+-Cache::PutAll(const nsTArray<RefPtr<Request>>& aRequestList,
++Cache::PutAll(JSContext* aCx, const nsTArray<RefPtr<Request>>& aRequestList,
+               const nsTArray<RefPtr<Response>>& aResponseList,
+               ErrorResult& aRv)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(aRequestList.Length() == aResponseList.Length());
+ 
+   if (NS_WARN_IF(!mActor)) {
+     aRv.Throw(NS_ERROR_UNEXPECTED);
+     return nullptr;
+   }
+ 
+   CacheChild::AutoLock actorLock(mActor);
+ 
+   AutoChildOpArgs args(this, CachePutAllArgs(), aRequestList.Length());
+ 
+   for (uint32_t i = 0; i < aRequestList.Length(); ++i) {
+     RefPtr<InternalRequest> ir = aRequestList[i]->GetInternalRequest();
+-    args.Add(ir, ReadBody, TypeErrorOnInvalidScheme, *aResponseList[i], aRv);
++    args.Add(aCx, ir, ReadBody, TypeErrorOnInvalidScheme, *aResponseList[i],
++             aRv);
+     if (NS_WARN_IF(aRv.Failed())) {
+       return nullptr;
+     }
+   }
+ 
+   return ExecuteOp(args, aRv);
+ }
+ 
+diff --git a/dom/cache/Cache.h b/dom/cache/Cache.h
+--- a/dom/cache/Cache.h
++++ b/dom/cache/Cache.h
+@@ -40,36 +40,36 @@ class Cache final : public nsISupports
+                   , public nsWrapperCache
+                   , public TypeUtils
+ {
+ public:
+   Cache(nsIGlobalObject* aGlobal, CacheChild* aActor);
+ 
+   // webidl interface methods
+   already_AddRefed<Promise>
+-  Match(const RequestOrUSVString& aRequest, const CacheQueryOptions& aOptions,
+-        ErrorResult& aRv);
++  Match(JSContext* aCx, const RequestOrUSVString& aRequest,
++        const CacheQueryOptions& aOptions, ErrorResult& aRv);
+   already_AddRefed<Promise>
+-  MatchAll(const Optional<RequestOrUSVString>& aRequest,
++  MatchAll(JSContext* aCx, const Optional<RequestOrUSVString>& aRequest,
+            const CacheQueryOptions& aOptions, ErrorResult& aRv);
+   already_AddRefed<Promise>
+   Add(JSContext* aContext, const RequestOrUSVString& aRequest,
+       CallerType aCallerType, ErrorResult& aRv);
+   already_AddRefed<Promise>
+   AddAll(JSContext* aContext,
+          const Sequence<OwningRequestOrUSVString>& aRequests,
+          CallerType aCallerType, ErrorResult& aRv);
+   already_AddRefed<Promise>
+-  Put(const RequestOrUSVString& aRequest, Response& aResponse,
++  Put(JSContext* aCx, const RequestOrUSVString& aRequest, Response& aResponse,
+       ErrorResult& aRv);
+   already_AddRefed<Promise>
+-  Delete(const RequestOrUSVString& aRequest, const CacheQueryOptions& aOptions,
+-         ErrorResult& aRv);
++  Delete(JSContext* aCx, const RequestOrUSVString& aRequest,
++         const CacheQueryOptions& aOptions, ErrorResult& aRv);
+   already_AddRefed<Promise>
+-  Keys(const Optional<RequestOrUSVString>& aRequest,
++  Keys(JSContext* aCx, const Optional<RequestOrUSVString>& aRequest,
+        const CacheQueryOptions& aParams, ErrorResult& aRv);
+ 
+   // binding methods
+   static bool PrefEnabled(JSContext* aCx, JSObject* aObj);
+ 
+   nsISupports* GetParentObject() const;
+   virtual JSObject* WrapObject(JSContext* aContext, JS::Handle<JSObject*> aGivenProto) override;
+ 
+@@ -98,17 +98,17 @@ private:
+   already_AddRefed<Promise>
+   ExecuteOp(AutoChildOpArgs& aOpArgs, ErrorResult& aRv);
+ 
+   already_AddRefed<Promise>
+   AddAll(const GlobalObject& aGlobal, nsTArray<RefPtr<Request>>&& aRequestList,
+          CallerType aCallerType, ErrorResult& aRv);
+ 
+   already_AddRefed<Promise>
+-  PutAll(const nsTArray<RefPtr<Request>>& aRequestList,
++  PutAll(JSContext* aCx, const nsTArray<RefPtr<Request>>& aRequestList,
+          const nsTArray<RefPtr<Response>>& aResponseList,
+          ErrorResult& aRv);
+ 
+   nsCOMPtr<nsIGlobalObject> mGlobal;
+   CacheChild* mActor;
+ 
+ public:
+   NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+diff --git a/dom/cache/CacheStorage.cpp b/dom/cache/CacheStorage.cpp
+--- a/dom/cache/CacheStorage.cpp
++++ b/dom/cache/CacheStorage.cpp
+@@ -302,28 +302,28 @@ CacheStorage::CacheStorage(nsresult aFai
+   : mNamespace(INVALID_NAMESPACE)
+   , mActor(nullptr)
+   , mStatus(aFailureResult)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(NS_FAILED(mStatus));
+ }
+ 
+ already_AddRefed<Promise>
+-CacheStorage::Match(const RequestOrUSVString& aRequest,
++CacheStorage::Match(JSContext* aCx, const RequestOrUSVString& aRequest,
+                     const CacheQueryOptions& aOptions, ErrorResult& aRv)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStorage);
+ 
+   if (NS_WARN_IF(NS_FAILED(mStatus))) {
+     aRv.Throw(mStatus);
+     return nullptr;
+   }
+ 
+-  RefPtr<InternalRequest> request = ToInternalRequest(aRequest, IgnoreBody,
+-                                                        aRv);
++  RefPtr<InternalRequest> request =
++    ToInternalRequest(aCx, aRequest, IgnoreBody, aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return nullptr;
+   }
+ 
+   RefPtr<Promise> promise = Promise::Create(mGlobal, aRv);
+   if (NS_WARN_IF(!promise)) {
+     return nullptr;
+   }
+diff --git a/dom/cache/CacheStorage.h b/dom/cache/CacheStorage.h
+--- a/dom/cache/CacheStorage.h
++++ b/dom/cache/CacheStorage.h
+@@ -55,19 +55,19 @@ public:
+   static already_AddRefed<CacheStorage>
+   CreateOnWorker(Namespace aNamespace, nsIGlobalObject* aGlobal,
+                  workers::WorkerPrivate* aWorkerPrivate, ErrorResult& aRv);
+ 
+   static bool
+   DefineCaches(JSContext* aCx, JS::Handle<JSObject*> aGlobal);
+ 
+   // webidl interface methods
+-  already_AddRefed<Promise> Match(const RequestOrUSVString& aRequest,
+-                                  const CacheQueryOptions& aOptions,
+-                                  ErrorResult& aRv);
++  already_AddRefed<Promise>
++  Match(JSContext* aCx, const RequestOrUSVString& aRequest,
++        const CacheQueryOptions& aOptions, ErrorResult& aRv);
+   already_AddRefed<Promise> Has(const nsAString& aKey, ErrorResult& aRv);
+   already_AddRefed<Promise> Open(const nsAString& aKey, ErrorResult& aRv);
+   already_AddRefed<Promise> Delete(const nsAString& aKey, ErrorResult& aRv);
+   already_AddRefed<Promise> Keys(ErrorResult& aRv);
+ 
+   // chrome-only webidl interface methods
+   static already_AddRefed<CacheStorage>
+   Constructor(const GlobalObject& aGlobal, CacheStorageNamespace aNamespace,
+diff --git a/dom/cache/TypeUtils.cpp b/dom/cache/TypeUtils.cpp
+--- a/dom/cache/TypeUtils.cpp
++++ b/dom/cache/TypeUtils.cpp
+@@ -73,44 +73,45 @@ ToHeadersEntryList(nsTArray<HeadersEntry
+     InternalHeaders::Entry& entry = entryList[i];
+     aOut.AppendElement(HeadersEntry(entry.mName, entry.mValue));
+   }
+ }
+ 
+ } // namespace
+ 
+ already_AddRefed<InternalRequest>
+-TypeUtils::ToInternalRequest(const RequestOrUSVString& aIn,
++TypeUtils::ToInternalRequest(JSContext* aCx, const RequestOrUSVString& aIn,
+                              BodyAction aBodyAction, ErrorResult& aRv)
+ {
+   if (aIn.IsRequest()) {
+     Request& request = aIn.GetAsRequest();
+ 
+     // Check and set bodyUsed flag immediately because its on Request
+     // instead of InternalRequest.
+-    CheckAndSetBodyUsed(&request, aBodyAction, aRv);
++    CheckAndSetBodyUsed(aCx, &request, aBodyAction, aRv);
+     if (aRv.Failed()) { return nullptr; }
+ 
+     return request.GetInternalRequest();
+   }
+ 
+   return ToInternalRequest(aIn.GetAsUSVString(), aRv);
+ }
+ 
+ already_AddRefed<InternalRequest>
+-TypeUtils::ToInternalRequest(const OwningRequestOrUSVString& aIn,
++TypeUtils::ToInternalRequest(JSContext* aCx,
++                             const OwningRequestOrUSVString& aIn,
+                              BodyAction aBodyAction, ErrorResult& aRv)
+ {
+ 
+   if (aIn.IsRequest()) {
+     RefPtr<Request> request = aIn.GetAsRequest().get();
+ 
+     // Check and set bodyUsed flag immediately because its on Request
+     // instead of InternalRequest.
+-    CheckAndSetBodyUsed(request, aBodyAction, aRv);
++    CheckAndSetBodyUsed(aCx, request, aBodyAction, aRv);
+     if (aRv.Failed()) { return nullptr; }
+ 
+     return request->GetInternalRequest();
+   }
+ 
+   return ToInternalRequest(aIn.GetAsUSVString(), aRv);
+ }
+ 
+@@ -198,17 +199,17 @@ TypeUtils::ToCacheResponseWithoutBody(Ca
+   if (aIn.GetPrincipalInfo()) {
+     aOut.principalInfo() = *aIn.GetPrincipalInfo();
+   } else {
+     aOut.principalInfo() = void_t();
+   }
+ }
+ 
+ void
+-TypeUtils::ToCacheResponse(CacheResponse& aOut, Response& aIn,
++TypeUtils::ToCacheResponse(JSContext* aCx, CacheResponse& aOut, Response& aIn,
+                            nsTArray<UniquePtr<AutoIPCStream>>& aStreamCleanupList,
+                            ErrorResult& aRv)
+ {
+   if (aIn.BodyUsed()) {
+     aRv.ThrowTypeError<MSG_FETCH_BODY_CONSUMED_ERROR>();
+     return;
+   }
+ 
+@@ -216,17 +217,20 @@ TypeUtils::ToCacheResponse(CacheResponse
+   ToCacheResponseWithoutBody(aOut, *ir, aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return;
+   }
+ 
+   nsCOMPtr<nsIInputStream> stream;
+   ir->GetUnfilteredBody(getter_AddRefs(stream));
+   if (stream) {
+-    aIn.SetBodyUsed();
++    aIn.SetBodyUsed(aCx, aRv);
++    if (NS_WARN_IF(aRv.Failed())) {
++      return;
++    }
+   }
+ 
+   SerializeCacheStream(stream, &aOut.body(), aStreamCleanupList, aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return;
+   }
+ }
+ 
+@@ -420,34 +424,37 @@ TypeUtils::ProcessURL(nsACString& aUrl, 
+   // ParsePath gives us query position relative to the start of the path
+   queryPos += pathPos;
+ 
+   *aUrlWithoutQueryOut = Substring(aUrl, 0, queryPos - 1);
+   *aUrlQueryOut = Substring(aUrl, queryPos - 1, queryLen + 1);
+ }
+ 
+ void
+-TypeUtils::CheckAndSetBodyUsed(Request* aRequest, BodyAction aBodyAction,
+-                               ErrorResult& aRv)
++TypeUtils::CheckAndSetBodyUsed(JSContext* aCx, Request* aRequest,
++                               BodyAction aBodyAction, ErrorResult& aRv)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(aRequest);
+ 
+   if (aBodyAction == IgnoreBody) {
+     return;
+   }
+ 
+   if (aRequest->BodyUsed()) {
+     aRv.ThrowTypeError<MSG_FETCH_BODY_CONSUMED_ERROR>();
+     return;
+   }
+ 
+   nsCOMPtr<nsIInputStream> stream;
+   aRequest->GetBody(getter_AddRefs(stream));
+   if (stream) {
+-    aRequest->SetBodyUsed();
++    aRequest->SetBodyUsed(aCx, aRv);
++    if (NS_WARN_IF(aRv.Failed())) {
++      return;
++    }
+   }
+ }
+ 
+ already_AddRefed<InternalRequest>
+ TypeUtils::ToInternalRequest(const nsAString& aIn, ErrorResult& aRv)
+ {
+   RequestOrUSVString requestOrString;
+   requestOrString.SetAsUSVString().Rebind(aIn.Data(), aIn.Length());
+diff --git a/dom/cache/TypeUtils.h b/dom/cache/TypeUtils.h
+--- a/dom/cache/TypeUtils.h
++++ b/dom/cache/TypeUtils.h
+@@ -68,35 +68,35 @@ public:
+   // This is mainly declared to support serializing body streams.  Some
+   // TypeUtils implementations do not expect to be used for this kind of
+   // serialization.  These classes will MOZ_CRASH() if you try to call
+   // GetIPCManager().
+   virtual mozilla::ipc::PBackgroundChild*
+   GetIPCManager() = 0;
+ 
+   already_AddRefed<InternalRequest>
+-  ToInternalRequest(const RequestOrUSVString& aIn, BodyAction aBodyAction,
+-                    ErrorResult& aRv);
++  ToInternalRequest(JSContext* aCx, const RequestOrUSVString& aIn,
++                    BodyAction aBodyAction, ErrorResult& aRv);
+ 
+   already_AddRefed<InternalRequest>
+-  ToInternalRequest(const OwningRequestOrUSVString& aIn, BodyAction aBodyAction,
+-                    ErrorResult& aRv);
++  ToInternalRequest(JSContext* aCx, const OwningRequestOrUSVString& aIn,
++                    BodyAction aBodyAction, ErrorResult& aRv);
+ 
+   void
+   ToCacheRequest(CacheRequest& aOut, InternalRequest* aIn,
+                  BodyAction aBodyAction, SchemeAction aSchemeAction,
+                  nsTArray<UniquePtr<mozilla::ipc::AutoIPCStream>>& aStreamCleanupList,
+                  ErrorResult& aRv);
+ 
+   void
+   ToCacheResponseWithoutBody(CacheResponse& aOut, InternalResponse& aIn,
+                              ErrorResult& aRv);
+ 
+   void
+-  ToCacheResponse(CacheResponse& aOut, Response& aIn,
++  ToCacheResponse(JSContext* aCx, CacheResponse& aOut, Response& aIn,
+                   nsTArray<UniquePtr<mozilla::ipc::AutoIPCStream>>& aStreamCleanupList,
+                   ErrorResult& aRv);
+ 
+   void
+   ToCacheQueryParams(CacheQueryParams& aOut, const CacheQueryOptions& aIn);
+ 
+   already_AddRefed<Response>
+   ToResponse(const CacheResponse& aIn);
+@@ -128,17 +128,17 @@ public:
+   // Any errors are thrown on ErrorResult.
+   static void
+   ProcessURL(nsACString& aUrl, bool* aSchemeValidOut,
+              nsACString* aUrlWithoutQueryOut, nsACString* aUrlQueryOut,
+              ErrorResult& aRv);
+ 
+ private:
+   void
+-  CheckAndSetBodyUsed(Request* aRequest, BodyAction aBodyAction,
++  CheckAndSetBodyUsed(JSContext* aCx, Request* aRequest, BodyAction aBodyAction,
+                       ErrorResult& aRv);
+ 
+   already_AddRefed<InternalRequest>
+   ToInternalRequest(const nsAString& aIn, ErrorResult& aRv);
+ 
+   void
+   SerializeCacheStream(nsIInputStream* aStream, CacheReadStreamOrVoid* aStreamOut,
+                        nsTArray<UniquePtr<mozilla::ipc::AutoIPCStream>>& aStreamCleanupList,
+diff --git a/dom/fetch/Fetch.cpp b/dom/fetch/Fetch.cpp
+--- a/dom/fetch/Fetch.cpp
++++ b/dom/fetch/Fetch.cpp
+@@ -965,49 +965,74 @@ template
+ bool
+ FetchBody<Request>::BodyUsed() const;
+ 
+ template
+ bool
+ FetchBody<Response>::BodyUsed() const;
+ 
+ template <class Derived>
++void
++FetchBody<Derived>::SetBodyUsed(JSContext* aCx, ErrorResult& aRv)
++{
++  MOZ_ASSERT(aCx);
++  MOZ_ASSERT(mOwner->EventTargetFor(TaskCategory::Other)->IsOnCurrentThread());
++
++  if (mBodyUsed) {
++    return;
++  }
++
++  mBodyUsed = true;
++
++  // If we already have a ReadableStreamBody and it has been created by DOM, we
++  // have to lock it now because it can have been shared with other objects.
++  if (mReadableStreamBody) {
++    JS::Rooted<JSObject*> readableStreamObj(aCx, mReadableStreamBody);
++    if (JS::ReadableStreamGetMode(readableStreamObj) ==
++          JS::ReadableStreamMode::ExternalSource) {
++      LockStream(aCx, readableStreamObj, aRv);
++      if (NS_WARN_IF(aRv.Failed())) {
++        return;
++      }
++    } else {
++      // If this is not a native ReadableStream, let's activate the
++      // FetchStreamReader.
++      MOZ_ASSERT(mFetchStreamReader);
++      JS::Rooted<JSObject*> reader(aCx);
++      mFetchStreamReader->StartConsuming(aCx, readableStreamObj, &reader, aRv);
++      if (NS_WARN_IF(aRv.Failed())) {
++        return;
++      }
++
++      mReadableStreamReader = reader;
++    }
++  }
++}
++
++template
++void
++FetchBody<Request>::SetBodyUsed(JSContext* aCx, ErrorResult& aRv);
++
++template
++void
++FetchBody<Response>::SetBodyUsed(JSContext* aCx, ErrorResult& aRv);
++
++template <class Derived>
+ already_AddRefed<Promise>
+ FetchBody<Derived>::ConsumeBody(JSContext* aCx, FetchConsumeType aType,
+                                 ErrorResult& aRv)
+ {
+   if (BodyUsed()) {
+     aRv.ThrowTypeError<MSG_FETCH_BODY_CONSUMED_ERROR>();
+     return nullptr;
+   }
+ 
+-  SetBodyUsed();
+-
+-  // If we already have a ReadableStreamBody and it has been created by DOM, we
+-  // have to lock it now because it can have been shared with other objects.
+-  if (mReadableStreamBody) {
+-    JS::Rooted<JSObject*> readableStreamObj(aCx, mReadableStreamBody);
+-    if (JS::ReadableStreamGetMode(readableStreamObj) ==
+-          JS::ReadableStreamMode::ExternalSource) {
+-      LockStream(aCx, readableStreamObj, aRv);
+-      if (NS_WARN_IF(aRv.Failed())) {
+-        return nullptr;
+-      }
+-    } else {
+-      // If this is not a native ReadableStream, let's activate the
+-      // FetchStreamReader.
+-      MOZ_ASSERT(mFetchStreamReader);
+-      JS::Rooted<JSObject*> reader(aCx);
+-      mFetchStreamReader->StartConsuming(aCx, readableStreamObj, &reader, aRv);
+-      if (NS_WARN_IF(aRv.Failed())) {
+-        return nullptr;
+-      }
+-
+-      mReadableStreamReader = reader;
+-    }
++  SetBodyUsed(aCx, aRv);
++  if (NS_WARN_IF(aRv.Failed())) {
++    return nullptr;
+   }
+ 
+   nsCOMPtr<nsIGlobalObject> global = DerivedClass()->GetParentObject();
+ 
+   RefPtr<Promise> promise =
+     FetchBodyConsumer<Derived>::Create(global, mMainThreadEventTarget, this,
+                                        aType, aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+diff --git a/dom/fetch/Fetch.h b/dom/fetch/Fetch.h
+--- a/dom/fetch/Fetch.h
++++ b/dom/fetch/Fetch.h
+@@ -187,21 +187,38 @@ public:
+   MaybeTeeReadableStreamBody(JSContext* aCx,
+                              JS::MutableHandle<JSObject*> aBodyOut,
+                              FetchStreamReader** aStreamReader,
+                              nsIInputStream** aInputStream,
+                              ErrorResult& aRv);
+ 
+   // Utility public methods accessed by various runnables.
+ 
++  // This method _must_ be called in order to set the body as used. If the body
++  // is a ReadableStream, this method will start reading the stream.
++  // More in details, this method does:
++  // 1) It uses an internal flag to track if the body is used.  This is tracked
++  // separately from the ReadableStream disturbed state due to purely native
++  // streams.
++  // 2) If there is a ReadableStream reflector for the native stream it is
++  // Locked.
++  // 3) If there is a JS ReadableStream then we begin pumping it into the native
++  // body stream.  This effectively locks and disturbs the stream.
++  //
++  // Note that JSContext is used only if there is a ReadableStream (this can
++  // happen because the body is a ReadableStream or because attribute body has
++  // already been used by content). If something goes wrong using
++  // ReadableStream, errors will be reported via ErrorResult and not as JS
++  // exceptions in JSContext. This is done in order to have a centralized error
++  // reporting way.
++  //
++  // Exceptions generated when reading from the ReadableStream are directly sent
++  // to the Console (NOTE FOR THE REVIEWER: this is part of patch 16)
+   void
+-  SetBodyUsed()
+-  {
+-    mBodyUsed = true;
+-  }
++  SetBodyUsed(JSContext* aCx, ErrorResult& aRv);
+ 
+   const nsCString&
+   MimeType() const
+   {
+     return mMimeType;
+   }
+ 
+   // FetchStreamHolder
+diff --git a/dom/fetch/Request.cpp b/dom/fetch/Request.cpp
+--- a/dom/fetch/Request.cpp
++++ b/dom/fetch/Request.cpp
+@@ -601,17 +601,20 @@ Request::Constructor(const GlobalObject&
+   domRequest->SetMimeType();
+ 
+   if (aInput.IsRequest()) {
+     RefPtr<Request> inputReq = &aInput.GetAsRequest();
+     nsCOMPtr<nsIInputStream> body;
+     inputReq->GetBody(getter_AddRefs(body));
+     if (body) {
+       inputReq->SetBody(nullptr);
+-      inputReq->SetBodyUsed();
++      inputReq->SetBodyUsed(aGlobal.Context(), aRv);
++      if (NS_WARN_IF(aRv.Failed())) {
++        return nullptr;
++      }
+     }
+   }
+   return domRequest.forget();
+ }
+ 
+ already_AddRefed<Request>
+ Request::Clone(ErrorResult& aRv) const
+ {
+diff --git a/dom/flyweb/FlyWebServerEvents.cpp b/dom/flyweb/FlyWebServerEvents.cpp
+--- a/dom/flyweb/FlyWebServerEvents.cpp
++++ b/dom/flyweb/FlyWebServerEvents.cpp
+@@ -82,17 +82,23 @@ FlyWebFetchEvent::ResolvedCallback(JSCon
+   if (aValue.isObject()) {
+     UNWRAP_OBJECT(Response, &aValue.toObject(), response);
+   }
+ 
+   RefPtr<InternalResponse> intResponse;
+   if (response && response->Type() != ResponseType::Opaque) {
+     intResponse = response->GetInternalResponse();
+ 
+-    response->SetBodyUsed();
++    IgnoredErrorResult rv;
++    response->SetBodyUsed(aCx, rv);
++    if (NS_WARN_IF(rv.Failed())) {
++      // Let's nullify the response. In this way we end up using a NetworkError
++      // response.
++      intResponse = nullptr;
++    }
+   }
+ 
+   if (!intResponse) {
+     intResponse = InternalResponse::NetworkError();
+   }
+ 
+   NotifyServer(intResponse);
+ }
+diff --git a/dom/tests/mochitest/fetch/common_readableStreams.js b/dom/tests/mochitest/fetch/common_readableStreams.js
+--- a/dom/tests/mochitest/fetch/common_readableStreams.js
++++ b/dom/tests/mochitest/fetch/common_readableStreams.js
+@@ -75,16 +75,73 @@ function test_pendingStream() {
+ 
+   r.body.getReader().read().then(d => {
+     ok(!d.done, "We have read something!");
+     close();
+     next();
+   });
+ }
+ 
++async function test_nativeStream_cache() {
++  info("test_nativeStream_cache");
++
++  let origBody = '123456789abcdef';
++  let url = '/nativeStream';
++
++  let cache = await caches.open('nativeStream');
++
++  info("Storing a body as a string");
++  await cache.put(url, new Response(origBody));
++
++  info("Retrieving the stored value");
++  let cacheResponse = await cache.match(url);
++
++  info("Converting the response to text");
++  let cacheBody = await cacheResponse.text();
++
++  is(origBody, cacheBody, "Bodies match");
++
++  await caches.delete('nativeStream');
++
++  next();
++};
++
++async function test_nonNativeStream_cache() {
++  info("test_nonNativeStream_cache");
++
++  let url = '/nonNativeStream';
++
++  let cache = await caches.open('nonNativeStream');
++
++  info("Storing a body as a string");
++  let r = new Response(new ReadableStream({start : controller => {
++    controller.enqueue(new Uint8Array([0x01, 0x02, 0x03]));
++    controller.close();
++  }}));
++
++  await cache.put(url, r);
++
++  info("Retrieving the stored value");
++  let cacheResponse = await cache.match(url);
++
++  info("Converting the response to text");
++  let cacheBody = await cacheResponse.arrayBuffer();
++
++  ok(cacheBody instanceof ArrayBuffer, "Body is an array buffer");
++  is(cacheBody.byteLength, 3, "Body length is correct");
++
++  is(new Uint8Array(cacheBody)[0], 0x01, "First byte is correct");
++  is(new Uint8Array(cacheBody)[1], 0x02, "Second byte is correct");
++  is(new Uint8Array(cacheBody)[2], 0x03, "Third byte is correct");
++
++  await caches.delete('nonNativeStream');
++
++  next();
++};
++
+ function workify(func) {
+   info("Workifing " + func);
+ 
+   let worker = new Worker('worker_readableStreams.js');
+   worker.postMessage(func);
+   worker.onmessage = function(e) {
+     if (e.data.type == 'done') {
+       next();
+diff --git a/dom/tests/mochitest/fetch/test_readableStreams.html b/dom/tests/mochitest/fetch/test_readableStreams.html
+--- a/dom/tests/mochitest/fetch/test_readableStreams.html
++++ b/dom/tests/mochitest/fetch/test_readableStreams.html
+@@ -6,26 +6,41 @@
+   <script type="application/javascript" src="/tests/SimpleTest/SimpleTest.js"></script>
+   <script type="application/javascript" src="common_readableStreams.js"></script>
+   <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css"/>
+ </head>
+ <body>
+   <script type="application/javascript">
+ 
+ let tests = [
++  function() {
++    SpecialPowers.pushPrefEnv({
++      "set": [["dom.caches.enabled", true],
++              ["dom.caches.testing.enabled", true],
++              ["dom.quotaManager.testing", true]]
++    }, next);
++  },
++
+   test_nativeStream,
+   function() { workify('test_nativeStream'); },
+ 
+   test_nonNativeStream,
+   function() { workify('test_nonNativeStream'); },
+ 
++  test_pendingStream,
+   function() { workify('test_pendingStream'); },
+ 
+   test_noUint8Array,
+   function() { workify('test_noUint8Array'); },
++
++  test_nativeStream_cache,
++  function() { workify('test_nativeStream_cache'); },
++
++  test_nonNativeStream_cache,
++  function() { workify('test_nonNativeStream_cache'); },
+ ];
+ 
+ function next() {
+   if (!tests.length) {
+     SimpleTest.finish();
+     return;
+   }
+ 
+diff --git a/dom/tests/mochitest/fetch/worker_readableStreams.js b/dom/tests/mochitest/fetch/worker_readableStreams.js
+--- a/dom/tests/mochitest/fetch/worker_readableStreams.js
++++ b/dom/tests/mochitest/fetch/worker_readableStreams.js
+@@ -3,15 +3,19 @@ importScripts('common_readableStreams.js
+ function info(message) {
+   postMessage({type: 'info', message });
+ }
+ 
+ function ok(a, message) {
+   postMessage({type: 'test', test: !!a, message });
+ }
+ 
++function is(a, b, message) {
++  ok(a === b, message);
++}
++
+ function next() {
+   postMessage({type: 'done'});
+ }
+ 
+ onmessage = function(e) {
+   self[e.data]();
+ }
+diff --git a/dom/workers/ScriptLoader.cpp b/dom/workers/ScriptLoader.cpp
+--- a/dom/workers/ScriptLoader.cpp
++++ b/dom/workers/ScriptLoader.cpp
+@@ -721,19 +721,24 @@ private:
+       new mozilla::dom::Response(mCacheCreator->Global(), ir);
+ 
+     mozilla::dom::RequestOrUSVString request;
+ 
+     MOZ_ASSERT(!loadInfo.mFullURL.IsEmpty());
+     request.SetAsUSVString().Rebind(loadInfo.mFullURL.Data(),
+                                     loadInfo.mFullURL.Length());
+ 
++    // This JSContext will not end up executing JS code because here there are
++    // no ReadableStreams involved.
++    AutoJSAPI jsapi;
++    jsapi.Init();
++
+     ErrorResult error;
+     RefPtr<Promise> cachePromise =
+-      mCacheCreator->Cache_()->Put(request, *response, error);
++      mCacheCreator->Cache_()->Put(jsapi.cx(), request, *response, error);
+     if (NS_WARN_IF(error.Failed())) {
+       nsresult rv = error.StealNSResult();
+       channel->Cancel(rv);
+       return rv;
+     }
+ 
+     RefPtr<CachePromiseHandler> promiseHandler =
+       new CachePromiseHandler(this, loadInfo, aIndex);
+@@ -1614,18 +1619,23 @@ CacheScriptLoader::Load(Cache* aCache)
+   CopyUTF8toUTF16(spec, mLoadInfo.mFullURL);
+ 
+   mozilla::dom::RequestOrUSVString request;
+   request.SetAsUSVString().Rebind(mLoadInfo.mFullURL.Data(),
+                                   mLoadInfo.mFullURL.Length());
+ 
+   mozilla::dom::CacheQueryOptions params;
+ 
++  // This JSContext will not end up executing JS code because here there are
++  // no ReadableStreams involved.
++  AutoJSAPI jsapi;
++  jsapi.Init();
++
+   ErrorResult error;
+-  RefPtr<Promise> promise = aCache->Match(request, params, error);
++  RefPtr<Promise> promise = aCache->Match(jsapi.cx(), request, params, error);
+   if (NS_WARN_IF(error.Failed())) {
+     Fail(error.StealNSResult());
+     return;
+   }
+ 
+   promise->AppendNativeHandler(this);
+ }
+ 
+diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEvents.cpp
+--- a/dom/workers/ServiceWorkerEvents.cpp
++++ b/dom/workers/ServiceWorkerEvents.cpp
+@@ -510,16 +510,54 @@ public:
+         mOwner->AsyncLog(mMessageName, mParams);
+       } else {
+         mOwner->AsyncLog(mSourceSpec, mLine, mColumn, mMessageName, mParams);
+       }
+       mOwner->CancelRequest(NS_ERROR_INTERCEPTION_FAILED);
+     }
+   }
+ 
++  // This function steals the error message from a ErrorResult.
++  void
++  SetCancelErrorResult(JSContext* aCx, ErrorResult& aRv)
++  {
++    MOZ_ASSERT(aRv.Failed());
++
++    // Storing the error as exception in the JSContext.
++    if (!aRv.MaybeSetPendingException(aCx)) {
++      return;
++    }
++
++    MOZ_ASSERT(!aRv.Failed());
++
++    // Let's take the pending exception.
++    JS::Rooted<JS::Value> exn(aCx);
++    if (!JS_GetPendingException(aCx, &exn)) {
++      return;
++    }
++
++    // Cleaning the exception.
++    JS_ClearPendingException(aCx);
++
++    // Converting the exception in a js::ErrorReport.
++    js::ErrorReport report(aCx);
++    if (!report.init(aCx, exn, js::ErrorReport::WithSideEffects)) {
++      JS_ClearPendingException(aCx);
++      return;
++    }
++
++    MOZ_ASSERT(mOwner);
++    MOZ_ASSERT(mMessageName.EqualsLiteral("InterceptionFailedWithURL"));
++    MOZ_ASSERT(mParams.Length() == 1);
++
++    // Let's store the error message here.
++    mMessageName.Assign(report.toStringResult().c_str());
++    mParams.Clear();
++  }
++
+   template<typename... Params>
+   void SetCancelMessage(const nsACString& aMessageName, Params&&... aParams)
+   {
+     MOZ_ASSERT(mOwner);
+     MOZ_ASSERT(mMessageName.EqualsLiteral("InterceptionFailedWithURL"));
+     MOZ_ASSERT(mParams.Length() == 1);
+     mMessageName = aMessageName;
+     mParams.Clear();
+@@ -665,17 +703,22 @@ RespondWithHandler::ResolvedCallback(JSC
+                                                                mRequestURL,
+                                                                mRespondWithScriptSpec,
+                                                                mRespondWithLineNumber,
+                                                                mRespondWithColumnNumber));
+   nsCOMPtr<nsIInputStream> body;
+   ir->GetUnfilteredBody(getter_AddRefs(body));
+   // Errors and redirects may not have a body.
+   if (body) {
+-    response->SetBodyUsed();
++    IgnoredErrorResult error;
++    response->SetBodyUsed(aCx, error);
++    if (NS_WARN_IF(error.Failed())) {
++      autoCancel.SetCancelErrorResult(aCx, error);
++      return;
++    }
+ 
+     nsCOMPtr<nsIOutputStream> responseBody;
+     rv = mInterceptedChannel->GetResponseBody(getter_AddRefs(responseBody));
+     if (NS_WARN_IF(NS_FAILED(rv)) || !responseBody) {
+       return;
+     }
+ 
+     const uint32_t kCopySegmentSize = 4096;
+diff --git a/dom/workers/ServiceWorkerScriptCache.cpp b/dom/workers/ServiceWorkerScriptCache.cpp
+--- a/dom/workers/ServiceWorkerScriptCache.cpp
++++ b/dom/workers/ServiceWorkerScriptCache.cpp
+@@ -418,18 +418,20 @@ private:
+     if (NS_WARN_IF(!obj) ||
+         NS_WARN_IF(NS_FAILED(UNWRAP_OBJECT(Cache, obj, mOldCache)))) {
+       return;
+     }
+ 
+     Optional<RequestOrUSVString> request;
+     CacheQueryOptions options;
+     ErrorResult error;
+-    RefPtr<Promise> promise = mOldCache->Keys(request, options, error);
++    RefPtr<Promise> promise = mOldCache->Keys(aCx, request, options, error);
+     if (NS_WARN_IF(error.Failed())) {
++      // No exception here because there are no ReadableStreams involved here.
++      MOZ_ASSERT(!error.IsJSException());
+       rv = error.StealNSResult();
+       return;
+     }
+ 
+     mState = WaitingForExistingKeys;
+     promise->AppendNativeHandler(this);
+     guard.release();
+   }
+@@ -516,17 +518,17 @@ private:
+     }
+ 
+     // Just to be safe.
+     RefPtr<Cache> kungfuDeathGrip = cache;
+ 
+     MOZ_ASSERT(mPendingCount == 0);
+     for (uint32_t i = 0; i < mCNList.Length(); ++i) {
+       // We bail out immediately when something goes wrong.
+-      rv = WriteToCache(cache, mCNList[i]);
++      rv = WriteToCache(aCx, cache, mCNList[i]);
+       if (NS_WARN_IF(NS_FAILED(rv))) {
+         return;
+       }
+     }
+ 
+     mState = WaitingForPut;
+     guard.release();
+   }
+@@ -554,17 +556,17 @@ private:
+       return;
+     }
+ 
+     mState = WaitingForOpen;
+     cacheOpenPromise->AppendNativeHandler(this);
+   }
+ 
+   nsresult
+-  WriteToCache(Cache* aCache, CompareNetwork* aCN)
++  WriteToCache(JSContext* aCx, Cache* aCache, CompareNetwork* aCN)
+   {
+     AssertIsOnMainThread();
+     MOZ_ASSERT(aCache);
+     MOZ_ASSERT(aCN);
+     MOZ_DIAGNOSTIC_ASSERT(mState == WaitingForOpen);
+ 
+     // We don't have to save any information from a failed CompareNetwork.
+     if (!aCN->Succeeded()) {
+@@ -597,18 +599,20 @@ private:
+     RefPtr<Response> response = new Response(aCache->GetGlobalObject(), ir);
+ 
+     RequestOrUSVString request;
+     request.SetAsUSVString().Rebind(aCN->URL().Data(), aCN->URL().Length());
+ 
+     // For now we have to wait until the Put Promise is fulfilled before we can
+     // continue since Cache does not yet support starting a read that is being
+     // written to.
+-    RefPtr<Promise> cachePromise = aCache->Put(request, *response, result);
++    RefPtr<Promise> cachePromise = aCache->Put(aCx, request, *response, result);
+     if (NS_WARN_IF(result.Failed())) {
++      // No exception here because there are no ReadableStreams involved here.
++      MOZ_ASSERT(!result.IsJSException());
+       MOZ_ASSERT(!result.IsErrorWithMessage());
+       return result.StealNSResult();
+     }
+ 
+     mPendingCount += 1;
+     cachePromise->AppendNativeHandler(this);
+     return NS_OK;
+   }
+@@ -998,22 +1002,29 @@ CompareNetwork::OnStreamComplete(nsIStre
+ 
+ nsresult
+ CompareCache::Initialize(Cache* const aCache, const nsAString& aURL)
+ {
+   AssertIsOnMainThread();
+   MOZ_ASSERT(aCache);
+   MOZ_DIAGNOSTIC_ASSERT(mState == WaitingForInitialization);
+ 
++  // This JSContext will not end up executing JS code because here there are
++  // no ReadableStreams involved.
++  AutoJSAPI jsapi;
++  jsapi.Init();
++
+   RequestOrUSVString request;
+   request.SetAsUSVString().Rebind(aURL.Data(), aURL.Length());
+   ErrorResult error;
+   CacheQueryOptions params;
+-  RefPtr<Promise> promise = aCache->Match(request, params, error);
++  RefPtr<Promise> promise = aCache->Match(jsapi.cx(), request, params, error);
+   if (NS_WARN_IF(error.Failed())) {
++    // No exception here because there are no ReadableStreams involved here.
++    MOZ_ASSERT(!error.IsJSException());
+     mState = Finished;
+     return error.StealNSResult();
+   }
+ 
+   // Retrieve the script from aCache.
+   mState = WaitingForScript;
+   promise->AppendNativeHandler(this);
+   return NS_OK;
+diff --git a/dom/workers/test/serviceworkers/fetch/fetch_tests.js b/dom/workers/test/serviceworkers/fetch/fetch_tests.js
+--- a/dom/workers/test/serviceworkers/fetch/fetch_tests.js
++++ b/dom/workers/test/serviceworkers/fetch/fetch_tests.js
+@@ -122,16 +122,46 @@ fetchXHR('headers.txt', function(xhr) {
+ }, null, [["X-Test1", "header1"], ["X-Test2", "header2"]]);
+ 
+ fetchXHR('http://user:pass@mochi.test:8888/user-pass', function(xhr) {
+   my_ok(xhr.status == 200, "load should be successful");
+   my_ok(xhr.responseText == 'http://user:pass@mochi.test:8888/user-pass', 'The username and password should be preserved');
+   finish();
+ });
+ 
++fetchXHR('readable-stream.txt', function(xhr) {
++  my_ok(xhr.status == 200, "loading completed");
++  my_ok(xhr.responseText == 'Hello!', "The message is correct!");
++  finish();
++});
++
++fetchXHR('readable-stream-locked.txt', function(xhr) {
++  my_ok(false, "This should not be called!");
++  finish();
++}, function() {
++  my_ok(true, "The exception has been correctly handled!");
++  finish();
++});
++
++fetchXHR('readable-stream-with-exception.txt', function(xhr) {
++  my_ok(false, "This should not be called!");
++  finish();
++}, function() {
++  my_ok(true, "The exception has been correctly handled!");
++  finish();
++});
++
++fetchXHR('readable-stream-already-consumed.txt', function(xhr) {
++  my_ok(false, "This should not be called!");
++  finish();
++}, function() {
++  my_ok(true, "The exception has been correctly handled!");
++  finish();
++});
++
+ var expectedUncompressedResponse = "";
+ for (var i = 0; i < 10; ++i) {
+   expectedUncompressedResponse += "hello";
+ }
+ expectedUncompressedResponse += "\n";
+ 
+ // ServiceWorker does not intercept, at which point the network request should
+ // be correctly decoded.
+diff --git a/dom/workers/test/serviceworkers/fetch_event_worker.js b/dom/workers/test/serviceworkers/fetch_event_worker.js
+--- a/dom/workers/test/serviceworkers/fetch_event_worker.js
++++ b/dom/workers/test/serviceworkers/fetch_event_worker.js
+@@ -94,16 +94,68 @@ onfetch = function(ev) {
+     var ok = true;
+     ok &= ev.request.headers.get("X-Test1") == "header1";
+     ok &= ev.request.headers.get("X-Test2") == "header2";
+     ev.respondWith(Promise.resolve(
+       new Response(ok.toString(), {})
+     ));
+   }
+ 
++  else if (ev.request.url.includes("readable-stream.txt")) {
++    ev.respondWith(
++      new Response(
++        new ReadableStream({
++          start: function(controller) {
++            controller.enqueue(new Uint8Array([0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x21]));
++            controller.close();
++          }
++        })
++    ));
++  }
++
++  else if (ev.request.url.includes("readable-stream-locked.txt")) {
++    let stream = new ReadableStream({
++          start(controller) {
++            controller.enqueue(new Uint8Array([0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x21]));
++            controller.close();
++          }
++        });
++
++    ev.respondWith(new Response(stream));
++
++    // This locks the stream.
++    stream.getReader();
++  }
++
++  else if (ev.request.url.includes("readable-stream-with-exception.txt")) {
++    ev.respondWith(
++      new Response(
++        new ReadableStream({
++          start(controller) {},
++          pull() {
++            throw "EXCEPTION!";
++          }
++        })
++    ));
++  }
++
++  else if (ev.request.url.includes("readable-stream-already-consumed.txt")) {
++    let r = new Response(
++        new ReadableStream({
++          start(controller) {
++            controller.enqueue(new Uint8Array([0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x21]));
++            controller.close();
++          }
++        }));
++
++    r.blob();
++
++    ev.respondWith(r);
++  }
++
+   else if (ev.request.url.includes('user-pass')) {
+     ev.respondWith(new Response(ev.request.url));
+   }
+ 
+   else if (ev.request.url.includes("nonexistent_image.gif")) {
+     var imageAsBinaryString = atob("R0lGODlhAQABAIAAAAUEBAAAACwAAAAAAQABAAACAkQBADs");
+     var imageLength = imageAsBinaryString.length;
+ 
