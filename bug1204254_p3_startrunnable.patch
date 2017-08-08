@@ -1,0 +1,177 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  564b5ace5be6d1afce19b8b3ee28cd1e044f2c28
+Bug 1204254 P3 Move logic into StartFinish() runnable separate from FinishRunnable() in ServiceWorkerEvents. r=asuth
+
+diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEvents.cpp
+--- a/dom/workers/ServiceWorkerEvents.cpp
++++ b/dom/workers/ServiceWorkerEvents.cpp
+@@ -159,31 +159,31 @@ FetchEvent::Constructor(const GlobalObje
+   e->mRequest = aOptions.mRequest;
+   e->mClientId = aOptions.mClientId;
+   e->mIsReload = aOptions.mIsReload;
+   return e.forget();
+ }
+ 
+ namespace {
+ 
+-class FinishResponse final : public Runnable
++class StartResponse final : public Runnable
+ {
+   nsMainThreadPtrHandle<nsIInterceptedChannel> mChannel;
+   RefPtr<InternalResponse> mInternalResponse;
+   ChannelInfo mWorkerChannelInfo;
+   const nsCString mScriptSpec;
+   const nsCString mResponseURLSpec;
+ 
+ public:
+-  FinishResponse(nsMainThreadPtrHandle<nsIInterceptedChannel>& aChannel,
+-                 InternalResponse* aInternalResponse,
+-                 const ChannelInfo& aWorkerChannelInfo,
+-                 const nsACString& aScriptSpec,
+-                 const nsACString& aResponseURLSpec)
+-    : Runnable("dom::workers::FinishResponse")
++  StartResponse(nsMainThreadPtrHandle<nsIInterceptedChannel>& aChannel,
++                InternalResponse* aInternalResponse,
++                const ChannelInfo& aWorkerChannelInfo,
++                const nsACString& aScriptSpec,
++                const nsACString& aResponseURLSpec)
++    : Runnable("dom::workers::StartResponse")
+     , mChannel(aChannel)
+     , mInternalResponse(aInternalResponse)
+     , mWorkerChannelInfo(aWorkerChannelInfo)
+     , mScriptSpec(aScriptSpec)
+     , mResponseURLSpec(aResponseURLSpec)
+   {
+   }
+ 
+@@ -234,34 +234,23 @@ public:
+     castLoadInfo->SynthesizeServiceWorkerTainting(mInternalResponse->GetTainting());
+ 
+     rv = mChannel->StartSynthesizedResponse(mResponseURLSpec);
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       mChannel->Cancel(NS_ERROR_INTERCEPTION_FAILED);
+       return NS_OK;
+     }
+ 
+-    rv = mChannel->FinishSynthesizedResponse();
+-    if (NS_WARN_IF(NS_FAILED(rv))) {
+-      mChannel->Cancel(NS_ERROR_INTERCEPTION_FAILED);
+-      return NS_OK;
+-    }
+-
+     TimeStamp timeStamp = TimeStamp::Now();
+     mChannel->SetHandleFetchEventEnd(timeStamp);
+-    mChannel->SetFinishSynthesizedResponseEnd(timeStamp);
+     mChannel->SaveTimeStamps();
+ 
+-    nsCOMPtr<nsIObserverService> obsService = services::GetObserverService();
+-    if (obsService) {
+-      obsService->NotifyObservers(underlyingChannel, "service-worker-synthesized-response", nullptr);
+-    }
+-
+     return rv;
+   }
++
+   bool CSPPermitsResponse(nsILoadInfo* aLoadInfo)
+   {
+     AssertIsOnMainThread();
+     MOZ_ASSERT(aLoadInfo);
+     nsresult rv;
+     nsCOMPtr<nsIURI> uri;
+     nsCString url = mInternalResponse->GetUnfilteredURL();
+     if (url.IsEmpty()) {
+@@ -275,16 +264,56 @@ public:
+                                    aLoadInfo->LoadingPrincipal(),
+                                    aLoadInfo->LoadingNode(), EmptyCString(),
+                                    nullptr, &decision);
+     NS_ENSURE_SUCCESS(rv, false);
+     return decision == nsIContentPolicy::ACCEPT;
+   }
+ };
+ 
++class FinishResponse final : public Runnable
++{
++  nsMainThreadPtrHandle<nsIInterceptedChannel> mChannel;
++
++public:
++  explicit FinishResponse(nsMainThreadPtrHandle<nsIInterceptedChannel>& aChannel)
++    : Runnable("dom::workers::FinishResponse")
++    , mChannel(aChannel)
++  {
++  }
++
++  NS_IMETHOD
++  Run() override
++  {
++    AssertIsOnMainThread();
++
++    nsresult rv = mChannel->FinishSynthesizedResponse();
++    if (NS_WARN_IF(NS_FAILED(rv))) {
++      mChannel->Cancel(NS_ERROR_INTERCEPTION_FAILED);
++      return NS_OK;
++    }
++
++    TimeStamp timeStamp = TimeStamp::Now();
++    mChannel->SetFinishSynthesizedResponseEnd(timeStamp);
++    mChannel->SaveTimeStamps();
++
++    nsCOMPtr<nsIObserverService> obsService = services::GetObserverService();
++    if (obsService) {
++      nsCOMPtr<nsIChannel> underlyingChannel;
++      nsresult rv = mChannel->GetChannel(getter_AddRefs(underlyingChannel));
++      NS_ENSURE_SUCCESS(rv, rv);
++      NS_ENSURE_TRUE(underlyingChannel, NS_ERROR_UNEXPECTED);
++
++      obsService->NotifyObservers(underlyingChannel, "service-worker-synthesized-response", nullptr);
++    }
++
++    return rv;
++  }
++};
++
+ class RespondWithHandler final : public PromiseNativeHandler
+ {
+   nsMainThreadPtrHandle<nsIInterceptedChannel> mInterceptedChannel;
+   nsMainThreadPtrHandle<ServiceWorkerRegistrationInfo> mRegistration;
+   const RequestMode mRequestMode;
+   const RequestRedirect mRequestRedirectMode;
+ #ifdef DEBUG
+   const bool mIsClientRequest;
+@@ -399,22 +428,31 @@ void RespondWithCopyComplete(void* aClos
+     AsyncLog(data->mInterceptedChannel, data->mRespondWithScriptSpec,
+              data->mRespondWithLineNumber, data->mRespondWithColumnNumber,
+              NS_LITERAL_CSTRING("InterceptionFailedWithURL"),
+              data->mRequestURL);
+     event = new CancelChannelRunnable(data->mInterceptedChannel,
+                                       data->mRegistration,
+                                       NS_ERROR_INTERCEPTION_FAILED);
+   } else {
+-    event = new FinishResponse(data->mInterceptedChannel,
+-                               data->mInternalResponse,
+-                               data->mWorkerChannelInfo,
+-                               data->mScriptSpec,
+-                               data->mResponseURLSpec);
++    event = new StartResponse(data->mInterceptedChannel,
++                              data->mInternalResponse,
++                              data->mWorkerChannelInfo,
++                              data->mScriptSpec,
++                              data->mResponseURLSpec);
++    WorkerPrivate* worker = GetCurrentThreadWorkerPrivate();
++    if (worker) {
++      MOZ_ALWAYS_SUCCEEDS(worker->DispatchToMainThread(event.forget()));
++    } else {
++      MOZ_ALWAYS_SUCCEEDS(NS_DispatchToMainThread(event.forget()));
++    }
++
++    event = new FinishResponse(data->mInterceptedChannel);
+   }
++
+   // In theory this can happen after the worker thread is terminated.
+   WorkerPrivate* worker = GetCurrentThreadWorkerPrivate();
+   if (worker) {
+     MOZ_ALWAYS_SUCCEEDS(worker->DispatchToMainThread(event.forget()));
+   } else {
+     MOZ_ALWAYS_SUCCEEDS(NS_DispatchToMainThread(event.forget()));
+   }
+ }

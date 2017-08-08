@@ -1,0 +1,207 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  faa4f52b759c6ad374242295865fc5331cea8e3c
+Bug 1204254 P2 Move StartSynthesizedResponse() out from FinishSynthesizedResponse(). r=asuth
+
+diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEvents.cpp
+--- a/dom/workers/ServiceWorkerEvents.cpp
++++ b/dom/workers/ServiceWorkerEvents.cpp
+@@ -228,17 +228,23 @@ public:
+     mInternalResponse->UnfilteredHeaders()->GetEntries(entries);
+     for (uint32_t i = 0; i < entries.Length(); ++i) {
+        mChannel->SynthesizeHeader(entries[i].mName, entries[i].mValue);
+     }
+ 
+     auto castLoadInfo = static_cast<LoadInfo*>(loadInfo.get());
+     castLoadInfo->SynthesizeServiceWorkerTainting(mInternalResponse->GetTainting());
+ 
+-    rv = mChannel->FinishSynthesizedResponse(mResponseURLSpec);
++    rv = mChannel->StartSynthesizedResponse(mResponseURLSpec);
++    if (NS_WARN_IF(NS_FAILED(rv))) {
++      mChannel->Cancel(NS_ERROR_INTERCEPTION_FAILED);
++      return NS_OK;
++    }
++
++    rv = mChannel->FinishSynthesizedResponse();
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       mChannel->Cancel(NS_ERROR_INTERCEPTION_FAILED);
+       return NS_OK;
+     }
+ 
+     TimeStamp timeStamp = TimeStamp::Now();
+     mChannel->SetHandleFetchEventEnd(timeStamp);
+     mChannel->SetFinishSynthesizedResponseEnd(timeStamp);
+diff --git a/netwerk/base/nsINetworkInterceptController.idl b/netwerk/base/nsINetworkInterceptController.idl
+--- a/netwerk/base/nsINetworkInterceptController.idl
++++ b/netwerk/base/nsINetworkInterceptController.idl
+@@ -49,26 +49,30 @@ interface nsIInterceptedChannel : nsISup
+     void synthesizeStatus(in uint16_t status, in ACString reason);
+ 
+     /**
+      * Attach a header name/value pair to the forthcoming synthesized response.
+      * Overwrites any existing header value.
+      */
+     void synthesizeHeader(in ACString name, in ACString value);
+ 
+-    void startSynthesizedResponse(in ACString finalURLSpec);
+-
+     /**
+-     * Instruct a channel that has been intercepted that a response has been
+-     * synthesized and can now be read. No further header modification is allowed
++     * Instruct a channel that has been intercepted that a response is
++     * starting to be synthesized.  No further header modification is
+      * after this point. The caller may optionally pass a spec for a URL that
+      * this response originates from; an empty string will cause the original
+      * intercepted request's URL to be used instead.
+      */
+-    void finishSynthesizedResponse(in ACString finalURLSpec);
++    void startSynthesizedResponse(in ACString finalURLSpec);
++
++    /**
++     * Instruct a channel that has been intercepted that response synthesis
++     * has completed and all outstanding resources can be closed.
++     */
++    void finishSynthesizedResponse();
+ 
+     /**
+      * Cancel the pending intercepted request.
+      * @return NS_ERROR_FAILURE if the response has already been synthesized or
+      *         the original request has been instructed to continue.
+      */
+     void cancel(in nsresult status);
+ 
+diff --git a/netwerk/protocol/http/HttpChannelParentListener.cpp b/netwerk/protocol/http/HttpChannelParentListener.cpp
+--- a/netwerk/protocol/http/HttpChannelParentListener.cpp
++++ b/netwerk/protocol/http/HttpChannelParentListener.cpp
+@@ -309,17 +309,18 @@ public:
+     , mChannel(aChannel)
+   {
+   }
+ 
+   NS_IMETHOD Run() override
+   {
+     // The URL passed as an argument here doesn't matter, since the child will
+     // receive a redirection notification as a result of this synthesized response.
+-    mChannel->FinishSynthesizedResponse(EmptyCString());
++    mChannel->StartSynthesizedResponse(EmptyCString());
++    mChannel->FinishSynthesizedResponse();
+     return NS_OK;
+   }
+ };
+ 
+ NS_IMETHODIMP
+ HttpChannelParentListener::ChannelIntercepted(nsIInterceptedChannel* aChannel)
+ {
+   if (mShouldSuspendIntercept) {
+diff --git a/netwerk/protocol/http/InterceptedChannel.cpp b/netwerk/protocol/http/InterceptedChannel.cpp
+--- a/netwerk/protocol/http/InterceptedChannel.cpp
++++ b/netwerk/protocol/http/InterceptedChannel.cpp
+@@ -359,32 +359,29 @@ InterceptedChannelChrome::StartSynthesiz
+       NS_ENSURE_SUCCESS(rv, rv);
+     }
+   }
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+-InterceptedChannelChrome::FinishSynthesizedResponse(const nsACString& aFinalURLSpec)
++InterceptedChannelChrome::FinishSynthesizedResponse()
+ {
+   if (mClosed) {
+     return NS_ERROR_NOT_AVAILABLE;
+   }
+ 
+   // Make sure the cache entry's output stream is always closed.  If the
+   // channel was intercepted with a null-body response then its possible
+   // the synthesis completed without a stream copy operation.
+   mResponseBody->Close();
+ 
+   mReportCollector->FlushConsoleReports(mChannel);
+ 
+-  nsresult rv = StartSynthesizedResponse(aFinalURLSpec);
+-  NS_ENSURE_SUCCESS(rv, rv);
+-
+   mClosed = true;
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ InterceptedChannelChrome::Cancel(nsresult aStatus)
+ {
+@@ -538,32 +535,29 @@ InterceptedChannelContent::StartSynthesi
+                                               mSynthesizedInput,
+                                               mStreamListener);
+   }
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+-InterceptedChannelContent::FinishSynthesizedResponse(const nsACString& aFinalURLSpec)
++InterceptedChannelContent::FinishSynthesizedResponse()
+ {
+   if (NS_WARN_IF(mClosed)) {
+     return NS_ERROR_NOT_AVAILABLE;
+   }
+ 
+   // Make sure the body output stream is always closed.  If the channel was
+   // intercepted with a null-body response then its possible the synthesis
+   // completed without a stream copy operation.
+   mResponseBody->Close();
+ 
+   mReportCollector->FlushConsoleReports(mChannel);
+ 
+-  nsresult rv = StartSynthesizedResponse(aFinalURLSpec);
+-  NS_ENSURE_SUCCESS(rv, rv);
+-
+   mResponseBody = nullptr;
+   mStreamListener = nullptr;
+   mClosed = true;
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+diff --git a/netwerk/protocol/http/InterceptedChannel.h b/netwerk/protocol/http/InterceptedChannel.h
+--- a/netwerk/protocol/http/InterceptedChannel.h
++++ b/netwerk/protocol/http/InterceptedChannel.h
+@@ -165,17 +165,17 @@ class InterceptedChannelChrome : public 
+   bool mOldApplyConversion;
+ public:
+   InterceptedChannelChrome(nsHttpChannel* aChannel,
+                            nsINetworkInterceptController* aController,
+                            nsICacheEntry* aEntry);
+ 
+   NS_IMETHOD ResetInterception() override;
+   NS_IMETHOD StartSynthesizedResponse(const nsACString& aFinalURLSpec) override;
+-  NS_IMETHOD FinishSynthesizedResponse(const nsACString& aFinalURLSpec) override;
++  NS_IMETHOD FinishSynthesizedResponse() override;
+   NS_IMETHOD GetChannel(nsIChannel** aChannel) override;
+   NS_IMETHOD GetSecureUpgradedChannelURI(nsIURI** aURI) override;
+   NS_IMETHOD SynthesizeStatus(uint16_t aStatus, const nsACString& aReason) override;
+   NS_IMETHOD SynthesizeHeader(const nsACString& aName, const nsACString& aValue) override;
+   NS_IMETHOD Cancel(nsresult aStatus) override;
+   NS_IMETHOD SetChannelInfo(mozilla::dom::ChannelInfo* aChannelInfo) override;
+   NS_IMETHOD GetInternalContentPolicyType(nsContentPolicyType *aInternalContentPolicyType) override;
+ 
+@@ -199,17 +199,17 @@ class InterceptedChannelContent : public
+ public:
+   InterceptedChannelContent(HttpChannelChild* aChannel,
+                             nsINetworkInterceptController* aController,
+                             InterceptStreamListener* aListener,
+                             bool aSecureUpgrade);
+ 
+   NS_IMETHOD ResetInterception() override;
+   NS_IMETHOD StartSynthesizedResponse(const nsACString& aFinalURLSpec) override;
+-  NS_IMETHOD FinishSynthesizedResponse(const nsACString& aFinalURLSpec) override;
++  NS_IMETHOD FinishSynthesizedResponse() override;
+   NS_IMETHOD GetChannel(nsIChannel** aChannel) override;
+   NS_IMETHOD GetSecureUpgradedChannelURI(nsIURI** aURI) override;
+   NS_IMETHOD SynthesizeStatus(uint16_t aStatus, const nsACString& aReason) override;
+   NS_IMETHOD SynthesizeHeader(const nsACString& aName, const nsACString& aValue) override;
+   NS_IMETHOD Cancel(nsresult aStatus) override;
+   NS_IMETHOD SetChannelInfo(mozilla::dom::ChannelInfo* aChannelInfo) override;
+   NS_IMETHOD GetInternalContentPolicyType(nsContentPolicyType *aInternalContentPolicyType) override;
+ 
