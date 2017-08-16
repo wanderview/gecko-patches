@@ -1,0 +1,666 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  9a9ef531e4b9c15b3bd50b5b66b866512be2dd8c
+Bug 1204254 P8 Move the body stream copying into the nsIInterceptedChannel::StartSynthesizedResponse() method. r=asuth
+
+diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEvents.cpp
+--- a/dom/workers/ServiceWorkerEvents.cpp
++++ b/dom/workers/ServiceWorkerEvents.cpp
+@@ -159,18 +159,136 @@ FetchEvent::Constructor(const GlobalObje
+   e->mRequest = aOptions.mRequest;
+   e->mClientId = aOptions.mClientId;
+   e->mIsReload = aOptions.mIsReload;
+   return e.forget();
+ }
+ 
+ namespace {
+ 
+-struct RespondWithClosure;
+-void RespondWithCopyComplete(void* aClosure, nsresult aStatus);
++struct RespondWithClosure
++{
++  nsMainThreadPtrHandle<nsIInterceptedChannel> mInterceptedChannel;
++  nsMainThreadPtrHandle<ServiceWorkerRegistrationInfo> mRegistration;
++  const nsString mRequestURL;
++  const nsCString mRespondWithScriptSpec;
++  const uint32_t mRespondWithLineNumber;
++  const uint32_t mRespondWithColumnNumber;
++
++  RespondWithClosure(nsMainThreadPtrHandle<nsIInterceptedChannel>& aChannel,
++                     nsMainThreadPtrHandle<ServiceWorkerRegistrationInfo>& aRegistration,
++                     const nsAString& aRequestURL,
++                     const nsACString& aRespondWithScriptSpec,
++                     uint32_t aRespondWithLineNumber,
++                     uint32_t aRespondWithColumnNumber)
++    : mInterceptedChannel(aChannel)
++    , mRegistration(aRegistration)
++    , mRequestURL(aRequestURL)
++    , mRespondWithScriptSpec(aRespondWithScriptSpec)
++    , mRespondWithLineNumber(aRespondWithLineNumber)
++    , mRespondWithColumnNumber(aRespondWithColumnNumber)
++  {
++  }
++};
++
++class FinishResponse final : public Runnable
++{
++  nsMainThreadPtrHandle<nsIInterceptedChannel> mChannel;
++
++public:
++  explicit FinishResponse(nsMainThreadPtrHandle<nsIInterceptedChannel>& aChannel)
++    : Runnable("dom::workers::FinishResponse")
++    , mChannel(aChannel)
++  {
++  }
++
++  NS_IMETHOD
++  Run() override
++  {
++    AssertIsOnMainThread();
++
++    nsresult rv = mChannel->FinishSynthesizedResponse();
++    if (NS_WARN_IF(NS_FAILED(rv))) {
++      mChannel->Cancel(NS_ERROR_INTERCEPTION_FAILED);
++      return NS_OK;
++    }
++
++    TimeStamp timeStamp = TimeStamp::Now();
++    mChannel->SetHandleFetchEventEnd(timeStamp);
++    mChannel->SetFinishSynthesizedResponseEnd(timeStamp);
++    mChannel->SaveTimeStamps();
++
++    nsCOMPtr<nsIObserverService> obsService = services::GetObserverService();
++    if (obsService) {
++      nsCOMPtr<nsIChannel> underlyingChannel;
++      nsresult rv = mChannel->GetChannel(getter_AddRefs(underlyingChannel));
++      NS_ENSURE_SUCCESS(rv, rv);
++      NS_ENSURE_TRUE(underlyingChannel, NS_ERROR_UNEXPECTED);
++
++      obsService->NotifyObservers(underlyingChannel, "service-worker-synthesized-response", nullptr);
++    }
++
++    return rv;
++  }
++};
++
++class BodyCopyHandle final : public nsIRunnable
++                           , public nsICancelable
++{
++  UniquePtr<RespondWithClosure> mClosure;
++  nsresult mStatus;
++
++  ~BodyCopyHandle()
++  {
++  }
++
++public:
++  NS_DECL_THREADSAFE_ISUPPORTS
++
++  explicit BodyCopyHandle(UniquePtr<RespondWithClosure>&& aClosure)
++    : mClosure(Move(aClosure))
++    , mStatus(NS_OK)
++  {
++  }
++
++  NS_IMETHOD
++  Run() override
++  {
++    MOZ_ASSERT(NS_IsMainThread());
++
++    nsCOMPtr<nsIRunnable> event;
++    if (NS_WARN_IF(NS_FAILED(mStatus))) {
++      AsyncLog(mClosure->mInterceptedChannel, mClosure->mRespondWithScriptSpec,
++               mClosure->mRespondWithLineNumber,
++               mClosure->mRespondWithColumnNumber,
++               NS_LITERAL_CSTRING("InterceptionFailedWithURL"),
++               mClosure->mRequestURL);
++      event = new CancelChannelRunnable(mClosure->mInterceptedChannel,
++                                        mClosure->mRegistration,
++                                        NS_ERROR_INTERCEPTION_FAILED);
++    } else {
++      event = new FinishResponse(mClosure->mInterceptedChannel);
++    }
++
++    mClosure.reset();
++
++    event->Run();
++
++    return NS_OK;
++  }
++
++  NS_IMETHOD
++  Cancel(nsresult aStatus) override
++  {
++    mStatus = aStatus;
++    return Run();
++  }
++};
++
++NS_IMPL_ISUPPORTS(BodyCopyHandle, nsIRunnable, nsICancelable)
+ 
+ class StartResponse final : public Runnable
+ {
+   nsMainThreadPtrHandle<nsIInterceptedChannel> mChannel;
+   RefPtr<InternalResponse> mInternalResponse;
+   ChannelInfo mWorkerChannelInfo;
+   const nsCString mScriptSpec;
+   const nsCString mResponseURLSpec;
+@@ -234,71 +352,31 @@ public:
+     mInternalResponse->UnfilteredHeaders()->GetEntries(entries);
+     for (uint32_t i = 0; i < entries.Length(); ++i) {
+        mChannel->SynthesizeHeader(entries[i].mName, entries[i].mValue);
+     }
+ 
+     auto castLoadInfo = static_cast<LoadInfo*>(loadInfo.get());
+     castLoadInfo->SynthesizeServiceWorkerTainting(mInternalResponse->GetTainting());
+ 
+-    rv = mChannel->StartSynthesizedResponse(nullptr, nullptr, nullptr,
++    nsCOMPtr<nsIInputStream> body;
++    mInternalResponse->GetUnfilteredBody(getter_AddRefs(body));
++    RefPtr<BodyCopyHandle> copyHandle;
++    // Errors and redirects may not have a body.
++    if (body) {
++      copyHandle = new BodyCopyHandle(Move(mClosure));
++    }
++
++    rv = mChannel->StartSynthesizedResponse(body, copyHandle, copyHandle,
+                                             mResponseURLSpec);
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       mChannel->Cancel(NS_ERROR_INTERCEPTION_FAILED);
+       return NS_OK;
+     }
+ 
+-    // Only start copying after we have begun synthesizing the response.
+-    // Some of the necko invariants can fail if we trigger an OnDataAvailable
+-    // too early.
+-    nsCOMPtr<nsIInputStream> body;
+-    mInternalResponse->GetUnfilteredBody(getter_AddRefs(body));
+-    // Errors and redirects may not have a body.
+-    if (body) {
+-      nsCOMPtr<nsIOutputStream> responseBody;
+-      rv = mChannel->GetResponseBody(getter_AddRefs(responseBody));
+-      if (NS_WARN_IF(NS_FAILED(rv)) || !responseBody) {
+-        return rv;
+-      }
+-
+-      const uint32_t kCopySegmentSize = 4096;
+-
+-      // Depending on how the Response passed to .respondWith() was created, we may
+-      // get a non-buffered input stream.  In addition, in some configurations the
+-      // destination channel's output stream can be unbuffered.  We wrap the output
+-      // stream side here so that NS_AsyncCopy() works.  Wrapping the output side
+-      // provides the most consistent operation since there are fewer stream types
+-      // we are writing to.  The input stream can be a wide variety of concrete
+-      // objects which may or many not play well with NS_InputStreamIsBuffered().
+-      if (!NS_OutputStreamIsBuffered(responseBody)) {
+-        nsCOMPtr<nsIOutputStream> buffered;
+-        rv = NS_NewBufferedOutputStream(getter_AddRefs(buffered), responseBody,
+-             kCopySegmentSize);
+-        if (NS_WARN_IF(NS_FAILED(rv))) {
+-          return rv;
+-        }
+-        responseBody = buffered;
+-      }
+-
+-      nsCOMPtr<nsIEventTarget> stsThread = do_GetService(NS_STREAMTRANSPORTSERVICE_CONTRACTID, &rv);
+-      if (NS_WARN_IF(!stsThread)) {
+-        return NS_ERROR_FAILURE;
+-      }
+-
+-      // XXXnsm, Fix for Bug 1141332 means that if we decide to make this
+-      // streaming at some point, we'll need a different solution to that bug.
+-      rv = NS_AsyncCopy(body, responseBody, stsThread, NS_ASYNCCOPY_VIA_WRITESEGMENTS,
+-                        kCopySegmentSize, RespondWithCopyComplete, mClosure.release());
+-      if (NS_WARN_IF(NS_FAILED(rv))) {
+-        return rv;
+-      }
+-    } else {
+-      RespondWithCopyComplete(mClosure.release(), NS_OK);
+-    }
+-
+     return rv;
+   }
+ 
+   bool CSPPermitsResponse(nsILoadInfo* aLoadInfo)
+   {
+     AssertIsOnMainThread();
+     MOZ_ASSERT(aLoadInfo);
+     nsresult rv;
+@@ -315,57 +393,16 @@ public:
+                                    aLoadInfo->LoadingPrincipal(),
+                                    aLoadInfo->LoadingNode(), EmptyCString(),
+                                    nullptr, &decision);
+     NS_ENSURE_SUCCESS(rv, false);
+     return decision == nsIContentPolicy::ACCEPT;
+   }
+ };
+ 
+-class FinishResponse final : public Runnable
+-{
+-  nsMainThreadPtrHandle<nsIInterceptedChannel> mChannel;
+-
+-public:
+-  explicit FinishResponse(nsMainThreadPtrHandle<nsIInterceptedChannel>& aChannel)
+-    : Runnable("dom::workers::FinishResponse")
+-    , mChannel(aChannel)
+-  {
+-  }
+-
+-  NS_IMETHOD
+-  Run() override
+-  {
+-    AssertIsOnMainThread();
+-
+-    nsresult rv = mChannel->FinishSynthesizedResponse();
+-    if (NS_WARN_IF(NS_FAILED(rv))) {
+-      mChannel->Cancel(NS_ERROR_INTERCEPTION_FAILED);
+-      return NS_OK;
+-    }
+-
+-    TimeStamp timeStamp = TimeStamp::Now();
+-    mChannel->SetHandleFetchEventEnd(timeStamp);
+-    mChannel->SetFinishSynthesizedResponseEnd(timeStamp);
+-    mChannel->SaveTimeStamps();
+-
+-    nsCOMPtr<nsIObserverService> obsService = services::GetObserverService();
+-    if (obsService) {
+-      nsCOMPtr<nsIChannel> underlyingChannel;
+-      nsresult rv = mChannel->GetChannel(getter_AddRefs(underlyingChannel));
+-      NS_ENSURE_SUCCESS(rv, rv);
+-      NS_ENSURE_TRUE(underlyingChannel, NS_ERROR_UNEXPECTED);
+-
+-      obsService->NotifyObservers(underlyingChannel, "service-worker-synthesized-response", nullptr);
+-    }
+-
+-    return rv;
+-  }
+-};
+-
+ class RespondWithHandler final : public PromiseNativeHandler
+ {
+   nsMainThreadPtrHandle<nsIInterceptedChannel> mInterceptedChannel;
+   nsMainThreadPtrHandle<ServiceWorkerRegistrationInfo> mRegistration;
+   const RequestMode mRequestMode;
+   const RequestRedirect mRequestRedirectMode;
+ #ifdef DEBUG
+   const bool mIsClientRequest;
+@@ -430,66 +467,16 @@ private:
+       ::AsyncLog(mInterceptedChannel, mRespondWithScriptSpec,
+                  mRespondWithLineNumber, mRespondWithColumnNumber,
+                  NS_LITERAL_CSTRING("InterceptionFailedWithURL"), mRequestURL);
+       CancelRequest(NS_ERROR_INTERCEPTION_FAILED);
+     }
+   }
+ };
+ 
+-struct RespondWithClosure
+-{
+-  nsMainThreadPtrHandle<nsIInterceptedChannel> mInterceptedChannel;
+-  nsMainThreadPtrHandle<ServiceWorkerRegistrationInfo> mRegistration;
+-  const nsString mRequestURL;
+-  const nsCString mRespondWithScriptSpec;
+-  const uint32_t mRespondWithLineNumber;
+-  const uint32_t mRespondWithColumnNumber;
+-
+-  RespondWithClosure(nsMainThreadPtrHandle<nsIInterceptedChannel>& aChannel,
+-                     nsMainThreadPtrHandle<ServiceWorkerRegistrationInfo>& aRegistration,
+-                     const nsAString& aRequestURL,
+-                     const nsACString& aRespondWithScriptSpec,
+-                     uint32_t aRespondWithLineNumber,
+-                     uint32_t aRespondWithColumnNumber)
+-    : mInterceptedChannel(aChannel)
+-    , mRegistration(aRegistration)
+-    , mRequestURL(aRequestURL)
+-    , mRespondWithScriptSpec(aRespondWithScriptSpec)
+-    , mRespondWithLineNumber(aRespondWithLineNumber)
+-    , mRespondWithColumnNumber(aRespondWithColumnNumber)
+-  {
+-  }
+-};
+-
+-void RespondWithCopyComplete(void* aClosure, nsresult aStatus)
+-{
+-  UniquePtr<RespondWithClosure> data(static_cast<RespondWithClosure*>(aClosure));
+-  nsCOMPtr<nsIRunnable> event;
+-  if (NS_WARN_IF(NS_FAILED(aStatus))) {
+-    AsyncLog(data->mInterceptedChannel, data->mRespondWithScriptSpec,
+-             data->mRespondWithLineNumber, data->mRespondWithColumnNumber,
+-             NS_LITERAL_CSTRING("InterceptionFailedWithURL"),
+-             data->mRequestURL);
+-    event = new CancelChannelRunnable(data->mInterceptedChannel,
+-                                      data->mRegistration,
+-                                      NS_ERROR_INTERCEPTION_FAILED);
+-  } else {
+-    event = new FinishResponse(data->mInterceptedChannel);
+-  }
+-
+-  // In theory this can happen after the worker thread is terminated.
+-  if (NS_IsMainThread()) {
+-    event->Run();
+-    return;
+-  }
+-
+-  MOZ_ALWAYS_SUCCEEDS(NS_DispatchToMainThread(event.forget()));
+-}
+-
+ class MOZ_STACK_CLASS AutoCancel
+ {
+   RefPtr<RespondWithHandler> mOwner;
+   nsCString mSourceSpec;
+   uint32_t mLine;
+   uint32_t mColumn;
+   nsCString mMessageName;
+   nsTArray<nsString> mParams;
+diff --git a/netwerk/protocol/http/InterceptedChannel.cpp b/netwerk/protocol/http/InterceptedChannel.cpp
+--- a/netwerk/protocol/http/InterceptedChannel.cpp
++++ b/netwerk/protocol/http/InterceptedChannel.cpp
+@@ -2,43 +2,155 @@
+ /* vim:set expandtab ts=2 sw=2 sts=2 cin: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "HttpLog.h"
+ 
+ #include "InterceptedChannel.h"
++#include "nsICancelable.h"
+ #include "nsInputStreamPump.h"
+ #include "nsIPipe.h"
+ #include "nsIStreamListener.h"
+ #include "nsITimedChannel.h"
+ #include "nsHttpChannel.h"
+ #include "HttpChannelChild.h"
+ #include "nsHttpResponseHead.h"
+ #include "nsNetUtil.h"
+ #include "mozilla/ConsoleReportCollector.h"
+ #include "mozilla/dom/ChannelInfo.h"
+ #include "nsIChannelEventSink.h"
++#include "nsThreadUtils.h"
+ 
+ namespace mozilla {
+ namespace net {
+ 
+ extern nsresult
+ DoUpdateExpirationTime(nsHttpChannel* aSelf,
+                        nsICacheEntry* aCacheEntry,
+                        nsHttpResponseHead* aResponseHead,
+                        uint32_t& aExpirationTime);
+ extern nsresult
+ DoAddCacheEntryHeaders(nsHttpChannel *self,
+                        nsICacheEntry *entry,
+                        nsHttpRequestHead *requestHead,
+                        nsHttpResponseHead *responseHead,
+                        nsISupports *securityInfo);
+ 
++namespace {
++
++struct StreamCopyClosure
++{
++  nsCOMPtr<nsIRunnable> mSuccessCallback;
++  nsCOMPtr<nsICancelable> mFailureCallback;
++  nsCOMPtr<nsIEventTarget> mTarget;
++
++  StreamCopyClosure(nsIRunnable* aSuccessCallback,
++                    nsICancelable* aFailureCallback)
++    : mSuccessCallback(aSuccessCallback)
++    , mFailureCallback(aFailureCallback)
++    , mTarget(GetCurrentThreadSerialEventTarget())
++  {
++    MOZ_DIAGNOSTIC_ASSERT(mSuccessCallback || mFailureCallback);
++  }
++
++  StreamCopyClosure() = delete;
++  StreamCopyClosure(const StreamCopyClosure&) = delete;
++};
++
++void
++StreamCopyComplete(void* aClosure, nsresult aStatus)
++{
++  UniquePtr<StreamCopyClosure> closure(static_cast<StreamCopyClosure*>(aClosure));
++
++  if (!closure) {
++    return;
++  }
++
++  nsCOMPtr<nsIEventTarget> target = closure->mTarget.forget();
++
++  // We need to be careful to only run/addref the provided callbacks on the
++  // original thread.  The xpcshell tests pass js runnables which cannot
++  // be used from a separate thread.  Therefore we pass the closure pointer
++  // to our runnable by forgetting it and re-acquiring it in the lambda.
++  StreamCopyClosure* dispatchedClosure = closure.release();
++
++  nsCOMPtr<nsIRunnable> runnable =
++    NS_NewRunnableFunction("InterceptedChannel::StreamCopyCompelte",
++                           [aStatus, dispatchedClosure]() {
++      UniquePtr<StreamCopyClosure> closure(dispatchedClosure);
++      if (NS_SUCCEEDED(aStatus)) {
++        if (closure->mSuccessCallback) {
++          closure->mSuccessCallback->Run();
++        }
++        return;
++      }
++
++      if (closure->mFailureCallback) {
++        closure->mFailureCallback->Cancel(aStatus);
++      }
++    });
++
++  MOZ_ALWAYS_SUCCEEDS(
++    target->Dispatch(runnable.forget(), nsIThread::DISPATCH_NORMAL));
++}
++
++nsresult
++StreamCopyStart(nsIOutputStream* aWriter,
++                nsIInputStream* aReader,
++                nsIRunnable* aSuccessCallback,
++                nsICancelable* aFailureCallback)
++{
++  MOZ_DIAGNOSTIC_ASSERT(aWriter);
++  MOZ_DIAGNOSTIC_ASSERT(aReader);
++
++  // Use a strong ref because we might need to hold a new stream
++  // alive if we decide to wrap the one passed to us.
++  nsCOMPtr<nsIOutputStream> writer(aWriter);
++
++  const uint32_t kCopySegmentSize = 4096;
++  nsresult rv = NS_OK;
++
++  // Depending on how the Response passed to .respondWith() was created, we may
++  // get a non-buffered input stream.  In addition, in some configurations the
++  // destination channel's output stream can be unbuffered.  We wrap the output
++  // stream side here so that NS_AsyncCopy() works.  Wrapping the output side
++  // provides the most consistent operation since there are fewer stream types
++  // we are writing to.  The input stream can be a wide variety of concrete
++  // objects which may or many not play well with NS_InputStreamIsBuffered().
++  if (!NS_OutputStreamIsBuffered(writer)) {
++    nsCOMPtr<nsIOutputStream> buffered;
++    rv = NS_NewBufferedOutputStream(getter_AddRefs(buffered), writer,
++                                    kCopySegmentSize);
++    NS_ENSURE_SUCCESS(rv, rv);
++    NS_ENSURE_TRUE(buffered, rv);
++
++    writer = buffered.forget();
++  }
++
++  nsCOMPtr<nsIEventTarget> stsThread =
++    do_GetService(NS_STREAMTRANSPORTSERVICE_CONTRACTID, &rv);
++  NS_ENSURE_SUCCESS(rv, rv);
++  NS_ENSURE_TRUE(stsThread, NS_ERROR_FAILURE);
++
++  UniquePtr<StreamCopyClosure> closure;
++  if (aSuccessCallback || aFailureCallback) {
++    closure = MakeUnique<StreamCopyClosure>(aSuccessCallback, aFailureCallback);
++  }
++
++  rv = NS_AsyncCopy(aReader, writer, stsThread, NS_ASYNCCOPY_VIA_WRITESEGMENTS,
++                    kCopySegmentSize, StreamCopyComplete, closure.release());
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  return NS_OK;
++}
++
++} // anonymous namespace
++
+ NS_IMPL_ISUPPORTS(InterceptedChannelBase, nsIInterceptedChannel)
+ 
+ InterceptedChannelBase::InterceptedChannelBase(nsINetworkInterceptController* aController)
+   : mController(aController)
+   , mReportCollector(new ConsoleReportCollector())
+   , mClosed(false)
+   , mSynthesizedOrReset(Invalid)
+ {
+@@ -356,16 +468,27 @@ InterceptedChannelChrome::StartSynthesiz
+     NS_ENSURE_SUCCESS(rv, rv);
+ 
+     mSynthesizedCacheEntry = nullptr;
+ 
+     if (!mChannel->AwaitingCacheCallbacks()) {
+       rv = mChannel->ContinueConnect();
+       NS_ENSURE_SUCCESS(rv, rv);
+     }
++
++    if (!aBody) {
++      if (aBodyCompletionCallback) {
++        aBodyCompletionCallback->Run();
++      }
++    } else {
++      nsresult rv = StreamCopyStart(mResponseBody, aBody,
++                                    aBodyCompletionCallback,
++                                    aBodyFailedCallback);
++      NS_ENSURE_SUCCESS(rv, rv);
++    }
+   }
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ InterceptedChannelChrome::FinishSynthesizedResponse()
+ {
+@@ -535,16 +658,27 @@ InterceptedChannelContent::StartSynthesi
+   originalURI->Equals(responseURI, &equal);
+   if (!equal) {
+     mChannel->ForceIntercepted(mSynthesizedInput);
+     mChannel->BeginNonIPCRedirect(responseURI, *mSynthesizedResponseHead.ptr());
+   } else {
+     mChannel->OverrideWithSynthesizedResponse(mSynthesizedResponseHead.ref(),
+                                               mSynthesizedInput,
+                                               mStreamListener);
++
++    if (!aBody) {
++      if (aBodyCompletionCallback) {
++        aBodyCompletionCallback->Run();
++      }
++    } else {
++      nsresult rv = StreamCopyStart(mResponseBody, aBody,
++                                    aBodyCompletionCallback,
++                                    aBodyFailedCallback);
++      NS_ENSURE_SUCCESS(rv, rv);
++    }
+   }
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ InterceptedChannelContent::FinishSynthesizedResponse()
+ {
+diff --git a/netwerk/test/unit/test_synthesized_response.js b/netwerk/test/unit/test_synthesized_response.js
+--- a/netwerk/test/unit/test_synthesized_response.js
++++ b/netwerk/test/unit/test_synthesized_response.js
+@@ -50,17 +50,17 @@ function make_channel(url, body, cb) {
+     channelIntercepted: function(channel) {
+       channel.QueryInterface(Ci.nsIInterceptedChannel);
+       if (body) {
+         var synthesized = Cc["@mozilla.org/io/string-input-stream;1"]
+                             .createInstance(Ci.nsIStringInputStream);
+         synthesized.data = body;
+ 
+         NetUtil.asyncCopy(synthesized, channel.responseBody, function() {
+-          channel.startSynthesizedResponse('');
++          channel.startSynthesizedResponse(null, null, null, '');
+           channel.finishSynthesizedResponse();
+         });
+       }
+       if (cb) {
+         cb(channel);
+       }
+       return {
+         dispatch: function() { }
+@@ -141,17 +141,17 @@ add_test(function() {
+ add_test(function() {
+   var chan = make_channel(URL + '/body', null, function(channel) {
+     do_timeout(100, function() {
+       var synthesized = Cc["@mozilla.org/io/string-input-stream;1"]
+                           .createInstance(Ci.nsIStringInputStream);
+       synthesized.data = NON_REMOTE_BODY;
+       NetUtil.asyncCopy(synthesized, channel.responseBody, function() {
+         channel.synthesizeHeader("Content-Length", NON_REMOTE_BODY.length);
+-        channel.startSynthesizedResponse('');
++        channel.startSynthesizedResponse(null, null, null, '');
+         channel.finishSynthesizedResponse();
+       });
+     });
+   });
+   chan.asyncOpen2(new ChannelListener(handle_synthesized_response, null));
+ });
+ 
+ // ensure that the channel waits for a decision
+@@ -170,17 +170,17 @@ add_test(function() {
+     var synthesized = Cc["@mozilla.org/io/string-input-stream;1"]
+                         .createInstance(Ci.nsIStringInputStream);
+     synthesized.data = NON_REMOTE_BODY;
+ 
+     NetUtil.asyncCopy(synthesized, intercepted.responseBody, function() {
+       // set the content-type to ensure that the stream converter doesn't hold up notifications
+       // and cause the test to fail
+       intercepted.synthesizeHeader("Content-Type", "text/plain");
+-      intercepted.startSynthesizedResponse('');
++      intercepted.startSynthesizedResponse(null, null, null, '');
+       intercepted.finishSynthesizedResponse();
+     });
+   });
+   chan.asyncOpen2(new ChannelListener(handle_synthesized_response, null,
+ 				     CL_ALLOW_UNKNOWN_CL | CL_SUSPEND | CL_EXPECT_3S_DELAY));
+ });
+ 
+ // ensure that the intercepted channel can be cancelled
+@@ -212,17 +212,17 @@ add_test(function() {
+ add_test(function() {
+   var chan = make_channel(URL + '/body', null, function(intercepted) {
+     var synthesized = Cc["@mozilla.org/io/string-input-stream;1"]
+                         .createInstance(Ci.nsIStringInputStream);
+     synthesized.data = NON_REMOTE_BODY;
+ 
+     NetUtil.asyncCopy(synthesized, intercepted.responseBody, function() {
+       let channel = intercepted.channel;
+-      intercepted.startSynthesizedResponse('');
++      intercepted.startSynthesizedResponse(null, null, null, '');
+       intercepted.finishSynthesizedResponse();
+       channel.cancel(Cr.NS_BINDING_ABORTED);
+     });
+   });
+   chan.asyncOpen2(new ChannelListener(run_next_test, null,
+                                      CL_EXPECT_FAILURE | CL_ALLOW_UNKNOWN_CL));
+ });
+ 
+@@ -230,17 +230,17 @@ add_test(function() {
+ add_test(function() {
+   var chan = make_channel(URL + '/body', null, function(intercepted) {
+     var synthesized = Cc["@mozilla.org/io/string-input-stream;1"]
+                         .createInstance(Ci.nsIStringInputStream);
+     synthesized.data = NON_REMOTE_BODY;
+ 
+     NetUtil.asyncCopy(synthesized, intercepted.responseBody, function() {
+       intercepted.channel.cancel(Cr.NS_BINDING_ABORTED);
+-      intercepted.startSynthesizedResponse('');
++      intercepted.startSynthesizedResponse(null, null, null, '');
+       intercepted.finishSynthesizedResponse();
+     });
+   });
+   chan.asyncOpen2(new ChannelListener(run_next_test, null,
+                                      CL_EXPECT_FAILURE | CL_ALLOW_UNKNOWN_CL));
+ });
+ 
+ add_test(function() {

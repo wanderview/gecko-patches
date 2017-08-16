@@ -1,0 +1,182 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  07ce8c96222d533fc89c02802143d35d7c351f9c
+
+diff --git a/netwerk/protocol/http/nsHttpChannel.cpp b/netwerk/protocol/http/nsHttpChannel.cpp
+--- a/netwerk/protocol/http/nsHttpChannel.cpp
++++ b/netwerk/protocol/http/nsHttpChannel.cpp
+@@ -297,16 +297,17 @@ AutoRedirectVetoNotifier::ReportRedirect
+ }
+ 
+ //-----------------------------------------------------------------------------
+ // nsHttpChannel <public>
+ //-----------------------------------------------------------------------------
+ 
+ nsHttpChannel::nsHttpChannel()
+     : HttpAsyncAborter<nsHttpChannel>(this)
++    , mSynthesizedStreamLength(-1)
+     , mLogicalOffset(0)
+     , mPostID(0)
+     , mRequestTime(0)
+     , mOfflineCacheLastModifiedTime(0)
+     , mSuspendTotalTime(0)
+     , mInterceptCache(DO_NOT_INTERCEPT)
+     , mInterceptionID(gNumIntercepted++)
+     , mCacheOpenWithPriority(false)
+@@ -344,16 +345,18 @@ nsHttpChannel::nsHttpChannel()
+     , mWarningReporter(nullptr)
+     , mIsReadingFromCache(false)
+     , mFirstResponseSource(RESPONSE_PENDING)
+     , mOnCacheAvailableCalled(false)
+     , mRaceCacheWithNetwork(false)
+     , mRaceDelay(0)
+     , mCacheAsyncOpenCalled(false)
+     , mIgnoreCacheEntry(false)
++    , mSynthesizedResponse(false)
++    , mShouldInterceptSubsequentRedirect(false)
+     , mRCWNLock("nsHttpChannel.mRCWNLock")
+     , mDidReval(false)
+ {
+     LOG(("Creating nsHttpChannel [this=%p]\n", this));
+     mChannelCreationTime = PR_Now();
+     mChannelCreationTimestamp = TimeStamp::Now();
+ }
+ 
+@@ -6209,16 +6212,71 @@ nsHttpChannel::GetOrCreateChannelClassif
+         LOG(("nsHttpChannel [%p] created nsChannelClassifier [%p]\n",
+              this, mChannelClassifier.get()));
+     }
+ 
+     RefPtr<nsChannelClassifier> classifier = mChannelClassifier;
+     return classifier.forget();
+ }
+ 
++void
++nsHttpChannel::OverrideWithSynthesizedResponse(nsAutoPtr<nsHttpResponseHead>& aResponseHead,
++                                               nsIInputStream* aSynthesizedInput,
++                                               nsIStreamListener* aStreamListener)
++{
++  mInterceptListener = aStreamListener;
++
++  if (!WillRedirect(aResponseHead)) {
++    SetApplyConversion(false);
++  }
++
++  mResponseHead = aResponseHead;
++  mSynthesizedResponse = true;
++
++  if (WillRedirect(mResponseHead)) {
++    mShouldInterceptSubsequentRedirect = true;
++    nsresult rv = ContinueConnect();
++    if (NS_WARN_IF(NS_FAILED(rv))) {
++      MOZ_ALWAYS_SUCCEEDS(AsyncAbort(rv));
++    }
++    return;
++  }
++
++  uint64_t available = 0;
++  nsresult rv = aSynthesizedInput->Available(&available);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    mSynthesizedStreamLength = -1;
++  } else {
++    mSynthesizedStreamLength = static_cast<int64_t>(available);
++  }
++
++  rv = nsInputStreamPump::Create(getter_AddRefs(mSynthesizedResponsePump),
++                                 aSynthesizedInput,
++                                 int64_t(-1), int64_t(-1), 0, 0, true);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    aSynthesizedInput->Close();
++    // TODO: abort?
++    return;
++  }
++
++  rv = mSynthesizedResponsePump->AsyncRead(aStreamListener, nullptr);
++  NS_ENSURE_SUCCESS_VOID(rv); // TODO: abort?
++
++  for (uint32_t i = 0; i < mSuspendCount; ++i) {
++    rv = mSynthesizedResponsePump->Suspend();
++    NS_ENSURE_SUCCESS_VOID(rv); // TODO: abort?
++  }
++
++  if (mCanceled) {
++    mSynthesizedResponsePump->Cancel(mStatus);
++  }
++
++  // TODO
++}
++
+ bool
+ nsHttpChannel::InitLocalBlockList(const InitLocalBlockListCallback& aCallback)
+ {
+     mLocalBlocklist = false;
+ 
+     if (!(mLoadFlags & LOAD_CLASSIFY_URI)) {
+         return false;
+     }
+diff --git a/netwerk/protocol/http/nsHttpChannel.h b/netwerk/protocol/http/nsHttpChannel.h
+--- a/netwerk/protocol/http/nsHttpChannel.h
++++ b/netwerk/protocol/http/nsHttpChannel.h
+@@ -507,16 +507,21 @@ private:
+     void MaybeWarnAboutAppCache();
+ 
+     void SetLoadGroupUserAgentOverride();
+ 
+     void SetDoNotTrack();
+ 
+     already_AddRefed<nsChannelClassifier> GetOrCreateChannelClassifier();
+ 
++    void
++    OverrideWithSynthesizedResponse(nsAutoPtr<nsHttpResponseHead>& aResponseHead,
++                                    nsIInputStream* aSynthesizedInput,
++                                    nsIStreamListener* aStreamListener);
++
+ private:
+     // this section is for main-thread-only object
+     // all the references need to be proxy released on main thread.
+     nsCOMPtr<nsIApplicationCache> mApplicationCacheForWrite;
+     // auth specific data
+     nsCOMPtr<nsIHttpChannelAuthProvider> mAuthProvider;
+     nsCOMPtr<nsIURI> mRedirectURI;
+     nsCOMPtr<nsIChannel> mRedirectChannel;
+@@ -533,16 +538,21 @@ private:
+     void ReleaseMainThreadOnlyReferences();
+ 
+ private:
+     nsCOMPtr<nsICancelable>           mProxyRequest;
+ 
+     RefPtr<nsInputStreamPump>       mTransactionPump;
+     RefPtr<nsHttpTransaction>       mTransaction;
+ 
++    RefPtr<nsIStreamListener>         mInterceptListener;
++    RefPtr<nsInputStreamPump>         mSynthesizedResponsePump;
++    nsCOMPtr<nsIInputStream>          mSynthesizedInput;
++    int64_t                           mSynthesizedStreamLength;
++
+     uint64_t                          mLogicalOffset;
+ 
+     // cache specific data
+     nsCOMPtr<nsICacheEntry>           mCacheEntry;
+     // This will be set during OnStopRequest() before calling CloseCacheEntry(),
+     // but only if the listener wants to use alt-data (signaled by
+     // HttpBaseChannel::mPreferredCachedAltDataType being not empty)
+     // Needed because calling openAlternativeOutputStream needs a reference
+@@ -713,16 +723,18 @@ private:
+     // time we send the network request
+     Atomic<bool> mRaceCacheWithNetwork;
+     uint32_t mRaceDelay;
+     bool mCacheAsyncOpenCalled;
+     // If true then OnCacheEntryAvailable should ignore the entry, because
+     // SetupTransaction removed conditional headers and decisions made in
+     // OnCacheEntryCheck are no longer valid.
+     bool mIgnoreCacheEntry;
++    bool mSynthesizedResponse;
++    bool mShouldInterceptSubsequentRedirect;
+     // Lock preventing OnCacheEntryCheck and SetupTransaction being called at
+     // the same time.
+     mozilla::Mutex mRCWNLock;
+ 
+ protected:
+     virtual void DoNotifyListenerCleanup() override;
+ 
+     // Override ReleaseListeners() because mChannelClassifier only exists
