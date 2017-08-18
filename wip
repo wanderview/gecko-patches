@@ -1,7 +1,255 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  07ce8c96222d533fc89c02802143d35d7c351f9c
+# Parent  04bee69b3274bd8d5cf52d54a0a5cc14dbe8693a
 
+diff --git a/netwerk/protocol/http/InterceptedChannel.cpp b/netwerk/protocol/http/InterceptedChannel.cpp
+--- a/netwerk/protocol/http/InterceptedChannel.cpp
++++ b/netwerk/protocol/http/InterceptedChannel.cpp
+@@ -598,10 +598,195 @@ InterceptedChannelContent::GetSecureUpgr
+   }
+   if (uri) {
+     uri.forget(aURI);
+     return NS_OK;
+   }
+   return NS_ERROR_FAILURE;
+ }
+ 
++InterceptedChannelChrome2::InterceptedChannelChrome2(nsHttpChannel* aChannel,
++                                                     nsINetworkInterceptController* aController,
++                                                     nsIStreamListener* aListener,
++                                                     bool aSecureUpgrade)
++: InterceptedChannelBase(aController)
++, mChannel(aChannel)
++, mStreamListener(aListener)
++, mSecureUpgrade(aSecureUpgrade)
++{
++}
++
++void
++InterceptedChannelChrome2::NotifyController()
++{
++  nsresult rv = NS_NewPipe(getter_AddRefs(mSynthesizedInput),
++                           getter_AddRefs(mResponseBody),
++                           0, UINT32_MAX, true, true);
++  NS_ENSURE_SUCCESS_VOID(rv);
++
++  DoNotifyController();
++}
++
++NS_IMETHODIMP
++InterceptedChannelChrome2::GetChannel(nsIChannel** aChannel)
++{
++  NS_IF_ADDREF(*aChannel = mChannel);
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++InterceptedChannelChrome2::ResetInterception()
++{
++  if (mClosed) {
++    return NS_ERROR_NOT_AVAILABLE;
++  }
++
++  mReportCollector->FlushConsoleReports(mChannel);
++
++  mResponseBody->Close();
++  mResponseBody = nullptr;
++  mSynthesizedInput = nullptr;
++
++  mChannel->ResetInterception();
++
++  mClosed = true;
++
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++InterceptedChannelChrome2::SynthesizeStatus(uint16_t aStatus, const nsACString& aReason)
++{
++  if (!mResponseBody) {
++    return NS_ERROR_NOT_AVAILABLE;
++  }
++
++  return DoSynthesizeStatus(aStatus, aReason);
++}
++
++NS_IMETHODIMP
++InterceptedChannelChrome2::SynthesizeHeader(const nsACString& aName, const nsACString& aValue)
++{
++  if (!mResponseBody) {
++    return NS_ERROR_NOT_AVAILABLE;
++  }
++
++  return DoSynthesizeHeader(aName, aValue);
++}
++
++NS_IMETHODIMP
++InterceptedChannelChrome2::FinishSynthesizedResponse(const nsACString& aFinalURLSpec)
++{
++  if (NS_WARN_IF(mClosed)) {
++    return NS_ERROR_NOT_AVAILABLE;
++  }
++
++  // Make sure the body output stream is always closed.  If the channel was
++  // intercepted with a null-body response then its possible the synthesis
++  // completed without a stream copy operation.
++  mResponseBody->Close();
++
++  mReportCollector->FlushConsoleReports(mChannel);
++
++  EnsureSynthesizedResponse();
++
++  nsCOMPtr<nsIURI> originalURI;
++  mChannel->GetURI(getter_AddRefs(originalURI));
++
++  nsCOMPtr<nsIURI> responseURI;
++  if (!aFinalURLSpec.IsEmpty()) {
++    nsresult rv = NS_NewURI(getter_AddRefs(responseURI), aFinalURLSpec);
++    NS_ENSURE_SUCCESS(rv, rv);
++  } else if (mSecureUpgrade) {
++    nsresult rv = NS_GetSecureUpgradedURI(originalURI,
++                                          getter_AddRefs(responseURI));
++    NS_ENSURE_SUCCESS(rv, rv);
++  } else {
++    responseURI = originalURI;
++  }
++
++  bool equal = false;
++  originalURI->Equals(responseURI, &equal);
++  if (!equal) {
++    mChannel->ForceIntercepted(mSynthesizedInput);
++    // TODO: is this right?  probably need to pass the synthesized head
++    //mChannel->BeginNonIPCRedirect(responseURI, *mSynthesizedResponseHead.ptr());
++    nsresult rv =
++        mChannel->StartRedirectChannelToURI(responseURI, nsIChannelEventSink::REDIRECT_INTERNAL);
++    NS_ENSURE_SUCCESS(rv, rv);
++  } else {
++    mChannel->OverrideWithSynthesizedResponse(mSynthesizedResponseHead.ref(),
++                                              mSynthesizedInput,
++                                              mStreamListener);
++  }
++
++  mResponseBody = nullptr;
++  mStreamListener = nullptr;
++  mClosed = true;
++
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++InterceptedChannelChrome2::Cancel(nsresult aStatus)
++{
++  MOZ_ASSERT(NS_FAILED(aStatus));
++
++  if (mClosed) {
++    return NS_ERROR_FAILURE;
++  }
++
++  mReportCollector->FlushConsoleReports(mChannel);
++
++  // we need to use AsyncAbort instead of Cancel since there's no active pump
++  // to cancel which will provide OnStart/OnStopRequest to the channel.
++  nsresult rv = mChannel->AsyncAbort(aStatus);
++  NS_ENSURE_SUCCESS(rv, rv);
++  mStreamListener = nullptr;
++  mClosed = true;
++
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++InterceptedChannelChrome2::SetChannelInfo(dom::ChannelInfo* aChannelInfo)
++{
++  if (mClosed) {
++    return NS_ERROR_FAILURE;
++  }
++
++  return aChannelInfo->ResurrectInfoOnChannel(mChannel);
++}
++
++NS_IMETHODIMP
++InterceptedChannelChrome2::GetInternalContentPolicyType(nsContentPolicyType* aPolicyType)
++{
++  NS_ENSURE_ARG(aPolicyType);
++
++  nsCOMPtr<nsILoadInfo> loadInfo;
++  nsresult rv = mChannel->GetLoadInfo(getter_AddRefs(loadInfo));
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  if (loadInfo) {
++    *aPolicyType = loadInfo->InternalContentPolicyType();
++  }
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++InterceptedChannelChrome2::GetSecureUpgradedChannelURI(nsIURI** aURI)
++{
++  nsCOMPtr<nsIURI> uri;
++  if (mSecureUpgrade) {
++    uri = SecureUpgradeChannelURI(mChannel);
++  } else {
++    nsresult rv = mChannel->GetURI(getter_AddRefs(uri));
++    NS_ENSURE_SUCCESS(rv, rv);
++  }
++  if (uri) {
++    uri.forget(aURI);
++    return NS_OK;
++  }
++  return NS_ERROR_FAILURE;
++}
++
+ } // namespace net
+ } // namespace mozilla
+diff --git a/netwerk/protocol/http/InterceptedChannel.h b/netwerk/protocol/http/InterceptedChannel.h
+--- a/netwerk/protocol/http/InterceptedChannel.h
++++ b/netwerk/protocol/http/InterceptedChannel.h
+@@ -209,12 +209,45 @@ public:
+   NS_IMETHOD SynthesizeHeader(const nsACString& aName, const nsACString& aValue) override;
+   NS_IMETHOD Cancel(nsresult aStatus) override;
+   NS_IMETHOD SetChannelInfo(mozilla::dom::ChannelInfo* aChannelInfo) override;
+   NS_IMETHOD GetInternalContentPolicyType(nsContentPolicyType *aInternalContentPolicyType) override;
+ 
+   virtual void NotifyController() override;
+ };
+ 
++class InterceptedChannelChrome2 : public InterceptedChannelBase
++{
++  // The actual channel being intercepted.
++  RefPtr<nsHttpChannel> mChannel;
++
++  // Reader-side of the response body when synthesizing in a child proces
++  nsCOMPtr<nsIInputStream> mSynthesizedInput;
++
++  // Listener for the synthesized response to fix up the notifications before they reach
++  // the actual channel.
++  nsCOMPtr<nsIStreamListener> mStreamListener;
++
++  // Set for intercepted channels that have gone through a secure upgrade.
++  bool mSecureUpgrade;
++public:
++  InterceptedChannelChrome2(nsHttpChannel* aChannel,
++                            nsINetworkInterceptController* aController,
++                            nsIStreamListener* aListener,
++                            bool aSecureUpgrade);
++
++  NS_IMETHOD ResetInterception() override;
++  NS_IMETHOD FinishSynthesizedResponse(const nsACString& aFinalURLSpec) override;
++  NS_IMETHOD GetChannel(nsIChannel** aChannel) override;
++  NS_IMETHOD GetSecureUpgradedChannelURI(nsIURI** aURI) override;
++  NS_IMETHOD SynthesizeStatus(uint16_t aStatus, const nsACString& aReason) override;
++  NS_IMETHOD SynthesizeHeader(const nsACString& aName, const nsACString& aValue) override;
++  NS_IMETHOD Cancel(nsresult aStatus) override;
++  NS_IMETHOD SetChannelInfo(mozilla::dom::ChannelInfo* aChannelInfo) override;
++  NS_IMETHOD GetInternalContentPolicyType(nsContentPolicyType *aInternalContentPolicyType) override;
++
++  virtual void NotifyController() override;
++};
++
+ } // namespace net
+ } // namespace mozilla
+ 
+ #endif // InterceptedChannel_h
 diff --git a/netwerk/protocol/http/nsHttpChannel.cpp b/netwerk/protocol/http/nsHttpChannel.cpp
 --- a/netwerk/protocol/http/nsHttpChannel.cpp
 +++ b/netwerk/protocol/http/nsHttpChannel.cpp
@@ -23,7 +271,7 @@ diff --git a/netwerk/protocol/http/nsHttpChannel.cpp b/netwerk/protocol/http/nsH
      , mInterceptCache(DO_NOT_INTERCEPT)
      , mInterceptionID(gNumIntercepted++)
      , mCacheOpenWithPriority(false)
-@@ -344,16 +345,18 @@ nsHttpChannel::nsHttpChannel()
+@@ -344,16 +345,19 @@ nsHttpChannel::nsHttpChannel()
      , mWarningReporter(nullptr)
      , mIsReadingFromCache(false)
      , mFirstResponseSource(RESPONSE_PENDING)
@@ -34,6 +282,7 @@ diff --git a/netwerk/protocol/http/nsHttpChannel.cpp b/netwerk/protocol/http/nsH
      , mIgnoreCacheEntry(false)
 +    , mSynthesizedResponse(false)
 +    , mShouldInterceptSubsequentRedirect(false)
++    , mRedirectingForSubsequentSynthesizedResponse(false)
      , mRCWNLock("nsHttpChannel.mRCWNLock")
      , mDidReval(false)
  {
@@ -42,15 +291,117 @@ diff --git a/netwerk/protocol/http/nsHttpChannel.cpp b/netwerk/protocol/http/nsH
      mChannelCreationTimestamp = TimeStamp::Now();
  }
  
-@@ -6209,16 +6212,71 @@ nsHttpChannel::GetOrCreateChannelClassif
-         LOG(("nsHttpChannel [%p] created nsChannelClassifier [%p]\n",
-              this, mChannelClassifier.get()));
+@@ -462,29 +466,43 @@ nsHttpChannel::OnBeforeConnect()
+     OriginAttributes originAttributes;
+     if (!NS_GetOriginAttributes(this, originAttributes)) {
+         return NS_ERROR_FAILURE;
+     }
+     bool isHttp = false;
+     rv = mURI->SchemeIs("http", &isHttp);
+     NS_ENSURE_SUCCESS(rv,rv);
+ 
++    bool shouldUpgrade = false;
+     if (isHttp) {
+-        bool shouldUpgrade = false;
+         rv = NS_ShouldSecureUpgrade(mURI,
+                                     mLoadInfo,
+                                     resultPrincipal,
+                                     mPrivateBrowsing,
+                                     mAllowSTS,
+                                     originAttributes,
+                                     shouldUpgrade);
+         NS_ENSURE_SUCCESS(rv, rv);
+-        if (shouldUpgrade) {
+-            return AsyncCall(&nsHttpChannel::HandleAsyncRedirectChannelToHttps);
+-        }
++    }
++
++    if (mInterceptCache == MAYBE_INTERCEPT) {
++      nsCOMPtr<nsINetworkInterceptController> controller;
++      GetCallback(controller);
++
++      mInterceptListener = new InterceptStreamListener2(this, mListenerContext);
++
++      RefPtr<InterceptedChannelChrome2> intercepted =
++          new InterceptedChannelChrome2(this, controller, mInterceptListener,
++                                        shouldUpgrade);
++      intercepted->NotifyController();
++      return NS_OK;
++    }
++
++    if (shouldUpgrade) {
++        return AsyncCall(&nsHttpChannel::HandleAsyncRedirectChannelToHttps);
      }
  
-     RefPtr<nsChannelClassifier> classifier = mChannelClassifier;
-     return classifier.forget();
+     // ensure that we are using a valid hostname
+     if (!net_IsValidHostName(nsDependentCString(mConnectionInfo->Origin())))
+         return NS_ERROR_UNKNOWN_HOST;
+ 
+     if (mUpgradeProtocolCallback) {
+         mCaps |=  NS_HTTP_DISALLOW_SPDY;
+@@ -3918,30 +3936,27 @@ nsHttpChannel::OpenCacheEntry(bool isHtt
+         extension.Append(nsPrintfCString("u%" PRIu64, mInterceptionID));
+     } else if (mPostID) {
+         extension.Append(nsPrintfCString("%d", mPostID));
+     }
+ 
+     // If this channel should be intercepted, we do not open a cache entry for this channel
+     // until the interception process is complete and the consumer decides what to do with it.
+     if (mInterceptCache == MAYBE_INTERCEPT) {
++        MOZ_CRASH("hmm");
+         DebugOnly<bool> exists;
+         MOZ_ASSERT(NS_FAILED(cacheStorage->Exists(openURI, extension, &exists)) || !exists,
+                    "The entry must not exist in the cache before we create it here");
+ 
+         nsCOMPtr<nsICacheEntry> entry;
+         rv = cacheStorage->OpenTruncate(openURI, extension, getter_AddRefs(entry));
+         NS_ENSURE_SUCCESS(rv, rv);
+ 
+         nsCOMPtr<nsINetworkInterceptController> controller;
+         GetCallback(controller);
+-
+-        RefPtr<InterceptedChannelChrome> intercepted =
+-                new InterceptedChannelChrome(this, controller, entry);
+-        intercepted->NotifyController();
+     } else {
+         if (mInterceptCache == INTERCEPTED) {
+             cacheEntryOpenFlags |= nsICacheStorage::OPEN_INTERCEPTED;
+             // Clear OPEN_TRUNCATE for the fake cache entry, since otherwise
+             // cache storage will close the current entry which breaks the
+             // response synthesis.
+             cacheEntryOpenFlags &= ~nsICacheStorage::OPEN_TRUNCATE;
+             DebugOnly<bool> exists;
+@@ -8713,16 +8728,102 @@ bool nsHttpChannel::IsRedirectStatus(uin
+ void
+ nsHttpChannel::SetCouldBeSynthesized()
+ {
+   MOZ_ASSERT(!BypassServiceWorker());
+   mResponseCouldBeSynthesized = true;
  }
  
+ void
++nsHttpChannel::ResetInterception()
++{
++  /* TODO
++  if (mInterceptListener) {
++    mInterceptListener->Cleanup();
++  }
++  */
++  mInterceptListener = nullptr;
++
++  // The chance to intercept any further requests associated with this channel
++  // (such as redirects) has passed.
++  if (mRedirectMode != nsIHttpChannelInternal::REDIRECT_MODE_MANUAL) {
++    mLoadFlags |= LOAD_BYPASS_SERVICE_WORKER;
++  }
++
++  // Continue with the original cross-process request
++  nsresult rv = ContinueConnect();
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    Unused << AsyncAbort(rv);
++  }
++}
++
 +void
 +nsHttpChannel::OverrideWithSynthesizedResponse(nsAutoPtr<nsHttpResponseHead>& aResponseHead,
 +                                               nsIInputStream* aSynthesizedInput,
@@ -106,40 +457,184 @@ diff --git a/netwerk/protocol/http/nsHttpChannel.cpp b/netwerk/protocol/http/nsH
 +  // TODO
 +}
 +
- bool
- nsHttpChannel::InitLocalBlockList(const InitLocalBlockListCallback& aCallback)
++void
++nsHttpChannel::ForceIntercepted(nsIInputStream* aSynthesizedInput)
++{
++  mSynthesizedInput = aSynthesizedInput;
++  mSynthesizedResponse = true;
++  mRedirectingForSubsequentSynthesizedResponse = true;
++}
++
++void
+ nsHttpChannel::SetConnectionInfo(nsHttpConnectionInfo *aCI)
  {
-     mLocalBlocklist = false;
+     mConnectionInfo = aCI ? aCI->Clone() : nullptr;
+ }
  
-     if (!(mLoadFlags & LOAD_CLASSIFY_URI)) {
-         return false;
-     }
+ NS_IMETHODIMP
+ nsHttpChannel::OnPreflightSucceeded()
+ {
+@@ -9346,10 +9447,92 @@ nsHttpChannel::SetWarningReporter(HttpCh
+ 
+ HttpChannelSecurityWarningReporter*
+ nsHttpChannel::GetWarningReporter()
+ {
+     LOG(("nsHttpChannel [this=%p] GetWarningReporter [%p]", this, mWarningReporter.get()));
+     return mWarningReporter.get();
+ }
+ 
++NS_IMPL_ISUPPORTS(InterceptStreamListener2,
++                  nsIStreamListener,
++                  nsIRequestObserver,
++                  nsIProgressEventSink)
++
++NS_IMETHODIMP
++InterceptStreamListener2::OnStartRequest(nsIRequest* aRequest, nsISupports* aContext)
++{
++  if (mOwner) {
++    mOwner->OnStartRequest(mOwner, mContext);
++  }
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++InterceptStreamListener2::OnStatus(nsIRequest* aRequest, nsISupports* aContext,
++                                  nsresult status, const char16_t* aStatusArg)
++{
++  if (mOwner) {
++    // TODO
++    //mOwner->DoOnStatus(mOwner, status);
++  }
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++InterceptStreamListener2::OnProgress(nsIRequest* aRequest, nsISupports* aContext,
++                                    int64_t aProgress, int64_t aProgressMax)
++{
++  if (mOwner) {
++    // TODO
++    //mOwner->DoOnProgress(mOwner, aProgress, aProgressMax);
++  }
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++InterceptStreamListener2::OnDataAvailable(nsIRequest* aRequest, nsISupports* aContext,
++                                         nsIInputStream* aInputStream, uint64_t aOffset,
++                                         uint32_t aCount)
++{
++  if (!mOwner) {
++    return NS_OK;
++  }
++
++  uint32_t loadFlags;
++  mOwner->GetLoadFlags(&loadFlags);
++
++  if (!(loadFlags & HttpBaseChannel::LOAD_BACKGROUND)) {
++    nsCOMPtr<nsIURI> uri;
++    mOwner->GetURI(getter_AddRefs(uri));
++
++    nsAutoCString host;
++    uri->GetHost(host);
++
++    OnStatus(mOwner, aContext, NS_NET_STATUS_READING, NS_ConvertUTF8toUTF16(host).get());
++
++    int64_t progress = aOffset + aCount;
++    OnProgress(mOwner, aContext, progress, mOwner->mSynthesizedStreamLength);
++  }
++
++  mOwner->OnDataAvailable(mOwner, mContext, aInputStream, aOffset, aCount);
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++InterceptStreamListener2::OnStopRequest(nsIRequest* aRequest, nsISupports* aContext, nsresult aStatusCode)
++{
++  if (mOwner) {
++    mOwner->OnStopRequest(mOwner, mContext, aStatusCode);
++  }
++  Cleanup();
++  return NS_OK;
++}
++
++void
++InterceptStreamListener2::Cleanup()
++{
++  mOwner = nullptr;
++  mContext = nullptr;
++}
++
+ } // namespace net
+ } // namespace mozilla
 diff --git a/netwerk/protocol/http/nsHttpChannel.h b/netwerk/protocol/http/nsHttpChannel.h
 --- a/netwerk/protocol/http/nsHttpChannel.h
 +++ b/netwerk/protocol/http/nsHttpChannel.h
-@@ -507,16 +507,21 @@ private:
-     void MaybeWarnAboutAppCache();
+@@ -61,16 +61,37 @@ public:
+ #define NS_HTTPCHANNEL_IID                         \
+ {                                                  \
+   0x301bf95b,                                      \
+   0x7bb3,                                          \
+   0x4ae1,                                          \
+   {0xa9, 0x71, 0x40, 0xbc, 0xfa, 0x81, 0xde, 0x12} \
+ }
  
-     void SetLoadGroupUserAgentOverride();
++class InterceptStreamListener2 : public nsIStreamListener
++                               , public nsIProgressEventSink
++{
++  RefPtr<nsHttpChannel> mOwner;
++  nsCOMPtr<nsISupports> mContext;
++  virtual ~InterceptStreamListener2() {}
++ public:
++  InterceptStreamListener2(nsHttpChannel* aOwner, nsISupports* aContext)
++  : mOwner(aOwner)
++  , mContext(aContext)
++  {
++  }
++
++  NS_DECL_ISUPPORTS
++  NS_DECL_NSIREQUESTOBSERVER
++  NS_DECL_NSISTREAMLISTENER
++  NS_DECL_NSIPROGRESSEVENTSINK
++
++  void Cleanup();
++};
++
+ class nsHttpChannel final : public HttpBaseChannel
+                           , public HttpAsyncAborter<nsHttpChannel>
+                           , public nsIStreamListener
+                           , public nsICachingChannel
+                           , public nsICacheEntryOpenCallback
+                           , public nsITransportEventSink
+                           , public nsIProtocolProxyCallback
+                           , public nsIInputAvailableCallback
+@@ -282,16 +303,25 @@ public: /* internal necko use only */
+       uint32_t mKeep : 2;
+     };
  
-     void SetDoNotTrack();
+     void MarkIntercepted();
+     NS_IMETHOD GetResponseSynthesized(bool* aSynthesized) override;
+     bool AwaitingCacheCallbacks();
+     void SetCouldBeSynthesized();
  
-     already_AddRefed<nsChannelClassifier> GetOrCreateChannelClassifier();
- 
++    void ResetInterception();
++
 +    void
 +    OverrideWithSynthesizedResponse(nsAutoPtr<nsHttpResponseHead>& aResponseHead,
 +                                    nsIInputStream* aSynthesizedInput,
 +                                    nsIStreamListener* aStreamListener);
 +
- private:
-     // this section is for main-thread-only object
-     // all the references need to be proxy released on main thread.
-     nsCOMPtr<nsIApplicationCache> mApplicationCacheForWrite;
-     // auth specific data
-     nsCOMPtr<nsIHttpChannelAuthProvider> mAuthProvider;
-     nsCOMPtr<nsIURI> mRedirectURI;
-     nsCOMPtr<nsIChannel> mRedirectChannel;
-@@ -533,16 +538,21 @@ private:
++    void ForceIntercepted(nsIInputStream* aSynthesizedInput);
++
+     // Return true if the latest ODA is invoked by mCachePump.
+     // Should only be called on the same thread as ODA.
+     bool IsReadingFromCache() const { return mIsReadingFromCache; }
+ 
+ private: // used for alternate service validation
+     RefPtr<TransactionObserver> mTransactionObserver;
+ public:
+     void SetConnectionInfo(nsHttpConnectionInfo *); // clones the argument
+@@ -535,16 +565,21 @@ private:
      void ReleaseMainThreadOnlyReferences();
  
  private:
@@ -161,7 +656,25 @@ diff --git a/netwerk/protocol/http/nsHttpChannel.h b/netwerk/protocol/http/nsHtt
      // but only if the listener wants to use alt-data (signaled by
      // HttpBaseChannel::mPreferredCachedAltDataType being not empty)
      // Needed because calling openAlternativeOutputStream needs a reference
-@@ -713,16 +723,18 @@ private:
+@@ -585,16 +620,17 @@ private:
+ 
+     // If the channel is associated with a cache, and the URI matched
+     // a fallback namespace, this will hold the key for the fallback
+     // cache entry.
+     nsCString                         mFallbackKey;
+ 
+     friend class AutoRedirectVetoNotifier;
+     friend class HttpAsyncAborter<nsHttpChannel>;
++    friend class InterceptStreamListener2;
+ 
+     uint32_t                          mRedirectType;
+ 
+     static const uint32_t WAIT_FOR_CACHE_ENTRY = 1;
+     static const uint32_t WAIT_FOR_OFFLINE_CACHE_ENTRY = 2;
+ 
+     bool                              mCacheOpenWithPriority;
+     uint32_t                          mCacheQueueSizeWhenOpen;
+@@ -715,16 +751,19 @@ private:
      // time we send the network request
      Atomic<bool> mRaceCacheWithNetwork;
      uint32_t mRaceDelay;
@@ -172,6 +685,7 @@ diff --git a/netwerk/protocol/http/nsHttpChannel.h b/netwerk/protocol/http/nsHtt
      bool mIgnoreCacheEntry;
 +    bool mSynthesizedResponse;
 +    bool mShouldInterceptSubsequentRedirect;
++    bool mRedirectingForSubsequentSynthesizedResponse;
      // Lock preventing OnCacheEntryCheck and SetupTransaction being called at
      // the same time.
      mozilla::Mutex mRCWNLock;
