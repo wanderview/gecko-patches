@@ -1,83 +1,12 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  b20dddd615de85622f8bc04aad9945ea8314af2e
+# Parent  153bb332d617da1e744abef379f8b06a71b683a3
+Bug 1391693 P6 Make HttpChannelParent operate on HttpBaseChannel objects instead of nsHttpChannel directly.
 
 diff --git a/netwerk/protocol/http/HttpChannelParent.cpp b/netwerk/protocol/http/HttpChannelParent.cpp
 --- a/netwerk/protocol/http/HttpChannelParent.cpp
 +++ b/netwerk/protocol/http/HttpChannelParent.cpp
-@@ -14,16 +14,17 @@
- #include "mozilla/dom/Element.h"
- #include "mozilla/dom/TabParent.h"
- #include "mozilla/net/NeckoParent.h"
- #include "mozilla/IntegerPrintfMacros.h"
- #include "mozilla/UniquePtr.h"
- #include "mozilla/Unused.h"
- #include "HttpBackgroundChannelParent.h"
- #include "HttpChannelParentListener.h"
-+#include "InterceptedHttpChannel.h"
- #include "nsHttpHandler.h"
- #include "nsNetCID.h"
- #include "nsNetUtil.h"
- #include "nsISupportsPriority.h"
- #include "nsIAuthPromptProvider.h"
- #include "nsIBackgroundChannelRegistrar.h"
- #include "nsSerializationHelper.h"
- #include "nsISerializable.h"
-@@ -47,16 +48,17 @@
- #include "nsIWindowWatcher.h"
- #include "nsIDocument.h"
- #include "nsStreamUtils.h"
- #include "nsStringStream.h"
- #include "nsIStorageStream.h"
- #include "nsThreadUtils.h"
- #include "nsQueryObject.h"
- #include "nsIURIClassifier.h"
-+#include "mozilla/ErrorNames.h"
- 
- using mozilla::BasePrincipal;
- using namespace mozilla::dom;
- using namespace mozilla::ipc;
- 
- namespace mozilla {
- namespace net {
- 
-@@ -71,16 +73,17 @@ HttpChannelParent::HttpChannelParent(con
-   , mLoadContext(aLoadContext)
-   , mStatus(NS_OK)
-   , mPendingDiversion(false)
-   , mDivertingFromChild(false)
-   , mDivertedOnStartRequest(false)
-   , mSuspendedForDiversion(false)
-   , mSuspendAfterSynthesizeResponse(false)
-   , mWillSynthesizeResponse(false)
-+  , mSynthesizedRedirectWillSuspend(false)
-   , mNestedFrameId(0)
- {
-   LOG(("Creating HttpChannelParent [this=%p]\n", this));
- 
-   // Ensure gHttpHandler is initialized: we need the atom table up and running.
-   nsCOMPtr<nsIHttpProtocolHandler> dummyInitializer =
-     do_GetService(NS_NETWORK_PROTOCOL_CONTRACTID_PREFIX "http");
- 
-@@ -122,16 +125,17 @@ HttpChannelParent::ActorDestroy(ActorDes
- bool
- HttpChannelParent::Init(const HttpChannelCreationArgs& aArgs)
- {
-   LOG(("HttpChannelParent::Init [this=%p]\n", this));
-   switch (aArgs.type()) {
-   case HttpChannelCreationArgs::THttpChannelOpenArgs:
-   {
-     const HttpChannelOpenArgs& a = aArgs.get_HttpChannelOpenArgs();
-+    nsCOMPtr<nsIURI> uri = DeserializeURI(a.uri());
-     return DoAsyncOpen(a.uri(), a.original(), a.doc(), a.referrer(),
-                        a.referrerPolicy(), a.apiRedirectTo(), a.topWindowURI(),
-                        a.loadFlags(), a.requestHeaders(),
-                        a.requestMethod(), a.uploadStream(),
-                        a.uploadStreamHasHeaders(), a.priority(), a.classOfService(),
-                        a.redirectionLimit(), a.allowSTS(),
-                        a.thirdPartyFlags(), a.resumeAt(), a.startPos(),
-                        a.entityID(), a.chooseApplicationCache(),
-@@ -230,35 +234,38 @@ HttpChannelParent::CleanupBackgroundChan
+@@ -230,35 +230,38 @@ HttpChannelParent::CleanupBackgroundChan
    if (mBgParent) {
      RefPtr<HttpBackgroundChannelParent> bgParent = mBgParent.forget();
      bgParent->OnChannelClosed();
@@ -119,99 +48,20 @@ diff --git a/netwerk/protocol/http/HttpChannelParent.cpp b/netwerk/protocol/http
        TryInvokeAsyncOpen(NS_ERROR_FAILURE);
      }
    }
-@@ -384,16 +391,22 @@ HttpChannelParent::InvokeAsyncOpen(nsres
-     rv = mChannel->AsyncOpen2(mParentListener);
-   }
-   else {
-     rv = mChannel->AsyncOpen(mParentListener, nullptr);
-   }
-   if (NS_FAILED(rv)) {
-     AsyncOpenFailed(rv);
-   }
-+
-+  if (mWillSynthesizeResponse && mSuspendAfterSynthesizeResponse) {
-+    mChannel->Suspend();
-+    mWillSynthesizeResponse = false;
-+    MaybeFlushPendingDiversion();
-+  }
- }
+@@ -516,78 +519,93 @@ HttpChannelParent::DoAsyncOpen(  const U
  
- namespace {
- class InvokeAsyncOpen : public Runnable
- {
-   nsMainThreadPtrHandle<nsIInterfaceRequestor> mChannel;
-   nsresult mStatus;
- public:
-@@ -509,85 +522,141 @@ HttpChannelParent::DoAsyncOpen(  const U
+   nsCOMPtr<nsIChannel> channel;
+   rv = NS_NewChannelInternal(getter_AddRefs(channel), uri, loadInfo,
+                              nullptr, nullptr, aLoadFlags, ios);
    if (NS_FAILED(rv)) {
      return SendFailedAsyncOpen(rv);
    }
  
-   if (!loadInfo) {
-     return SendFailedAsyncOpen(NS_ERROR_UNEXPECTED);
-   }
- 
--  nsCOMPtr<nsIChannel> channel;
--  rv = NS_NewChannelInternal(getter_AddRefs(channel), uri, loadInfo,
--                             nullptr, nullptr, aLoadFlags, ios);
--  if (NS_FAILED(rv)) {
--    return SendFailedAsyncOpen(rv);
-+  RefPtr<HttpBaseChannel> httpChannel;
-+
-+  if (aSynthesizedResponseHead.type() == OptionalHttpResponseHead::TnsHttpResponseHead) {
-+    const nsHttpResponseHead& head =
-+      aSynthesizedResponseHead.get_nsHttpResponseHead();
-+
-+    nsCOMPtr<nsIInputStream> body;
-+    rv = NS_NewCStringInputStream(getter_AddRefs(body), EmptyCString());
-+    if (NS_WARN_IF(NS_FAILED(rv))) {
-+      return SendFailedAsyncOpen(rv);
-+    }
-+
-+    RefPtr<InterceptedHttpChannel> intercepted =
-+      InterceptedHttpChannel::CreateForSynthesis(&head, body);
-+    if (NS_WARN_IF(!intercepted)) {
-+      return SendFailedAsyncOpen(NS_ERROR_FAILURE);
-+    }
-+
-+    if (nsHttpChannel::WillRedirect(const_cast<nsHttpResponseHead*>(&head))) {
-+      intercepted->AutoSuspendRedirectChannel();
-+      mSynthesizedRedirectWillSuspend = true;
-+    }
-+
-+    httpChannel = intercepted.forget();
-+
-+    rv = httpChannel->Init(uri, 0, nullptr, 0, nullptr, aChannelId);
-+    if (NS_WARN_IF(NS_FAILED(rv))) {
-+      return SendFailedAsyncOpen(rv);
-+    }
-+
-+    rv = httpChannel->SetLoadInfo(loadInfo);
-+    if (NS_WARN_IF(NS_FAILED(rv))) {
-+      return SendFailedAsyncOpen(rv);
-+    }
-+
-+    mWillSynthesizeResponse = true;
-+
-+  } else {
-+    nsCOMPtr<nsIChannel> channel;
-+    rv = NS_NewChannelInternal(getter_AddRefs(channel), uri, loadInfo,
-+                               nullptr, nullptr, aLoadFlags, ios);
-+    if (NS_FAILED(rv)) {
-+      return SendFailedAsyncOpen(rv);
-+    }
-+
-+    httpChannel = do_QueryObject(channel);
-+    if (!httpChannel) {
-+      return SendFailedAsyncOpen(NS_ERROR_FAILURE);
-+    }
-   }
- 
 -  RefPtr<nsHttpChannel> httpChannel = do_QueryObject(channel, &rv);
--  if (NS_FAILED(rv)) {
--    return SendFailedAsyncOpen(rv);
--  }
-+  MOZ_DIAGNOSTIC_ASSERT(httpChannel);
++  RefPtr<HttpBaseChannel> httpChannel = do_QueryObject(channel, &rv);
+   if (NS_FAILED(rv)) {
+     return SendFailedAsyncOpen(rv);
+   }
  
    // Set the channelId allocated in child to the parent instance
 -  httpChannel->SetChannelId(aChannelId);
@@ -310,7 +160,7 @@ diff --git a/netwerk/protocol/http/HttpChannelParent.cpp b/netwerk/protocol/http
        // Wait for completion of async copying IPC upload stream to a local input stream.
        ++mAsyncOpenBarrier;
  
-@@ -630,23 +699,24 @@ HttpChannelParent::DoAsyncOpen(  const U
+@@ -630,27 +648,27 @@ HttpChannelParent::DoAsyncOpen(  const U
        // the AsyncOpen process once the full stream has been received.
        rv = NS_AsyncCopy(stream, sink, target, NS_ASYNCCOPY_VIA_READSEGMENTS,
                          kBufferSize, // copy segment size
@@ -329,29 +179,20 @@ diff --git a/netwerk/protocol/http/HttpChannelParent.cpp b/netwerk/protocol/http
 +    httpChannelImpl->SetUploadStreamHasHeaders(uploadStreamHasHeaders);
    }
  
-+  /*
    if (aSynthesizedResponseHead.type() == OptionalHttpResponseHead::TnsHttpResponseHead) {
      parentListener->SetupInterception(aSynthesizedResponseHead.get_nsHttpResponseHead());
      mWillSynthesizeResponse = true;
-     httpChannel->SetCouldBeSynthesized();
+-    httpChannel->SetCouldBeSynthesized();
++    httpChannelImpl->SetCouldBeSynthesized();
  
      if (!aSecurityInfoSerialization.IsEmpty()) {
        nsCOMPtr<nsISupports> secInfo;
        NS_DeserializeObject(aSecurityInfoSerialization, getter_AddRefs(secInfo));
-@@ -654,50 +724,64 @@ HttpChannelParent::DoAsyncOpen(  const U
+       rv = httpChannel->OverrideSecurityInfo(secInfo);
        MOZ_ASSERT(NS_SUCCEEDED(rv));
      }
    } else {
-     nsLoadFlags newLoadFlags;
-     httpChannel->GetLoadFlags(&newLoadFlags);
-     newLoadFlags |= nsIChannel::LOAD_BYPASS_SERVICE_WORKER;
-     httpChannel->SetLoadFlags(newLoadFlags);
-   }
-+  */
- 
-   nsCOMPtr<nsISupportsPRUint32> cacheKey =
-     do_CreateInstance(NS_SUPPORTS_PRUINT32_CONTRACTID, &rv);
-   if (NS_FAILED(rv)) {
+@@ -666,38 +684,51 @@ HttpChannelParent::DoAsyncOpen(  const U
      return SendFailedAsyncOpen(rv);
    }
  
@@ -415,7 +256,7 @@ diff --git a/netwerk/protocol/http/HttpChannelParent.cpp b/netwerk/protocol/http
    httpChannel->SetHandleFetchEventStart(aHandleFetchEventStart);
    httpChannel->SetHandleFetchEventEnd(aHandleFetchEventEnd);
  
-@@ -733,17 +817,18 @@ HttpChannelParent::DoAsyncOpen(  const U
+@@ -733,17 +764,18 @@ HttpChannelParent::DoAsyncOpen(  const U
        // This works because we've already called SetNotificationCallbacks and
        // done mPBOverride logic by this point.
        chooseAppCache = NS_ShouldCheckAppCache(principal);
@@ -435,7 +276,7 @@ diff --git a/netwerk/protocol/http/HttpChannelParent.cpp b/netwerk/protocol/http
    mParentListener = parentListener.forget();
    mChannel->SetNotificationCallbacks(mParentListener);
  
-@@ -776,17 +861,19 @@ HttpChannelParent::WaitForBgParent()
+@@ -776,17 +808,19 @@ HttpChannelParent::WaitForBgParent()
    LOG(("HttpChannelParent::WaitForBgParent [this=%p]\n", this));
    MOZ_ASSERT(!mBgParent);
    MOZ_ASSERT(mChannel);
@@ -456,20 +297,7 @@ diff --git a/netwerk/protocol/http/HttpChannelParent.cpp b/netwerk/protocol/http
      return promise;
    }
  
-@@ -797,42 +884,48 @@ bool
- HttpChannelParent::ConnectChannel(const uint32_t& registrarId, const bool& shouldIntercept)
- {
-   nsresult rv;
- 
-   LOG(("HttpChannelParent::ConnectChannel: Looking for a registered channel "
-        "[this=%p, id=%" PRIu32 "]\n", this, registrarId));
-   nsCOMPtr<nsIChannel> channel;
-   rv = NS_LinkRedirectChannels(registrarId, this, getter_AddRefs(channel));
--  if (NS_FAILED(rv)) {
-+  if (NS_WARN_IF(NS_FAILED(rv))) {
-     NS_ERROR("Could not find the http channel to connect its IPC parent");
-     // This makes the channel delete itself safely.  It's the only thing
-     // we can do now, since this parent channel cannot be used and there is
+@@ -809,24 +843,27 @@ HttpChannelParent::ConnectChannel(const 
      // no other way to tell the child side there were something wrong.
      Delete();
      return true;
@@ -477,17 +305,15 @@ diff --git a/netwerk/protocol/http/HttpChannelParent.cpp b/netwerk/protocol/http
  
    LOG(("  found channel %p, rv=%08" PRIx32, channel.get(), static_cast<uint32_t>(rv)));
    mChannel = do_QueryObject(channel);
--  if (!mChannel) {
-+  if (NS_WARN_IF(!mChannel)) {
-     LOG(("  but it's not nsHttpChannel"));
+   if (!mChannel) {
+-    LOG(("  but it's not nsHttpChannel"));
++    LOG(("  but it's not HttpBaseChannel"));
      Delete();
      return true;
    }
  
-+  uint64_t channelId = 0;
-+  Unused << mChannel->GetChannelId(&channelId);
-+
-   LOG(("  and it is nsHttpChannel %p", mChannel.get()));
+-  LOG(("  and it is nsHttpChannel %p", mChannel.get()));
++  LOG(("  and it is HttpBaseChannel %p", mChannel.get()));
  
 -  mChannel->SetWarningReporter(this);
 +  RefPtr<nsHttpChannel> httpChannelImpl = do_QueryObject(mChannel);
@@ -497,21 +323,12 @@ diff --git a/netwerk/protocol/http/HttpChannelParent.cpp b/netwerk/protocol/http
  
    nsCOMPtr<nsINetworkInterceptController> controller;
    NS_QueryNotificationCallbacks(channel, controller);
--  RefPtr<HttpChannelParentListener> parentListener = do_QueryObject(controller);
--  MOZ_ASSERT(parentListener);
--  parentListener->SetupInterceptionAfterRedirect(shouldIntercept);
-+  //RefPtr<HttpChannelParentListener> parentListener = do_QueryObject(controller);
-+  //MOZ_ASSERT(parentListener);
-+  //parentListener->SetupInterceptionAfterRedirect(shouldIntercept);
+   RefPtr<HttpChannelParentListener> parentListener = do_QueryObject(controller);
+   MOZ_ASSERT(parentListener);
+   parentListener->SetupInterceptionAfterRedirect(shouldIntercept);
  
    if (mPBOverride != kPBOverride_Unset) {
-     // redirected-to channel may not support PB
-     nsCOMPtr<nsIPrivateBrowsingChannel> pbChannel = do_QueryObject(mChannel);
-     if (pbChannel) {
-       pbChannel->SetPrivate(mPBOverride == kPBOverride_Private ? true : false);
-     }
-   }
-@@ -1404,100 +1497,111 @@ HttpChannelParent::OnStartRequest(nsIReq
+@@ -1404,100 +1441,112 @@ HttpChannelParent::OnStartRequest(nsIReq
  {
    LOG(("HttpChannelParent::OnStartRequest [this=%p, aRequest=%p]\n",
         this, aRequest));
@@ -546,7 +363,6 @@ diff --git a/netwerk/protocol/http/HttpChannelParent.cpp b/netwerk/protocol/http
  
    nsHttpResponseHead *responseHead = chan->GetResponseHead();
    nsHttpRequestHead  *requestHead = chan->GetRequestHead();
-+
    bool isFromCache = false;
 -  chan->IsFromCache(&isFromCache);
    int32_t fetchCount = 0;
@@ -599,10 +415,9 @@ diff --git a/netwerk/protocol/http/HttpChannelParent.cpp b/netwerk/protocol/http
      }
    }
  
--  nsCOMPtr<nsIEncodedChannel> encodedChannel = do_QueryInterface(aRequest);
--  if (encodedChannel)
--    encodedChannel->SetApplyConversion(false);
-+  chan->SetApplyConversion(false);
+   nsCOMPtr<nsIEncodedChannel> encodedChannel = do_QueryInterface(aRequest);
+   if (encodedChannel)
+     encodedChannel->SetApplyConversion(false);
  
    // Keep the cache entry for future use in RecvSetCacheTokenCachedCharset().
    // It could be already released by nsHttpChannel at that time.
@@ -669,20 +484,7 @@ diff --git a/netwerk/protocol/http/HttpChannelParent.cpp b/netwerk/protocol/http
    if (mIPCClosed ||
        !SendOnStartRequest(channelStatus,
                            responseHead ? *responseHead : nsHttpResponseHead(),
-@@ -1536,38 +1640,44 @@ HttpChannelParent::OnStopRequest(nsIRequ
-                                  nsresult aStatusCode)
- {
-   LOG(("HttpChannelParent::OnStopRequest: [this=%p aRequest=%p status=%" PRIx32 "]\n",
-        this, aRequest, static_cast<uint32_t>(aStatusCode)));
-   MOZ_ASSERT(NS_IsMainThread());
- 
-   MOZ_RELEASE_ASSERT(!mDivertingFromChild,
-     "Cannot call OnStopRequest if diverting is set!");
-+
-   ResourceTimingStruct timing;
-   mChannel->GetDomainLookupStart(&timing.domainLookupStart);
-   mChannel->GetDomainLookupEnd(&timing.domainLookupEnd);
-   mChannel->GetConnectStart(&timing.connectStart);
+@@ -1548,26 +1597,31 @@ HttpChannelParent::OnStopRequest(nsIRequ
    mChannel->GetSecureConnectionStart(&timing.secureConnectionStart);
    mChannel->GetConnectEnd(&timing.connectEnd);
    mChannel->GetRequestStart(&timing.requestStart);
@@ -718,7 +520,7 @@ diff --git a/netwerk/protocol/http/HttpChannelParent.cpp b/netwerk/protocol/http
    if (mIPCClosed ||
        !mBgParent || !mBgParent->OnStopRequest(aStatusCode, timing)) {
      return NS_ERROR_UNEXPECTED;
-@@ -1592,19 +1702,21 @@ HttpChannelParent::OnDataAvailable(nsIRe
+@@ -1592,19 +1646,21 @@ HttpChannelParent::OnDataAvailable(nsIRe
    MOZ_ASSERT(NS_IsMainThread());
  
    MOZ_RELEASE_ASSERT(!mDivertingFromChild,
@@ -743,7 +545,7 @@ diff --git a/netwerk/protocol/http/HttpChannelParent.cpp b/netwerk/protocol/http
    if (!data.SetCapacity(toRead, fallible)) {
      LOG(("  out of memory!"));
      return NS_ERROR_OUT_OF_MEMORY;
-@@ -1793,17 +1905,17 @@ HttpChannelParent::StartRedirect(uint32_
+@@ -1793,17 +1849,17 @@ HttpChannelParent::StartRedirect(uint32_
    SerializeURI(newOriginalURI, uriParams);
  
    nsCString secInfoSerialization;
@@ -762,7 +564,7 @@ diff --git a/netwerk/protocol/http/HttpChannelParent.cpp b/netwerk/protocol/http
  
    nsHttpResponseHead *responseHead = mChannel->GetResponseHead();
    bool result = false;
-@@ -1868,33 +1980,35 @@ HttpChannelParent::SuspendForDiversion()
+@@ -1868,33 +1924,35 @@ HttpChannelParent::SuspendForDiversion()
  
    if (NS_WARN_IF(mDivertingFromChild)) {
      MOZ_ASSERT(!mDivertingFromChild, "Already suspended for diversion!");
@@ -800,7 +602,7 @@ diff --git a/netwerk/protocol/http/HttpChannelParent.cpp b/netwerk/protocol/http
      mSuspendedForDiversion = true;
  
      // If mSuspendAfterSynthesizeResponse is true channel has been already
-@@ -1939,21 +2053,23 @@ HttpChannelParent::ResumeForDiversion()
+@@ -1939,21 +1997,23 @@ HttpChannelParent::ResumeForDiversion()
    LOG(("HttpChannelParent::ResumeForDiversion [this=%p]\n", this));
    MOZ_ASSERT(mChannel);
    if (NS_WARN_IF(!mDivertingFromChild)) {
@@ -826,7 +628,7 @@ diff --git a/netwerk/protocol/http/HttpChannelParent.cpp b/netwerk/protocol/http
  
    if (NS_WARN_IF(mIPCClosed || !DoSendDeleteSelf())) {
      return NS_ERROR_UNEXPECTED;
-@@ -2025,17 +2141,18 @@ HttpChannelParent::StartDiversion()
+@@ -2025,17 +2085,18 @@ HttpChannelParent::StartDiversion()
    mDivertedOnStartRequest = true;
  
    // After OnStartRequest has been called, setup content decoders if needed.
@@ -846,7 +648,7 @@ diff --git a/netwerk/protocol/http/HttpChannelParent.cpp b/netwerk/protocol/http
    DebugOnly<nsresult> rvdbg = mParentListener->DivertTo(mDivertListener);
    MOZ_ASSERT(NS_SUCCEEDED(rvdbg));
    mDivertListener = nullptr;
-@@ -2099,17 +2216,19 @@ HttpChannelParent::NotifyDiversionFailed
+@@ -2099,17 +2160,19 @@ HttpChannelParent::NotifyDiversionFailed
    mChannel->ForcePending(false);
  
    bool isPending = false;
@@ -867,35 +669,6 @@ diff --git a/netwerk/protocol/http/HttpChannelParent.cpp b/netwerk/protocol/http
      mParentListener->OnStartRequest(mChannel, nullptr);
      mChannel->ForcePending(false);
    }
-@@ -2186,22 +2305,28 @@ HttpChannelParent::RecvDeletingChannel()
-     return IPC_FAIL_NO_REASON(this);
-   }
-   return IPC_OK();
- }
- 
- mozilla::ipc::IPCResult
- HttpChannelParent::RecvFinishInterceptedRedirect()
- {
-+
-   // We make sure not to send any more messages until the IPC channel is torn
-   // down by the child.
-   mIPCClosed = true;
-   if (!SendFinishInterceptedRedirect()) {
-     return IPC_FAIL_NO_REASON(this);
-   }
-+
-+  // Resume the channel since we called
-+  // InterceptedHttpChannel::AutoSuspendRedirectChannel earlier.
-+  mChannel->Resume();
-+
-   return IPC_OK();
- }
- 
- //-----------------------------------------------------------------------------
- // HttpChannelSecurityWarningReporter
- //-----------------------------------------------------------------------------
- 
- nsresult
 diff --git a/netwerk/protocol/http/HttpChannelParent.h b/netwerk/protocol/http/HttpChannelParent.h
 --- a/netwerk/protocol/http/HttpChannelParent.h
 +++ b/netwerk/protocol/http/HttpChannelParent.h
@@ -918,21 +691,3 @@ diff --git a/netwerk/protocol/http/HttpChannelParent.h b/netwerk/protocol/http/H
    nsCOMPtr<nsIAsyncVerifyRedirectCallback> mRedirectCallback;
  
    nsAutoPtr<class nsHttpChannel::OfflineCacheEntryAsForeignMarker> mOfflineForeignMarker;
-@@ -301,16 +301,17 @@ private:
-   bool mDivertedOnStartRequest;
- 
-   bool mSuspendedForDiversion;
- 
-   // Set if this channel should be suspended after synthesizing a response.
-   bool mSuspendAfterSynthesizeResponse;
-   // Set if this channel will synthesize its response.
-   bool mWillSynthesizeResponse;
-+  bool mSynthesizedRedirectWillSuspend;
- 
-   dom::TabId mNestedFrameId;
- 
-   RefPtr<ChannelEventQueue> mEventQ;
- 
-   RefPtr<HttpBackgroundChannelParent> mBgParent;
- 
-   // Number of events to wait before actually invoking AsyncOpen on the main
