@@ -1,0 +1,154 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  1f84ff2a173f5b6eefd5dea33b2f395712fa949a
+Bug 1397128 P3 Add an OpenStreamAction class to open the file stream on the io thread. r=asuth
+
+diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
+--- a/dom/cache/Manager.cpp
++++ b/dom/cache/Manager.cpp
+@@ -1451,16 +1451,53 @@ public:
+ 
+ private:
+   const Namespace mNamespace;
+   nsTArray<nsString> mKeys;
+ };
+ 
+ // ----------------------------------------------------------------------------
+ 
++class Manager::OpenStreamAction final : public Manager::BaseAction
++{
++public:
++  OpenStreamAction(Manager* aManager, ListenerId aListenerId,
++                   OpenStreamResolver&& aResolver, const nsID& aBodyId)
++    : BaseAction(aManager, aListenerId)
++    , mResolver(Move(aResolver))
++    , mBodyId(aBodyId)
++  { }
++
++  virtual nsresult
++  RunSyncWithDBOnTarget(const QuotaInfo& aQuotaInfo, nsIFile* aDBDir,
++                        mozIStorageConnection* aConn) override
++  {
++    nsresult rv = BodyOpen(aQuotaInfo, aDBDir, mBodyId,
++                           getter_AddRefs(mBodyStream));
++    if (NS_WARN_IF(NS_FAILED(rv))) { return rv; }
++    if (NS_WARN_IF(!mBodyStream)) { return NS_ERROR_FILE_NOT_FOUND; }
++
++    return rv;
++  }
++
++  virtual void
++  Complete(Listener* aListener, ErrorResult&& aRv) override
++  {
++    mResolver(Move(mBodyStream));
++    mResolver = nullptr;
++  }
++
++private:
++  OpenStreamResolver mResolver;
++  const nsID mBodyId;
++  nsCOMPtr<nsIInputStream> mBodyStream;
++};
++
++// ----------------------------------------------------------------------------
++
+ //static
+ Manager::ListenerId Manager::sNextListenerId = 0;
+ 
+ void
+ Manager::Listener::OnOpComplete(ErrorResult&& aRv, const CacheOpResult& aResult)
+ {
+   OnOpComplete(Move(aRv), aResult, INVALID_CACHE_ID, nsTArray<SavedResponse>(),
+                nsTArray<SavedRequest>(), nullptr);
+@@ -1818,16 +1855,44 @@ Manager::ExecuteStorageOp(Listener* aLis
+     default:
+       MOZ_CRASH("Unknown CacheStorage operation!");
+   }
+ 
+   context->Dispatch(action);
+ }
+ 
+ void
++Manager::ExecuteOpenStream(Listener* aListener, OpenStreamResolver&& aResolver,
++                           const nsID& aBodyId)
++{
++  NS_ASSERT_OWNINGTHREAD(Manager);
++  MOZ_DIAGNOSTIC_ASSERT(aListener);
++  MOZ_DIAGNOSTIC_ASSERT(aResolver);
++
++  if (NS_WARN_IF(mState == Closing)) {
++    aResolver(nullptr);
++    return;
++  }
++
++  RefPtr<Context> context = mContext;
++  MOZ_DIAGNOSTIC_ASSERT(!context->IsCanceled());
++
++  // We save the listener simply to track the existence of the caller here.
++  // Our returned value will really be passed to the resolver when the
++  // operation completes.  In the future we should remove the Listener
++  // mechanism in favor of std::function or MozPromise.
++  ListenerId listenerId = SaveListener(aListener);
++
++  RefPtr<Action> action =
++    new OpenStreamAction(this, listenerId, Move(aResolver), aBodyId);
++
++  context->Dispatch(action);
++}
++
++void
+ Manager::ExecutePutAll(Listener* aListener, CacheId aCacheId,
+                        const nsTArray<CacheRequestResponse>& aPutList,
+                        const nsTArray<nsCOMPtr<nsIInputStream>>& aRequestStreamList,
+                        const nsTArray<nsCOMPtr<nsIInputStream>>& aResponseStreamList)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_DIAGNOSTIC_ASSERT(aListener);
+ 
+diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
+--- a/dom/cache/Manager.h
++++ b/dom/cache/Manager.h
+@@ -172,16 +172,24 @@ public:
+   void ExecutePutAll(Listener* aListener, CacheId aCacheId,
+                      const nsTArray<CacheRequestResponse>& aPutList,
+                      const nsTArray<nsCOMPtr<nsIInputStream>>& aRequestStreamList,
+                      const nsTArray<nsCOMPtr<nsIInputStream>>& aResponseStreamList);
+ 
+   void ExecuteStorageOp(Listener* aListener, Namespace aNamespace,
+                         const CacheOpArgs& aOpArgs);
+ 
++  typedef std::function<void(nsCOMPtr<nsIInputStream>&&)> OpenStreamResolver;
++  void ExecuteOpenStream(Listener* aListener, OpenStreamResolver&& aResolver,
++                         const nsID& aBodyId);
++
++  void
++  NoteStreamOpenComplete(const nsID& aBodyId, ErrorResult&& aRv,
++                         nsCOMPtr<nsIInputStream>&& aBodyStream);
++
+ private:
+   class Factory;
+   class BaseAction;
+   class DeleteOrphanedCacheAction;
+ 
+   class CacheMatchAction;
+   class CacheMatchAllAction;
+   class CachePutAllAction;
+@@ -189,16 +197,18 @@ private:
+   class CacheKeysAction;
+ 
+   class StorageMatchAction;
+   class StorageHasAction;
+   class StorageOpenAction;
+   class StorageDeleteAction;
+   class StorageKeysAction;
+ 
++  class OpenStreamAction;
++
+   typedef uint64_t ListenerId;
+ 
+   Manager(ManagerId* aManagerId, nsIThread* aIOThread);
+   ~Manager();
+   void Init(Manager* aOldManager);
+   void Shutdown();
+ 
+   void Abort();

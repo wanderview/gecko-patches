@@ -1,0 +1,478 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  a5e68e37d341800ecb4cbafaf1c8445b426a4d9c
+Bug 1397128 P4 Add a PCacheStreamControl message to open a stream based on its body ID. r=asuth
+
+diff --git a/dom/cache/CacheStreamControlChild.cpp b/dom/cache/CacheStreamControlChild.cpp
+--- a/dom/cache/CacheStreamControlChild.cpp
++++ b/dom/cache/CacheStreamControlChild.cpp
+@@ -102,16 +102,35 @@ CacheStreamControlChild::SerializeStream
+   MOZ_DIAGNOSTIC_ASSERT(aReadStreamOut);
+   MOZ_DIAGNOSTIC_ASSERT(aStream);
+   UniquePtr<AutoIPCStream> autoStream(new AutoIPCStream(aReadStreamOut->stream()));
+   autoStream->Serialize(aStream, Manager());
+   aStreamCleanupList.AppendElement(Move(autoStream));
+ }
+ 
+ void
++CacheStreamControlChild::OpenStream(const nsID& aId, InputStreamResolver&& aResolver)
++{
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
++
++  if (mDestroyStarted) {
++    aResolver(nullptr);
++    return;
++  }
++
++  SendOpenStream(aId)->Then(GetCurrentThreadSerialEventTarget(), __func__,
++  [aResolver](const OptionalIPCStream& aOptionalStream) {
++    nsCOMPtr<nsIInputStream> stream = DeserializeIPCStream(aOptionalStream);
++    aResolver(Move(stream));
++  }, [aResolver](PromiseRejectReason aReason) {
++    aResolver(nullptr);
++  });
++}
++
++void
+ CacheStreamControlChild::NoteClosedAfterForget(const nsID& aId)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+   Unused << SendNoteClosed(aId);
+ 
+   // A stream has closed.  If we delayed StartDestry() due to this stream
+   // being read, then we should check to see if any of the remaining streams
+   // are active.  If none of our other streams have been read, then we can
+diff --git a/dom/cache/CacheStreamControlChild.h b/dom/cache/CacheStreamControlChild.h
+--- a/dom/cache/CacheStreamControlChild.h
++++ b/dom/cache/CacheStreamControlChild.h
+@@ -35,16 +35,19 @@ public:
+   // StreamControl methods
+   virtual void
+   SerializeControl(CacheReadStream* aReadStreamOut) override;
+ 
+   virtual void
+   SerializeStream(CacheReadStream* aReadStreamOut, nsIInputStream* aStream,
+                   nsTArray<UniquePtr<mozilla::ipc::AutoIPCStream>>& aStreamCleanupList) override;
+ 
++  virtual void
++  OpenStream(const nsID& aId, InputStreamResolver&& aResolver) override;
++
+ private:
+   virtual void
+   NoteClosedAfterForget(const nsID& aId) override;
+ 
+ #ifdef DEBUG
+   virtual void
+   AssertOwningThread() override;
+ #endif
+diff --git a/dom/cache/CacheStreamControlParent.cpp b/dom/cache/CacheStreamControlParent.cpp
+--- a/dom/cache/CacheStreamControlParent.cpp
++++ b/dom/cache/CacheStreamControlParent.cpp
+@@ -64,16 +64,31 @@ CacheStreamControlParent::SerializeStrea
+   UniquePtr<AutoIPCStream> autoStream(new AutoIPCStream(aReadStreamOut->stream()));
+   DebugOnly<bool> ok = autoStream->Serialize(aStream, Manager());
+   MOZ_ASSERT(ok);
+ 
+   aStreamCleanupList.AppendElement(Move(autoStream));
+ }
+ 
+ void
++CacheStreamControlParent::OpenStream(const nsID& aId,
++                                     InputStreamResolver&& aResolver)
++{
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
++  MOZ_DIAGNOSTIC_ASSERT(aResolver);
++
++  if (!mStreamList || !mStreamList->ShouldOpenStreamFor(aId)) {
++    aResolver(nullptr);
++    return;
++  }
++
++  mStreamList->GetManager()->ExecuteOpenStream(this, Move(aResolver), aId);
++}
++
++void
+ CacheStreamControlParent::NoteClosedAfterForget(const nsID& aId)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+   RecvNoteClosed(aId);
+ }
+ 
+ #ifdef DEBUG
+ void
+@@ -88,22 +103,40 @@ CacheStreamControlParent::ActorDestroy(A
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+   CloseAllReadStreamsWithoutReporting();
+   // If the initial SendPStreamControlConstructor() fails we will
+   // be called before mStreamList is set.
+   if (!mStreamList) {
+     return;
+   }
++  mStreamList->GetManager()->RemoveListener(this);
+   mStreamList->RemoveStreamControl(this);
+   mStreamList->NoteClosedAll();
+   mStreamList = nullptr;
+ }
+ 
+ mozilla::ipc::IPCResult
++CacheStreamControlParent::RecvOpenStream(const nsID& aStreamId,
++                                         OpenStreamResolver&& aResolver)
++{
++  NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
++
++  CacheStreamControlParent* self = this;
++
++  OpenStream(aStreamId, [self, aResolver](nsCOMPtr<nsIInputStream>&& aStream) {
++      AutoIPCStream stream;
++      Unused << stream.Serialize(aStream, self->Manager());
++      aResolver(stream.TakeOptionalValue());
++    });
++
++  return IPC_OK();
++}
++
++mozilla::ipc::IPCResult
+ CacheStreamControlParent::RecvNoteClosed(const nsID& aId)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+   MOZ_DIAGNOSTIC_ASSERT(mStreamList);
+   mStreamList->NoteClosed(aId);
+   return IPC_OK();
+ }
+ 
+diff --git a/dom/cache/CacheStreamControlParent.h b/dom/cache/CacheStreamControlParent.h
+--- a/dom/cache/CacheStreamControlParent.h
++++ b/dom/cache/CacheStreamControlParent.h
+@@ -2,32 +2,34 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_cache_CacheStreamControlParent_h
+ #define mozilla_dom_cache_CacheStreamControlParent_h
+ 
++#include "mozilla/dom/cache/Manager.h"
+ #include "mozilla/dom/cache/PCacheStreamControlParent.h"
+ #include "mozilla/dom/cache/StreamControl.h"
+ #include "nsTObserverArray.h"
+ 
+ namespace mozilla {
+ namespace ipc {
+ class AutoIPCStream;
+ } // namespace ipc
+ namespace dom {
+ namespace cache {
+ 
+ class ReadStream;
+ class StreamList;
+ 
+ class CacheStreamControlParent final : public PCacheStreamControlParent
+                                      , public StreamControl
++                                     , Manager::Listener
+ {
+ public:
+   CacheStreamControlParent();
+   ~CacheStreamControlParent();
+ 
+   void SetStreamList(StreamList* aStreamList);
+   void Close(const nsID& aId);
+   void CloseAll();
+@@ -36,27 +38,34 @@ public:
+   // StreamControl methods
+   virtual void
+   SerializeControl(CacheReadStream* aReadStreamOut) override;
+ 
+   virtual void
+   SerializeStream(CacheReadStream* aReadStreamOut, nsIInputStream* aStream,
+                   nsTArray<UniquePtr<mozilla::ipc::AutoIPCStream>>& aStreamCleanupList) override;
+ 
++  virtual void
++  OpenStream(const nsID& aId, InputStreamResolver&& aResolver) override;
++
+ private:
+   virtual void
+   NoteClosedAfterForget(const nsID& aId) override;
+ 
+ #ifdef DEBUG
+   virtual void
+   AssertOwningThread() override;
+ #endif
+ 
+   // PCacheStreamControlParent methods
+   virtual void ActorDestroy(ActorDestroyReason aReason) override;
++
++  virtual mozilla::ipc::IPCResult
++  RecvOpenStream(const nsID& aStreamId, OpenStreamResolver&& aResolve) override;
++
+   virtual mozilla::ipc::IPCResult RecvNoteClosed(const nsID& aId) override;
+ 
+   void NotifyClose(const nsID& aId);
+   void NotifyCloseAll();
+ 
+   // Cycle with StreamList via a weak-ref to us.  Cleanup occurs when the actor
+   // is deleted by the PBackground manager.  ActorDestroy() then calls
+   // StreamList::RemoveStreamControl() to clear the weak ref.
+diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
+--- a/dom/cache/Manager.cpp
++++ b/dom/cache/Manager.cpp
+@@ -1455,17 +1455,17 @@ private:
+ };
+ 
+ // ----------------------------------------------------------------------------
+ 
+ class Manager::OpenStreamAction final : public Manager::BaseAction
+ {
+ public:
+   OpenStreamAction(Manager* aManager, ListenerId aListenerId,
+-                   OpenStreamResolver&& aResolver, const nsID& aBodyId)
++                   InputStreamResolver&& aResolver, const nsID& aBodyId)
+     : BaseAction(aManager, aListenerId)
+     , mResolver(Move(aResolver))
+     , mBodyId(aBodyId)
+   { }
+ 
+   virtual nsresult
+   RunSyncWithDBOnTarget(const QuotaInfo& aQuotaInfo, nsIFile* aDBDir,
+                         mozIStorageConnection* aConn) override
+@@ -1481,17 +1481,17 @@ public:
+   virtual void
+   Complete(Listener* aListener, ErrorResult&& aRv) override
+   {
+     mResolver(Move(mBodyStream));
+     mResolver = nullptr;
+   }
+ 
+ private:
+-  OpenStreamResolver mResolver;
++  InputStreamResolver mResolver;
+   const nsID mBodyId;
+   nsCOMPtr<nsIInputStream> mBodyStream;
+ };
+ 
+ // ----------------------------------------------------------------------------
+ 
+ //static
+ Manager::ListenerId Manager::sNextListenerId = 0;
+@@ -1855,17 +1855,17 @@ Manager::ExecuteStorageOp(Listener* aLis
+     default:
+       MOZ_CRASH("Unknown CacheStorage operation!");
+   }
+ 
+   context->Dispatch(action);
+ }
+ 
+ void
+-Manager::ExecuteOpenStream(Listener* aListener, OpenStreamResolver&& aResolver,
++Manager::ExecuteOpenStream(Listener* aListener, InputStreamResolver&& aResolver,
+                            const nsID& aBodyId)
+ {
+   NS_ASSERT_OWNINGTHREAD(Manager);
+   MOZ_DIAGNOSTIC_ASSERT(aListener);
+   MOZ_DIAGNOSTIC_ASSERT(aResolver);
+ 
+   if (NS_WARN_IF(mState == Closing)) {
+     aResolver(nullptr);
+diff --git a/dom/cache/Manager.h b/dom/cache/Manager.h
+--- a/dom/cache/Manager.h
++++ b/dom/cache/Manager.h
+@@ -172,18 +172,17 @@ public:
+   void ExecutePutAll(Listener* aListener, CacheId aCacheId,
+                      const nsTArray<CacheRequestResponse>& aPutList,
+                      const nsTArray<nsCOMPtr<nsIInputStream>>& aRequestStreamList,
+                      const nsTArray<nsCOMPtr<nsIInputStream>>& aResponseStreamList);
+ 
+   void ExecuteStorageOp(Listener* aListener, Namespace aNamespace,
+                         const CacheOpArgs& aOpArgs);
+ 
+-  typedef std::function<void(nsCOMPtr<nsIInputStream>&&)> OpenStreamResolver;
+-  void ExecuteOpenStream(Listener* aListener, OpenStreamResolver&& aResolver,
++  void ExecuteOpenStream(Listener* aListener, InputStreamResolver&& aResolver,
+                          const nsID& aBodyId);
+ 
+   void
+   NoteStreamOpenComplete(const nsID& aBodyId, ErrorResult&& aRv,
+                          nsCOMPtr<nsIInputStream>&& aBodyStream);
+ 
+ private:
+   class Factory;
+diff --git a/dom/cache/PCacheStreamControl.ipdl b/dom/cache/PCacheStreamControl.ipdl
+--- a/dom/cache/PCacheStreamControl.ipdl
++++ b/dom/cache/PCacheStreamControl.ipdl
+@@ -1,25 +1,30 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+  * You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ include protocol PBackground;
++include protocol PFileDescriptorSet;
++include protocol PChildToParentStream;
++include protocol PParentToChildStream;
++include IPCStream;
+ 
+ using struct nsID from "nsID.h";
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ protocol PCacheStreamControl
+ {
+   manager PBackground;
+ 
+ parent:
++  async OpenStream(nsID aStreamId) returns(OptionalIPCStream aStream);
+   async NoteClosed(nsID aStreamId);
+ 
+ child:
+   async Close(nsID aStreamId);
+   async CloseAll();
+   async __delete__();
+ };
+ 
+diff --git a/dom/cache/StreamControl.h b/dom/cache/StreamControl.h
+--- a/dom/cache/StreamControl.h
++++ b/dom/cache/StreamControl.h
+@@ -3,16 +3,17 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_cache_StreamControl_h
+ #define mozilla_dom_cache_StreamControl_h
+ 
+ #include "mozilla/dom/cache/ReadStream.h"
++#include "mozilla/dom/cache/Types.h"
+ #include "mozilla/RefPtr.h"
+ #include "nsTObserverArray.h"
+ 
+ struct nsID;
+ 
+ namespace mozilla {
+ namespace ipc {
+ class AutoIPCStream;
+@@ -31,16 +32,19 @@ public:
+   // abstract interface that must be implemented by child class
+   virtual void
+   SerializeControl(CacheReadStream* aReadStreamOut) = 0;
+ 
+   virtual void
+   SerializeStream(CacheReadStream* aReadStreamOut, nsIInputStream* aStream,
+                   nsTArray<UniquePtr<mozilla::ipc::AutoIPCStream>>& aStreamCleanupList) = 0;
+ 
++  virtual void
++  OpenStream(const nsID& aId, InputStreamResolver&& aResolver) = 0;
++
+   // inherited implementation of the ReadStream::Controllable list
+ 
+   // Begin controlling the given ReadStream.  This causes a strong ref to
+   // be held by the control.  The ReadStream must call NoteClosed() or
+   // ForgetReadStream() to release this ref.
+   void
+   AddReadStream(ReadStream::Controllable* aReadStream);
+ 
+diff --git a/dom/cache/StreamList.cpp b/dom/cache/StreamList.cpp
+--- a/dom/cache/StreamList.cpp
++++ b/dom/cache/StreamList.cpp
+@@ -21,16 +21,36 @@ StreamList::StreamList(Manager* aManager
+   , mCacheId(INVALID_CACHE_ID)
+   , mStreamControl(nullptr)
+   , mActivated(false)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(mManager);
+   mContext->AddActivity(this);
+ }
+ 
++Manager*
++StreamList::GetManager() const
++{
++  return mManager;
++}
++
++bool
++StreamList::ShouldOpenStreamFor(const nsID& aId) const
++{
++  NS_ASSERT_OWNINGTHREAD(StreamList);
++
++  for (auto entry : mList) {
++    if (entry.mId == aId) {
++      return true;
++    }
++  }
++
++  return false;
++}
++
+ void
+ StreamList::SetStreamControl(CacheStreamControlParent* aStreamControl)
+ {
+   NS_ASSERT_OWNINGTHREAD(StreamList);
+   MOZ_DIAGNOSTIC_ASSERT(aStreamControl);
+ 
+   // For cases where multiple streams are serialized for a single list
+   // then the control will get passed multiple times.  This is ok, but
+diff --git a/dom/cache/StreamList.h b/dom/cache/StreamList.h
+--- a/dom/cache/StreamList.h
++++ b/dom/cache/StreamList.h
+@@ -21,16 +21,19 @@ namespace cache {
+ class CacheStreamControlParent;
+ class Manager;
+ 
+ class StreamList final : public Context::Activity
+ {
+ public:
+   StreamList(Manager* aManager, Context* aContext);
+ 
++  Manager* GetManager() const;
++  bool ShouldOpenStreamFor(const nsID& aId) const;
++
+   void SetStreamControl(CacheStreamControlParent* aStreamControl);
+   void RemoveStreamControl(CacheStreamControlParent* aStreamControl);
+ 
+   void Activate(CacheId aCacheId);
+ 
+   void Add(const nsID& aId);
+   void SetStream(const nsID& aId, nsCOMPtr<nsIInputStream>&& aStream);
+   already_AddRefed<nsIInputStream> Extract(const nsID& aId);
+diff --git a/dom/cache/Types.h b/dom/cache/Types.h
+--- a/dom/cache/Types.h
++++ b/dom/cache/Types.h
+@@ -2,19 +2,21 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_cache_Types_h
+ #define mozilla_dom_cache_Types_h
+ 
++#include <functional>
+ #include <stdint.h>
+ #include "nsCOMPtr.h"
+ #include "nsIFile.h"
++#include "nsIInputStream.h"
+ #include "nsString.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ enum Namespace
+ {
+@@ -30,13 +32,15 @@ static const CacheId INVALID_CACHE_ID = 
+ struct QuotaInfo
+ {
+   nsCOMPtr<nsIFile> mDir;
+   nsCString mSuffix;
+   nsCString mGroup;
+   nsCString mOrigin;
+ };
+ 
++typedef std::function<void(nsCOMPtr<nsIInputStream>&&)> InputStreamResolver;
++
+ } // namespace cache
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_cache_Types_h
