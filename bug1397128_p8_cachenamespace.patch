@@ -1,0 +1,179 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  2064d40b04f6f5cc2491820efb2737c8d6e077f2
+Bug 1397128 P8 Track which storage "namespace" each Cache object is associated with. r=tt
+
+diff --git a/dom/cache/Cache.cpp b/dom/cache/Cache.cpp
+--- a/dom/cache/Cache.cpp
++++ b/dom/cache/Cache.cpp
+@@ -251,22 +251,24 @@ NS_IMPL_CYCLE_COLLECTING_ADDREF(mozilla:
+ NS_IMPL_CYCLE_COLLECTING_RELEASE(mozilla::dom::cache::Cache);
+ NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(mozilla::dom::cache::Cache, mGlobal);
+ 
+ NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Cache)
+   NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+   NS_INTERFACE_MAP_ENTRY(nsISupports)
+ NS_INTERFACE_MAP_END
+ 
+-Cache::Cache(nsIGlobalObject* aGlobal, CacheChild* aActor)
++Cache::Cache(nsIGlobalObject* aGlobal, CacheChild* aActor, Namespace aNamespace)
+   : mGlobal(aGlobal)
+   , mActor(aActor)
++  , mNamespace(aNamespace)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(mGlobal);
+   MOZ_DIAGNOSTIC_ASSERT(mActor);
++  MOZ_DIAGNOSTIC_ASSERT(mNamespace != INVALID_NAMESPACE);
+   mActor->SetListener(this);
+ }
+ 
+ already_AddRefed<Promise>
+ Cache::Match(JSContext* aCx, const RequestOrUSVString& aRequest,
+              const CacheQueryOptions& aOptions, ErrorResult& aRv)
+ {
+   if (NS_WARN_IF(!mActor)) {
+diff --git a/dom/cache/Cache.h b/dom/cache/Cache.h
+--- a/dom/cache/Cache.h
++++ b/dom/cache/Cache.h
+@@ -36,17 +36,17 @@ namespace cache {
+ class AutoChildOpArgs;
+ class CacheChild;
+ 
+ class Cache final : public nsISupports
+                   , public nsWrapperCache
+                   , public TypeUtils
+ {
+ public:
+-  Cache(nsIGlobalObject* aGlobal, CacheChild* aActor);
++  Cache(nsIGlobalObject* aGlobal, CacheChild* aActor, Namespace aNamespace);
+ 
+   // webidl interface methods
+   already_AddRefed<Promise>
+   Match(JSContext* aCx, const RequestOrUSVString& aRequest,
+         const CacheQueryOptions& aOptions, ErrorResult& aRv);
+   already_AddRefed<Promise>
+   MatchAll(JSContext* aCx, const Optional<RequestOrUSVString>& aRequest,
+            const CacheQueryOptions& aOptions, ErrorResult& aRv);
+@@ -104,16 +104,17 @@ private:
+ 
+   already_AddRefed<Promise>
+   PutAll(JSContext* aCx, const nsTArray<RefPtr<Request>>& aRequestList,
+          const nsTArray<RefPtr<Response>>& aResponseList,
+          ErrorResult& aRv);
+ 
+   nsCOMPtr<nsIGlobalObject> mGlobal;
+   CacheChild* mActor;
++  const Namespace mNamespace;
+ 
+ public:
+   NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+   NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS(Cache)
+ };
+ 
+ } // namespace cache
+ } // namespace dom
+diff --git a/dom/cache/CacheOpChild.cpp b/dom/cache/CacheOpChild.cpp
+--- a/dom/cache/CacheOpChild.cpp
++++ b/dom/cache/CacheOpChild.cpp
+@@ -153,35 +153,35 @@ CacheOpChild::Recv__delete__(const Error
+     }
+     case CacheOpResult::TStorageHasResult:
+     {
+       mPromise->MaybeResolve(aResult.get_StorageHasResult().success());
+       break;
+     }
+     case CacheOpResult::TStorageOpenResult:
+     {
+-      auto actor = static_cast<CacheChild*>(
+-        aResult.get_StorageOpenResult().actorChild());
++      auto result = aResult.get_StorageOpenResult();
++      auto actor = static_cast<CacheChild*>(result.actorChild());
+ 
+       // If we have a success status then we should have an actor.  Gracefully
+       // reject instead of crashing, though, if we get a nullptr here.
+       MOZ_DIAGNOSTIC_ASSERT(actor);
+       if (!actor) {
+         ErrorResult status;
+         status.ThrowTypeError<MSG_CACHE_OPEN_FAILED>();
+         mPromise->MaybeReject(status);
+         break;
+       }
+ 
+       RefPtr<CacheWorkerHolder> workerHolder =
+         CacheWorkerHolder::PreferBehavior(GetWorkerHolder(),
+                                           CacheWorkerHolder::AllowIdleShutdownStart);
+ 
+       actor->SetWorkerHolder(workerHolder);
+-      RefPtr<Cache> cache = new Cache(mGlobal, actor);
++      RefPtr<Cache> cache = new Cache(mGlobal, actor, result.ns());
+       mPromise->MaybeResolve(cache);
+       break;
+     }
+     case CacheOpResult::TStorageDeleteResult:
+     {
+       mPromise->MaybeResolve(aResult.get_StorageDeleteResult().success());
+       break;
+     }
+diff --git a/dom/cache/CacheTypes.ipdlh b/dom/cache/CacheTypes.ipdlh
+--- a/dom/cache/CacheTypes.ipdlh
++++ b/dom/cache/CacheTypes.ipdlh
+@@ -5,16 +5,17 @@
+ include protocol PCache;
+ include protocol PCacheStreamControl;
+ include protocol PChildToParentStream;
+ include IPCStream;
+ include ChannelInfo;
+ include PBackgroundSharedTypes;
+ 
+ using HeadersGuardEnum from "mozilla/dom/FetchIPCTypes.h";
++using Namespace from "mozilla/dom/cache/IPCUtils.h";
+ using OpenMode from "mozilla/dom/cache/IPCUtils.h";
+ using ReferrerPolicy from "mozilla/dom/FetchIPCTypes.h";
+ using RequestCredentials from "mozilla/dom/FetchIPCTypes.h";
+ using RequestMode from "mozilla/dom/FetchIPCTypes.h";
+ using RequestCache from "mozilla/dom/FetchIPCTypes.h";
+ using RequestRedirect from "mozilla/dom/FetchIPCTypes.h";
+ using ResponseType from "mozilla/dom/FetchIPCTypes.h";
+ using mozilla::void_t from "ipc/IPCMessageUtils.h";
+@@ -207,16 +208,17 @@ struct StorageMatchResult
+ struct StorageHasResult
+ {
+   bool success;
+ };
+ 
+ struct StorageOpenResult
+ {
+   nullable PCache actor;
++  Namespace ns;
+ };
+ 
+ struct StorageDeleteResult
+ {
+   bool success;
+ };
+ 
+ struct StorageKeysResult
+diff --git a/dom/cache/Manager.cpp b/dom/cache/Manager.cpp
+--- a/dom/cache/Manager.cpp
++++ b/dom/cache/Manager.cpp
+@@ -1337,17 +1337,19 @@ public:
+     MOZ_DIAGNOSTIC_ASSERT(mCacheId != INVALID_CACHE_ID);
+     return rv;
+   }
+ 
+   virtual void
+   Complete(Listener* aListener, ErrorResult&& aRv) override
+   {
+     MOZ_DIAGNOSTIC_ASSERT(aRv.Failed() || mCacheId != INVALID_CACHE_ID);
+-    aListener->OnOpComplete(Move(aRv), StorageOpenResult(), mCacheId);
++    aListener->OnOpComplete(Move(aRv),
++                            StorageOpenResult(nullptr, nullptr, mNamespace),
++                            mCacheId);
+   }
+ 
+ private:
+   const Namespace mNamespace;
+   const StorageOpenArgs mArgs;
+   CacheId mCacheId;
+ };
+ 

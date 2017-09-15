@@ -1,0 +1,213 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  48e1e9e1eae5a60c20c130f7b5567b2cf58f675f
+Bug 1397128 P6 Allow ReadStream to be created with an initially nullptr base stream. r=tt
+
+diff --git a/dom/cache/AutoUtils.cpp b/dom/cache/AutoUtils.cpp
+--- a/dom/cache/AutoUtils.cpp
++++ b/dom/cache/AutoUtils.cpp
+@@ -348,17 +348,17 @@ AutoChildOpArgs::Add(JSContext* aCx, Int
+ }
+ 
+ const CacheOpArgs&
+ AutoChildOpArgs::SendAsOpArgs()
+ {
+   MOZ_DIAGNOSTIC_ASSERT(!mSent);
+   mSent = true;
+   for (UniquePtr<AutoIPCStream>& autoStream : mStreamCleanupList) {
+-    autoStream->TakeValue();
++    autoStream->TakeOptionalValue();
+   }
+   return mOpArgs;
+ }
+ 
+ // --------------------------------------------
+ 
+ AutoParentOpResult::AutoParentOpResult(mozilla::ipc::PBackgroundParent* aManager,
+                                        const CacheOpResult& aOpResult,
+@@ -501,17 +501,17 @@ AutoParentOpResult::Add(const SavedReque
+ }
+ 
+ const CacheOpResult&
+ AutoParentOpResult::SendAsOpResult()
+ {
+   MOZ_DIAGNOSTIC_ASSERT(!mSent);
+   mSent = true;
+   for (UniquePtr<AutoIPCStream>& autoStream : mStreamCleanupList) {
+-    autoStream->TakeValue();
++    autoStream->TakeOptionalValue();
+   }
+   return mOpResult;
+ }
+ 
+ void
+ AutoParentOpResult::SerializeResponseBody(const SavedResponse& aSavedResponse,
+                                           StreamList* aStreamList,
+                                           CacheResponse* aResponseOut)
+@@ -532,17 +532,16 @@ void
+ AutoParentOpResult::SerializeReadStream(const nsID& aId, StreamList* aStreamList,
+                                         CacheReadStream* aReadStreamOut)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(aStreamList);
+   MOZ_DIAGNOSTIC_ASSERT(aReadStreamOut);
+   MOZ_DIAGNOSTIC_ASSERT(!mSent);
+ 
+   nsCOMPtr<nsIInputStream> stream = aStreamList->Extract(aId);
+-  MOZ_DIAGNOSTIC_ASSERT(stream);
+ 
+   if (!mStreamControl) {
+     mStreamControl = static_cast<CacheStreamControlParent*>(
+       mManager->SendPCacheStreamControlConstructor(new CacheStreamControlParent()));
+ 
+     // If this failed, then the child process is gone.  Warn and allow actor
+     // cleanup to proceed as normal.
+     if (!mStreamControl) {
+diff --git a/dom/cache/CacheStreamControlChild.cpp b/dom/cache/CacheStreamControlChild.cpp
+--- a/dom/cache/CacheStreamControlChild.cpp
++++ b/dom/cache/CacheStreamControlChild.cpp
+@@ -95,17 +95,16 @@ CacheStreamControlChild::SerializeContro
+ 
+ void
+ CacheStreamControlChild::SerializeStream(CacheReadStream* aReadStreamOut,
+                                          nsIInputStream* aStream,
+                                          nsTArray<UniquePtr<AutoIPCStream>>& aStreamCleanupList)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+   MOZ_DIAGNOSTIC_ASSERT(aReadStreamOut);
+-  MOZ_DIAGNOSTIC_ASSERT(aStream);
+   UniquePtr<AutoIPCStream> autoStream(new AutoIPCStream(aReadStreamOut->stream()));
+   autoStream->Serialize(aStream, Manager());
+   aStreamCleanupList.AppendElement(Move(autoStream));
+ }
+ 
+ void
+ CacheStreamControlChild::OpenStream(const nsID& aId, InputStreamResolver&& aResolver)
+ {
+diff --git a/dom/cache/CacheStreamControlParent.cpp b/dom/cache/CacheStreamControlParent.cpp
+--- a/dom/cache/CacheStreamControlParent.cpp
++++ b/dom/cache/CacheStreamControlParent.cpp
+@@ -54,17 +54,16 @@ CacheStreamControlParent::SerializeContr
+ 
+ void
+ CacheStreamControlParent::SerializeStream(CacheReadStream* aReadStreamOut,
+                                           nsIInputStream* aStream,
+                                           nsTArray<UniquePtr<AutoIPCStream>>& aStreamCleanupList)
+ {
+   NS_ASSERT_OWNINGTHREAD(CacheStreamControlParent);
+   MOZ_DIAGNOSTIC_ASSERT(aReadStreamOut);
+-  MOZ_DIAGNOSTIC_ASSERT(aStream);
+ 
+   UniquePtr<AutoIPCStream> autoStream(new AutoIPCStream(aReadStreamOut->stream()));
+   DebugOnly<bool> ok = autoStream->Serialize(aStream, Manager());
+   MOZ_ASSERT(ok);
+ 
+   aStreamCleanupList.AppendElement(Move(autoStream));
+ }
+ 
+diff --git a/dom/cache/ReadStream.cpp b/dom/cache/ReadStream.cpp
+--- a/dom/cache/ReadStream.cpp
++++ b/dom/cache/ReadStream.cpp
+@@ -18,16 +18,17 @@
+ 
+ namespace mozilla {
+ namespace dom {
+ namespace cache {
+ 
+ using mozilla::Unused;
+ using mozilla::ipc::AutoIPCStream;
+ using mozilla::ipc::IPCStream;
++using mozilla::ipc::OptionalIPCStream;
+ 
+ // ----------------------------------------------------------------------------
+ 
+ // The inner stream class.  This is where all of the real work is done.  As
+ // an invariant Inner::Close() must be called before ~Inner().  This is
+ // guaranteed by our outer ReadStream class.
+ class ReadStream::Inner final : public ReadStream::Controllable
+ {
+@@ -215,19 +216,18 @@ ReadStream::Inner::Inner(StreamControl* 
+   , mId(aId)
+   , mOwningEventTarget(GetCurrentThreadSerialEventTarget())
+   , mState(Open)
+   , mHasEverBeenRead(false)
+   , mAsyncOpenStarted(false)
+   , mMutex("dom::cache::ReadStream")
+   , mCondVar(mMutex, "dom::cache::ReadStream")
+   , mStream(aStream)
+-  , mSnappyStream(new SnappyUncompressInputStream(aStream))
++  , mSnappyStream(aStream ? new SnappyUncompressInputStream(aStream) : nullptr)
+ {
+-  MOZ_DIAGNOSTIC_ASSERT(mStream);
+   MOZ_DIAGNOSTIC_ASSERT(mControl);
+   mControl->AddReadStream(this);
+ }
+ 
+ void
+ ReadStream::Inner::Serialize(CacheReadStreamOrVoid* aReadStreamOut,
+                              nsTArray<UniquePtr<AutoIPCStream>>& aStreamCleanupList,
+                              ErrorResult& aRv)
+@@ -256,17 +256,18 @@ ReadStream::Inner::Serialize(CacheReadSt
+   aReadStreamOut->id() = mId;
+   mControl->SerializeControl(aReadStreamOut);
+ 
+   {
+     MutexAutoLock lock(mMutex);
+     mControl->SerializeStream(aReadStreamOut, mStream, aStreamCleanupList);
+   }
+ 
+-  MOZ_DIAGNOSTIC_ASSERT(aReadStreamOut->stream().get_IPCStream().type() ==
++  MOZ_DIAGNOSTIC_ASSERT(aReadStreamOut->stream().type() == OptionalIPCStream::Tvoid_t ||
++                        aReadStreamOut->stream().get_IPCStream().type() ==
+                         IPCStream::TInputStreamParamsWithFds);
+ 
+   // We're passing ownership across the IPC barrier with the control, so
+   // do not signal that the stream is closed here.
+   Forget();
+ }
+ 
+ void
+@@ -586,38 +587,40 @@ ReadStream::Create(const CacheReadStream
+ {
+   // The parameter may or may not be for a Cache created stream.  The way we
+   // tell is by looking at the stream control actor.  If the actor exists,
+   // then we know the Cache created it.
+   if (!aReadStream.controlChild() && !aReadStream.controlParent()) {
+     return nullptr;
+   }
+ 
+-  MOZ_DIAGNOSTIC_ASSERT(aReadStream.stream().get_IPCStream().type() ==
++  MOZ_DIAGNOSTIC_ASSERT(aReadStream.stream().type() == OptionalIPCStream::Tvoid_t ||
++                        aReadStream.stream().get_IPCStream().type() ==
+                         IPCStream::TInputStreamParamsWithFds);
+ 
+   // Control is guaranteed to survive this method as ActorDestroy() cannot
+   // run on this thread until we complete.
+   StreamControl* control;
+   if (aReadStream.controlChild()) {
+     auto actor = static_cast<CacheStreamControlChild*>(aReadStream.controlChild());
+     control = actor;
+   } else {
+     auto actor = static_cast<CacheStreamControlParent*>(aReadStream.controlParent());
+     control = actor;
+   }
+   MOZ_DIAGNOSTIC_ASSERT(control);
+ 
+   nsCOMPtr<nsIInputStream> stream = DeserializeIPCStream(aReadStream.stream());
+-  MOZ_DIAGNOSTIC_ASSERT(stream);
+ 
+   // Currently we expect all cache read streams to be blocking file streams.
+ #if !defined(RELEASE_OR_BETA)
+-  nsCOMPtr<nsIAsyncInputStream> asyncStream = do_QueryInterface(stream);
+-  MOZ_DIAGNOSTIC_ASSERT(!asyncStream);
++  if (stream) {
++    nsCOMPtr<nsIAsyncInputStream> asyncStream = do_QueryInterface(stream);
++    MOZ_DIAGNOSTIC_ASSERT(!asyncStream);
++  }
+ #endif
+ 
+   RefPtr<Inner> inner = new Inner(control, aReadStream.id(), stream);
+   RefPtr<ReadStream> ref = new ReadStream(inner);
+   return ref.forget();
+ }
+ 
+ // static
