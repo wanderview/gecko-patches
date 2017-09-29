@@ -1,0 +1,119 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  999b973d92a4c5b97f748f330c7a372cfcb8f579
+Bug 1336364 P9 Block storage denied windows from ServiceWorker.postMessage() and clients.matchAll(). r=asuth
+
+diff --git a/dom/workers/ServiceWorker.cpp b/dom/workers/ServiceWorker.cpp
+--- a/dom/workers/ServiceWorker.cpp
++++ b/dom/workers/ServiceWorker.cpp
+@@ -88,16 +88,22 @@ ServiceWorker::PostMessage(JSContext* aC
+ 
+   nsCOMPtr<nsPIDOMWindowInner> window = do_QueryInterface(GetParentObject());
+   if (!window || !window->GetExtantDoc()) {
+     NS_WARNING("Trying to call post message from an invalid dom object.");
+     aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+     return;
+   }
+ 
++  auto storageAllowed = nsContentUtils::StorageAllowedForWindow(window);
++  if (storageAllowed != nsContentUtils::StorageAccess::eAllow) {
++    aRv.Throw(NS_ERROR_DOM_SECURITY_ERR);
++    return;
++  }
++
+   UniquePtr<ServiceWorkerClientInfo> clientInfo(new ServiceWorkerClientInfo(window->GetExtantDoc()));
+   ServiceWorkerPrivate* workerPrivate = mInfo->WorkerPrivate();
+   aRv = workerPrivate->SendMessageEvent(aCx, aMessage, aTransferable, Move(clientInfo));
+ }
+ 
+ } // namespace workers
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
+--- a/dom/workers/ServiceWorkerManager.cpp
++++ b/dom/workers/ServiceWorkerManager.cpp
+@@ -3305,31 +3305,39 @@ ServiceWorkerManager::GetClient(nsIPrinc
+                                      PromiseFlatString(aClientId).get());
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return clientInfo;
+   }
+ 
+   nsCOMPtr<nsISupports> ptr;
+   ifptr->GetData(getter_AddRefs(ptr));
+   nsCOMPtr<nsIDocument> doc = do_QueryInterface(ptr);
+-  if (NS_WARN_IF(!doc)) {
++  if (NS_WARN_IF(!doc || !doc->GetInnerWindow())) {
+     return clientInfo;
+   }
+ 
+   bool equals = false;
+   aPrincipal->Equals(doc->NodePrincipal(), &equals);
+   if (!equals) {
+     return clientInfo;
+   }
+ 
+   if (!IsFromAuthenticatedOrigin(doc)) {
+     aRv.Throw(NS_ERROR_DOM_SECURITY_ERR);
+     return clientInfo;
+   }
+ 
++  // Don't let service worker see 3rd party iframes that are denied storage
++  // access.  We don't want these to communicate.
++  auto storageAccess =
++    nsContentUtils::StorageAllowedForWindow(doc->GetInnerWindow());
++  if (storageAccess != nsContentUtils::StorageAccess::eAllow) {
++    return clientInfo;
++  }
++
+   clientInfo.reset(new ServiceWorkerClientInfo(doc));
+   return clientInfo;
+ }
+ 
+ void
+ ServiceWorkerManager::GetAllClients(nsIPrincipal* aPrincipal,
+                                     const nsCString& aScope,
+                                     uint64_t aServiceWorkerID,
+@@ -3364,17 +3372,17 @@ ServiceWorkerManager::GetAllClients(nsIP
+   while (NS_SUCCEEDED(enumerator->HasMoreElements(&loop)) && loop) {
+     nsCOMPtr<nsISupports> ptr;
+     rv = enumerator->GetNext(getter_AddRefs(ptr));
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       continue;
+     }
+ 
+     nsCOMPtr<nsIDocument> doc = do_QueryInterface(ptr);
+-    if (!doc || !doc->GetWindow()) {
++    if (!doc || !doc->GetWindow() || !doc->GetInnerWindow()) {
+       continue;
+     }
+ 
+     bool equals = false;
+     Unused << aPrincipal->Equals(doc->NodePrincipal(), &equals);
+     if (!equals) {
+       continue;
+     }
+@@ -3382,16 +3390,24 @@ ServiceWorkerManager::GetAllClients(nsIP
+     // Treat http windows with devtools opened as secure if the correct devtools
+     // setting is enabled.
+     if (!doc->GetWindow()->GetServiceWorkersTestingEnabled() &&
+         !Preferences::GetBool("dom.serviceWorkers.testing.enabled") &&
+         !IsFromAuthenticatedOrigin(doc)) {
+       continue;
+     }
+ 
++    // Don't let service worker find 3rd party iframes that are denied storage
++    // access.  We don't want these to communicate.
++    auto storageAccess =
++      nsContentUtils::StorageAllowedForWindow(doc->GetInnerWindow());
++    if (storageAccess != nsContentUtils::StorageAccess::eAllow) {
++      continue;
++    }
++
+     // If we are only returning controlled Clients then skip any documents
+     // that are for different registrations.  We also skip service workers
+     // that don't match the ID of our calling service worker.  We should
+     // only return Clients controlled by that precise service worker.
+     if (!aIncludeUncontrolled) {
+       ServiceWorkerRegistrationInfo* reg = mControlledDocuments.GetWeak(doc);
+       if (!reg || reg->mScope != aScope || !reg->GetActive() ||
+           reg->GetActive()->ID() != aServiceWorkerID) {
