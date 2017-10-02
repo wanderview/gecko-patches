@@ -1,12 +1,12 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  fd48ef2a906b804af451a710745ebb013d2c8727
+# Parent  21667c7e9578c36eb574e0b75ab68f2e6315bead
 Bug 1204254 P8 Move the body stream copying into the nsIInterceptedChannel::StartSynthesizedResponse() method. r=asuth
 
 diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEvents.cpp
 --- a/dom/workers/ServiceWorkerEvents.cpp
 +++ b/dom/workers/ServiceWorkerEvents.cpp
-@@ -159,18 +159,136 @@ FetchEvent::Constructor(const GlobalObje
+@@ -159,18 +159,126 @@ FetchEvent::Constructor(const GlobalObje
    e->mRequest = aOptions.mRequest;
    e->mClientId = aOptions.mClientId;
    e->mIsReload = aOptions.mIsReload;
@@ -83,11 +83,9 @@ diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEven
 +  }
 +};
 +
-+class BodyCopyHandle final : public nsIRunnable
-+                           , public nsICancelable
++class BodyCopyHandle final : public nsIInterceptedBodyCallback
 +{
 +  UniquePtr<RespondWithClosure> mClosure;
-+  nsresult mStatus;
 +
 +  ~BodyCopyHandle()
 +  {
@@ -98,17 +96,16 @@ diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEven
 +
 +  explicit BodyCopyHandle(UniquePtr<RespondWithClosure>&& aClosure)
 +    : mClosure(Move(aClosure))
-+    , mStatus(NS_OK)
 +  {
 +  }
 +
 +  NS_IMETHOD
-+  Run() override
++  BodyComplete(nsresult aRv) override
 +  {
 +    MOZ_ASSERT(NS_IsMainThread());
 +
 +    nsCOMPtr<nsIRunnable> event;
-+    if (NS_WARN_IF(NS_FAILED(mStatus))) {
++    if (NS_WARN_IF(NS_FAILED(aRv))) {
 +      AsyncLog(mClosure->mInterceptedChannel, mClosure->mRespondWithScriptSpec,
 +               mClosure->mRespondWithLineNumber,
 +               mClosure->mRespondWithColumnNumber,
@@ -127,16 +124,9 @@ diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEven
 +
 +    return NS_OK;
 +  }
-+
-+  NS_IMETHOD
-+  Cancel(nsresult aStatus) override
-+  {
-+    mStatus = aStatus;
-+    return Run();
-+  }
 +};
 +
-+NS_IMPL_ISUPPORTS(BodyCopyHandle, nsIRunnable, nsICancelable)
++NS_IMPL_ISUPPORTS(BodyCopyHandle, nsIInterceptedBodyCallback)
  
  class StartResponse final : public Runnable
  {
@@ -145,7 +135,7 @@ diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEven
    ChannelInfo mWorkerChannelInfo;
    const nsCString mScriptSpec;
    const nsCString mResponseURLSpec;
-@@ -234,71 +352,31 @@ public:
+@@ -234,71 +342,31 @@ public:
      mInternalResponse->UnfilteredHeaders()->GetEntries(entries);
      for (uint32_t i = 0; i < entries.Length(); ++i) {
         mChannel->SynthesizeHeader(entries[i].mName, entries[i].mValue);
@@ -154,7 +144,7 @@ diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEven
      auto castLoadInfo = static_cast<LoadInfo*>(loadInfo.get());
      castLoadInfo->SynthesizeServiceWorkerTainting(mInternalResponse->GetTainting());
  
--    rv = mChannel->StartSynthesizedResponse(nullptr, nullptr, nullptr,
+-    rv = mChannel->StartSynthesizedResponse(nullptr, nullptr,
 +    nsCOMPtr<nsIInputStream> body;
 +    mInternalResponse->GetUnfilteredBody(getter_AddRefs(body));
 +    RefPtr<BodyCopyHandle> copyHandle;
@@ -163,7 +153,7 @@ diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEven
 +      copyHandle = new BodyCopyHandle(Move(mClosure));
 +    }
 +
-+    rv = mChannel->StartSynthesizedResponse(body, copyHandle, copyHandle,
++    rv = mChannel->StartSynthesizedResponse(body, copyHandle,
                                              mResponseURLSpec);
      if (NS_WARN_IF(NS_FAILED(rv))) {
        mChannel->CancelInterception(NS_ERROR_INTERCEPTION_FAILED);
@@ -226,7 +216,7 @@ diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEven
      AssertIsOnMainThread();
      MOZ_ASSERT(aLoadInfo);
      nsresult rv;
-@@ -315,57 +393,16 @@ public:
+@@ -315,57 +383,16 @@ public:
                                     aLoadInfo->LoadingPrincipal(),
                                     aLoadInfo->LoadingNode(), EmptyCString(),
                                     nullptr, &decision);
@@ -284,7 +274,7 @@ diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEven
    const RequestRedirect mRequestRedirectMode;
  #ifdef DEBUG
    const bool mIsClientRequest;
-@@ -430,66 +467,16 @@ private:
+@@ -430,66 +457,16 @@ private:
        ::AsyncLog(mInterceptedChannel, mRespondWithScriptSpec,
                   mRespondWithLineNumber, mRespondWithColumnNumber,
                   NS_LITERAL_CSTRING("InterceptionFailedWithURL"), mRequestURL);
@@ -354,7 +344,7 @@ diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEven
 diff --git a/netwerk/protocol/http/InterceptedChannel.cpp b/netwerk/protocol/http/InterceptedChannel.cpp
 --- a/netwerk/protocol/http/InterceptedChannel.cpp
 +++ b/netwerk/protocol/http/InterceptedChannel.cpp
-@@ -2,43 +2,155 @@
+@@ -2,43 +2,144 @@
  /* vim:set expandtab ts=2 sw=2 sts=2 cin: */
  /* This Source Code Form is subject to the terms of the Mozilla Public
   * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -396,17 +386,14 @@ diff --git a/netwerk/protocol/http/InterceptedChannel.cpp b/netwerk/protocol/htt
 +
 +struct StreamCopyClosure
 +{
-+  nsCOMPtr<nsIRunnable> mSuccessCallback;
-+  nsCOMPtr<nsICancelable> mFailureCallback;
++  nsCOMPtr<nsIInterceptedBodyCallback> mCallback;
 +  nsCOMPtr<nsIEventTarget> mTarget;
 +
-+  StreamCopyClosure(nsIRunnable* aSuccessCallback,
-+                    nsICancelable* aFailureCallback)
-+    : mSuccessCallback(aSuccessCallback)
-+    , mFailureCallback(aFailureCallback)
++  explicit StreamCopyClosure(nsIInterceptedBodyCallback* aCallback)
++    : mCallback(aCallback)
 +    , mTarget(GetCurrentThreadSerialEventTarget())
 +  {
-+    MOZ_DIAGNOSTIC_ASSERT(mSuccessCallback || mFailureCallback);
++    MOZ_DIAGNOSTIC_ASSERT(mCallback);
 +  }
 +
 +  StreamCopyClosure() = delete;
@@ -434,15 +421,8 @@ diff --git a/netwerk/protocol/http/InterceptedChannel.cpp b/netwerk/protocol/htt
 +    NS_NewRunnableFunction("InterceptedChannel::StreamCopyCompelte",
 +                           [aStatus, dispatchedClosure]() {
 +      UniquePtr<StreamCopyClosure> closure(dispatchedClosure);
-+      if (NS_SUCCEEDED(aStatus)) {
-+        if (closure->mSuccessCallback) {
-+          closure->mSuccessCallback->Run();
-+        }
-+        return;
-+      }
-+
-+      if (closure->mFailureCallback) {
-+        closure->mFailureCallback->Cancel(aStatus);
++      if (closure->mCallback) {
++        closure->mCallback->BodyComplete(aStatus);
 +      }
 +    });
 +
@@ -453,8 +433,7 @@ diff --git a/netwerk/protocol/http/InterceptedChannel.cpp b/netwerk/protocol/htt
 +nsresult
 +StreamCopyStart(nsIOutputStream* aWriter,
 +                nsIInputStream* aReader,
-+                nsIRunnable* aSuccessCallback,
-+                nsICancelable* aFailureCallback)
++                nsIInterceptedBodyCallback* aCallback)
 +{
 +  MOZ_DIAGNOSTIC_ASSERT(aWriter);
 +  MOZ_DIAGNOSTIC_ASSERT(aReader);
@@ -489,8 +468,8 @@ diff --git a/netwerk/protocol/http/InterceptedChannel.cpp b/netwerk/protocol/htt
 +  NS_ENSURE_TRUE(stsThread, NS_ERROR_FAILURE);
 +
 +  UniquePtr<StreamCopyClosure> closure;
-+  if (aSuccessCallback || aFailureCallback) {
-+    closure = MakeUnique<StreamCopyClosure>(aSuccessCallback, aFailureCallback);
++  if (aCallback) {
++    closure = MakeUnique<StreamCopyClosure>(aCallback);
 +  }
 +
 +  rv = NS_AsyncCopy(aReader, writer, stsThread, NS_ASYNCCOPY_VIA_WRITESEGMENTS,
@@ -510,7 +489,7 @@ diff --git a/netwerk/protocol/http/InterceptedChannel.cpp b/netwerk/protocol/htt
    , mClosed(false)
    , mSynthesizedOrReset(Invalid)
  {
-@@ -315,16 +427,27 @@ InterceptedChannelContent::StartSynthesi
+@@ -314,16 +415,26 @@ InterceptedChannelContent::StartSynthesi
      mChannel->ForceIntercepted(mSynthesizedInput);
      mChannel->BeginNonIPCRedirect(responseURI, *mSynthesizedResponseHead.ptr());
    } else {
@@ -520,13 +499,12 @@ diff --git a/netwerk/protocol/http/InterceptedChannel.cpp b/netwerk/protocol/htt
    }
  
 +  if (!aBody) {
-+    if (aBodyCompletionCallback) {
-+      aBodyCompletionCallback->Run();
++    if (aBodyCallback) {
++      aBodyCallback->BodyComplete(NS_OK);
 +    }
 +  } else {
 +    nsresult rv = StreamCopyStart(mResponseBody, aBody,
-+                                  aBodyCompletionCallback,
-+                                  aBodyFailedCallback);
++                                  aBodyCallback);
 +    NS_ENSURE_SUCCESS(rv, rv);
 +  }
 +
@@ -541,7 +519,7 @@ diff --git a/netwerk/protocol/http/InterceptedChannel.cpp b/netwerk/protocol/htt
 diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol/http/InterceptedHttpChannel.cpp
 --- a/netwerk/protocol/http/InterceptedHttpChannel.cpp
 +++ b/netwerk/protocol/http/InterceptedHttpChannel.cpp
-@@ -38,16 +38,18 @@ InterceptedHttpChannel::ReleaseListeners
+@@ -42,16 +42,17 @@ InterceptedHttpChannel::ReleaseListeners
    }
    HttpBaseChannel::ReleaseListeners();
    mSynthesizedResponseHead.reset();
@@ -550,8 +528,7 @@ diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol
    mBodyWriter = nullptr;
    mReleaseHandle = nullptr;
    mProgressSink = nullptr;
-+  mBodyCompletionCallback = nullptr;
-+  mBodyFailedCallback = nullptr;
++  mBodyCallback = nullptr;
    mPump = nullptr;
    mParentChannel = nullptr;
  
@@ -560,7 +537,7 @@ diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol
  
  nsresult
  InterceptedHttpChannel::SetupReplacementChannel(nsIURI *aURI,
-@@ -155,18 +157,25 @@ InterceptedHttpChannel::RedirectForOpaqu
+@@ -159,18 +160,23 @@ InterceptedHttpChannel::RedirectForOpaqu
    // Perform an internal redirect to another InterceptedHttpChannel using
    // the given cross-origin response URL.  The resulting channel will then
    // process the synthetic response as normal.  This extra redirect is
@@ -569,16 +546,14 @@ diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol
  
    nsresult rv = NS_OK;
  
-+  // We want to pass ownership of the body callbacks to the new synthesized
++  // We want to pass ownership of the body callback to the new synthesized
 +  // channel.  We need to hold a reference to the callbacks on the stack
 +  // as well, though, so we can call them if a failure occurs.
-+  nsCOMPtr<nsIRunnable> bodyCompletionCallback = mBodyCompletionCallback.forget();
-+  nsCOMPtr<nsICancelable> bodyFailedCallback = mBodyFailedCallback.forget();
++  nsCOMPtr<nsIInterceptedBodyCallback> bodyCallback = mBodyCallback.forget();
 +
    RefPtr<InterceptedHttpChannel> newChannel =
 -    CreateForSynthesis(mResponseHead, mBodyReader);
-+    CreateForSynthesis(mResponseHead, mBodyReader, bodyCompletionCallback,
-+                       bodyFailedCallback);
++    CreateForSynthesis(mResponseHead, mBodyReader, bodyCallback);
  
    rv = newChannel->Init(aResponseURI, mCaps,
                          static_cast<nsProxyInfo*>(mProxyInfo.get()),
@@ -587,7 +562,7 @@ diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol
    uint32_t flags = nsIChannelEventSink::REDIRECT_INTERNAL;
  
    nsCOMPtr<nsILoadInfo> redirectLoadInfo =
-@@ -177,16 +186,21 @@ InterceptedHttpChannel::RedirectForOpaqu
+@@ -181,16 +187,21 @@ InterceptedHttpChannel::RedirectForOpaqu
    rv = SetupReplacementChannel(aResponseURI, newChannel, true, flags);
    NS_ENSURE_SUCCESS(rv, rv);
  
@@ -596,10 +571,10 @@ diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol
    rv = gHttpHandler->AsyncOnChannelRedirect(this, mRedirectChannel, flags);
  
    if (NS_FAILED(rv)) {
-+    // Make sure to call the body failure callback since we took ownership
++    // Make sure to call the body callback since we took ownership
 +    // above.  Neither the new channel or our standard
 +    // OnRedirectVerifyCallback() code will invoke the callback.  Do it here.
-+    bodyFailedCallback->Cancel(rv);
++    bodyCallback->BodyComplete(rv);
 +
      OnRedirectVerifyCallback(rv);
    }
@@ -609,28 +584,21 @@ diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol
  
  nsresult
  InterceptedHttpChannel::StartPump()
-@@ -252,40 +266,60 @@ InterceptedHttpChannel::OpenRedirectChan
-   }
-   NS_ENSURE_SUCCESS(rv, rv);
+@@ -319,40 +330,51 @@ InterceptedHttpChannel::MaybeCallStatusA
+                           mStatusHost.get());
  
-   mStatus = NS_BINDING_REDIRECTED;
+   mProgressSink->OnProgress(this, mListenerContext, progress,
+                             mSynthesizedStreamLength);
  
-   return rv;
+   mProgressReported = progress;
  }
  
 +void
 +InterceptedHttpChannel::MaybeCallBodyCallback()
 +{
-+  nsCOMPtr<nsIRunnable> completionCallback = mBodyCompletionCallback.forget();
-+  nsCOMPtr<nsICancelable> failedCallback = mBodyFailedCallback.forget();
-+  if (NS_FAILED(mStatus)) {
-+    if (failedCallback) {
-+      failedCallback->Cancel(mStatus);
-+    }
-+    return;
-+  }
-+  if (completionCallback) {
-+    completionCallback->Run();
++  nsCOMPtr<nsIInterceptedBodyCallback> callback = mBodyCallback.forget();
++  if (callback) {
++    callback->BodyComplete(mStatus);
 +  }
 +}
 +
@@ -649,8 +617,7 @@ diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol
  InterceptedHttpChannel::CreateForSynthesis(const nsHttpResponseHead* aHead,
 -                                           nsIInputStream* aBody)
 +                                           nsIInputStream* aBody,
-+                                           nsIRunnable* aBodyCompletionCallback,
-+                                           nsICancelable* aBodyFailedCallback)
++                                           nsIInterceptedBodyCallback* aBodyCallback)
  {
    MOZ_DIAGNOSTIC_ASSERT(aHead);
    MOZ_DIAGNOSTIC_ASSERT(aBody);
@@ -662,8 +629,7 @@ diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol
 +  ref->mResponseHead = new nsHttpResponseHead(*aHead);
    ref->mBodyReader = aBody;
 -  ref->mResponseHead = new nsHttpResponseHead(*aHead);
-+  ref->mBodyCompletionCallback = aBodyCompletionCallback;
-+  ref->mBodyFailedCallback = aBodyFailedCallback;
++  ref->mBodyCallback = aBodyCallback;
  
    return ref.forget();
  }
@@ -672,29 +638,28 @@ diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol
  InterceptedHttpChannel::Cancel(nsresult aStatus)
  {
    return CancelInterception(aStatus);
-@@ -551,31 +585,44 @@ InterceptedHttpChannel::SynthesizeHeader
+@@ -617,31 +639,43 @@ InterceptedHttpChannel::SynthesizeHeader
+ }
  
  NS_IMETHODIMP
  InterceptedHttpChannel::StartSynthesizedResponse(nsIInputStream* aBody,
-                                                  nsIRunnable* aBodyCompletionCallback,
-                                                  nsICancelable* aBodyFailedCallback,
+                                                  nsIInterceptedBodyCallback* aBodyCallback,
                                                   const nsACString& aFinalURLSpec)
  {
    if (mCanceled) {
-+    if (aBodyFailedCallback) {
-+      aBodyFailedCallback->Cancel(mStatus);
++    if (aBodyCallback) {
++      aBodyCallback->BodyComplete(mStatus);
 +    }
      return mStatus;
    }
  
-+  // Take ownership of the body callbacks.  We expect that if a failure
++  // Take ownership of the body callbacks  We expect that if a failure
 +  // occurs here our caller will call Cancel().  This will then invoke
 +  // OnStopRequest() which will invoke the correct callback.  We also
 +  // invoke callbacks if we skip reading the body due to following a
 +  // redirect, etc.  In the case of an opaque response redirect we pass
 +  // ownership of the callbacks to the new channel.
-+  mBodyCompletionCallback = aBodyCompletionCallback;
-+  mBodyFailedCallback = aBodyFailedCallback;
++  mBodyCallback = aBodyCallback;
 +
    if (!mSynthesizedResponseHead) {
      mSynthesizedResponseHead.reset(new nsHttpResponseHead());
@@ -717,7 +682,7 @@ diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol
  
    nsCOMPtr<nsIURI> responseURI;
    if (!aFinalURLSpec.IsEmpty()) {
-@@ -805,16 +852,18 @@ InterceptedHttpChannel::OnRedirectVerify
+@@ -873,16 +907,18 @@ InterceptedHttpChannel::OnRedirectVerify
    if (hook) {
      hook->OnRedirectResult(NS_SUCCEEDED(rv));
    }
@@ -736,28 +701,29 @@ diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol
  
  NS_IMETHODIMP
  InterceptedHttpChannel::OnStartRequest(nsIRequest* aRequest,
-@@ -832,16 +881,17 @@ InterceptedHttpChannel::OnStartRequest(n
- NS_IMETHODIMP
- InterceptedHttpChannel::OnStopRequest(nsIRequest* aRequest,
-                                       nsISupports* aContext,
+@@ -905,16 +941,18 @@ InterceptedHttpChannel::OnStopRequest(ns
                                        nsresult aStatus)
  {
+   MOZ_ASSERT(NS_IsMainThread());
+ 
    if (NS_SUCCEEDED(mStatus)) {
      mStatus = aStatus;
    }
+ 
 +  MaybeCallBodyCallback();
++
+   // Its possible that we have any async runnable queued to report some
+   // progress when OnStopRequest() is triggered.  Report any left over
+   // progress immediately.  The extra runnable will then do nothing thanks
+   // to the ReleaseListeners() call below.
+   MaybeCallStatusAndProgress();
+ 
    mIsPending = false;
-   if (mListener) {
-     mListener->OnStopRequest(this, mListenerContext, mStatus);
-   }
-   ReleaseListeners();
-   return NS_OK;
- }
  
 diff --git a/netwerk/protocol/http/InterceptedHttpChannel.h b/netwerk/protocol/http/InterceptedHttpChannel.h
 --- a/netwerk/protocol/http/InterceptedHttpChannel.h
 +++ b/netwerk/protocol/http/InterceptedHttpChannel.h
-@@ -58,16 +58,18 @@ class InterceptedHttpChannel final : pub
+@@ -59,16 +59,17 @@ class InterceptedHttpChannel final : pub
    friend class HttpAsyncAborter<InterceptedHttpChannel>;
  
    UniquePtr<nsHttpResponseHead> mSynthesizedResponseHead;
@@ -766,24 +732,23 @@ diff --git a/netwerk/protocol/http/InterceptedHttpChannel.h b/netwerk/protocol/h
    nsCOMPtr<nsIOutputStream> mBodyWriter;
    nsCOMPtr<nsISupports> mReleaseHandle;
    nsCOMPtr<nsIProgressEventSink> mProgressSink;
-+  nsCOMPtr<nsIRunnable> mBodyCompletionCallback;
-+  nsCOMPtr<nsICancelable> mBodyFailedCallback;
++  nsCOMPtr<nsIInterceptedBodyCallback> mBodyCallback;
    RefPtr<nsInputStreamPump> mPump;
    RefPtr<ADivertableParentChannel> mParentChannel;
    TimeStamp mFinishResponseStart;
    TimeStamp mFinishResponseEnd;
+   Atomic<int64_t> mProgress;
+   int64_t mProgressReported;
    int64_t mSynthesizedStreamLength;
    uint64_t mResumeStartPos;
-   nsCString mResumeEntityId;
-   enum {
-@@ -97,22 +99,27 @@ class InterceptedHttpChannel final : pub
-   RedirectForOpaqueResponse(nsIURI* aResponseURI);
- 
-   nsresult
+@@ -105,22 +106,26 @@ class InterceptedHttpChannel final : pub
    StartPump();
  
    nsresult
    OpenRedirectChannel();
+ 
+   void
+   MaybeCallStatusAndProgress();
  
 +  void
 +  MaybeCallBodyCallback();
@@ -795,8 +760,7 @@ diff --git a/netwerk/protocol/http/InterceptedHttpChannel.h b/netwerk/protocol/h
    static already_AddRefed<InterceptedHttpChannel>
 -  CreateForSynthesis(const nsHttpResponseHead* aHead, nsIInputStream* aBody);
 +  CreateForSynthesis(const nsHttpResponseHead* aHead, nsIInputStream* aBody,
-+                     nsIRunnable* aBodyCompletionCallback,
-+                     nsICancelable* aBodyFailedCallback);
++                     nsIInterceptedBodyCallback* aBodyCallback);
  
    NS_IMETHOD
    Cancel(nsresult aStatus) override;
