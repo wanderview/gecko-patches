@@ -1,13 +1,13 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  be166b6fc1d3b61649c31c7e3b532660cfcc3f3d
+# Parent  13396f73255cfdceb5298082e9db22304b685b5c
 Bug 1391693 P8 Add new InterceptedHttpChannel class to represent parent-side channel with a ServiceWorker FetchEvent. r=asuth r=valentin
 
 diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol/http/InterceptedHttpChannel.cpp
 new file mode 100644
 --- /dev/null
 +++ b/netwerk/protocol/http/InterceptedHttpChannel.cpp
-@@ -0,0 +1,936 @@
+@@ -0,0 +1,1029 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set sw=2 ts=8 et tw=80 : */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -28,13 +28,17 @@ new file mode 100644
 +                            nsIRequestObserver,
 +                            nsIStreamListener,
 +                            nsIChannelWithDivertableParentListener,
-+                            nsIThreadRetargetableRequest)
++                            nsIThreadRetargetableRequest,
++                            nsIThreadRetargetableStreamListener)
 +
 +InterceptedHttpChannel::InterceptedHttpChannel()
 +  : HttpAsyncAborter<InterceptedHttpChannel>(this)
++  , mProgress(0)
++  , mProgressReported(0)
 +  , mSynthesizedStreamLength(-1)
 +  , mResumeStartPos(0)
 +  , mSynthesizedOrReset(Invalid)
++  , mCallingStatusAndProgress(false)
 +{
 +  mChannelCreationTime = PR_Now();
 +  mChannelCreationTimestamp = TimeStamp::Now();
@@ -265,6 +269,69 @@ new file mode 100644
 +  mStatus = NS_BINDING_REDIRECTED;
 +
 +  return rv;
++}
++
++void
++InterceptedHttpChannel::MaybeCallStatusAndProgress()
++{
++  // OnStatus() and OnProgress() must only be called on the main thread.  If
++  // we are on a separate thread, then we maybe need to schedule a runnable
++  // to call them asynchronousnly.
++  if (!NS_IsMainThread()) {
++    // Check to see if we are already trying to call OnStatus/OnProgress
++    // asynchronously.  If we are, then don't queue up another runnable.
++    // We don't want to flood the main thread.
++    if (mCallingStatusAndProgress) {
++      return;
++    }
++    mCallingStatusAndProgress = true;
++
++    nsCOMPtr<nsIRunnable> r =
++      NewRunnableMethod("InterceptedHttpChannel::MaybeCallStatusAndProgress",
++                        this,
++                        &InterceptedHttpChannel::MaybeCallStatusAndProgress);
++    MOZ_ALWAYS_SUCCEEDS(
++      SystemGroup::Dispatch(TaskCategory::Other, r.forget()));
++
++    return;
++  }
++
++  MOZ_ASSERT(NS_IsMainThread());
++
++  // Capture the current status from our atomic count.
++  int64_t progress = mProgress;
++
++  // Note that any asynchronous progress update is now taking place.
++  mCallingStatusAndProgress = false;
++
++  MOZ_DIAGNOSTIC_ASSERT(progress >= mProgressReported);
++
++  // Do nothing if we've already made the calls for this amount of progress
++  // or if the channel is not configured for these calls.  Note, the check
++  // for mProgressSink here means we will not fire any spurious late calls
++  // after ReleaseListeners() is executed.
++  if (progress <= mProgressReported ||
++      mCanceled ||
++      !mProgressSink ||
++      (mLoadFlags & HttpBaseChannel::LOAD_BACKGROUND)) {
++    return;
++  }
++
++  // Capture the host name on the first set of calls to avoid doing this
++  // string processing repeatedly.
++  if (mProgressReported == 0) {
++    nsAutoCString host;
++    MOZ_ALWAYS_SUCCEEDS(mURI->GetHost(host));
++    CopyUTF8toUTF16(host, mStatusHost);
++  }
++
++  mProgressSink->OnStatus(this, mListenerContext, NS_NET_STATUS_READING,
++                          mStatusHost.get());
++
++  mProgressSink->OnProgress(this, mListenerContext, progress,
++                            mSynthesizedStreamLength);
++
++  mProgressReported = progress;
 +}
 +
 +// static
@@ -801,6 +868,8 @@ new file mode 100644
 +NS_IMETHODIMP
 +InterceptedHttpChannel::OnRedirectVerifyCallback(nsresult rv)
 +{
++  MOZ_ASSERT(NS_IsMainThread());
++
 +  if (NS_SUCCEEDED(rv)) {
 +    rv = OpenRedirectChannel();
 +  }
@@ -825,6 +894,8 @@ new file mode 100644
 +InterceptedHttpChannel::OnStartRequest(nsIRequest* aRequest,
 +                                       nsISupports* aContext)
 +{
++  MOZ_ASSERT(NS_IsMainThread());
++
 +  if (!mProgressSink) {
 +    GetCallback(mProgressSink);
 +  }
@@ -839,14 +910,28 @@ new file mode 100644
 +                                      nsISupports* aContext,
 +                                      nsresult aStatus)
 +{
++  MOZ_ASSERT(NS_IsMainThread());
++
 +  if (NS_SUCCEEDED(mStatus)) {
 +    mStatus = aStatus;
 +  }
++
++  // Its possible that we have any async runnable queued to report some
++  // progress when OnStopRequest() is triggered.  Report any left over
++  // progress immediately.  The extra runnable will then do nothing thanks
++  // to the ReleaseListeners() call below.
++  MaybeCallStatusAndProgress();
++
 +  mIsPending = false;
++
 +  if (mListener) {
 +    mListener->OnStopRequest(this, mListenerContext, mStatus);
 +  }
++
++  gHttpHandler->OnStopRequest(this);
++
 +  ReleaseListeners();
++
 +  return NS_OK;
 +}
 +
@@ -857,6 +942,8 @@ new file mode 100644
 +                                        uint64_t aOffset,
 +                                        uint32_t aCount)
 +{
++  // Any thread if the channel has been retargeted.
++
 +  if (mCanceled || !mListener) {
 +    // If there is no listener, we still need to drain the stream in order
 +    // maintain necko invariants.
@@ -866,15 +953,8 @@ new file mode 100644
 +  }
 +  if (mProgressSink) {
 +    if (!(mLoadFlags & HttpBaseChannel::LOAD_BACKGROUND)) {
-+      nsAutoCString host;
-+      mURI->GetHost(host);
-+
-+      mProgressSink->OnStatus(this, mListenerContext, NS_NET_STATUS_READING,
-+                              NS_ConvertUTF8toUTF16(host).get());
-+
-+      int64_t progress = aOffset + aCount;
-+      mProgressSink->OnProgress(this, mListenerContext, progress,
-+                                mSynthesizedStreamLength);
++      mProgress = aOffset + aCount;
++      MaybeCallStatusAndProgress();
 +    }
 +  }
 +
@@ -942,13 +1022,26 @@ new file mode 100644
 +  return mPump->RetargetDeliveryTo(aNewTarget);
 +}
 +
++NS_IMETHODIMP
++InterceptedHttpChannel::CheckListenerChain()
++{
++  MOZ_ASSERT(NS_IsMainThread());
++  nsresult rv = NS_OK;
++  nsCOMPtr<nsIThreadRetargetableStreamListener> retargetableListener =
++  do_QueryInterface(mListener, &rv);
++  if (retargetableListener) {
++    rv = retargetableListener->CheckListenerChain();
++  }
++  return rv;
++}
++
 +} // namespace net
 +} // namespace mozilla
 diff --git a/netwerk/protocol/http/InterceptedHttpChannel.h b/netwerk/protocol/http/InterceptedHttpChannel.h
 new file mode 100644
 --- /dev/null
 +++ b/netwerk/protocol/http/InterceptedHttpChannel.h
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,181 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set sw=2 ts=8 et tw=80 : */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -1005,6 +1098,7 @@ new file mode 100644
 +                                   , public nsIStreamListener
 +                                   , public nsIChannelWithDivertableParentListener
 +                                   , public nsIThreadRetargetableRequest
++                                   , public nsIThreadRetargetableStreamListener
 +{
 +  friend class HttpAsyncAborter<InterceptedHttpChannel>;
 +
@@ -1018,14 +1112,18 @@ new file mode 100644
 +  RefPtr<ADivertableParentChannel> mParentChannel;
 +  TimeStamp mFinishResponseStart;
 +  TimeStamp mFinishResponseEnd;
++  Atomic<int64_t> mProgress;
++  int64_t mProgressReported;
 +  int64_t mSynthesizedStreamLength;
 +  uint64_t mResumeStartPos;
 +  nsCString mResumeEntityId;
++  nsString mStatusHost;
 +  enum {
 +    Invalid = 0,
 +    Synthesized,
 +    Reset
 +  } mSynthesizedOrReset;
++  Atomic<bool> mCallingStatusAndProgress;
 +
 +  InterceptedHttpChannel();
 +  ~InterceptedHttpChannel() = default;
@@ -1052,6 +1150,9 @@ new file mode 100644
 +
 +  nsresult
 +  OpenRedirectChannel();
++
++  void
++  MaybeCallStatusAndProgress();
 +
 +public:
 +  static already_AddRefed<InterceptedHttpChannel>
@@ -1115,6 +1216,7 @@ new file mode 100644
 +  NS_DECL_NSISTREAMLISTENER
 +  NS_DECL_NSICHANNELWITHDIVERTABLEPARENTLISTENER
 +  NS_DECL_NSITHREADRETARGETABLEREQUEST
++  NS_DECL_NSITHREADRETARGETABLESTREAMLISTENER
 +};
 +
 +} // namespace net

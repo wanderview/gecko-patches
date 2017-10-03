@@ -1,7 +1,7 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  21667c7e9578c36eb574e0b75ab68f2e6315bead
-Bug 1204254 P8 Move the body stream copying into the nsIInterceptedChannel::StartSynthesizedResponse() method. r=asuth
+# Parent  1046a0910990191749ee8a4e78610dfef6aafd13
+Bug 1204254 P8 Pass the body stream directly to StartSynthesizedResponse() instead of copying. r=asuth
 
 diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEvents.cpp
 --- a/dom/workers/ServiceWorkerEvents.cpp
@@ -341,10 +341,319 @@ diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEven
    uint32_t mColumn;
    nsCString mMessageName;
    nsTArray<nsString> mParams;
+diff --git a/netwerk/protocol/http/HttpChannelChild.cpp b/netwerk/protocol/http/HttpChannelChild.cpp
+--- a/netwerk/protocol/http/HttpChannelChild.cpp
++++ b/netwerk/protocol/http/HttpChannelChild.cpp
+@@ -1176,16 +1176,21 @@ HttpChannelChild::DoOnStopRequest(nsIReq
+     NS_ENSURE_SUCCESS_VOID(rv);
+ 
+     nsChannelClassifier::SetBlockedContent(this, aChannelStatus, list, provider, fullhash);
+   }
+ 
+   MOZ_ASSERT(!mOnStopRequestCalled,
+              "We should not call OnStopRequest twice");
+ 
++  if (mSynthesizedCallback) {
++    mSynthesizedCallback->BodyComplete(mStatus);
++    mSynthesizedCallback = nullptr;
++  }
++
+   // In theory mListener should not be null, but in practice sometimes it is.
+   MOZ_ASSERT(mListener);
+   if (mListener) {
+     mListener->OnStopRequest(aRequest, aContext, mStatus);
+   }
+   mOnStopRequestCalled = true;
+ 
+   // notify "http-on-stop-connect" observers
+@@ -1417,31 +1422,33 @@ HttpChannelChild::RecvDeleteSelf()
+   return IPC_OK();
+ }
+ 
+ HttpChannelChild::OverrideRunnable::OverrideRunnable(
+   HttpChannelChild* aChannel,
+   HttpChannelChild* aNewChannel,
+   InterceptStreamListener* aListener,
+   nsIInputStream* aInput,
++  nsIInterceptedBodyCallback* aCallback,
+   nsAutoPtr<nsHttpResponseHead>& aHead)
+   : Runnable("net::HttpChannelChild::OverrideRunnable")
+ {
+   mChannel = aChannel;
+   mNewChannel = aNewChannel;
+   mListener = aListener;
+   mInput = aInput;
++  mCallback = aCallback;
+   mHead = aHead;
+ }
+ 
+ void
+ HttpChannelChild::OverrideRunnable::OverrideWithSynthesizedResponse()
+ {
+   if (mNewChannel) {
+-    mNewChannel->OverrideWithSynthesizedResponse(mHead, mInput, mListener);
++    mNewChannel->OverrideWithSynthesizedResponse(mHead, mInput, mCallback, mListener);
+   }
+ }
+ 
+ NS_IMETHODIMP
+ HttpChannelChild::OverrideRunnable::Run()
+ {
+   bool ret = mChannel->Redirect3Complete(this);
+ 
+@@ -2122,19 +2129,22 @@ HttpChannelChild::OnRedirectVerifyCallba
+     // nsIHttpChannelChild (it could be a DataChannelChild).
+ 
+     RefPtr<InterceptStreamListener> streamListener =
+         new InterceptStreamListener(redirectedChannel, mListenerContext);
+ 
+     nsCOMPtr<nsIEventTarget> neckoTarget = GetNeckoTarget();
+     MOZ_ASSERT(neckoTarget);
+ 
++    nsCOMPtr<nsIInterceptedBodyCallback> callback =
++      mSynthesizedCallback.forget();
++
+     Unused << neckoTarget->Dispatch(
+       new OverrideRunnable(this, redirectedChannel, streamListener,
+-                           mSynthesizedInput, mResponseHead),
++                           mSynthesizedInput, callback, mResponseHead),
+       NS_DISPATCH_NORMAL);
+ 
+     return NS_OK;
+   }
+ 
+   RequestHeaderTuples emptyHeaders;
+   RequestHeaderTuples* headerTuples = &emptyHeaders;
+   nsLoadFlags loadFlags = 0;
+@@ -2176,16 +2186,21 @@ HttpChannelChild::OnRedirectVerifyCallba
+     }
+ 
+     nsCOMPtr<nsIRequest> request = do_QueryInterface(mRedirectChannelChild);
+     if (request) {
+       request->GetLoadFlags(&loadFlags);
+     }
+   }
+ 
++  if (mSynthesizedCallback) {
++    mSynthesizedCallback->BodyComplete(mStatus);
++    mSynthesizedCallback = nullptr;
++  }
++
+   bool chooseAppcache = false;
+   nsCOMPtr<nsIApplicationCacheChannel> appCacheChannel =
+     do_QueryInterface(newHttpChannel);
+   if (appCacheChannel) {
+     appCacheChannel->GetChooseApplicationCache(&chooseAppcache);
+   }
+ 
+   if (mIPCOpen)
+@@ -2208,19 +2223,30 @@ HttpChannelChild::Cancel(nsresult status
+ 
+   if (!mCanceled) {
+     // If this cancel occurs before nsHttpChannel has been set up, AsyncOpen
+     // is responsible for cleaning up.
+     mCanceled = true;
+     mStatus = status;
+     if (RemoteChannelExists())
+       SendCancel(status);
++
++    // If the channel is intercepted and already pumping, then just
++    // cancel the pump.  This will call OnStopRequest().
+     if (mSynthesizedResponsePump) {
+       mSynthesizedResponsePump->Cancel(status);
+     }
++
++    // Otherwise, if we are canceled while intercepting, but not yet
++    // pumping, then we must call AsyncAbort to trigger OnStopRequest().
++    else if (mInterceptListener) {
++      mInterceptListener->Cleanup();
++      Unused << AsyncAbort(status);
++    }
++
+     mInterceptListener = nullptr;
+   }
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ HttpChannelChild::Suspend()
+ {
+@@ -3493,29 +3519,41 @@ HttpChannelChild::CancelOnMainThread(nsr
+   UniquePtr<ChannelEvent> cancelEvent = MakeUnique<CancelEvent>(this, aRv);
+   mEventQ->PrependEvent(cancelEvent);
+   mEventQ->Resume();
+ }
+ 
+ void
+ HttpChannelChild::OverrideWithSynthesizedResponse(nsAutoPtr<nsHttpResponseHead>& aResponseHead,
+                                                   nsIInputStream* aSynthesizedInput,
++                                                  nsIInterceptedBodyCallback* aSynthesizedCallback,
+                                                   InterceptStreamListener* aStreamListener)
+ {
+   mInterceptListener = aStreamListener;
+ 
+   // Intercepted responses should already be decoded.  If its a redirect,
+   // however, we want to respect the encoding of the final result instead.
+   if (!nsHttpChannel::WillRedirect(aResponseHead)) {
+     SetApplyConversion(false);
+   }
+ 
+   mResponseHead = aResponseHead;
+   mSynthesizedResponse = true;
+ 
++  mSynthesizedInput = aSynthesizedInput;
++  if (!mSynthesizedInput) {
++    nsresult rv = NS_NewCStringInputStream(getter_AddRefs(mSynthesizedInput),
++                                           EmptyCString());
++    if (NS_FAILED(rv)) {
++      Unused << AsyncAbort(rv);
++      return;
++    }
++  }
++  mSynthesizedCallback = aSynthesizedCallback;
++
+   if (nsHttpChannel::WillRedirect(mResponseHead)) {
+     mShouldInterceptSubsequentRedirect = true;
+     // Continue with the original cross-process request
+     nsresult rv = ContinueAsyncOpen();
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       rv = AsyncAbort(rv);
+       MOZ_ASSERT(NS_SUCCEEDED(rv));
+     }
+@@ -3533,19 +3571,19 @@ HttpChannelChild::OverrideWithSynthesize
+   if (NS_FAILED(rv)) {
+     mSynthesizedStreamLength = -1;
+   }
+ 
+   nsCOMPtr<nsIEventTarget> neckoTarget = GetNeckoTarget();
+   MOZ_ASSERT(neckoTarget);
+ 
+   rv = nsInputStreamPump::Create(getter_AddRefs(mSynthesizedResponsePump),
+-                                 aSynthesizedInput, 0, 0, true, neckoTarget);
++                                 mSynthesizedInput, 0, 0, true, neckoTarget);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    aSynthesizedInput->Close();
++    mSynthesizedInput->Close();
+     return;
+   }
+ 
+   rv = mSynthesizedResponsePump->AsyncRead(aStreamListener, nullptr);
+   NS_ENSURE_SUCCESS_VOID(rv);
+ 
+   // if this channel has been suspended previously, the pump needs to be
+   // correspondingly suspended now that it exists.
+@@ -3565,19 +3603,21 @@ HttpChannelChild::ForceIntercepted(bool 
+ {
+   mShouldParentIntercept = true;
+   mPostRedirectChannelShouldIntercept = aPostRedirectChannelShouldIntercept;
+   mPostRedirectChannelShouldUpgrade = aPostRedirectChannelShouldUpgrade;
+   return NS_OK;
+ }
+ 
+ void
+-HttpChannelChild::ForceIntercepted(nsIInputStream* aSynthesizedInput)
++HttpChannelChild::ForceIntercepted(nsIInputStream* aSynthesizedInput,
++                                   nsIInterceptedBodyCallback* aSynthesizedCallback)
+ {
+   mSynthesizedInput = aSynthesizedInput;
++  mSynthesizedCallback = aSynthesizedCallback;
+   mSynthesizedResponse = true;
+   mRedirectingForSubsequentSynthesizedResponse = true;
+ }
+ 
+ mozilla::ipc::IPCResult
+ HttpChannelChild::RecvIssueDeprecationWarning(const uint32_t& warning,
+                                               const bool& asError)
+ {
+diff --git a/netwerk/protocol/http/HttpChannelChild.h b/netwerk/protocol/http/HttpChannelChild.h
+--- a/netwerk/protocol/http/HttpChannelChild.h
++++ b/netwerk/protocol/http/HttpChannelChild.h
+@@ -34,16 +34,17 @@
+ #include "nsIDivertableChannel.h"
+ #include "nsIThreadRetargetableRequest.h"
+ #include "mozilla/net/DNS.h"
+ 
+ using mozilla::Telemetry::LABELS_HTTP_CHILD_OMT_STATS;
+ 
+ class nsIEventTarget;
+ class nsInputStreamPump;
++class nsIInterceptedBodyCallback;
+ 
+ namespace mozilla {
+ namespace net {
+ 
+ class HttpBackgroundChannelChild;
+ class InterceptedChannelContent;
+ class InterceptStreamListener;
+ 
+@@ -199,25 +200,27 @@ private:
+ private:
+ 
+   class OverrideRunnable : public Runnable {
+   public:
+     OverrideRunnable(HttpChannelChild* aChannel,
+                      HttpChannelChild* aNewChannel,
+                      InterceptStreamListener* aListener,
+                      nsIInputStream* aInput,
++                     nsIInterceptedBodyCallback* aCallback,
+                      nsAutoPtr<nsHttpResponseHead>& aHead);
+ 
+     NS_IMETHOD Run() override;
+     void OverrideWithSynthesizedResponse();
+   private:
+     RefPtr<HttpChannelChild> mChannel;
+     RefPtr<HttpChannelChild> mNewChannel;
+     RefPtr<InterceptStreamListener> mListener;
+     nsCOMPtr<nsIInputStream> mInput;
++    nsCOMPtr<nsIInterceptedBodyCallback> mCallback;
+     nsAutoPtr<nsHttpResponseHead> mHead;
+   };
+ 
+   // Sets the event target for future IPC messages. Messages will either be
+   // directed to the TabGroup or DocGroup, depending on the LoadInfo associated
+   // with the channel. Should be called when a new channel is being set up,
+   // before the constructor message is sent to the parent.
+   void SetEventTarget();
+@@ -259,31 +262,34 @@ private:
+ 
+   // Discard the prior interception and continue with the original network request.
+   void ResetInterception();
+ 
+   // Override this channel's pending response with a synthesized one. The content will be
+   // asynchronously read from the pump.
+   void OverrideWithSynthesizedResponse(nsAutoPtr<nsHttpResponseHead>& aResponseHead,
+                                        nsIInputStream* aSynthesizedInput,
++                                       nsIInterceptedBodyCallback* aSynthesizedCallback,
+                                        InterceptStreamListener* aStreamListener);
+ 
+-  void ForceIntercepted(nsIInputStream* aSynthesizedInput);
++  void ForceIntercepted(nsIInputStream* aSynthesizedInput,
++                        nsIInterceptedBodyCallback* aSynthesizedCallback);
+ 
+   // Try send DeletingChannel message to parent side. Dispatch an async task to
+   // main thread if invoking on non-main thread.
+   void TrySendDeletingChannel();
+ 
+   // Try invoke Cancel if on main thread, or prepend a CancelEvent in mEventQ to
+   // ensure Cacnel is processed before any other channel events.
+   void CancelOnMainThread(nsresult aRv);
+ 
+   RequestHeaderTuples mClientSetRequestHeaders;
+   RefPtr<nsInputStreamPump> mSynthesizedResponsePump;
+   nsCOMPtr<nsIInputStream> mSynthesizedInput;
++  nsCOMPtr<nsIInterceptedBodyCallback> mSynthesizedCallback;
+   int64_t mSynthesizedStreamLength;
+ 
+   bool mIsFromCache;
+   bool mCacheEntryAvailable;
+   bool mAltDataCacheEntryAvailable;
+   int32_t      mCacheFetchCount;
+   uint32_t     mCacheExpirationTime;
+   nsCString    mCachedCharset;
 diff --git a/netwerk/protocol/http/InterceptedChannel.cpp b/netwerk/protocol/http/InterceptedChannel.cpp
 --- a/netwerk/protocol/http/InterceptedChannel.cpp
 +++ b/netwerk/protocol/http/InterceptedChannel.cpp
-@@ -2,43 +2,144 @@
+@@ -2,27 +2,29 @@
  /* vim:set expandtab ts=2 sw=2 sts=2 cin: */
  /* This Source Code Form is subject to the terms of the Mozilla Public
   * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -374,148 +683,58 @@ diff --git a/netwerk/protocol/http/InterceptedChannel.cpp b/netwerk/protocol/htt
  DoUpdateExpirationTime(nsHttpChannel* aSelf,
                         nsICacheEntry* aCacheEntry,
                         nsHttpResponseHead* aResponseHead,
-                        uint32_t& aExpirationTime);
- extern nsresult
- DoAddCacheEntryHeaders(nsHttpChannel *self,
-                        nsICacheEntry *entry,
-                        nsHttpRequestHead *requestHead,
-                        nsHttpResponseHead *responseHead,
-                        nsISupports *securityInfo);
- 
-+namespace {
-+
-+struct StreamCopyClosure
-+{
-+  nsCOMPtr<nsIInterceptedBodyCallback> mCallback;
-+  nsCOMPtr<nsIEventTarget> mTarget;
-+
-+  explicit StreamCopyClosure(nsIInterceptedBodyCallback* aCallback)
-+    : mCallback(aCallback)
-+    , mTarget(GetCurrentThreadSerialEventTarget())
-+  {
-+    MOZ_DIAGNOSTIC_ASSERT(mCallback);
-+  }
-+
-+  StreamCopyClosure() = delete;
-+  StreamCopyClosure(const StreamCopyClosure&) = delete;
-+};
-+
-+void
-+StreamCopyComplete(void* aClosure, nsresult aStatus)
-+{
-+  UniquePtr<StreamCopyClosure> closure(static_cast<StreamCopyClosure*>(aClosure));
-+
-+  if (!closure) {
-+    return;
-+  }
-+
-+  nsCOMPtr<nsIEventTarget> target = closure->mTarget.forget();
-+
-+  // We need to be careful to only run/addref the provided callbacks on the
-+  // original thread.  The xpcshell tests pass js runnables which cannot
-+  // be used from a separate thread.  Therefore we pass the closure pointer
-+  // to our runnable by forgetting it and re-acquiring it in the lambda.
-+  StreamCopyClosure* dispatchedClosure = closure.release();
-+
-+  nsCOMPtr<nsIRunnable> runnable =
-+    NS_NewRunnableFunction("InterceptedChannel::StreamCopyCompelte",
-+                           [aStatus, dispatchedClosure]() {
-+      UniquePtr<StreamCopyClosure> closure(dispatchedClosure);
-+      if (closure->mCallback) {
-+        closure->mCallback->BodyComplete(aStatus);
-+      }
-+    });
-+
-+  MOZ_ALWAYS_SUCCEEDS(
-+    target->Dispatch(runnable.forget(), nsIThread::DISPATCH_NORMAL));
-+}
-+
-+nsresult
-+StreamCopyStart(nsIOutputStream* aWriter,
-+                nsIInputStream* aReader,
-+                nsIInterceptedBodyCallback* aCallback)
-+{
-+  MOZ_DIAGNOSTIC_ASSERT(aWriter);
-+  MOZ_DIAGNOSTIC_ASSERT(aReader);
-+
-+  // Use a strong ref because we might need to hold a new stream
-+  // alive if we decide to wrap the one passed to us.
-+  nsCOMPtr<nsIOutputStream> writer(aWriter);
-+
-+  const uint32_t kCopySegmentSize = 4096;
-+  nsresult rv = NS_OK;
-+
-+  // Depending on how the Response passed to .respondWith() was created, we may
-+  // get a non-buffered input stream.  In addition, in some configurations the
-+  // destination channel's output stream can be unbuffered.  We wrap the output
-+  // stream side here so that NS_AsyncCopy() works.  Wrapping the output side
-+  // provides the most consistent operation since there are fewer stream types
-+  // we are writing to.  The input stream can be a wide variety of concrete
-+  // objects which may or many not play well with NS_InputStreamIsBuffered().
-+  if (!NS_OutputStreamIsBuffered(writer)) {
-+    nsCOMPtr<nsIOutputStream> buffered;
-+    rv = NS_NewBufferedOutputStream(getter_AddRefs(buffered), writer,
-+                                    kCopySegmentSize);
-+    NS_ENSURE_SUCCESS(rv, rv);
-+    NS_ENSURE_TRUE(buffered, rv);
-+
-+    writer = buffered.forget();
-+  }
-+
-+  nsCOMPtr<nsIEventTarget> stsThread =
-+    do_GetService(NS_STREAMTRANSPORTSERVICE_CONTRACTID, &rv);
-+  NS_ENSURE_SUCCESS(rv, rv);
-+  NS_ENSURE_TRUE(stsThread, NS_ERROR_FAILURE);
-+
-+  UniquePtr<StreamCopyClosure> closure;
-+  if (aCallback) {
-+    closure = MakeUnique<StreamCopyClosure>(aCallback);
-+  }
-+
-+  rv = NS_AsyncCopy(aReader, writer, stsThread, NS_ASYNCCOPY_VIA_WRITESEGMENTS,
-+                    kCopySegmentSize, StreamCopyComplete, closure.release());
-+  NS_ENSURE_SUCCESS(rv, rv);
-+
-+  return NS_OK;
-+}
-+
-+} // anonymous namespace
-+
- NS_IMPL_ISUPPORTS(InterceptedChannelBase, nsIInterceptedChannel)
- 
- InterceptedChannelBase::InterceptedChannelBase(nsINetworkInterceptController* aController)
-   : mController(aController)
-   , mReportCollector(new ConsoleReportCollector())
-   , mClosed(false)
-   , mSynthesizedOrReset(Invalid)
+@@ -286,41 +288,47 @@ NS_IMETHODIMP
+ InterceptedChannelContent::StartSynthesizedResponse(nsIInputStream* aBody,
+                                                     nsIInterceptedBodyCallback* aBodyCallback,
+                                                     const nsACString& aFinalURLSpec)
  {
-@@ -314,16 +415,26 @@ InterceptedChannelContent::StartSynthesi
-     mChannel->ForceIntercepted(mSynthesizedInput);
+   if (NS_WARN_IF(mClosed)) {
+     return NS_ERROR_NOT_AVAILABLE;
+   }
+ 
++  nsresult rv = NS_ERROR_FAILURE;
++  Unused << mChannel->GetStatus(&rv);
++  if (NS_FAILED(rv)) {
++    return rv;
++  }
++
+   EnsureSynthesizedResponse();
+ 
+   nsCOMPtr<nsIURI> originalURI;
+   mChannel->GetURI(getter_AddRefs(originalURI));
+ 
+   nsCOMPtr<nsIURI> responseURI;
+   if (!aFinalURLSpec.IsEmpty()) {
+-    nsresult rv = NS_NewURI(getter_AddRefs(responseURI), aFinalURLSpec);
++    rv = NS_NewURI(getter_AddRefs(responseURI), aFinalURLSpec);
+     NS_ENSURE_SUCCESS(rv, rv);
+   } else if (mSecureUpgrade) {
+-    nsresult rv = NS_GetSecureUpgradedURI(originalURI,
++    rv = NS_GetSecureUpgradedURI(originalURI,
+                                           getter_AddRefs(responseURI));
+     NS_ENSURE_SUCCESS(rv, rv);
+   } else {
+     responseURI = originalURI;
+   }
+ 
+   bool equal = false;
+   originalURI->Equals(responseURI, &equal);
+   if (!equal) {
+-    mChannel->ForceIntercepted(mSynthesizedInput);
++    mChannel->ForceIntercepted(aBody, aBodyCallback);
      mChannel->BeginNonIPCRedirect(responseURI, *mSynthesizedResponseHead.ptr());
    } else {
      mChannel->OverrideWithSynthesizedResponse(mSynthesizedResponseHead.ref(),
-                                               mSynthesizedInput,
+-                                              mSynthesizedInput,
++                                              aBody, aBodyCallback,
                                                mStreamListener);
    }
  
-+  if (!aBody) {
-+    if (aBodyCallback) {
-+      aBodyCallback->BodyComplete(NS_OK);
-+    }
-+  } else {
-+    nsresult rv = StreamCopyStart(mResponseBody, aBody,
-+                                  aBodyCallback);
-+    NS_ENSURE_SUCCESS(rv, rv);
-+  }
-+
    return NS_OK;
  }
  
  NS_IMETHODIMP
  InterceptedChannelContent::FinishSynthesizedResponse()
- {
-   if (NS_WARN_IF(mClosed)) {
-     return NS_ERROR_NOT_AVAILABLE;
 diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol/http/InterceptedHttpChannel.cpp
 --- a/netwerk/protocol/http/InterceptedHttpChannel.cpp
 +++ b/netwerk/protocol/http/InterceptedHttpChannel.cpp
@@ -772,7 +991,8 @@ diff --git a/netwerk/protocol/http/InterceptedHttpChannel.h b/netwerk/protocol/h
 diff --git a/netwerk/test/unit/test_synthesized_response.js b/netwerk/test/unit/test_synthesized_response.js
 --- a/netwerk/test/unit/test_synthesized_response.js
 +++ b/netwerk/test/unit/test_synthesized_response.js
-@@ -50,17 +50,17 @@ function make_channel(url, body, cb) {
+@@ -49,20 +49,18 @@ function make_channel(url, body, cb) {
+     },
      channelIntercepted: function(channel) {
        channel.QueryInterface(Ci.nsIInterceptedChannel);
        if (body) {
@@ -780,90 +1000,123 @@ diff --git a/netwerk/test/unit/test_synthesized_response.js b/netwerk/test/unit/
                              .createInstance(Ci.nsIStringInputStream);
          synthesized.data = body;
  
-         NetUtil.asyncCopy(synthesized, channel.responseBody, function() {
+-        NetUtil.asyncCopy(synthesized, channel.responseBody, function() {
 -          channel.startSynthesizedResponse('');
-+          channel.startSynthesizedResponse(null, null, null, '');
-           channel.finishSynthesizedResponse();
-         });
+-          channel.finishSynthesizedResponse();
+-        });
++        channel.startSynthesizedResponse(synthesized, null, '');
++        channel.finishSynthesizedResponse();
        }
        if (cb) {
          cb(channel);
        }
        return {
          dispatch: function() { }
-@@ -141,17 +141,17 @@ add_test(function() {
+       };
+     },
+@@ -139,21 +137,19 @@ add_test(function() {
+ 
+ // ensure that the channel waits for a decision and synthesizes headers correctly
  add_test(function() {
    var chan = make_channel(URL + '/body', null, function(channel) {
      do_timeout(100, function() {
        var synthesized = Cc["@mozilla.org/io/string-input-stream;1"]
                            .createInstance(Ci.nsIStringInputStream);
        synthesized.data = NON_REMOTE_BODY;
-       NetUtil.asyncCopy(synthesized, channel.responseBody, function() {
-         channel.synthesizeHeader("Content-Length", NON_REMOTE_BODY.length);
+-      NetUtil.asyncCopy(synthesized, channel.responseBody, function() {
+-        channel.synthesizeHeader("Content-Length", NON_REMOTE_BODY.length);
 -        channel.startSynthesizedResponse('');
-+        channel.startSynthesizedResponse(null, null, null, '');
-         channel.finishSynthesizedResponse();
-       });
+-        channel.finishSynthesizedResponse();
+-      });
++      channel.synthesizeHeader("Content-Length", NON_REMOTE_BODY.length);
++      channel.startSynthesizedResponse(synthesized, null, '');
++      channel.finishSynthesizedResponse();
      });
    });
    chan.asyncOpen2(new ChannelListener(handle_synthesized_response, null));
  });
  
  // ensure that the channel waits for a decision
-@@ -170,17 +170,17 @@ add_test(function() {
+ add_test(function() {
+   var chan = make_channel(URL + '/body', null, function(chan) {
+@@ -166,23 +162,21 @@ add_test(function() {
+ 
+ // ensure that the intercepted channel supports suspend/resume
+ add_test(function() {
+   var chan = make_channel(URL + '/body', null, function(intercepted) {
      var synthesized = Cc["@mozilla.org/io/string-input-stream;1"]
                          .createInstance(Ci.nsIStringInputStream);
      synthesized.data = NON_REMOTE_BODY;
  
-     NetUtil.asyncCopy(synthesized, intercepted.responseBody, function() {
-       // set the content-type to ensure that the stream converter doesn't hold up notifications
-       // and cause the test to fail
-       intercepted.synthesizeHeader("Content-Type", "text/plain");
+-    NetUtil.asyncCopy(synthesized, intercepted.responseBody, function() {
+-      // set the content-type to ensure that the stream converter doesn't hold up notifications
+-      // and cause the test to fail
+-      intercepted.synthesizeHeader("Content-Type", "text/plain");
 -      intercepted.startSynthesizedResponse('');
-+      intercepted.startSynthesizedResponse(null, null, null, '');
-       intercepted.finishSynthesizedResponse();
-     });
+-      intercepted.finishSynthesizedResponse();
+-    });
++    // set the content-type to ensure that the stream converter doesn't hold up notifications
++    // and cause the test to fail
++    intercepted.synthesizeHeader("Content-Type", "text/plain");
++    intercepted.startSynthesizedResponse(synthesized, null, '');
++    intercepted.finishSynthesizedResponse();
    });
    chan.asyncOpen2(new ChannelListener(handle_synthesized_response, null,
  				     CL_ALLOW_UNKNOWN_CL | CL_SUSPEND | CL_EXPECT_3S_DELAY));
  });
  
  // ensure that the intercepted channel can be cancelled
-@@ -212,17 +212,17 @@ add_test(function() {
+ add_test(function() {
+   var chan = make_channel(URL + '/body', null, function(intercepted) {
+@@ -210,39 +204,41 @@ add_test(function() {
+ 
+ // ensure that the intercepted channel can be canceled during the response
  add_test(function() {
    var chan = make_channel(URL + '/body', null, function(intercepted) {
      var synthesized = Cc["@mozilla.org/io/string-input-stream;1"]
                          .createInstance(Ci.nsIStringInputStream);
      synthesized.data = NON_REMOTE_BODY;
  
-     NetUtil.asyncCopy(synthesized, intercepted.responseBody, function() {
-       let channel = intercepted.channel;
+-    NetUtil.asyncCopy(synthesized, intercepted.responseBody, function() {
+-      let channel = intercepted.channel;
 -      intercepted.startSynthesizedResponse('');
-+      intercepted.startSynthesizedResponse(null, null, null, '');
-       intercepted.finishSynthesizedResponse();
-       channel.cancel(Cr.NS_BINDING_ABORTED);
-     });
+-      intercepted.finishSynthesizedResponse();
+-      channel.cancel(Cr.NS_BINDING_ABORTED);
+-    });
++    let channel = intercepted.channel;
++    intercepted.startSynthesizedResponse(synthesized, null, '');
++    intercepted.finishSynthesizedResponse();
++    channel.cancel(Cr.NS_BINDING_ABORTED);
    });
    chan.asyncOpen2(new ChannelListener(run_next_test, null,
                                       CL_EXPECT_FAILURE | CL_ALLOW_UNKNOWN_CL));
  });
  
-@@ -230,17 +230,17 @@ add_test(function() {
+ // ensure that the intercepted channel can be canceled before the response
  add_test(function() {
    var chan = make_channel(URL + '/body', null, function(intercepted) {
      var synthesized = Cc["@mozilla.org/io/string-input-stream;1"]
                          .createInstance(Ci.nsIStringInputStream);
      synthesized.data = NON_REMOTE_BODY;
  
-     NetUtil.asyncCopy(synthesized, intercepted.responseBody, function() {
-       intercepted.channel.cancel(Cr.NS_BINDING_ABORTED);
+-    NetUtil.asyncCopy(synthesized, intercepted.responseBody, function() {
+-      intercepted.channel.cancel(Cr.NS_BINDING_ABORTED);
 -      intercepted.startSynthesizedResponse('');
-+      intercepted.startSynthesizedResponse(null, null, null, '');
++    intercepted.channel.cancel(Cr.NS_BINDING_ABORTED);
++    var gotexception = false;
++    try {
++      intercepted.startSynthesizedResponse(synthesized, null, '');
        intercepted.finishSynthesizedResponse();
-     });
+-    });
++    } catch (x) {
++      gotexception = true;
++    }
++    do_check_true(gotexception);
    });
    chan.asyncOpen2(new ChannelListener(run_next_test, null,
                                       CL_EXPECT_FAILURE | CL_ALLOW_UNKNOWN_CL));
  });
  
  add_test(function() {
+   httpServer.stop(run_next_test);
+ });
