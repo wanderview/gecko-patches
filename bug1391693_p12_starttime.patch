@@ -1,0 +1,182 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  994379d0242a34a7645467023ef1e88effb56d66
+Bug 1391693 P12 Propagate creation and start times to InterceptedHttpChannel from original channel. r=valentin
+
+diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol/http/InterceptedHttpChannel.cpp
+--- a/netwerk/protocol/http/InterceptedHttpChannel.cpp
++++ b/netwerk/protocol/http/InterceptedHttpChannel.cpp
+@@ -25,18 +25,16 @@ InterceptedHttpChannel::InterceptedHttpC
+   : HttpAsyncAborter<InterceptedHttpChannel>(this)
+   , mProgress(0)
+   , mProgressReported(0)
+   , mSynthesizedStreamLength(-1)
+   , mResumeStartPos(0)
+   , mSynthesizedOrReset(Invalid)
+   , mCallingStatusAndProgress(false)
+ {
+-  mChannelCreationTime = PR_Now();
+-  mChannelCreationTimestamp = TimeStamp::Now();
+ }
+ 
+ void
+ InterceptedHttpChannel::ReleaseListeners()
+ {
+   if (mLoadGroup) {
+     mLoadGroup->RemoveRequest(this, nullptr, mStatus);
+   }
+@@ -160,17 +158,19 @@ InterceptedHttpChannel::RedirectForOpaqu
+   // the given cross-origin response URL.  The resulting channel will then
+   // process the synthetic response as normal.  This extra redirect is
+   // performed so that listeners treat the result as unsafe cross-origin
+   // data.
+ 
+   nsresult rv = NS_OK;
+ 
+   RefPtr<InterceptedHttpChannel> newChannel =
+-    CreateForSynthesis(mResponseHead, mBodyReader);
++    CreateForSynthesis(mResponseHead, mBodyReader,
++                       mChannelCreationTime, mChannelCreationTimestamp,
++                       mAsyncOpenTime);
+ 
+   rv = newChannel->Init(aResponseURI, mCaps,
+                         static_cast<nsProxyInfo*>(mProxyInfo.get()),
+                         mProxyResolveFlags, mProxyURI, mChannelId);
+ 
+   uint32_t flags = nsIChannelEventSink::REDIRECT_INTERNAL;
+ 
+   nsCOMPtr<nsILoadInfo> redirectLoadInfo =
+@@ -321,39 +321,56 @@ InterceptedHttpChannel::MaybeCallStatusA
+   mProgressSink->OnProgress(this, mListenerContext, progress,
+                             mSynthesizedStreamLength);
+ 
+   mProgressReported = progress;
+ }
+ 
+ // static
+ already_AddRefed<InterceptedHttpChannel>
+-InterceptedHttpChannel::CreateForInterception()
++InterceptedHttpChannel::CreateForInterception(PRTime aCreationTime,
++                                              const TimeStamp& aCreationTimestamp,
++                                              const TimeStamp& aAsyncOpenTimestamp)
+ {
+   // Create an InterceptedHttpChannel that will trigger a FetchEvent
+   // in a ServiceWorker when opened.
+   RefPtr<InterceptedHttpChannel> ref = new InterceptedHttpChannel();
++
++  // Pre-set the creation and AsyncOpen times based on the original channel
++  // we are intercepting.  We don't want our extra internal redirect to mask
++  // any time spent processing the channel.
++  ref->mChannelCreationTime = aCreationTime;
++  ref->mChannelCreationTimestamp = aCreationTimestamp;
++  ref->mAsyncOpenTime = aAsyncOpenTimestamp;
++
+   return ref.forget();
+ }
+ 
+ // static
+ already_AddRefed<InterceptedHttpChannel>
+ InterceptedHttpChannel::CreateForSynthesis(const nsHttpResponseHead* aHead,
+-                                           nsIInputStream* aBody)
++                                           nsIInputStream* aBody,
++                                           PRTime aCreationTime,
++                                           const TimeStamp& aCreationTimestamp,
++                                           const TimeStamp& aAsyncOpenTimestamp)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(aHead);
+   MOZ_DIAGNOSTIC_ASSERT(aBody);
+ 
+   // Create an InterceptedHttpChannel that already has a synthesized response.
+   // The synthetic response will be processed when opened.  A FetchEvent
+   // will not be triggered.
+   RefPtr<InterceptedHttpChannel> ref = new InterceptedHttpChannel();
+   ref->mBodyReader = aBody;
+   ref->mResponseHead = new nsHttpResponseHead(*aHead);
+ 
++  ref->mChannelCreationTime = aCreationTime;
++  ref->mChannelCreationTimestamp = aCreationTimestamp;
++  ref->mAsyncOpenTime = aAsyncOpenTimestamp;
++
+   return ref.forget();
+ }
+ 
+ NS_IMETHODIMP
+ InterceptedHttpChannel::Cancel(nsresult aStatus)
+ {
+   return CancelInterception(aStatus);
+ }
+@@ -394,17 +411,19 @@ InterceptedHttpChannel::GetSecurityInfo(
+ 
+ NS_IMETHODIMP
+ InterceptedHttpChannel::AsyncOpen(nsIStreamListener* aListener, nsISupports* aContext)
+ {
+   if (mCanceled) {
+     return mStatus;
+   }
+ 
+-  mAsyncOpenTime = TimeStamp::Now();
++  // We should have pre-set the AsyncOpen time based on the original channel.
++  MOZ_DIAGNOSTIC_ASSERT(!mAsyncOpenTime.IsNull());
++
+   mIsPending = true;
+   mListener = aListener;
+ 
+   mResponseCouldBeSynthesized = true;
+ 
+   if (mLoadGroup) {
+     mLoadGroup->AddRequest(this, nullptr);
+   }
+diff --git a/netwerk/protocol/http/InterceptedHttpChannel.h b/netwerk/protocol/http/InterceptedHttpChannel.h
+--- a/netwerk/protocol/http/InterceptedHttpChannel.h
++++ b/netwerk/protocol/http/InterceptedHttpChannel.h
+@@ -107,20 +107,24 @@ class InterceptedHttpChannel final : pub
+   nsresult
+   OpenRedirectChannel();
+ 
+   void
+   MaybeCallStatusAndProgress();
+ 
+ public:
+   static already_AddRefed<InterceptedHttpChannel>
+-  CreateForInterception();
++  CreateForInterception(PRTime aCreationTime, const TimeStamp& aCreationTimestamp,
++                        const TimeStamp& aAsyncOpenTimestamp);
+ 
+   static already_AddRefed<InterceptedHttpChannel>
+-  CreateForSynthesis(const nsHttpResponseHead* aHead, nsIInputStream* aBody);
++  CreateForSynthesis(const nsHttpResponseHead* aHead, nsIInputStream* aBody,
++                     PRTime aCreationTime,
++                     const TimeStamp& aCreationTimestamp,
++                     const TimeStamp& aAsyncOpenTimestamp);
+ 
+   NS_IMETHOD
+   Cancel(nsresult aStatus) override;
+ 
+   NS_IMETHOD
+   Suspend(void) override;
+ 
+   NS_IMETHOD
+diff --git a/netwerk/protocol/http/nsHttpChannel.cpp b/netwerk/protocol/http/nsHttpChannel.cpp
+--- a/netwerk/protocol/http/nsHttpChannel.cpp
++++ b/netwerk/protocol/http/nsHttpChannel.cpp
+@@ -9486,17 +9486,19 @@ nsHttpChannel::GetWarningReporter()
+ 
+ nsresult
+ nsHttpChannel::RedirectToInterceptedChannel()
+ {
+     nsCOMPtr<nsINetworkInterceptController> controller;
+     GetCallback(controller);
+ 
+     RefPtr<InterceptedHttpChannel> intercepted =
+-      InterceptedHttpChannel::CreateForInterception();
++      InterceptedHttpChannel::CreateForInterception(mChannelCreationTime,
++                                                    mChannelCreationTimestamp,
++                                                    mAsyncOpenTime);
+ 
+     nsresult rv =
+       intercepted->Init(mURI, mCaps, static_cast<nsProxyInfo*>(mProxyInfo.get()),
+                         mProxyResolveFlags, mProxyURI, mChannelId);
+ 
+     nsCOMPtr<nsILoadInfo> redirectLoadInfo =
+       CloneLoadInfoForRedirect(mURI, nsIChannelEventSink::REDIRECT_INTERNAL);
+     intercepted->SetLoadInfo(redirectLoadInfo);
