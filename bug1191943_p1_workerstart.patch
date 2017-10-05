@@ -1,0 +1,296 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  07d954c93ed38a253f501d97dbaa1b2f7aba282f
+Bug 11931943 P1 Implement PerformanceResourceTiming.workerStart. r=asuth
+
+diff --git a/dom/performance/PerformanceResourceTiming.cpp b/dom/performance/PerformanceResourceTiming.cpp
+--- a/dom/performance/PerformanceResourceTiming.cpp
++++ b/dom/performance/PerformanceResourceTiming.cpp
+@@ -66,18 +66,32 @@ PerformanceResourceTiming::SetProperties
+ 
+ PerformanceResourceTiming::~PerformanceResourceTiming()
+ {
+ }
+ 
+ DOMHighResTimeStamp
+ PerformanceResourceTiming::StartTime() const
+ {
+-  DOMHighResTimeStamp startTime = mTiming->RedirectStartHighRes();
+-  return startTime ? startTime : mTiming->FetchStartHighRes();
++  // Force the start time to be the earliest of:
++  //  - RedirectStart
++  //  - WorkerStart
++  //  - AsyncOpen
++  // Ignore zero values.  The RedirectStart and WorkerStart values
++  // can come from earlier redirected channels prior to the AsyncOpen
++  // time being recorded.
++  DOMHighResTimeStamp redirect = mTiming->RedirectStartHighRes();
++  redirect = redirect ? redirect : DBL_MAX;
++
++  DOMHighResTimeStamp worker = mTiming->WorkerStartHighRes();
++  worker = worker ? worker : DBL_MAX;
++
++  DOMHighResTimeStamp asyncOpen = mTiming->AsyncOpenHighRes();
++
++  return std::min(asyncOpen, std::min(redirect, worker));
+ }
+ 
+ JSObject*
+ PerformanceResourceTiming::WrapObject(JSContext* aCx, JS::Handle<JSObject*> aGivenProto)
+ {
+   return PerformanceResourceTimingBinding::Wrap(aCx, this, aGivenProto);
+ }
+ 
+diff --git a/dom/performance/PerformanceResourceTiming.h b/dom/performance/PerformanceResourceTiming.h
+--- a/dom/performance/PerformanceResourceTiming.h
++++ b/dom/performance/PerformanceResourceTiming.h
+@@ -58,16 +58,22 @@ public:
+     aNextHopProtocol = mNextHopProtocol;
+   }
+ 
+   void SetNextHopProtocol(const nsAString& aNextHopProtocol)
+   {
+     mNextHopProtocol = aNextHopProtocol;
+   }
+ 
++  DOMHighResTimeStamp WorkerStart() const {
++    return mTiming && mTiming->TimingAllowed()
++        ? mTiming->WorkerStartHighRes()
++        : 0;
++  }
++
+   DOMHighResTimeStamp FetchStart() const {
+     return mTiming
+         ? mTiming->FetchStartHighRes()
+         : 0;
+   }
+ 
+   DOMHighResTimeStamp RedirectStart() const {
+     // We have to check if all the redirect URIs had the same origin (since
+diff --git a/dom/performance/PerformanceTiming.cpp b/dom/performance/PerformanceTiming.cpp
+--- a/dom/performance/PerformanceTiming.cpp
++++ b/dom/performance/PerformanceTiming.cpp
+@@ -66,55 +66,64 @@ PerformanceTiming::PerformanceTiming(Per
+ 
+ // Copy the timing info from the channel so we don't need to keep the channel
+ // alive just to get the timestamps.
+ void
+ PerformanceTiming::InitializeTimingInfo(nsITimedChannel* aChannel)
+ {
+   if (aChannel) {
+     aChannel->GetAsyncOpen(&mAsyncOpen);
++    aChannel->GetDispatchFetchEventStart(&mWorkerStart);
+     aChannel->GetAllRedirectsSameOrigin(&mAllRedirectsSameOrigin);
+     aChannel->GetRedirectCount(&mRedirectCount);
+     aChannel->GetRedirectStart(&mRedirectStart);
+     aChannel->GetRedirectEnd(&mRedirectEnd);
+     aChannel->GetDomainLookupStart(&mDomainLookupStart);
+     aChannel->GetDomainLookupEnd(&mDomainLookupEnd);
+     aChannel->GetConnectStart(&mConnectStart);
+     aChannel->GetSecureConnectionStart(&mSecureConnectionStart);
+     aChannel->GetConnectEnd(&mConnectEnd);
+     aChannel->GetRequestStart(&mRequestStart);
+     aChannel->GetResponseStart(&mResponseStart);
+     aChannel->GetCacheReadStart(&mCacheReadStart);
+     aChannel->GetResponseEnd(&mResponseEnd);
+     aChannel->GetCacheReadEnd(&mCacheReadEnd);
+ 
+-    // the performance timing api essentially requires that the event timestamps
+-    // are >= asyncOpen().. but in truth the browser engages in a number of
+-    // speculative activities that sometimes mean connections and lookups begin
+-    // earlier. Workaround that here by just using asyncOpen as the minimum
+-    // timestamp for dns and connection info.
++    // The performance timing api essentially requires that the event timestamps
++    // have a strict relation with each other. The truth, however, is the browser
++    // engages in a number of speculative activities that sometimes mean connections
++    // and lookups begin at different times. Workaround that here by clamping
++    // these values to what we expect FetchStart to be.  This means the later of
++    // AsnycOpen or WorkerStart times.
+     if (!mAsyncOpen.IsNull()) {
+-      if (!mDomainLookupStart.IsNull() && mDomainLookupStart < mAsyncOpen) {
+-        mDomainLookupStart = mAsyncOpen;
++      // We want to clamp to the expected FetchStart value.  This is later of
++      // the AsyncOpen and WorkerStart values.
++      const TimeStamp* clampTime = &mAsyncOpen;
++      if (!mWorkerStart.IsNull() && mWorkerStart > mAsyncOpen) {
++        clampTime = & mWorkerStart;
+       }
+ 
+-      if (!mDomainLookupEnd.IsNull() && mDomainLookupEnd < mAsyncOpen) {
+-        mDomainLookupEnd = mAsyncOpen;
++      if (!mDomainLookupStart.IsNull() && mDomainLookupStart < *clampTime) {
++        mDomainLookupStart = *clampTime;
+       }
+ 
+-      if (!mConnectStart.IsNull() && mConnectStart < mAsyncOpen) {
+-        mConnectStart = mAsyncOpen;
++      if (!mDomainLookupEnd.IsNull() && mDomainLookupEnd < *clampTime) {
++        mDomainLookupEnd = *clampTime;
+       }
+ 
+-      if (!mSecureConnectionStart.IsNull() && mSecureConnectionStart < mAsyncOpen) {
+-        mSecureConnectionStart = mAsyncOpen;
++      if (!mConnectStart.IsNull() && mConnectStart < *clampTime) {
++        mConnectStart = *clampTime;
+       }
+ 
+-      if (!mConnectEnd.IsNull() && mConnectEnd < mAsyncOpen) {
+-        mConnectEnd = mAsyncOpen;
++      if (!mSecureConnectionStart.IsNull() && mSecureConnectionStart < *clampTime) {
++        mSecureConnectionStart = *clampTime;
++      }
++
++      if (!mConnectEnd.IsNull() && mConnectEnd < *clampTime) {
++        mConnectEnd = *clampTime;
+       }
+     }
+   }
+ }
+ 
+ PerformanceTiming::~PerformanceTiming()
+ {
+ }
+@@ -124,19 +133,23 @@ PerformanceTiming::FetchStartHighRes()
+ {
+   if (!mFetchStart) {
+     if (!nsContentUtils::IsPerformanceTimingEnabled() || !IsInitialized() ||
+         nsContentUtils::ShouldResistFingerprinting()) {
+       return mZeroTime;
+     }
+     MOZ_ASSERT(!mAsyncOpen.IsNull(), "The fetch start time stamp should always be "
+         "valid if the performance timing is enabled");
+-    mFetchStart = (!mAsyncOpen.IsNull())
+-        ? TimeStampToDOMHighRes(mAsyncOpen)
+-        : 0.0;
++    if (!mAsyncOpen.IsNull()) {
++      if (!mWorkerStart.IsNull() && mWorkerStart > mAsyncOpen) {
++        mFetchStart = TimeStampToDOMHighRes(mWorkerStart);
++      } else {
++        mFetchStart = TimeStampToDOMHighRes(mAsyncOpen);
++      }
++    }
+   }
+   return mFetchStart;
+ }
+ 
+ DOMTimeMilliSec
+ PerformanceTiming::FetchStart()
+ {
+   return static_cast<int64_t>(FetchStartHighRes());
+@@ -200,16 +213,36 @@ PerformanceTiming::ShouldReportCrossOrig
+   }
+ 
+   // If the redirect count is 0, or if one of the cross-origin
+   // redirects doesn't have the proper Timing-Allow-Origin header,
+   // then RedirectStart and RedirectEnd will be set to zero
+   return (mRedirectCount != 0) && mReportCrossOriginRedirect;
+ }
+ 
++DOMHighResTimeStamp
++PerformanceTiming::AsyncOpenHighRes()
++{
++  if (!nsContentUtils::IsPerformanceTimingEnabled() || !IsInitialized() ||
++      nsContentUtils::ShouldResistFingerprinting() || mAsyncOpen.IsNull()) {
++    return mZeroTime;
++  }
++  return TimeStampToDOMHighRes(mAsyncOpen);
++}
++
++DOMHighResTimeStamp
++PerformanceTiming::WorkerStartHighRes()
++{
++  if (!nsContentUtils::IsPerformanceTimingEnabled() || !IsInitialized() ||
++      nsContentUtils::ShouldResistFingerprinting() || mWorkerStart.IsNull()) {
++    return mZeroTime;
++  }
++  return TimeStampToDOMHighRes(mWorkerStart);
++}
++
+ /**
+  * RedirectStartHighRes() is used by both the navigation timing and the
+  * resource timing. Since, navigation timing and resource timing check and
+  * interpret cross-domain redirects in a different manner,
+  * RedirectStartHighRes() will make no checks for cross-domain redirect.
+  * It's up to the consumers of this method (PerformanceTiming::RedirectStart()
+  * and PerformanceResourceTiming::RedirectStart() to make such verifications.
+  *
+diff --git a/dom/performance/PerformanceTiming.h b/dom/performance/PerformanceTiming.h
+--- a/dom/performance/PerformanceTiming.h
++++ b/dom/performance/PerformanceTiming.h
+@@ -152,17 +152,22 @@ public:
+   // attributes of the resourceTiming object will be set to 0
+   bool TimingAllowed() const;
+ 
+   // If this is false the values of redirectStart/End will be 0
+   // This is false if no redirects occured, or if any of the responses failed
+   // the timing-allow-origin check in HttpBaseChannel::TimingAllowCheck
+   bool ShouldReportCrossOriginRedirect() const;
+ 
++  // The last channel's AsyncOpen time.  This may occur before the FetchStart
++  // in some cases.
++  DOMHighResTimeStamp AsyncOpenHighRes();
++
+   // High resolution (used by resource timing)
++  DOMHighResTimeStamp WorkerStartHighRes();
+   DOMHighResTimeStamp FetchStartHighRes();
+   DOMHighResTimeStamp RedirectStartHighRes();
+   DOMHighResTimeStamp RedirectEndHighRes();
+   DOMHighResTimeStamp DomainLookupStartHighRes();
+   DOMHighResTimeStamp DomainLookupEndHighRes();
+   DOMHighResTimeStamp ConnectStartHighRes();
+   DOMHighResTimeStamp SecureConnectionStartHighRes();
+   DOMHighResTimeStamp ConnectEndHighRes();
+@@ -268,16 +273,17 @@ private:
+ 
+   // This is an offset that will be added to each timing ([ms] resolution).
+   // There are only 2 possible values: (1) logicaly equal to navigationStart
+   // TimeStamp (results are absolute timstamps - wallclock); (2) "0" (results
+   // are relative to the navigation start).
+   DOMHighResTimeStamp mZeroTime;
+ 
+   TimeStamp mAsyncOpen;
++  TimeStamp mWorkerStart;
+   TimeStamp mRedirectStart;
+   TimeStamp mRedirectEnd;
+   TimeStamp mDomainLookupStart;
+   TimeStamp mDomainLookupEnd;
+   TimeStamp mConnectStart;
+   TimeStamp mSecureConnectionStart;
+   TimeStamp mConnectEnd;
+   TimeStamp mRequestStart;
+diff --git a/dom/webidl/PerformanceResourceTiming.webidl b/dom/webidl/PerformanceResourceTiming.webidl
+--- a/dom/webidl/PerformanceResourceTiming.webidl
++++ b/dom/webidl/PerformanceResourceTiming.webidl
+@@ -1,30 +1,26 @@
+ /* -*- Mode: IDL; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+  * You can obtain one at http://mozilla.org/MPL/2.0/.
+  *
+  * The origin of this IDL file is
+- * http://w3c-test.org/webperf/specs/ResourceTiming/#performanceresourcetiming
++ * https://w3c.github.io/resource-timing/#performanceresourcetiming
+  *
+  * Copyright © 2012 W3C® (MIT, ERCIM, Keio), All Rights Reserved. W3C
+  * liability, trademark and document use rules apply.
+  */
+ 
+ interface PerformanceResourceTiming : PerformanceEntry
+ {
+-  // A string with the name of that element that initiated the load.
+-  // If the initiator is a CSS resource, the initiatorType attribute must return
+-  // the string "css".
+-  // If the initiator is an XMLHttpRequest object, the initiatorType attribute
+-  // must return the string "xmlhttprequest".
+   readonly attribute DOMString initiatorType;
+   readonly attribute DOMString nextHopProtocol;
+ 
++  readonly attribute DOMHighResTimeStamp workerStart;
+   readonly attribute DOMHighResTimeStamp redirectStart;
+   readonly attribute DOMHighResTimeStamp redirectEnd;
+   readonly attribute DOMHighResTimeStamp fetchStart;
+   readonly attribute DOMHighResTimeStamp domainLookupStart;
+   readonly attribute DOMHighResTimeStamp domainLookupEnd;
+   readonly attribute DOMHighResTimeStamp connectStart;
+   readonly attribute DOMHighResTimeStamp connectEnd;
+   readonly attribute DOMHighResTimeStamp secureConnectionStart;
