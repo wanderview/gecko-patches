@@ -1,7 +1,7 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  d270b23e6ce5d80082b94ea1a742d94add0828cf
-Bug 1204254 P8 Pass the body stream directly to StartSynthesizedResponse() instead of copying. r=asuth
+# Parent  b865221c24e97b80ed3aad37a06ac4f1950b0e8c
+Bug 1204254 P9 Pass the body stream directly to StartSynthesizedResponse() instead of copying. r=asuth
 
 diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEvents.cpp
 --- a/dom/workers/ServiceWorkerEvents.cpp
@@ -341,7 +341,7 @@ diff --git a/dom/workers/ServiceWorkerEvents.cpp b/dom/workers/ServiceWorkerEven
 diff --git a/netwerk/protocol/http/HttpChannelChild.cpp b/netwerk/protocol/http/HttpChannelChild.cpp
 --- a/netwerk/protocol/http/HttpChannelChild.cpp
 +++ b/netwerk/protocol/http/HttpChannelChild.cpp
-@@ -1112,16 +1112,21 @@ HttpChannelChild::OnStopRequest(const ns
+@@ -1112,16 +1112,18 @@ HttpChannelChild::OnStopRequest(const ns
  
  void
  HttpChannelChild::DoPreOnStopRequest(nsresult aStatus)
@@ -350,10 +350,7 @@ diff --git a/netwerk/protocol/http/HttpChannelChild.cpp b/netwerk/protocol/http/
         this, static_cast<uint32_t>(aStatus)));
    mIsPending = false;
  
-+  if (mSynthesizedCallback) {
-+    mSynthesizedCallback->BodyComplete(mStatus);
-+    mSynthesizedCallback = nullptr;
-+  }
++  MaybeCallSynthesizedCallback();
 +
    Performance* documentPerformance = GetPerformance();
    if (documentPerformance) {
@@ -363,7 +360,26 @@ diff --git a/netwerk/protocol/http/HttpChannelChild.cpp b/netwerk/protocol/http/
    if (!mCanceled && NS_SUCCEEDED(mStatus)) {
      mStatus = aStatus;
    }
-@@ -1419,31 +1424,33 @@ HttpChannelChild::RecvDeleteSelf()
+@@ -1396,16 +1398,18 @@ void
+ HttpChannelChild::DoNotifyListenerCleanup()
+ {
+   LOG(("HttpChannelChild::DoNotifyListenerCleanup [this=%p]\n", this));
+ 
+   if (mInterceptListener) {
+     mInterceptListener->Cleanup();
+     mInterceptListener = nullptr;
+   }
++
++  MaybeCallSynthesizedCallback();
+ }
+ 
+ class DeleteSelfEvent : public NeckoTargetChannelEvent<HttpChannelChild>
+ {
+  public:
+   explicit DeleteSelfEvent(HttpChannelChild* child)
+   : NeckoTargetChannelEvent<HttpChannelChild>(child) {}
+   void Run() { mChild->DeleteSelf(); }
+@@ -1419,41 +1423,47 @@ HttpChannelChild::RecvDeleteSelf()
    return IPC_OK();
  }
  
@@ -396,9 +412,23 @@ diff --git a/netwerk/protocol/http/HttpChannelChild.cpp b/netwerk/protocol/http/
  NS_IMETHODIMP
  HttpChannelChild::OverrideRunnable::Run()
  {
+   // Check to see if the channel was canceled in the middle of the redirect.
+   nsresult rv = NS_OK;
+   Unused << mChannel->GetStatus(&rv);
+   if (NS_FAILED(rv)) {
++    if (mCallback) {
++      mCallback->BodyComplete(rv);
++      mCallback = nullptr;
++    }
+     mChannel->CleanupRedirectingChannel(rv);
+     mNewChannel->Cancel(rv);
+     return NS_OK;
+   }
+ 
    bool ret = mChannel->Redirect3Complete(this);
  
-@@ -2124,19 +2131,22 @@ HttpChannelChild::OnRedirectVerifyCallba
+   // If the method returns false, it means the IPDL connection is being
+@@ -2133,19 +2143,22 @@ HttpChannelChild::OnRedirectVerifyCallba
      // nsIHttpChannelChild (it could be a DataChannelChild).
  
      RefPtr<InterceptStreamListener> streamListener =
@@ -422,7 +452,7 @@ diff --git a/netwerk/protocol/http/HttpChannelChild.cpp b/netwerk/protocol/http/
    RequestHeaderTuples emptyHeaders;
    RequestHeaderTuples* headerTuples = &emptyHeaders;
    nsLoadFlags loadFlags = 0;
-@@ -2178,16 +2188,21 @@ HttpChannelChild::OnRedirectVerifyCallba
+@@ -2187,16 +2200,18 @@ HttpChannelChild::OnRedirectVerifyCallba
      }
  
      nsCOMPtr<nsIRequest> request = do_QueryInterface(mRedirectChannelChild);
@@ -431,10 +461,7 @@ diff --git a/netwerk/protocol/http/HttpChannelChild.cpp b/netwerk/protocol/http/
      }
    }
  
-+  if (mSynthesizedCallback) {
-+    mSynthesizedCallback->BodyComplete(mStatus);
-+    mSynthesizedCallback = nullptr;
-+  }
++  MaybeCallSynthesizedCallback();
 +
    bool chooseAppcache = false;
    nsCOMPtr<nsIApplicationCacheChannel> appCacheChannel =
@@ -444,38 +471,7 @@ diff --git a/netwerk/protocol/http/HttpChannelChild.cpp b/netwerk/protocol/http/
    }
  
    if (mIPCOpen)
-@@ -2210,19 +2225,30 @@ HttpChannelChild::Cancel(nsresult status
- 
-   if (!mCanceled) {
-     // If this cancel occurs before nsHttpChannel has been set up, AsyncOpen
-     // is responsible for cleaning up.
-     mCanceled = true;
-     mStatus = status;
-     if (RemoteChannelExists())
-       SendCancel(status);
-+
-+    // If the channel is intercepted and already pumping, then just
-+    // cancel the pump.  This will call OnStopRequest().
-     if (mSynthesizedResponsePump) {
-       mSynthesizedResponsePump->Cancel(status);
-     }
-+
-+    // Otherwise, if we are canceled while intercepting, but not yet
-+    // pumping, then we must call AsyncAbort to trigger OnStopRequest().
-+    else if (mInterceptListener) {
-+      mInterceptListener->Cleanup();
-+      Unused << AsyncAbort(status);
-+    }
-+
-     mInterceptListener = nullptr;
-   }
-   return NS_OK;
- }
- 
- NS_IMETHODIMP
- HttpChannelChild::Suspend()
- {
-@@ -3495,29 +3521,42 @@ HttpChannelChild::CancelOnMainThread(nsr
+@@ -3520,23 +3535,32 @@ HttpChannelChild::CancelOnMainThread(nsr
    UniquePtr<ChannelEvent> cancelEvent = MakeUnique<CancelEvent>(this, aRv);
    mEventQ->PrependEvent(cancelEvent);
    mEventQ->Resume();
@@ -487,9 +483,29 @@ diff --git a/netwerk/protocol/http/HttpChannelChild.cpp b/netwerk/protocol/http/
 +                                                  nsIInterceptedBodyCallback* aSynthesizedCallback,
                                                    InterceptStreamListener* aStreamListener)
  {
+   nsresult rv = NS_OK;
+-  auto autoCancel = MakeScopeExit([&] {
++  auto autoCleanup = MakeScopeExit([&] {
++    // Auto-cancel on failure.  Do this first to get mStatus set, if necessary.
+     if (NS_FAILED(rv)) {
+       Cancel(rv);
+     }
++
++    // If we early exit before taking ownership of the body, then automatically
++    // invoke the callback.  This could be due to an error or because we're not
++    // going to consume it due to a redirect, etc.
++    if (aSynthesizedCallback) {
++      aSynthesizedCallback->BodyComplete(mStatus);
++    }
+   });
+ 
+   if (NS_FAILED(mStatus)) {
+     return;
+   }
+ 
    mInterceptListener = aStreamListener;
  
-   // Intercepted responses should already be decoded.  If its a redirect,
+@@ -3544,16 +3568,24 @@ HttpChannelChild::OverrideWithSynthesize
    // however, we want to respect the encoding of the final result instead.
    if (!nsHttpChannel::WillRedirect(aResponseHead)) {
      SetApplyConversion(false);
@@ -499,26 +515,22 @@ diff --git a/netwerk/protocol/http/HttpChannelChild.cpp b/netwerk/protocol/http/
    mSynthesizedResponse = true;
  
 +  mSynthesizedInput = aSynthesizedInput;
-+  mSynthesizedCallback = aSynthesizedCallback;
 +
 +  if (!mSynthesizedInput) {
-+    nsresult rv = NS_NewCStringInputStream(getter_AddRefs(mSynthesizedInput),
-+                                           EmptyCString());
-+    if (NS_FAILED(rv)) {
-+      Unused << AsyncAbort(rv);
-+      return;
-+    }
++    rv = NS_NewCStringInputStream(getter_AddRefs(mSynthesizedInput),
++                                  EmptyCString());
++    NS_ENSURE_SUCCESS_VOID(rv);
 +  }
 +
    if (nsHttpChannel::WillRedirect(mResponseHead)) {
      mShouldInterceptSubsequentRedirect = true;
      // Continue with the original cross-process request
-     nsresult rv = ContinueAsyncOpen();
-     if (NS_WARN_IF(NS_FAILED(rv))) {
-       rv = AsyncAbort(rv);
-       MOZ_ASSERT(NS_SUCCEEDED(rv));
-     }
-@@ -3535,19 +3574,19 @@ HttpChannelChild::OverrideWithSynthesize
+     rv = ContinueAsyncOpen();
+     return;
+   }
+ 
+   // For progress we trust the content-length for the "maximum" size.
+@@ -3567,25 +3599,28 @@ HttpChannelChild::OverrideWithSynthesize
    if (NS_FAILED(rv)) {
      mSynthesizedStreamLength = -1;
    }
@@ -528,19 +540,31 @@ diff --git a/netwerk/protocol/http/HttpChannelChild.cpp b/netwerk/protocol/http/
  
    rv = nsInputStreamPump::Create(getter_AddRefs(mSynthesizedResponsePump),
 -                                 aSynthesizedInput, 0, 0, true, neckoTarget);
-+                                 mSynthesizedInput, 0, 0, true, neckoTarget);
-   if (NS_WARN_IF(NS_FAILED(rv))) {
+-  if (NS_WARN_IF(NS_FAILED(rv))) {
 -    aSynthesizedInput->Close();
-+    mSynthesizedInput->Close();
-     return;
-   }
+-    return;
+-  }
++                                 mSynthesizedInput, 0, 0, true, neckoTarget);
++  NS_ENSURE_SUCCESS_VOID(rv);
  
    rv = mSynthesizedResponsePump->AsyncRead(aStreamListener, nullptr);
    NS_ENSURE_SUCCESS_VOID(rv);
  
++  // The pump is started, so take ownership of the body callback.  We
++  // clear the argument to avoid auto-completing it via the ScopeExit
++  // lambda.
++  mSynthesizedCallback = aSynthesizedCallback;
++  aSynthesizedCallback = nullptr;
++
    // if this channel has been suspended previously, the pump needs to be
    // correspondingly suspended now that it exists.
-@@ -3567,19 +3606,21 @@ HttpChannelChild::ForceIntercepted(bool 
+   for (uint32_t i = 0; i < mSuspendCount; i++) {
+     rv = mSynthesizedResponsePump->Suspend();
+     NS_ENSURE_SUCCESS_VOID(rv);
+   }
+ 
+   MOZ_DIAGNOSTIC_ASSERT(!mCanceled);
+@@ -3597,19 +3632,21 @@ HttpChannelChild::ForceIntercepted(bool 
  {
    mShouldParentIntercept = true;
    mPostRedirectChannelShouldIntercept = aPostRedirectChannelShouldIntercept;
@@ -563,6 +587,28 @@ diff --git a/netwerk/protocol/http/HttpChannelChild.cpp b/netwerk/protocol/http/
  HttpChannelChild::RecvIssueDeprecationWarning(const uint32_t& warning,
                                                const bool& asError)
  {
+@@ -3704,10 +3741,21 @@ HttpChannelChild::SynthesizeResponseStar
+ }
+ 
+ void
+ HttpChannelChild::SynthesizeResponseEndTime(const TimeStamp& aTime)
+ {
+   mTransactionTimings.responseEnd = aTime;
+ }
+ 
++void
++HttpChannelChild::MaybeCallSynthesizedCallback()
++{
++  if (!mSynthesizedCallback) {
++    return;
++  }
++
++  mSynthesizedCallback->BodyComplete(mStatus);
++  mSynthesizedCallback = nullptr;
++}
++
+ } // namespace net
+ } // namespace mozilla
 diff --git a/netwerk/protocol/http/HttpChannelChild.h b/netwerk/protocol/http/HttpChannelChild.h
 --- a/netwerk/protocol/http/HttpChannelChild.h
 +++ b/netwerk/protocol/http/HttpChannelChild.h
@@ -612,7 +658,7 @@ diff --git a/netwerk/protocol/http/HttpChannelChild.h b/netwerk/protocol/http/Ht
    // with the channel. Should be called when a new channel is being set up,
    // before the constructor message is sent to the parent.
    void SetEventTarget();
-@@ -259,19 +262,21 @@ private:
+@@ -259,37 +262,43 @@ private:
  
    // Discard the prior interception and continue with the original network request.
    void ResetInterception();
@@ -635,12 +681,16 @@ diff --git a/netwerk/protocol/http/HttpChannelChild.h b/netwerk/protocol/http/Ht
    // Try invoke Cancel if on main thread, or prepend a CancelEvent in mEventQ to
    // ensure Cacnel is processed before any other channel events.
    void CancelOnMainThread(nsresult aRv);
-@@ -280,16 +285,17 @@ private:
+ 
+   void
    SynthesizeResponseStartTime(const TimeStamp& aTime);
  
    void
    SynthesizeResponseEndTime(const TimeStamp& aTime);
  
++  void
++  MaybeCallSynthesizedCallback();
++
    RequestHeaderTuples mClientSetRequestHeaders;
    RefPtr<nsInputStreamPump> mSynthesizedResponsePump;
    nsCOMPtr<nsIInputStream> mSynthesizedInput;
@@ -778,7 +828,26 @@ diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol
  
  nsresult
  InterceptedHttpChannel::StartPump()
-@@ -408,16 +419,25 @@ InterceptedHttpChannel::MaybeCallStatusA
+@@ -307,16 +318,18 @@ InterceptedHttpChannel::StartPump()
+   rv = mPump->AsyncRead(this, mListenerContext);
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   uint32_t suspendCount = mSuspendCount;
+   while (suspendCount--) {
+     mPump->Suspend();
+   }
+ 
++  MOZ_DIAGNOSTIC_ASSERT(!mCanceled);
++
+   return rv;
+ }
+ 
+ nsresult
+ InterceptedHttpChannel::OpenRedirectChannel()
+ {
+   nsresult rv = NS_OK;
+ 
+@@ -408,16 +421,25 @@ InterceptedHttpChannel::MaybeCallStatusA
                            mStatusHost.get());
  
    mProgressSink->OnProgress(this, mListenerContext, progress,
@@ -804,7 +873,7 @@ diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol
  {
    // Create an InterceptedHttpChannel that will trigger a FetchEvent
    // in a ServiceWorker when opened.
-@@ -427,32 +447,34 @@ InterceptedHttpChannel::CreateForInterce
+@@ -427,32 +449,34 @@ InterceptedHttpChannel::CreateForInterce
  
    return ref.forget();
  }
@@ -840,7 +909,8 @@ diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol
  InterceptedHttpChannel::Cancel(nsresult aStatus)
  {
    // Note: This class has been designed to send all error results through
-@@ -693,34 +715,49 @@ InterceptedHttpChannel::SynthesizeHeader
+@@ -692,63 +716,99 @@ InterceptedHttpChannel::SynthesizeHeader
+   return NS_OK;
  }
  
  NS_IMETHODIMP
@@ -848,24 +918,36 @@ diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol
                                                   nsIInterceptedBodyCallback* aBodyCallback,
                                                   const nsACString& aFinalURLSpec)
  {
-   if (mCanceled) {
+-  if (mCanceled) {
 -    return mStatus;
++  nsresult rv = NS_OK;
++
++  auto autoCleanup = MakeScopeExit([&] {
++    // Auto-cancel on failure.  Do this first to get mStatus set, if necessary.
++    if (NS_FAILED(rv)) {
++      Cancel(rv);
++    }
++
++    // If we early exit before taking ownership of the body, then automatically
++    // invoke the callback.  This could be due to an error or because we're not
++    // going to consume it due to a redirect, etc.
 +    if (aBodyCallback) {
 +      aBodyCallback->BodyComplete(mStatus);
 +    }
++  });
 +
++  if (NS_FAILED(mStatus)) {
 +    // Return NS_OK.  The channel should fire callbacks with an error code
 +    // if it was cancelled before this point.
 +    return NS_OK;
    }
  
-+  // Take ownership of the body callbacks  We expect that if a failure
-+  // occurs here our caller will call Cancel().  This will then invoke
-+  // OnStopRequest() which will invoke the correct callback.  We also
-+  // invoke callbacks if we skip reading the body due to following a
-+  // redirect, etc.  In the case of an opaque response redirect we pass
-+  // ownership of the callbacks to the new channel.
++  // Take ownership of the body callbacks  If a failure occurs we will
++  // automatically Cancel() the channel.  This will then invoke OnStopRequest()
++  // which will invoke the correct callback.  In the case of an opaque response
++  // redirect we pass ownership of the callback to the new channel.
 +  mBodyCallback = aBodyCallback;
++  aBodyCallback = nullptr;
 +
    if (!mSynthesizedResponseHead) {
      mSynthesizedResponseHead.reset(new nsHttpResponseHead());
@@ -874,7 +956,11 @@ diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol
    mResponseHead = mSynthesizedResponseHead.release();
  
    if (ShouldRedirect()) {
-     return FollowSyntheticRedirect();
+-    return FollowSyntheticRedirect();
++    rv = FollowSyntheticRedirect();
++    NS_ENSURE_SUCCESS(rv, rv);
++
++    return NS_OK;
    }
  
    // Intercepted responses should already be decoded.
@@ -884,16 +970,36 @@ diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol
    // here so later code can be simpler.
 +  mBodyReader = aBody;
    if (!mBodyReader) {
-     nsresult rv = NS_NewCStringInputStream(getter_AddRefs(mBodyReader),
-                                            EmptyCString());
+-    nsresult rv = NS_NewCStringInputStream(getter_AddRefs(mBodyReader),
+-                                           EmptyCString());
++    rv = NS_NewCStringInputStream(getter_AddRefs(mBodyReader), EmptyCString());
      NS_ENSURE_SUCCESS(rv, rv);
    }
  
    nsCOMPtr<nsIURI> responseURI;
    if (!aFinalURLSpec.IsEmpty()) {
-@@ -738,17 +775,19 @@ InterceptedHttpChannel::StartSynthesized
+-    nsresult rv = NS_NewURI(getter_AddRefs(responseURI), aFinalURLSpec);
++    rv = NS_NewURI(getter_AddRefs(responseURI), aFinalURLSpec);
+     NS_ENSURE_SUCCESS(rv, rv);
+   } else {
+     responseURI = mURI;
+   }
  
-   return StartPump();
+   bool equal = false;
+   Unused << mURI->Equals(responseURI, &equal);
+   if (!equal) {
+-    return RedirectForOpaqueResponse(responseURI);
++    rv = RedirectForOpaqueResponse(responseURI);
++    NS_ENSURE_SUCCESS(rv, rv);
++
++    return NS_OK;
+   }
+ 
+-  return StartPump();
++  rv = StartPump();
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  return NS_OK;
  }
  
  NS_IMETHODIMP
@@ -912,7 +1018,7 @@ diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol
  
    return NS_OK;
  }
-@@ -938,16 +977,18 @@ InterceptedHttpChannel::OnRedirectVerify
+@@ -938,16 +998,18 @@ InterceptedHttpChannel::OnRedirectVerify
    if (hook) {
      hook->OnRedirectResult(NS_SUCCEEDED(rv));
    }
@@ -931,7 +1037,7 @@ diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol
  
  NS_IMETHODIMP
  InterceptedHttpChannel::OnStartRequest(nsIRequest* aRequest,
-@@ -971,16 +1012,18 @@ InterceptedHttpChannel::OnStopRequest(ns
+@@ -971,16 +1033,18 @@ InterceptedHttpChannel::OnStopRequest(ns
                                        nsresult aStatus)
  {
    MOZ_ASSERT(NS_IsMainThread());
