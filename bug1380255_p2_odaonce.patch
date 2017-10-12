@@ -1,0 +1,225 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  9ab3cddd7d2605f9de35e2a93417a7e2035120f8
+Bug 1380255 P2 Don't fire FetchDriverObserver::OnDataAvailable() for every FetchDriver ODA callback. r=baku
+
+diff --git a/dom/fetch/Fetch.cpp b/dom/fetch/Fetch.cpp
+--- a/dom/fetch/Fetch.cpp
++++ b/dom/fetch/Fetch.cpp
+@@ -224,16 +224,19 @@ public:
+   }
+ 
+   void
+   OnResponseAvailableInternal(InternalResponse* aResponse) override;
+ 
+   void
+   OnResponseEnd(FetchDriverObserver::EndReason eReason) override;
+ 
++  bool
++  NeedOnDataAvailable() override;
++
+   void
+   OnDataAvailable() override;
+ 
+ private:
+    WorkerFetchResolver(PromiseWorkerProxy* aProxy,
+                        AbortSignalProxy* aSignalProxy,
+                        FetchObserver* aObserver)
+     : mPromiseProxy(aProxy)
+@@ -284,16 +287,19 @@ public:
+       mPromise->MaybeReject(NS_ERROR_DOM_ABORT_ERR);
+     }
+ 
+     mFetchObserver = nullptr;
+ 
+     FlushConsoleReport();
+   }
+ 
++  bool
++  NeedOnDataAvailable() override;
++
+   void
+   OnDataAvailable() override;
+ 
+ private:
+   ~MainThreadFetchResolver();
+ 
+   void FlushConsoleReport() override
+   {
+@@ -494,16 +500,23 @@ MainThreadFetchResolver::OnResponseAvail
+     }
+ 
+     ErrorResult result;
+     result.ThrowTypeError<MSG_FETCH_FAILED>();
+     mPromise->MaybeReject(result);
+   }
+ }
+ 
++bool
++MainThreadFetchResolver::NeedOnDataAvailable()
++{
++  NS_ASSERT_OWNINGTHREAD(MainThreadFetchResolver);
++  return !!mFetchObserver;
++}
++
+ void
+ MainThreadFetchResolver::OnDataAvailable()
+ {
+   NS_ASSERT_OWNINGTHREAD(MainThreadFetchResolver);
+   AssertIsOnMainThread();
+ 
+   if (!mFetchObserver) {
+     return;
+@@ -693,16 +706,24 @@ WorkerFetchResolver::OnResponseAvailable
+     new WorkerFetchResponseRunnable(mPromiseProxy->GetWorkerPrivate(), this,
+                                     aResponse);
+ 
+   if (!r->Dispatch()) {
+     NS_WARNING("Could not dispatch fetch response");
+   }
+ }
+ 
++bool
++WorkerFetchResolver::NeedOnDataAvailable()
++{
++  AssertIsOnMainThread();
++  MutexAutoLock lock(mPromiseProxy->Lock());
++  return !!mFetchObserver;
++}
++
+ void
+ WorkerFetchResolver::OnDataAvailable()
+ {
+   AssertIsOnMainThread();
+ 
+   MutexAutoLock lock(mPromiseProxy->Lock());
+   if (mPromiseProxy->CleanedUp()) {
+     return;
+diff --git a/dom/fetch/FetchDriver.cpp b/dom/fetch/FetchDriver.cpp
+--- a/dom/fetch/FetchDriver.cpp
++++ b/dom/fetch/FetchDriver.cpp
+@@ -64,16 +64,17 @@ NS_IMPL_ISUPPORTS(FetchDriver,
+ 
+ FetchDriver::FetchDriver(InternalRequest* aRequest, nsIPrincipal* aPrincipal,
+                          nsILoadGroup* aLoadGroup, nsIEventTarget* aMainThreadEventTarget,
+                          bool aIsTrackingFetch)
+   : mPrincipal(aPrincipal)
+   , mLoadGroup(aLoadGroup)
+   , mRequest(aRequest)
+   , mMainThreadEventTarget(aMainThreadEventTarget)
++  , mNeedToObserveOnDataAvailable(false)
+   , mIsTrackingFetch(aIsTrackingFetch)
+ #ifdef DEBUG
+   , mResponseAvailableCalled(false)
+   , mFetchCalled(false)
+ #endif
+ {
+   AssertIsOnMainThread();
+ 
+@@ -496,16 +497,18 @@ FetchDriver::OnStartRequest(nsIRequest* 
+     FailWithNetworkError();
+     return rv;
+   }
+ 
+   // We should only get to the following code once.
+   MOZ_ASSERT(!mPipeOutputStream);
+   MOZ_ASSERT(mObserver);
+ 
++  mNeedToObserveOnDataAvailable = mObserver->NeedOnDataAvailable();
++
+   RefPtr<InternalResponse> response;
+   nsCOMPtr<nsIChannel> channel = do_QueryInterface(aRequest);
+   nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(aRequest);
+ 
+   // On a successful redirect we perform the following substeps of HTTP Fetch,
+   // step 5, "redirect status", step 11.
+ 
+   bool foundOpaqueRedirect = false;
+@@ -746,25 +749,28 @@ FetchDriver::OnDataAvailable(nsIRequest*
+                              nsIInputStream* aInputStream,
+                              uint64_t aOffset,
+                              uint32_t aCount)
+ {
+   // NB: This can be called on any thread!  But we're guaranteed that it is
+   // called between OnStartRequest and OnStopRequest, so we don't need to worry
+   // about races.
+ 
+-  if (mObserver) {
+-    if (NS_IsMainThread()) {
+-      mObserver->OnDataAvailable();
+-    } else {
+-      RefPtr<Runnable> runnable = new DataAvailableRunnable(mObserver);
+-      nsresult rv =
+-        mMainThreadEventTarget->Dispatch(runnable.forget(), NS_DISPATCH_NORMAL);
+-      if (NS_WARN_IF(NS_FAILED(rv))) {
+-        return rv;
++  if (mNeedToObserveOnDataAvailable) {
++    mNeedToObserveOnDataAvailable = false;
++    if (mObserver) {
++      if (NS_IsMainThread()) {
++        mObserver->OnDataAvailable();
++      } else {
++        RefPtr<Runnable> runnable = new DataAvailableRunnable(mObserver);
++        nsresult rv =
++          mMainThreadEventTarget->Dispatch(runnable.forget(), NS_DISPATCH_NORMAL);
++        if (NS_WARN_IF(NS_FAILED(rv))) {
++          return rv;
++        }
+       }
+     }
+   }
+ 
+   uint32_t aRead;
+   MOZ_ASSERT(mResponse);
+   MOZ_ASSERT(mPipeOutputStream);
+ 
+diff --git a/dom/fetch/FetchDriver.h b/dom/fetch/FetchDriver.h
+--- a/dom/fetch/FetchDriver.h
++++ b/dom/fetch/FetchDriver.h
+@@ -63,16 +63,23 @@ public:
+ 
+   nsIConsoleReportCollector* GetReporter() const
+   {
+     return mReporter;
+   }
+ 
+   virtual void FlushConsoleReport() = 0;
+ 
++  // Called in OnStartRequest() to determine if the OnDataAvailable() method
++  // needs to be called.  Invoking that method may generate additional main
++  // thread runnables.
++  virtual bool NeedOnDataAvailable() = 0;
++
++  // Called once when the first byte of data is received iff
++  // NeedOnDataAvailable() returned true when called in OnStartRequest().
+   virtual void OnDataAvailable() = 0;
+ 
+ protected:
+   virtual ~FetchDriverObserver()
+   { };
+ 
+   virtual void OnResponseAvailableInternal(InternalResponse* aResponse) = 0;
+ 
+@@ -126,16 +133,22 @@ private:
+   nsCOMPtr<nsIOutputStream> mPipeOutputStream;
+   RefPtr<FetchDriverObserver> mObserver;
+   nsCOMPtr<nsIDocument> mDocument;
+   nsCOMPtr<nsIChannel> mChannel;
+   nsAutoPtr<SRICheckDataVerifier> mSRIDataVerifier;
+   nsCOMPtr<nsIEventTarget> mMainThreadEventTarget;
+   SRIMetadata mSRIMetadata;
+   nsCString mWorkerScript;
++
++  // This is written once in OnStartRequest on the main thread and then
++  // written/read in OnDataAvailable() on any thread.  Necko guarantees
++  // that these do not overlap.
++  bool mNeedToObserveOnDataAvailable;
++
+   bool mIsTrackingFetch;
+ 
+ #ifdef DEBUG
+   bool mResponseAvailableCalled;
+   bool mFetchCalled;
+ #endif
+ 
+   FetchDriver() = delete;

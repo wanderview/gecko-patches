@@ -1,0 +1,262 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  2b59cab4f41dfbb329a3007c5702cb92a1ee353d
+Bug 1204254 P14 Stop faking responseStart/End directly and make PerformanceTiming map SW specific timings instead. r=asuth
+
+diff --git a/dom/performance/PerformanceTiming.cpp b/dom/performance/PerformanceTiming.cpp
+--- a/dom/performance/PerformanceTiming.cpp
++++ b/dom/performance/PerformanceTiming.cpp
+@@ -66,32 +66,37 @@ PerformanceTiming::PerformanceTiming(Per
+ 
+ // Copy the timing info from the channel so we don't need to keep the channel
+ // alive just to get the timestamps.
+ void
+ PerformanceTiming::InitializeTimingInfo(nsITimedChannel* aChannel)
+ {
+   if (aChannel) {
+     aChannel->GetAsyncOpen(&mAsyncOpen);
+-    aChannel->GetDispatchFetchEventStart(&mWorkerStart);
+     aChannel->GetAllRedirectsSameOrigin(&mAllRedirectsSameOrigin);
+     aChannel->GetRedirectCount(&mRedirectCount);
+     aChannel->GetRedirectStart(&mRedirectStart);
+     aChannel->GetRedirectEnd(&mRedirectEnd);
+     aChannel->GetDomainLookupStart(&mDomainLookupStart);
+     aChannel->GetDomainLookupEnd(&mDomainLookupEnd);
+     aChannel->GetConnectStart(&mConnectStart);
+     aChannel->GetSecureConnectionStart(&mSecureConnectionStart);
+     aChannel->GetConnectEnd(&mConnectEnd);
+     aChannel->GetRequestStart(&mRequestStart);
+     aChannel->GetResponseStart(&mResponseStart);
+     aChannel->GetCacheReadStart(&mCacheReadStart);
+     aChannel->GetResponseEnd(&mResponseEnd);
+     aChannel->GetCacheReadEnd(&mCacheReadEnd);
+ 
++    aChannel->GetDispatchFetchEventStart(&mWorkerStart);
++    aChannel->GetHandleFetchEventStart(&mWorkerRequestStart);
++    // TODO: Track when FetchEvent.respondWith() promise resolves as
++    //       ServiceWorker interception responseStart?
++    aChannel->GetHandleFetchEventEnd(&mWorkerResponseEnd);
++
+     // The performance timing api essentially requires that the event timestamps
+     // have a strict relation with each other. The truth, however, is the browser
+     // engages in a number of speculative activities that sometimes mean connections
+     // and lookups begin at different times. Workaround that here by clamping
+     // these values to what we expect FetchStart to be.  This means the later of
+     // AsyncOpen or WorkerStart times.
+     if (!mAsyncOpen.IsNull()) {
+       // We want to clamp to the expected FetchStart value.  This is later of
+@@ -394,16 +399,21 @@ PerformanceTiming::ConnectEnd()
+ 
+ DOMHighResTimeStamp
+ PerformanceTiming::RequestStartHighRes()
+ {
+   if (!nsContentUtils::IsPerformanceTimingEnabled() || !IsInitialized() ||
+       nsContentUtils::ShouldResistFingerprinting()) {
+     return mZeroTime;
+   }
++
++  if (mRequestStart.IsNull()) {
++    mRequestStart = mWorkerRequestStart;
++  }
++
+   return TimeStampToDOMHighResOrFetchStart(mRequestStart);
+ }
+ 
+ DOMTimeMilliSec
+ PerformanceTiming::RequestStart()
+ {
+   return static_cast<int64_t>(RequestStartHighRes());
+ }
+@@ -439,16 +449,19 @@ PerformanceTiming::ResponseEndHighRes()
+   if (!nsContentUtils::IsPerformanceTimingEnabled() || !IsInitialized() ||
+       nsContentUtils::ShouldResistFingerprinting()) {
+     return mZeroTime;
+   }
+   if (mResponseEnd.IsNull() ||
+      (!mCacheReadEnd.IsNull() && mCacheReadEnd < mResponseEnd)) {
+     mResponseEnd = mCacheReadEnd;
+   }
++  if (mResponseEnd.IsNull()) {
++    mResponseEnd = mWorkerResponseEnd;
++  }
+   // Bug 1155008 - nsHttpTransaction is racy. Return ResponseStart when null
+   return mResponseEnd.IsNull() ? ResponseStartHighRes()
+                                : TimeStampToDOMHighRes(mResponseEnd);
+ }
+ 
+ DOMTimeMilliSec
+ PerformanceTiming::ResponseEnd()
+ {
+diff --git a/dom/performance/PerformanceTiming.h b/dom/performance/PerformanceTiming.h
+--- a/dom/performance/PerformanceTiming.h
++++ b/dom/performance/PerformanceTiming.h
+@@ -273,29 +273,34 @@ private:
+ 
+   // This is an offset that will be added to each timing ([ms] resolution).
+   // There are only 2 possible values: (1) logicaly equal to navigationStart
+   // TimeStamp (results are absolute timstamps - wallclock); (2) "0" (results
+   // are relative to the navigation start).
+   DOMHighResTimeStamp mZeroTime;
+ 
+   TimeStamp mAsyncOpen;
+-  TimeStamp mWorkerStart;
+   TimeStamp mRedirectStart;
+   TimeStamp mRedirectEnd;
+   TimeStamp mDomainLookupStart;
+   TimeStamp mDomainLookupEnd;
+   TimeStamp mConnectStart;
+   TimeStamp mSecureConnectionStart;
+   TimeStamp mConnectEnd;
+   TimeStamp mRequestStart;
+   TimeStamp mResponseStart;
+   TimeStamp mCacheReadStart;
+   TimeStamp mResponseEnd;
+   TimeStamp mCacheReadEnd;
++
++  // ServiceWorker interception timing information
++  TimeStamp mWorkerStart;
++  TimeStamp mWorkerRequestStart;
++  TimeStamp mWorkerResponseEnd;
++
+   uint8_t mRedirectCount;
+   bool mTimingAllowed;
+   bool mAllRedirectsSameOrigin;
+   bool mInitialized;
+ 
+   // If the resourceTiming object should have non-zero redirectStart and
+   // redirectEnd attributes. It is false if there were no redirects, or if
+   // any of the responses didn't pass the timing-allow-check
+diff --git a/netwerk/protocol/http/HttpChannelChild.cpp b/netwerk/protocol/http/HttpChannelChild.cpp
+--- a/netwerk/protocol/http/HttpChannelChild.cpp
++++ b/netwerk/protocol/http/HttpChannelChild.cpp
+@@ -76,17 +76,16 @@ NS_IMPL_ISUPPORTS(InterceptStreamListene
+                   nsIStreamListener,
+                   nsIRequestObserver,
+                   nsIProgressEventSink)
+ 
+ NS_IMETHODIMP
+ InterceptStreamListener::OnStartRequest(nsIRequest* aRequest, nsISupports* aContext)
+ {
+   if (mOwner) {
+-    mOwner->SynthesizeResponseStartTime(TimeStamp::Now());
+     mOwner->DoOnStartRequest(mOwner, mContext);
+   }
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ InterceptStreamListener::OnStatus(nsIRequest* aRequest, nsISupports* aContext,
+                                   nsresult status, const char16_t* aStatusArg)
+@@ -135,17 +134,16 @@ InterceptStreamListener::OnDataAvailable
+   mOwner->DoOnDataAvailable(mOwner, mContext, aInputStream, aOffset, aCount);
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ InterceptStreamListener::OnStopRequest(nsIRequest* aRequest, nsISupports* aContext, nsresult aStatusCode)
+ {
+   if (mOwner) {
+-    mOwner->SynthesizeResponseEndTime(TimeStamp::Now());
+     mOwner->DoPreOnStopRequest(aStatusCode);
+     mOwner->DoOnStopRequest(mOwner, aStatusCode, mContext);
+   }
+   Cleanup();
+   return NS_OK;
+ }
+ 
+ void
+@@ -3729,28 +3727,16 @@ HttpChannelChild::LogBlockedCORSRequest(
+   if (mLoadInfo) {
+     uint64_t innerWindowID = mLoadInfo->GetInnerWindowID();
+     nsCORSListenerProxy::LogBlockedCORSRequest(innerWindowID, aMessage);
+   }
+   return NS_OK;
+ }
+ 
+ void
+-HttpChannelChild::SynthesizeResponseStartTime(const TimeStamp& aTime)
+-{
+-  mTransactionTimings.responseStart = aTime;
+-}
+-
+-void
+-HttpChannelChild::SynthesizeResponseEndTime(const TimeStamp& aTime)
+-{
+-  mTransactionTimings.responseEnd = aTime;
+-}
+-
+-void
+ HttpChannelChild::MaybeCallSynthesizedCallback()
+ {
+   if (!mSynthesizedCallback) {
+     return;
+   }
+ 
+   mSynthesizedCallback->BodyComplete(mStatus);
+   mSynthesizedCallback = nullptr;
+diff --git a/netwerk/protocol/http/HttpChannelChild.h b/netwerk/protocol/http/HttpChannelChild.h
+--- a/netwerk/protocol/http/HttpChannelChild.h
++++ b/netwerk/protocol/http/HttpChannelChild.h
+@@ -277,22 +277,16 @@ private:
+   // main thread if invoking on non-main thread.
+   void TrySendDeletingChannel();
+ 
+   // Try invoke Cancel if on main thread, or prepend a CancelEvent in mEventQ to
+   // ensure Cacnel is processed before any other channel events.
+   void CancelOnMainThread(nsresult aRv);
+ 
+   void
+-  SynthesizeResponseStartTime(const TimeStamp& aTime);
+-
+-  void
+-  SynthesizeResponseEndTime(const TimeStamp& aTime);
+-
+-  void
+   MaybeCallSynthesizedCallback();
+ 
+   RequestHeaderTuples mClientSetRequestHeaders;
+   RefPtr<nsInputStreamPump> mSynthesizedResponsePump;
+   nsCOMPtr<nsIInputStream> mSynthesizedInput;
+   nsCOMPtr<nsIInterceptedBodyCallback> mSynthesizedCallback;
+   int64_t mSynthesizedStreamLength;
+ 
+diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol/http/InterceptedHttpChannel.cpp
+--- a/netwerk/protocol/http/InterceptedHttpChannel.cpp
++++ b/netwerk/protocol/http/InterceptedHttpChannel.cpp
+@@ -996,17 +996,16 @@ NS_IMETHODIMP
+ InterceptedHttpChannel::OnStartRequest(nsIRequest* aRequest,
+                                        nsISupports* aContext)
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+ 
+   if (!mProgressSink) {
+     GetCallback(mProgressSink);
+   }
+-  mTransactionTimings.responseStart = TimeStamp::Now();
+   if (mListener) {
+     mListener->OnStartRequest(this, mListenerContext);
+   }
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ InterceptedHttpChannel::OnStopRequest(nsIRequest* aRequest,
+@@ -1022,18 +1021,16 @@ InterceptedHttpChannel::OnStopRequest(ns
+   MaybeCallBodyCallback();
+ 
+   // Its possible that we have any async runnable queued to report some
+   // progress when OnStopRequest() is triggered.  Report any left over
+   // progress immediately.  The extra runnable will then do nothing thanks
+   // to the ReleaseListeners() call below.
+   MaybeCallStatusAndProgress();
+ 
+-  mTransactionTimings.responseEnd = TimeStamp::Now();
+-
+   mIsPending = false;
+ 
+   // Register entry to the Performance resource timing
+   mozilla::dom::Performance* documentPerformance = GetPerformance();
+   if (documentPerformance) {
+     documentPerformance->AddEntry(this, this);
+   }
+ 
