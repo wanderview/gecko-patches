@@ -1,0 +1,142 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  d1e995c8640a191cd127e87273ec96cb2fabffa9
+Bug 1400655 P1 Respect LOAD_CALL_CONTENT_SNIFFERS when a channel is intercepted by a ServiceWorker. r=valentin
+
+diff --git a/netwerk/protocol/http/HttpBaseChannel.cpp b/netwerk/protocol/http/HttpBaseChannel.cpp
+--- a/netwerk/protocol/http/HttpBaseChannel.cpp
++++ b/netwerk/protocol/http/HttpBaseChannel.cpp
+@@ -4334,10 +4334,25 @@ HttpBaseChannel::GetLastRedirectFlags(ui
+ 
+ NS_IMETHODIMP
+ HttpBaseChannel::SetLastRedirectFlags(uint32_t aValue)
+ {
+   mLastRedirectFlags = aValue;
+   return NS_OK;
+ }
+ 
++// NOTE: This function duplicates code from nsBaseChannel. This will go away
++// once HTTP uses nsBaseChannel (part of bug 312760)
++/* static */ void
++HttpBaseChannel::CallTypeSniffers(void *aClosure, const uint8_t *aData,
++                                  uint32_t aCount)
++{
++  nsIChannel *chan = static_cast<nsIChannel*>(aClosure);
++
++  nsAutoCString newType;
++  NS_SniffContent(NS_CONTENT_SNIFFER_CATEGORY, chan, aData, aCount, newType);
++  if (!newType.IsEmpty()) {
++    chan->SetContentType(newType);
++  }
++}
++
+ } // namespace net
+ } // namespace mozilla
+diff --git a/netwerk/protocol/http/HttpBaseChannel.h b/netwerk/protocol/http/HttpBaseChannel.h
+--- a/netwerk/protocol/http/HttpBaseChannel.h
++++ b/netwerk/protocol/http/HttpBaseChannel.h
+@@ -459,16 +459,19 @@ protected:
+ #ifdef DEBUG
+   // Check if mPrivateBrowsingId matches between LoadInfo and LoadContext.
+   void AssertPrivateBrowsingId();
+ #endif
+ 
+   // Called before we create the redirect target channel.
+   already_AddRefed<nsILoadInfo> CloneLoadInfoForRedirect(nsIURI *newURI, uint32_t redirectFlags);
+ 
++  static void CallTypeSniffers(void *aClosure, const uint8_t *aData,
++                               uint32_t aCount);
++
+   friend class PrivateBrowsingChannel<HttpBaseChannel>;
+   friend class InterceptFailedOnStop;
+ 
+ protected:
+   // this section is for main-thread-only object
+   // all the references need to be proxy released on main thread.
+   nsCOMPtr<nsIURI> mURI;
+   nsCOMPtr<nsIURI> mOriginalURI;
+diff --git a/netwerk/protocol/http/HttpChannelChild.cpp b/netwerk/protocol/http/HttpChannelChild.cpp
+--- a/netwerk/protocol/http/HttpChannelChild.cpp
++++ b/netwerk/protocol/http/HttpChannelChild.cpp
+@@ -676,16 +676,22 @@ HttpChannelChild::DoOnStartRequest(nsIRe
+   LOG(("HttpChannelChild::DoOnStartRequest [this=%p]\n", this));
+ 
+   // In theory mListener should not be null, but in practice sometimes it is.
+   MOZ_ASSERT(mListener);
+   if (!mListener) {
+     Cancel(NS_ERROR_FAILURE);
+     return;
+   }
++
++  if (mSynthesizedResponsePump && mLoadFlags & LOAD_CALL_CONTENT_SNIFFERS) {
++    mSynthesizedResponsePump->PeekStream(CallTypeSniffers,
++                                         static_cast<nsIChannel*>(this));
++  }
++
+   nsresult rv = mListener->OnStartRequest(aRequest, aContext);
+   if (NS_FAILED(rv)) {
+     Cancel(rv);
+     return;
+   }
+ 
+   if (mDivertingToParent) {
+     mListener = nullptr;
+diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol/http/InterceptedHttpChannel.cpp
+--- a/netwerk/protocol/http/InterceptedHttpChannel.cpp
++++ b/netwerk/protocol/http/InterceptedHttpChannel.cpp
+@@ -996,16 +996,21 @@ NS_IMETHODIMP
+ InterceptedHttpChannel::OnStartRequest(nsIRequest* aRequest,
+                                        nsISupports* aContext)
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+ 
+   if (!mProgressSink) {
+     GetCallback(mProgressSink);
+   }
++
++  if (mPump && mLoadFlags & LOAD_CALL_CONTENT_SNIFFERS) {
++    mPump->PeekStream(CallTypeSniffers, static_cast<nsIChannel*>(this));
++  }
++
+   if (mListener) {
+     mListener->OnStartRequest(this, mListenerContext);
+   }
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ InterceptedHttpChannel::OnStopRequest(nsIRequest* aRequest,
+diff --git a/netwerk/protocol/http/nsHttpChannel.cpp b/netwerk/protocol/http/nsHttpChannel.cpp
+--- a/netwerk/protocol/http/nsHttpChannel.cpp
++++ b/netwerk/protocol/http/nsHttpChannel.cpp
+@@ -1315,30 +1315,16 @@ nsHttpChannel::SetupTransaction()
+         mTransaction->SetRequestContext(mRequestContext);
+     }
+ 
+     rv = nsInputStreamPump::Create(getter_AddRefs(mTransactionPump),
+                                    responseStream);
+     return rv;
+ }
+ 
+-// NOTE: This function duplicates code from nsBaseChannel. This will go away
+-// once HTTP uses nsBaseChannel (part of bug 312760)
+-static void
+-CallTypeSniffers(void *aClosure, const uint8_t *aData, uint32_t aCount)
+-{
+-  nsIChannel *chan = static_cast<nsIChannel*>(aClosure);
+-
+-  nsAutoCString newType;
+-  NS_SniffContent(NS_CONTENT_SNIFFER_CATEGORY, chan, aData, aCount, newType);
+-  if (!newType.IsEmpty()) {
+-    chan->SetContentType(newType);
+-  }
+-}
+-
+ // Helper Function to report messages to the console when loading
+ // a resource was blocked due to a MIME type mismatch.
+ void
+ ReportTypeBlocking(nsIURI* aURI,
+                    nsILoadInfo* aLoadInfo,
+                    const char* aMessageName)
+ {
+     NS_ConvertUTF8toUTF16 specUTF16(aURI->GetSpecOrDefault());
