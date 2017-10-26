@@ -1,0 +1,226 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  a13c3bd4cf6274c2e73bd31970c6a27fe3b34137
+Bug 1412105 P2 Create a shared method in HttpBaseChannel to check the redirection limit. r=valentin
+
+diff --git a/netwerk/protocol/http/HttpBaseChannel.cpp b/netwerk/protocol/http/HttpBaseChannel.cpp
+--- a/netwerk/protocol/http/HttpBaseChannel.cpp
++++ b/netwerk/protocol/http/HttpBaseChannel.cpp
+@@ -4336,10 +4336,39 @@ HttpBaseChannel::GetLastRedirectFlags(ui
+ 
+ NS_IMETHODIMP
+ HttpBaseChannel::SetLastRedirectFlags(uint32_t aValue)
+ {
+   mLastRedirectFlags = aValue;
+   return NS_OK;
+ }
+ 
++nsresult
++HttpBaseChannel::CheckRedirectLimit(uint32_t aRedirectFlags) const
++{
++  if (aRedirectFlags & nsIChannelEventSink::REDIRECT_INTERNAL) {
++    // Some platform features, like Service Workers, depend on internal
++    // redirects.  We should allow some number of internal redirects above
++    // and beyond the normal redirect limit so these features continue
++    // to work.
++    static const int8_t kMinInternalRedirects = 5;
++
++    if (mInternalRedirectCount >= (mRedirectionLimit + kMinInternalRedirects)) {
++      LOG(("internal redirection limit reached!\n"));
++      return NS_ERROR_REDIRECT_LOOP;
++    }
++    return NS_OK;
++  }
++
++  MOZ_ASSERT(aRedirectFlags & (nsIChannelEventSink::REDIRECT_TEMPORARY |
++                               nsIChannelEventSink::REDIRECT_PERMANENT |
++                               nsIChannelEventSink::REDIRECT_STS_UPGRADE));
++
++  if (mRedirectCount >= mRedirectionLimit) {
++    LOG(("redirection limit reached!\n"));
++    return NS_ERROR_REDIRECT_LOOP;
++  }
++
++  return NS_OK;
++}
++
+ } // namespace net
+ } // namespace mozilla
+diff --git a/netwerk/protocol/http/HttpBaseChannel.h b/netwerk/protocol/http/HttpBaseChannel.h
+--- a/netwerk/protocol/http/HttpBaseChannel.h
++++ b/netwerk/protocol/http/HttpBaseChannel.h
+@@ -459,16 +459,19 @@ protected:
+ #ifdef DEBUG
+   // Check if mPrivateBrowsingId matches between LoadInfo and LoadContext.
+   void AssertPrivateBrowsingId();
+ #endif
+ 
+   // Called before we create the redirect target channel.
+   already_AddRefed<nsILoadInfo> CloneLoadInfoForRedirect(nsIURI *newURI, uint32_t redirectFlags);
+ 
++  nsresult
++  CheckRedirectLimit(uint32_t aRedirectFlags) const;
++
+   friend class PrivateBrowsingChannel<HttpBaseChannel>;
+   friend class InterceptFailedOnStop;
+ 
+ protected:
+   // this section is for main-thread-only object
+   // all the references need to be proxy released on main thread.
+   nsCOMPtr<nsIURI> mURI;
+   nsCOMPtr<nsIURI> mOriginalURI;
+diff --git a/netwerk/protocol/http/HttpChannelChild.cpp b/netwerk/protocol/http/HttpChannelChild.cpp
+--- a/netwerk/protocol/http/HttpChannelChild.cpp
++++ b/netwerk/protocol/http/HttpChannelChild.cpp
+@@ -1610,17 +1610,22 @@ HttpChannelChild::RecvRedirect1Begin(con
+ nsresult
+ HttpChannelChild::SetupRedirect(nsIURI* uri,
+                                 const nsHttpResponseHead* responseHead,
+                                 const uint32_t& redirectFlags,
+                                 nsIChannel** outChannel)
+ {
+   LOG(("HttpChannelChild::SetupRedirect [this=%p]\n", this));
+ 
+-  nsresult rv;
++  nsresult rv = CheckRedirectLimit(redirectFlags);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    Cancel(rv);
++    return rv;
++  }
++
+   nsCOMPtr<nsIIOService> ioService;
+   rv = gHttpHandler->GetIOService(getter_AddRefs(ioService));
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   nsCOMPtr<nsIChannel> newChannel;
+   nsCOMPtr<nsILoadInfo> redirectLoadInfo = CloneLoadInfoForRedirect(uri, redirectFlags);
+   rv = NS_NewChannelInternal(getter_AddRefs(newChannel),
+                              uri,
+diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol/http/InterceptedHttpChannel.cpp
+--- a/netwerk/protocol/http/InterceptedHttpChannel.cpp
++++ b/netwerk/protocol/http/InterceptedHttpChannel.cpp
+@@ -178,32 +178,31 @@ InterceptedHttpChannel::FollowSyntheticR
+   NS_ENSURE_SUCCESS(rv, NS_ERROR_FAILURE);
+ 
+   // make sure non-ASCII characters in the location header are escaped.
+   nsAutoCString locationBuf;
+   if (NS_EscapeURL(location.get(), -1, esc_OnlyNonASCII, locationBuf)) {
+     location = locationBuf;
+   }
+ 
+-  if (NS_WARN_IF(mRedirectionLimit == 0)) {
+-    return NS_ERROR_REDIRECT_LOOP;
+-  }
+-
+   nsCOMPtr<nsIURI> redirectURI;
+   rv = ioService->NewURI(nsDependentCString(location.get()),
+                          nullptr,
+                          mURI,
+                          getter_AddRefs(redirectURI));
+   NS_ENSURE_SUCCESS(rv, NS_ERROR_CORRUPTED_CONTENT);
+ 
+   uint32_t redirectFlags = nsIChannelEventSink::REDIRECT_TEMPORARY;
+   if (nsHttp::IsPermanentRedirect(mResponseHead->Status())) {
+     redirectFlags = nsIChannelEventSink::REDIRECT_PERMANENT;
+   }
+ 
++  rv = CheckRedirectLimit(redirectFlags);
++  NS_ENSURE_SUCCESS(rv, rv);
++
+   bool rewriteToGET = ShouldRewriteRedirectToGET(mResponseHead->Status(),
+                                                  mRequestHead.ParsedMethod());
+ 
+   nsCOMPtr<nsIChannel> newChannel;
+   nsCOMPtr<nsILoadInfo> redirectLoadInfo =
+     CloneLoadInfoForRedirect(redirectURI, redirectFlags);
+   rv = NS_NewChannelInternal(getter_AddRefs(newChannel),
+                              redirectURI,
+@@ -251,16 +250,19 @@ InterceptedHttpChannel::RedirectForOpaqu
+                        mAsyncOpenTime);
+ 
+   rv = newChannel->Init(aResponseURI, mCaps,
+                         static_cast<nsProxyInfo*>(mProxyInfo.get()),
+                         mProxyResolveFlags, mProxyURI, mChannelId);
+ 
+   uint32_t flags = nsIChannelEventSink::REDIRECT_INTERNAL;
+ 
++  rv = CheckRedirectLimit(flags);
++  NS_ENSURE_SUCCESS(rv, rv);
++
+   nsCOMPtr<nsILoadInfo> redirectLoadInfo =
+     CloneLoadInfoForRedirect(aResponseURI, flags);
+   newChannel->SetLoadInfo(redirectLoadInfo);
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   rv = SetupReplacementChannel(aResponseURI, newChannel, true, flags);
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+@@ -635,25 +637,28 @@ NS_IMETHODIMP
+ InterceptedHttpChannel::ResetInterception(void)
+ {
+   if (mCanceled) {
+     return mStatus;
+   }
+ 
+   uint32_t flags = nsIChannelEventSink::REDIRECT_INTERNAL;
+ 
++  nsresult rv = CheckRedirectLimit(flags);
++  NS_ENSURE_SUCCESS(rv, rv);
++
+   nsCOMPtr<nsIChannel> newChannel;
+   nsCOMPtr<nsILoadInfo> redirectLoadInfo =
+     CloneLoadInfoForRedirect(mURI, flags);
+-  nsresult rv = NS_NewChannelInternal(getter_AddRefs(newChannel),
+-                                      mURI,
+-                                      redirectLoadInfo,
+-                                      nullptr, // aLoadGroup
+-                                      nullptr, // aCallbacks
+-                                      mLoadFlags);
++  rv = NS_NewChannelInternal(getter_AddRefs(newChannel),
++                             mURI,
++                             redirectLoadInfo,
++                             nullptr, // aLoadGroup
++                             nullptr, // aCallbacks
++                             mLoadFlags);
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   rv = SetupReplacementChannel(mURI, newChannel, true, flags);
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   if (mRedirectMode != nsIHttpChannelInternal::REDIRECT_MODE_MANUAL) {
+     nsLoadFlags loadFlags = nsIRequest::LOAD_NORMAL;
+     rv = newChannel->GetLoadFlags(&loadFlags);
+diff --git a/netwerk/protocol/http/nsHttpChannel.cpp b/netwerk/protocol/http/nsHttpChannel.cpp
+--- a/netwerk/protocol/http/nsHttpChannel.cpp
++++ b/netwerk/protocol/http/nsHttpChannel.cpp
+@@ -5600,27 +5600,25 @@ nsHttpChannel::AsyncProcessRedirection(u
+     if (NS_FAILED(mResponseHead->GetHeader(nsHttp::Location, location)))
+         return NS_ERROR_FAILURE;
+ 
+     // make sure non-ASCII characters in the location header are escaped.
+     nsAutoCString locationBuf;
+     if (NS_EscapeURL(location.get(), -1, esc_OnlyNonASCII, locationBuf))
+         location = locationBuf;
+ 
+-    if (mRedirectCount >= mRedirectionLimit || mInternalRedirectCount >= mRedirectionLimit) {
+-        LOG(("redirection limit reached!\n"));
+-        return NS_ERROR_REDIRECT_LOOP;
+-    }
++    nsresult rv = CheckRedirectLimit(redirectType);
++    NS_ENSURE_SUCCESS(rv, rv);
+ 
+     mRedirectType = redirectType;
+ 
+     LOG(("redirecting to: %s [redirection-limit=%u]\n",
+         location.get(), uint32_t(mRedirectionLimit)));
+ 
+-    nsresult rv = CreateNewURI(location.get(), getter_AddRefs(mRedirectURI));
++    rv = CreateNewURI(location.get(), getter_AddRefs(mRedirectURI));
+ 
+     if (NS_FAILED(rv)) {
+         LOG(("Invalid URI for redirect: Location: %s\n", location.get()));
+         return NS_ERROR_CORRUPTED_CONTENT;
+     }
+ 
+     if (mApplicationCache) {
+         // if we are redirected to a different origin check if there is a fallback
