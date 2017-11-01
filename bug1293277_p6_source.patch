@@ -1,0 +1,660 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  c200f36f593fd17167f70e8de07a8a1afc4db166
+Bug 1293277 P6 Add the ClientSource class and hook it into ClientManager/ClientManagerService. r=baku
+
+diff --git a/dom/clients/manager/ClientIPCTypes.ipdlh b/dom/clients/manager/ClientIPCTypes.ipdlh
+--- a/dom/clients/manager/ClientIPCTypes.ipdlh
++++ b/dom/clients/manager/ClientIPCTypes.ipdlh
+@@ -12,16 +12,20 @@ using ClientType from "mozilla/dom/Clien
+ using FrameType from "mozilla/dom/ClientIPCUtils.h";
+ using VisibilityState from "mozilla/dom/ClientIPCUtils.h";
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ struct ClientSourceConstructorArgs
+ {
++  nsID id;
++  ClientType type;
++  PrincipalInfo principalInfo;
++  TimeStamp creationTime;
+ };
+ 
+ struct IPCClientInfo
+ {
+   nsID id;
+   ClientType type;
+   PrincipalInfo principalInfo;
+   TimeStamp creationTime;
+diff --git a/dom/clients/manager/ClientManager.cpp b/dom/clients/manager/ClientManager.cpp
+--- a/dom/clients/manager/ClientManager.cpp
++++ b/dom/clients/manager/ClientManager.cpp
+@@ -3,27 +3,29 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "ClientManager.h"
+ 
+ #include "ClientManagerChild.h"
+ #include "ClientManagerOpChild.h"
++#include "ClientSource.h"
+ #include "mozilla/dom/WorkerPrivate.h"
+ #include "mozilla/dom/workers/bindings/WorkerHolderToken.h"
+ #include "mozilla/ipc/BackgroundChild.h"
+ #include "mozilla/ipc/PBackgroundChild.h"
+ #include "prthread.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ using mozilla::ipc::BackgroundChild;
+ using mozilla::ipc::PBackgroundChild;
++using mozilla::ipc::PrincipalInfo;
+ using mozilla::dom::workers::Closing;
+ using mozilla::dom::workers::GetCurrentThreadWorkerPrivate;
+ using mozilla::dom::workers::WorkerHolderToken;
+ using mozilla::dom::workers::WorkerPrivate;
+ 
+ namespace {
+ 
+ uint32_t kBadThreadLocalIndex = -1;
+@@ -61,16 +63,46 @@ ClientManager::Shutdown()
+ 
+   if (IsShutdown()) {
+     return;
+   }
+ 
+   ShutdownThing();
+ }
+ 
++UniquePtr<ClientSource>
++ClientManager::CreateSourceInternal(ClientType aType,
++                                    const PrincipalInfo& aPrincipal)
++{
++  NS_ASSERT_OWNINGTHREAD(ClientManager);
++
++  if (IsShutdown()) {
++    return nullptr;
++  }
++
++  nsresult rv;
++  nsCOMPtr<nsIUUIDGenerator> idGen =
++    do_GetService("@mozilla.org/uuid-generator;1", &rv);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return nullptr;
++  }
++
++  nsID id;
++  rv = idGen->GenerateUUIDInPlace(&id);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return nullptr;
++  }
++
++  ClientSourceConstructorArgs args(id, aType, aPrincipal, TimeStamp::Now());
++  UniquePtr<ClientSource> source(new ClientSource(this, args));
++  source->Activate(GetActor());
++
++  return Move(source);
++}
++
+ already_AddRefed<ClientOpPromise>
+ ClientManager::StartOp(const ClientOpConstructorArgs& aArgs,
+                        nsISerialEventTarget* aSerialEventTarget)
+ {
+   RefPtr<ClientOpPromise::Private> promise =
+     new ClientOpPromise::Private(__func__);
+ 
+   // Hold a ref to the client until the remote operation completes.  Otherwise
+@@ -161,10 +193,35 @@ void
+ ClientManager::Startup()
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+   PRStatus status =
+     PR_NewThreadPrivateIndex(&sClientManagerThreadLocalIndex, nullptr);
+   MOZ_DIAGNOSTIC_ASSERT(status == PR_SUCCESS);
+ }
+ 
++// static
++UniquePtr<ClientSource>
++ClientManager::CreateSource(ClientType aType, nsIPrincipal* aPrincipal)
++{
++  MOZ_ASSERT(NS_IsMainThread());
++  MOZ_ASSERT(aPrincipal);
++
++  PrincipalInfo principalInfo;
++  nsresult rv = PrincipalToPrincipalInfo(aPrincipal, &principalInfo);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return nullptr;
++  }
++
++  RefPtr<ClientManager> mgr = GetOrCreateForCurrentThread();
++  return mgr->CreateSourceInternal(aType, principalInfo);
++}
++
++// static
++UniquePtr<ClientSource>
++ClientManager::CreateSource(ClientType aType, const PrincipalInfo& aPrincipal)
++{
++  RefPtr<ClientManager> mgr = GetOrCreateForCurrentThread();
++  return mgr->CreateSourceInternal(aType, aPrincipal);
++}
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/clients/manager/ClientManager.h b/dom/clients/manager/ClientManager.h
+--- a/dom/clients/manager/ClientManager.h
++++ b/dom/clients/manager/ClientManager.h
+@@ -12,16 +12,18 @@
+ namespace mozilla {
+ namespace ipc {
+ class PBackgroundChild;
+ } // namespace ipc
+ namespace dom {
+ 
+ class ClientManagerChild;
+ class ClientOpConstructorArgs;
++class ClientSource;
++enum class ClientType : uint8_t;
+ 
+ namespace workers {
+ class WorkerPrivate;
+ } // workers namespace
+ 
+ // The ClientManager provides a per-thread singleton interface workering
+ // with the client subsystem.  It allows globals to create ClientSource
+ // objects.  It allows other parts of the system to attach to this globals
+@@ -35,16 +37,20 @@ class ClientManager final : public Clien
+   ~ClientManager();
+ 
+   // Utility method to trigger a shutdown of the ClientManager.  This
+   // is called in various error conditions or when the last reference
+   // is dropped.
+   void
+   Shutdown();
+ 
++  UniquePtr<ClientSource>
++  CreateSourceInternal(ClientType aType,
++                       const mozilla::ipc::PrincipalInfo& aPrincipal);
++
+   // Utility method to perform an IPC operation.  This will create a
+   // PClientManagerOp actor tied to a MozPromise.  The promise will
+   // resolve or reject with the result of the remote operation.
+   already_AddRefed<ClientOpPromise>
+   StartOp(const ClientOpConstructorArgs& aArgs,
+           nsISerialEventTarget* aSerialEventTarget);
+ 
+   // Utility method that handles actor-based initialization.
+@@ -63,15 +69,21 @@ class ClientManager final : public Clien
+ 
+ public:
+   // Initialize the ClientManager at process start.  This
+   // does book-keeping like creating a TLS identifier, etc.
+   // This should only be called by process startup code.
+   static void
+   Startup();
+ 
++  static UniquePtr<ClientSource>
++  CreateSource(ClientType aType, nsIPrincipal* aPrincipal);
++
++  static UniquePtr<ClientSource>
++  CreateSource(ClientType aType, const mozilla::ipc::PrincipalInfo& aPrincipal);
++
+   NS_INLINE_DECL_REFCOUNTING(mozilla::dom::ClientManager)
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // _mozilla_dom_ClientManager_h
+diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/ClientManagerService.cpp
+--- a/dom/clients/manager/ClientManagerService.cpp
++++ b/dom/clients/manager/ClientManagerService.cpp
+@@ -7,31 +7,68 @@
+ #include "ClientManagerService.h"
+ 
+ #include "mozilla/ipc/BackgroundParent.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ using mozilla::ipc::AssertIsOnBackgroundThread;
++using mozilla::ipc::ContentPrincipalInfo;
+ 
+ namespace {
+ 
+ ClientManagerService* sClientManagerServiceInstance = nullptr;
+ 
++bool
++MatchPrincipalInfo(const PrincipalInfo& aLeft, const PrincipalInfo& aRight)
++{
++  if (aLeft.type() != aRight.type()) {
++    return false;
++  }
++
++  switch (aLeft.type()) {
++    case PrincipalInfo::TContentPrincipalInfo:
++    {
++      const ContentPrincipalInfo& leftContent = aLeft.get_ContentPrincipalInfo();
++      const ContentPrincipalInfo& rightContent = aRight.get_ContentPrincipalInfo();
++      return leftContent.attrs() == rightContent.attrs() &&
++             leftContent.originNoSuffix() == rightContent.originNoSuffix();
++    }
++    case PrincipalInfo::TSystemPrincipalInfo:
++    {
++      // system principal always matches
++      return true;
++    }
++    case PrincipalInfo::TNullPrincipalInfo:
++    {
++      // null principal never matches
++      return false;
++    }
++    default:
++    {
++      break;
++    }
++  }
++
++  // Clients (windows/workers) should never have an expanded principal type.
++  MOZ_CRASH("unexpected principal type!");
++}
++
+ } // anonymous namespace
+ 
+ ClientManagerService::ClientManagerService()
+ {
+   AssertIsOnBackgroundThread();
+ }
+ 
+ ClientManagerService::~ClientManagerService()
+ {
+   AssertIsOnBackgroundThread();
++  MOZ_DIAGNOSTIC_ASSERT(mSourceTable.Count() == 0);
+ 
+   MOZ_DIAGNOSTIC_ASSERT(sClientManagerServiceInstance == this);
+   sClientManagerServiceInstance = nullptr;
+ }
+ 
+ // static
+ already_AddRefed<ClientManagerService>
+ ClientManagerService::GetOrCreateInstance()
+@@ -41,10 +78,48 @@ ClientManagerService::GetOrCreateInstanc
+   if (!sClientManagerServiceInstance) {
+     sClientManagerServiceInstance = new ClientManagerService();
+   }
+ 
+   RefPtr<ClientManagerService> ref(sClientManagerServiceInstance);
+   return ref.forget();
+ }
+ 
++void
++ClientManagerService::AddSource(ClientSourceParent* aSource)
++{
++  AssertIsOnBackgroundThread();
++  MOZ_ASSERT(aSource);
++  auto entry = mSourceTable.LookupForAdd(aSource->Info().Id());
++  MOZ_DIAGNOSTIC_ASSERT(!entry);
++  entry.OrInsert([&] { return aSource; });
++}
++
++void
++ClientManagerService::RemoveSource(ClientSourceParent* aSource)
++{
++  AssertIsOnBackgroundThread();
++  MOZ_ASSERT(aSource);
++  auto entry = mSourceTable.Lookup(aSource->Info().Id());
++  MOZ_DIAGNOSTIC_ASSERT(entry);
++  entry.Remove();
++}
++
++ClientSourceParent*
++ClientManagerService::FindSource(const nsID& aID, const PrincipalInfo& aPrincipalInfo)
++{
++  AssertIsOnBackgroundThread();
++
++  auto entry = mSourceTable.Lookup(aID);
++  if (!entry) {
++    return nullptr;
++  }
++
++  ClientSourceParent* source = entry.Data();
++  if (!MatchPrincipalInfo(source->Info().PrincipalInfo(), aPrincipalInfo)) {
++    return nullptr;
++  }
++
++  return source;
++}
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/clients/manager/ClientManagerService.h b/dom/clients/manager/ClientManagerService.h
+--- a/dom/clients/manager/ClientManagerService.h
++++ b/dom/clients/manager/ClientManagerService.h
+@@ -1,31 +1,49 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ #ifndef _mozilla_dom_ClientManagerService_h
+ #define _mozilla_dom_ClientManagerService_h
+ 
++#include "nsDataHashtable.h"
++
+ namespace mozilla {
+ 
+ namespace dom {
+ 
++class ClientSourceParent;
++
+ // Define a singleton service to manage client activity throughout the
+ // browser.  This service runs on the PBackground thread.  To interact
+ // it with it please use the ClientManager and ClientHandle classes.
+ class ClientManagerService final
+ {
++  // Store the ClientSourceParent objects in a hash table.  We want to
++  // optimize for insertion, removal, and lookup by UUID.
++  nsDataHashtable<nsIDHashKey, ClientSourceParent*> mSourceTable;
++
+   ClientManagerService();
+   ~ClientManagerService();
+ 
+ public:
+   static already_AddRefed<ClientManagerService>
+   GetOrCreateInstance();
+ 
++  void
++  AddSource(ClientSourceParent* aSource);
++
++  void
++  RemoveSource(ClientSourceParent* aSource);
++
++  ClientSourceParent*
++  FindSource(const nsID& aID,
++             const mozilla::ipc::PrincipalInfo& aPrincipalInfo);
++
+   NS_INLINE_DECL_REFCOUNTING(mozilla::dom::ClientManagerService)
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // _mozilla_dom_ClientManagerService_h
+diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSource.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/clients/manager/ClientSource.cpp
+@@ -0,0 +1,68 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "ClientSource.h"
++
++#include "ClientManager.h"
++#include "ClientManagerChild.h"
++#include "ClientSourceChild.h"
++#include "mozilla/dom/ClientIPCTypes.h"
++
++namespace mozilla {
++namespace dom {
++
++using mozilla::ipc::PrincipalInfo;
++
++void
++ClientSource::Shutdown()
++{
++  NS_ASSERT_OWNINGTHREAD(ClientSource);
++  if (IsShutdown()) {
++    return;
++  }
++
++  ShutdownThing();
++
++  mManager = nullptr;
++}
++
++ClientSource::ClientSource(ClientManager* aManager,
++                           const ClientSourceConstructorArgs& aArgs)
++  : mManager(aManager)
++  , mClientInfo(aArgs.id(), aArgs.type(), aArgs.principalInfo(), aArgs.creationTime())
++{
++  MOZ_ASSERT(mManager);
++}
++
++void
++ClientSource::Activate(PClientManagerChild* aActor)
++{
++  NS_ASSERT_OWNINGTHREAD(ClientSource);
++  MOZ_ASSERT(!GetActor());
++
++  if (IsShutdown()) {
++    return;
++  }
++
++  ClientSourceConstructorArgs args(mClientInfo.Id(), mClientInfo.Type(),
++                                   mClientInfo.PrincipalInfo(),
++                                   mClientInfo.CreationTime());
++  PClientSourceChild* actor = aActor->SendPClientSourceConstructor(args);
++  if (!actor) {
++    Shutdown();
++    return;
++  }
++
++  ActivateThing(static_cast<ClientSourceChild*>(actor));
++}
++
++ClientSource::~ClientSource()
++{
++  Shutdown();
++}
++
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/clients/manager/ClientSource.h b/dom/clients/manager/ClientSource.h
+new file mode 100644
+--- /dev/null
++++ b/dom/clients/manager/ClientSource.h
+@@ -0,0 +1,61 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++#ifndef _mozilla_dom_ClientSource_h
++#define _mozilla_dom_ClientSource_h
++
++#include "mozilla/dom/ClientInfo.h"
++#include "mozilla/dom/ClientThing.h"
++
++#ifdef XP_WIN
++#undef PostMessage
++#endif
++
++namespace mozilla {
++namespace dom {
++
++class ClientManager;
++class ClientSourceChild;
++class ClientSourceConstructorArgs;
++class PClientManagerChild;
++
++namespace workers {
++class WorkerPrivate;
++} // workers namespace
++
++// ClientSource is an RAII style class that is designed to be held via
++// a UniquePtr<>.  When created ClientSource will register the existence
++// of a client in the cross-process ClientManagerService.  When the
++// ClientSource is destroyed then client entry will be removed.  Code
++// that represents globals or browsing environments, such as nsGlobalWindow
++// or WorkerPrivate, should use ClientManager to create a ClientSource.
++class ClientSource final : public ClientThing<ClientSourceChild>
++{
++  friend class ClientManager;
++
++  NS_DECL_OWNINGTHREAD
++
++  RefPtr<ClientManager> mManager;
++
++  ClientInfo mClientInfo;
++
++  void
++  Shutdown();
++
++  // Private methods called by ClientManager
++  ClientSource(ClientManager* aManager,
++               const ClientSourceConstructorArgs& aArgs);
++
++  void
++  Activate(PClientManagerChild* aActor);
++
++public:
++  ~ClientSource();
++};
++
++} // namespace dom
++} // namespace mozilla
++
++#endif // _mozilla_dom_ClientSource_h
+diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/ClientSourceParent.cpp
+--- a/dom/clients/manager/ClientSourceParent.cpp
++++ b/dom/clients/manager/ClientSourceParent.cpp
+@@ -23,16 +23,17 @@ ClientSourceParent::RecvTeardown()
+ {
+   Unused << Send__delete__(this);
+   return IPC_OK();
+ }
+ 
+ void
+ ClientSourceParent::ActorDestroy(ActorDestroyReason aReason)
+ {
++  mService->RemoveSource(this);
+ }
+ 
+ PClientSourceOpParent*
+ ClientSourceParent::AllocPClientSourceOpParent(const ClientOpConstructorArgs& aArgs)
+ {
+   MOZ_ASSERT_UNREACHABLE("ClientSourceOpParent should be explicitly constructed.");
+   return nullptr;
+ }
+@@ -40,18 +41,26 @@ ClientSourceParent::AllocPClientSourceOp
+ bool
+ ClientSourceParent::DeallocPClientSourceOpParent(PClientSourceOpParent* aActor)
+ {
+   delete aActor;
+   return true;
+ }
+ 
+ ClientSourceParent::ClientSourceParent(const ClientSourceConstructorArgs& aArgs)
+-  : mService(ClientManagerService::GetOrCreateInstance())
++  : mClientInfo(aArgs.id(), aArgs.type(), aArgs.principalInfo(), aArgs.creationTime())
++  , mService(ClientManagerService::GetOrCreateInstance())
+ {
++  mService->AddSource(this);
+ }
+ 
+ ClientSourceParent::~ClientSourceParent()
+ {
+ }
+ 
++const ClientInfo&
++ClientSourceParent::Info() const
++{
++  return mClientInfo;
++}
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/clients/manager/ClientSourceParent.h b/dom/clients/manager/ClientSourceParent.h
+--- a/dom/clients/manager/ClientSourceParent.h
++++ b/dom/clients/manager/ClientSourceParent.h
+@@ -1,25 +1,27 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ #ifndef _mozilla_dom_ClientSourceParent_h
+ #define _mozilla_dom_ClientSourceParent_h
+ 
++#include "ClientInfo.h"
+ #include "mozilla/dom/PClientSourceParent.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ class ClientManagerService;
+ 
+ class ClientSourceParent final : public PClientSourceParent
+ {
++  ClientInfo mClientInfo;
+   RefPtr<ClientManagerService> mService;
+ 
+   // PClientSourceParent
+   IPCResult
+   RecvTeardown() override;
+ 
+   void
+   ActorDestroy(ActorDestroyReason aReason) override;
+@@ -28,14 +30,17 @@ class ClientSourceParent final : public 
+   AllocPClientSourceOpParent(const ClientOpConstructorArgs& aArgs) override;
+ 
+   bool
+   DeallocPClientSourceOpParent(PClientSourceOpParent* aActor) override;
+ 
+ public:
+   explicit ClientSourceParent(const ClientSourceConstructorArgs& aArgs);
+   ~ClientSourceParent();
++
++  const ClientInfo&
++  Info() const;
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // _mozilla_dom_ClientSourceParent_h
+diff --git a/dom/clients/manager/moz.build b/dom/clients/manager/moz.build
+--- a/dom/clients/manager/moz.build
++++ b/dom/clients/manager/moz.build
+@@ -6,16 +6,17 @@
+ 
+ EXPORTS.mozilla.dom += [
+   'ClientInfo.h',
+   'ClientIPCUtils.h',
+   'ClientManager.h',
+   'ClientManagerActors.h',
+   'ClientOpenWindowOpActors.h',
+   'ClientOpPromise.h',
++  'ClientSource.h',
+   'ClientState.h',
+   'ClientThing.h',
+ ]
+ 
+ UNIFIED_SOURCES += [
+   'ClientHandleChild.cpp',
+   'ClientHandleOpChild.cpp',
+   'ClientHandleOpParent.cpp',
+@@ -28,16 +29,17 @@ UNIFIED_SOURCES += [
+   'ClientManagerOpParent.cpp',
+   'ClientManagerParent.cpp',
+   'ClientManagerService.cpp',
+   'ClientNavigateOpChild.cpp',
+   'ClientNavigateOpParent.cpp',
+   'ClientOpenWindowOpActors.cpp',
+   'ClientOpenWindowOpChild.cpp',
+   'ClientOpenWindowOpParent.cpp',
++  'ClientSource.cpp',
+   'ClientSourceChild.cpp',
+   'ClientSourceOpChild.cpp',
+   'ClientSourceOpParent.cpp',
+   'ClientSourceParent.cpp',
+   'ClientState.cpp',
+ ]
+ 
+ IPDL_SOURCES += [
