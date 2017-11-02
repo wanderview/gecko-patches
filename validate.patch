@@ -1,0 +1,540 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  1338d9412b088a2ec07a81dd7347abeb00835b6f
+Validate PrincipalInfo and creation URL.
+
+diff --git a/dom/clients/manager/ClientManagerParent.cpp b/dom/clients/manager/ClientManagerParent.cpp
+--- a/dom/clients/manager/ClientManagerParent.cpp
++++ b/dom/clients/manager/ClientManagerParent.cpp
+@@ -96,16 +96,28 @@ ClientManagerParent::AllocPClientSourceP
+ 
+ bool
+ ClientManagerParent::DeallocPClientSourceParent(PClientSourceParent* aActor)
+ {
+   delete aActor;
+   return true;
+ }
+ 
++IPCResult
++ClientManagerParent::RecvPClientSourceConstructor(PClientSourceParent* aActor,
++                                                  const ClientSourceConstructorArgs& aArgs)
++{
++  ClientSourceParent* actor = static_cast<ClientSourceParent*>(aActor);
++  if (!actor->Init()) {
++    Unused << PClientSourceParent::Send__delete__(actor);
++    return IPC_FAIL(this, "ClientSourceParent::Init() failed");
++  }
++  return IPC_OK();
++}
++
+ ClientManagerParent::ClientManagerParent()
+   : mService(ClientManagerService::GetOrCreateInstance())
+ {
+ }
+ 
+ ClientManagerParent::~ClientManagerParent()
+ {
+ }
+diff --git a/dom/clients/manager/ClientManagerParent.h b/dom/clients/manager/ClientManagerParent.h
+--- a/dom/clients/manager/ClientManagerParent.h
++++ b/dom/clients/manager/ClientManagerParent.h
+@@ -51,16 +51,20 @@ class ClientManagerParent final : public
+   DeallocPClientNavigateOpParent(PClientNavigateOpParent* aActor) override;
+ 
+   PClientSourceParent*
+   AllocPClientSourceParent(const ClientSourceConstructorArgs& aArgs) override;
+ 
+   bool
+   DeallocPClientSourceParent(PClientSourceParent* aActor) override;
+ 
++  mozilla::ipc::IPCResult
++  RecvPClientSourceConstructor(PClientSourceParent* aActor,
++                               const ClientSourceConstructorArgs& aArgs) override;
++
+ public:
+   ClientManagerParent();
+   ~ClientManagerParent();
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/ClientManagerService.cpp
+--- a/dom/clients/manager/ClientManagerService.cpp
++++ b/dom/clients/manager/ClientManagerService.cpp
+@@ -86,34 +86,43 @@ ClientManagerService::GetOrCreateInstanc
+   if (!sClientManagerServiceInstance) {
+     sClientManagerServiceInstance = new ClientManagerService();
+   }
+ 
+   RefPtr<ClientManagerService> ref(sClientManagerServiceInstance);
+   return ref.forget();
+ }
+ 
+-void
++bool
+ ClientManagerService::AddSource(ClientSourceParent* aSource)
+ {
+   AssertIsOnBackgroundThread();
+   MOZ_ASSERT(aSource);
+   auto entry = mSourceTable.LookupForAdd(aSource->Info().Id());
+-  MOZ_DIAGNOSTIC_ASSERT(!entry);
++  // Do not permit overwriting an existing ClientSource with the same
++  // UUID.  This would allow a spoofed ClientParentSource actor to
++  // intercept postMessage() intended for the real actor.
++  if (entry) {
++    return false;
++  }
+   entry.OrInsert([&] { return aSource; });
++  return true;
+ }
+ 
+-void
++bool
+ ClientManagerService::RemoveSource(ClientSourceParent* aSource)
+ {
+   AssertIsOnBackgroundThread();
+   MOZ_ASSERT(aSource);
+   auto entry = mSourceTable.Lookup(aSource->Info().Id());
+-  MOZ_DIAGNOSTIC_ASSERT(entry);
++  if (!entry) {
++    return false;
++  }
+   entry.Remove();
++  return true;
+ }
+ 
+ ClientSourceParent*
+ ClientManagerService::FindSource(const nsID& aID, const PrincipalInfo& aPrincipalInfo)
+ {
+   AssertIsOnBackgroundThread();
+ 
+   auto entry = mSourceTable.Lookup(aID);
+diff --git a/dom/clients/manager/ClientManagerService.h b/dom/clients/manager/ClientManagerService.h
+--- a/dom/clients/manager/ClientManagerService.h
++++ b/dom/clients/manager/ClientManagerService.h
+@@ -30,20 +30,20 @@ class ClientManagerService final
+ 
+   ClientManagerService();
+   ~ClientManagerService();
+ 
+ public:
+   static already_AddRefed<ClientManagerService>
+   GetOrCreateInstance();
+ 
+-  void
++  bool
+   AddSource(ClientSourceParent* aSource);
+ 
+-  void
++  bool
+   RemoveSource(ClientSourceParent* aSource);
+ 
+   ClientSourceParent*
+   FindSource(const nsID& aID,
+              const mozilla::ipc::PrincipalInfo& aPrincipalInfo);
+ 
+   already_AddRefed<ClientOpPromise>
+   Navigate(const ClientNavigateArgs& aArgs);
+diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/ClientSourceParent.cpp
+--- a/dom/clients/manager/ClientSourceParent.cpp
++++ b/dom/clients/manager/ClientSourceParent.cpp
+@@ -5,23 +5,225 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "ClientSourceParent.h"
+ 
+ #include "ClientHandleParent.h"
+ #include "ClientManagerService.h"
+ #include "ClientSourceOpParent.h"
+ #include "mozilla/dom/ClientIPCTypes.h"
++#include "mozilla/net/MozURL.h"
+ #include "mozilla/Unused.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
++using mozilla::ipc::ContentPrincipalInfo;
+ using mozilla::ipc::IPCResult;
+ using mozilla::ipc::PrincipalInfo;
++using mozilla::net::MozURL;
++
++bool
++ClientSourceParent::IsValidPrincipal()
++{
++  // Ideally we would verify that the source process has permission to
++  // create a window or worker with the given principal, but we don't
++  // currently have any such restriction in place.  Instead, at least
++  // verify the PrincipalInfo is an expected type and has a parsable
++  // origin/spec.
++  switch (mClientInfo.PrincipalInfo().type()) {
++    // Any system and null principal is acceptable.
++    case PrincipalInfo::TSystemPrincipalInfo:
++    case PrincipalInfo::TNullPrincipalInfo:
++    {
++      return true;
++    }
++
++    // Validate content principals to ensure that the origin and spec are sane.
++    case PrincipalInfo::TContentPrincipalInfo:
++    {
++      const ContentPrincipalInfo& content =
++        mClientInfo.PrincipalInfo().get_ContentPrincipalInfo();
++
++      // Verify the principal spec parses.
++      RefPtr<MozURL> specURL;
++      nsresult rv = MozURL::Init(getter_AddRefs(specURL), content.spec());
++      NS_ENSURE_SUCCESS(rv, false);
++
++      // Verify the principal originNoSuffix parses.
++      RefPtr<MozURL> originURL;
++      rv = MozURL::Init(getter_AddRefs(originURL),
++                        content.originNoSuffix().get_nsCString());
++      NS_ENSURE_SUCCESS(rv, false);
++
++      nsAutoCString specScheme;
++      rv = specURL->GetScheme(specScheme);
++      NS_ENSURE_SUCCESS(rv, false);
++
++      nsAutoCString originScheme;
++      rv = originURL->GetScheme(originScheme);
++      NS_ENSURE_SUCCESS(rv, false);
++
++      // View source uses a nested nsIURI concept that is not supported in
++      // MozURL.  Simply accept these windows for now.
++      if (specScheme == NS_LITERAL_CSTRING("view-source")) {
++        return true;
++      }
++
++      // The about: windows can run in a content window, but they use a special
++      // moz-safe-about origin spec that won't match below.  Check for this
++      // here and accept these windows.
++      if (specScheme == NS_LITERAL_CSTRING("about") &&
++          originScheme ==  NS_LITERAL_CSTRING("moz-safe-about")) {
++        return true;
++      }
++
++      nsAutoCString specHostname;
++      rv = specURL->GetHostname(specHostname);
++      NS_ENSURE_SUCCESS(rv, false);
++
++      nsAutoCString originHostname;
++      rv = originURL->GetHostname(originHostname);
++      NS_ENSURE_SUCCESS(rv, false);
++
++      // MozURL does not parse the origin correctly for all internal
++      // schemes, such as moz-extension.  Instead, lets just validate
++      // that the spec and originNoSuffix strings have the same scheme
++      // and hostname.
++      return specScheme == originScheme &&
++             specHostname == originHostname;
++    }
++    default:
++    {
++      break;
++    }
++  }
++
++  // Windows and workers should not have expanded URLs, etc.
++  return false;
++}
++
++bool
++ClientSourceParent::IsValidURL(const nsACString& aURL) const
++{
++  RefPtr<MozURL> url;
++  nsresult rv = MozURL::Init(getter_AddRefs(url), aURL);
++  NS_ENSURE_SUCCESS(rv, false);
++
++  switch (mClientInfo.PrincipalInfo().type()) {
++    case PrincipalInfo::TContentPrincipalInfo:
++    {
++      // Any origin can create an about:blank window.
++      if (aURL == NS_LITERAL_CSTRING("about:blank") ||
++          aURL == NS_LITERAL_CSTRING("about:srcdoc")) {
++        return true;
++      }
++
++      const ContentPrincipalInfo& content =
++        mClientInfo.PrincipalInfo().get_ContentPrincipalInfo();
++
++      nsAutoCString origin;
++      rv = url->GetOrigin(origin);
++      NS_ENSURE_SUCCESS(rv, false);
++
++      // MozURL produces the correct origin for many URLs, so check that
++      // value first.
++      if (content.originNoSuffix() == origin) {
++        return true;
++      }
++
++      nsAutoCString scheme;
++      rv = url->GetScheme(scheme);
++      NS_ENSURE_SUCCESS(rv, false);
++
++      // View source uses a nested nsIURI concept that is not supported in
++      // MozURL.  Simply accept these windows for now.
++      if (scheme == NS_LITERAL_CSTRING("view-source")) {
++        return true;
++      }
++
++      // Other about: URLs, like about:home and about:newtab, can run
++      // in with a content principal but may have a slightly different origin
++      // scheme.  Some windows use moz-safe-about: instead of about:.  Check
++      // for these allowed principal schemes explicitly here.  Note, we
++      // already handled about:blank above.
++      if (scheme == NS_LITERAL_CSTRING("about")) {
++        RefPtr<MozURL> originURL;
++        rv = MozURL::Init(getter_AddRefs(originURL),
++                          content.originNoSuffix().get_nsCString());
++        NS_ENSURE_SUCCESS(rv, false);
++
++        nsAutoCString originScheme;
++        rv = originURL->GetScheme(originScheme);
++        NS_ENSURE_SUCCESS(rv, false);
++
++        return originScheme == scheme ||
++               originScheme == NS_LITERAL_CSTRING("moz-safe-about");
++      }
++
++      // Generally any origin can also open javascript: windows and workers.
++      if (scheme == NS_LITERAL_CSTRING("javascript")) {
++        return true;
++      }
++
++      nsAutoCString hostname;
++      rv = url->GetHostname(hostname);
++      NS_ENSURE_SUCCESS(rv, false);
++
++      // If the origin string does not match, then we could just be
++      // hitting an internal URL type like moz-extension: or resource:.
++      // These should pass a simply scheme://hostname check.
++      if (content.originNoSuffix() ==
++          (scheme + NS_LITERAL_CSTRING("://") + hostname)) {
++        return true;
++      }
++
++      // Some URLs, like file:, have a principal origin matching the entire URL.
++      if (content.originNoSuffix().get_nsCString() == aURL) {
++        return true;
++      }
++
++      // Otherwise this URL does not seem to match the principal.
++      return false;
++    }
++    case PrincipalInfo::TSystemPrincipalInfo:
++    {
++      nsAutoCString scheme;
++      rv = url->GetScheme(scheme);
++      NS_ENSURE_SUCCESS(rv, false);
++
++      // While many types of documents can be created with a system principal,
++      // there are only a few that can reasonably become windows.  We attempt
++      // to validate the list of known cases here with a simple scheme check.
++      return scheme == NS_LITERAL_CSTRING("about") ||
++             scheme == NS_LITERAL_CSTRING("chrome") ||
++             scheme == NS_LITERAL_CSTRING("resource") ||
++             scheme == NS_LITERAL_CSTRING("blob") ||
++             scheme == NS_LITERAL_CSTRING("data") ||
++             scheme == NS_LITERAL_CSTRING("javascript") ||
++             scheme == NS_LITERAL_CSTRING("view-source");
++    }
++    case PrincipalInfo::TNullPrincipalInfo:
++    {
++      // A wide variety of clients can have a null principal.  For example,
++      // sandboxed iframes can have a normal content URL.  For now allow
++      // any parsable URL for null principals.  This is relatively safe since
++      // null principals have unique origins and won't most ClientManagerService
++      // queries anyway.
++      return true;
++    }
++    default:
++    {
++      break;
++    }
++  }
++
++  // Clients (windows/workers) should never have an expanded principal type.
++  return false;
++}
+ 
+ IPCResult
+ ClientSourceParent::RecvWorkerSyncPing()
+ {
+   // Do nothing here.  This is purely a sync message allowing the child to
+   // confirm that the actor has been created on the parent process.
+   return IPC_OK();
+ }
+@@ -31,28 +233,38 @@ ClientSourceParent::RecvTeardown()
+ {
+   Unused << Send__delete__(this);
+   return IPC_OK();
+ }
+ 
+ mozilla::ipc::IPCResult
+ ClientSourceParent::RecvRedirect(const ClientSourceConstructorArgs& aArgs)
+ {
+-  mService->RemoveSource(this);
++  if (NS_WARN_IF(!mService->RemoveSource(this))) {
++    return IPC_FAIL(this, "failed to remove ClientSource during redirect");
++  }
+   mClientInfo = ClientInfo(aArgs.id(), aArgs.type(), aArgs.principalInfo(),
+                            mClientInfo.CreationTime());
+-  mService->AddSource(this);
++  if (NS_WARN_IF(!mService->AddSource(this))) {
++    return IPC_FAIL(this, "failed to add ClientSource during redirect");
++  }
+   return IPC_OK();
+ }
+ 
+ IPCResult
+ ClientSourceParent::RecvExecutionReady(const ClientSourceExecutionReadyArgs& aArgs)
+ {
+-  // TODO: Validate this against nsIURI and nsIPrincipal
+-  // TODO: mark execution ready
++  // Now that we have the creation URL for the Client we can do some validation
++  // to make sure the child actor is not giving us garbage.
++  if (!IsValidURL(aArgs.url())) {
++    MOZ_DIAGNOSTIC_ASSERT(false,
++      "ClientSourceParent::RecvExecutionReady() got invalid URL");
++    return IPC_FAIL(this, "invalid ClientSource execution ready URL");
++  }
++
+   mClientInfo.SetURL(aArgs.url());
+   mClientInfo.SetFrameType(aArgs.frameType());
+   mExecutionReady = true;
+ 
+   for (ClientHandleParent* handle : mHandleList) {
+     Unused << handle->SendExecutionReady(mClientInfo.ToIPC());
+   }
+ 
+@@ -80,17 +292,17 @@ ClientSourceParent::RecvThaw()
+   MOZ_DIAGNOSTIC_ASSERT(mFrozen);
+   mFrozen = false;
+   return IPC_OK();
+ }
+ 
+ void
+ ClientSourceParent::ActorDestroy(ActorDestroyReason aReason)
+ {
+-  mService->RemoveSource(this);
++  Unused << mService->RemoveSource(this);
+ 
+   nsTArray<ClientHandleParent*> handleList;
+   mHandleList.SwapElements(handleList);
+   for (ClientHandleParent* handle : handleList) {
+     Unused << ClientHandleParent::Send__delete__(handle);
+   }
+ }
+ 
+@@ -109,25 +321,42 @@ ClientSourceParent::DeallocPClientSource
+ }
+ 
+ ClientSourceParent::ClientSourceParent(const ClientSourceConstructorArgs& aArgs)
+   : mClientInfo(aArgs.id(), aArgs.type(), aArgs.principalInfo(), aArgs.creationTime())
+   , mService(ClientManagerService::GetOrCreateInstance())
+   , mExecutionReady(false)
+   , mFrozen(false)
+ {
+-  mService->AddSource(this);
+ }
+ 
+ ClientSourceParent::~ClientSourceParent()
+ {
+   MOZ_DIAGNOSTIC_ASSERT(mHandleList.IsEmpty());
+ }
+ 
+ bool
++ClientSourceParent::Init()
++{
++  // Ensure the principal is reasonable before adding ourself to the service.
++  if (NS_WARN_IF(!IsValidPrincipal())) {
++    return false;
++  }
++
++  // Its possible for AddSource() to fail if there is already an entry for
++  // our UUID.  This should not normally happen, but could if someone is
++  // spoofing IPC messages.
++  if (NS_WARN_IF(!mService->AddSource(this))) {
++    return false;
++  }
++
++  return true;
++}
++
++bool
+ ClientSourceParent::IsFrozen() const
+ {
+   return mFrozen;
+ }
+ 
+ const ClientInfo&
+ ClientSourceParent::Info() const
+ {
+diff --git a/dom/clients/manager/ClientSourceParent.h b/dom/clients/manager/ClientSourceParent.h
+--- a/dom/clients/manager/ClientSourceParent.h
++++ b/dom/clients/manager/ClientSourceParent.h
+@@ -21,16 +21,22 @@ class ClientSourceParent final : public 
+ {
+   ClientInfo mClientInfo;
+   Maybe<ServiceWorkerDescriptor> mController;
+   RefPtr<ClientManagerService> mService;
+   nsTArray<ClientHandleParent*> mHandleList;
+   bool mExecutionReady;
+   bool mFrozen;
+ 
++  bool
++  IsValidPrincipal();
++
++  bool
++  IsValidURL(const nsACString& aURL) const;
++
+   // PClientSourceParent
+   mozilla::ipc::IPCResult
+   RecvWorkerSyncPing() override;
+ 
+   mozilla::ipc::IPCResult
+   RecvTeardown() override;
+ 
+   mozilla::ipc::IPCResult
+@@ -53,16 +59,19 @@ class ClientSourceParent final : public 
+ 
+   bool
+   DeallocPClientSourceOpParent(PClientSourceOpParent* aActor) override;
+ 
+ public:
+   explicit ClientSourceParent(const ClientSourceConstructorArgs& aArgs);
+   ~ClientSourceParent();
+ 
++  bool
++  Init();
++
+   const ClientInfo&
+   Info() const;
+ 
+   bool
+   IsFrozen() const;
+ 
+   bool
+   ExecutionReady() const;
+diff --git a/dom/clients/manager/moz.build b/dom/clients/manager/moz.build
+--- a/dom/clients/manager/moz.build
++++ b/dom/clients/manager/moz.build
+@@ -59,16 +59,17 @@ IPDL_SOURCES += [
+   'PClientSourceOp.ipdl',
+ ]
+ 
+ include('/ipc/chromium/chromium-config.mozbuild')
+ 
+ LOCAL_INCLUDES += [
+   '/dom/base',
+   '/dom/workers',
++  '/netwerk/base',
+ ]
+ 
+ FINAL_LIBRARY = 'xul'
+ 
+ MOCHITEST_MANIFESTS += [
+ ]
+ 
+ BROWSER_CHROME_MANIFESTS += [

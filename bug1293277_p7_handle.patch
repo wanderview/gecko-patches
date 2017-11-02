@@ -1,0 +1,568 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  80d4228261fbadfddbff6e26cb24de04c87af9df
+Bug 1293277 P7 Add ClientHandle class and make it attach to the correct ClientSource. r=baku
+
+diff --git a/dom/clients/manager/ClientHandle.cpp b/dom/clients/manager/ClientHandle.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/clients/manager/ClientHandle.cpp
+@@ -0,0 +1,99 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "ClientHandle.h"
++
++#include "ClientHandleChild.h"
++#include "ClientHandleOpChild.h"
++#include "ClientManager.h"
++#include "mozilla/dom/PClientManagerChild.h"
++
++namespace mozilla {
++namespace dom {
++
++ClientHandle::~ClientHandle()
++{
++  Shutdown();
++}
++
++void
++ClientHandle::Shutdown()
++{
++  NS_ASSERT_OWNINGTHREAD(ClientSource);
++  if (IsShutdown()) {
++    return;
++  }
++
++  ShutdownThing();
++
++  mManager = nullptr;
++}
++
++already_AddRefed<ClientOpPromise>
++ClientHandle::StartOp(const ClientOpConstructorArgs& aArgs)
++{
++  RefPtr<ClientOpPromise::Private> promise =
++    new ClientOpPromise::Private(__func__);
++
++  // Hold a ref to the client until the remote operation completes.  Otherwise
++  // the ClientHandle might get de-refed and teardown the actor before we
++  // get an answer.
++  RefPtr<ClientHandle> kungFuGrip = this;
++  promise->Then(mSerialEventTarget, __func__,
++                [kungFuGrip] (const ClientOpResult &) { },
++                [kungFuGrip] (nsresult) { });
++
++  MaybeExecute([aArgs, promise] (ClientHandleChild* aActor) {
++    ClientHandleOpChild* actor = new ClientHandleOpChild(aArgs, promise);
++    if (!aActor->SendPClientHandleOpConstructor(actor, aArgs)) {
++      // Constructor failure will reject promise via ActorDestroy()
++      return;
++    }
++  });
++
++  RefPtr<ClientOpPromise> ref = promise.get();
++  return ref.forget();
++}
++
++ClientHandle::ClientHandle(ClientManager* aManager,
++                           nsISerialEventTarget* aSerialEventTarget,
++                           const ClientInfo& aClientInfo)
++  : mManager(aManager)
++  , mSerialEventTarget(aSerialEventTarget)
++  , mClientInfo(aClientInfo)
++{
++  MOZ_DIAGNOSTIC_ASSERT(mManager);
++  MOZ_DIAGNOSTIC_ASSERT(mSerialEventTarget);
++  MOZ_ASSERT(mSerialEventTarget->IsOnCurrentThread());
++}
++
++void
++ClientHandle::Activate(PClientManagerChild* aActor)
++{
++  NS_ASSERT_OWNINGTHREAD(ClientHandle);
++
++  if (IsShutdown()) {
++    return;
++  }
++
++  PClientHandleChild* actor =
++    aActor->SendPClientHandleConstructor(mClientInfo.ToIPC());
++  if (!actor) {
++    Shutdown();
++    return;
++  }
++
++  ActivateThing(static_cast<ClientHandleChild*>(actor));
++}
++
++const ClientInfo&
++ClientHandle::Info() const
++{
++  return mClientInfo;
++}
++
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/clients/manager/ClientHandle.h b/dom/clients/manager/ClientHandle.h
+new file mode 100644
+--- /dev/null
++++ b/dom/clients/manager/ClientHandle.h
+@@ -0,0 +1,66 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++#ifndef _mozilla_dom_ClientHandle_h
++#define _mozilla_dom_ClientHandle_h
++
++#include "mozilla/dom/ClientInfo.h"
++#include "mozilla/dom/ClientOpPromise.h"
++#include "mozilla/dom/ClientThing.h"
++
++#ifdef XP_WIN
++#undef PostMessage
++#endif
++
++namespace mozilla {
++
++namespace dom {
++
++class ClientManager;
++class ClientHandleChild;
++class ClientOpConstructorArgs;
++class PClientManagerChild;
++
++// The ClientHandle allows code to take a simple ClientInfo struct and
++// convert it into a live actor-backed object attached to a particular
++// ClientSource somewhere in the browser.  If the ClientSource is
++// destroyed then the ClientHandle will simply begin to reject operations.
++// We do not currently provide a way to be notified when the ClientSource
++// is destroyed, but this could be added in the future.
++class ClientHandle final : public ClientThing<ClientHandleChild>
++{
++  friend class ClientManager;
++
++  RefPtr<ClientManager> mManager;
++  nsCOMPtr<nsISerialEventTarget> mSerialEventTarget;
++  ClientInfo mClientInfo;
++
++  ~ClientHandle();
++
++  void
++  Shutdown();
++
++  already_AddRefed<ClientOpPromise>
++  StartOp(const ClientOpConstructorArgs& aArgs);
++
++  // Private methods called by ClientManager
++  ClientHandle(ClientManager* aManager,
++               nsISerialEventTarget* aSerialEventTarget,
++               const ClientInfo& aClientInfo);
++
++  void
++  Activate(PClientManagerChild* aActor);
++
++public:
++  const ClientInfo&
++  Info() const;
++
++  NS_INLINE_DECL_REFCOUNTING(ClientHandle);
++};
++
++} // namespace dom
++} // namespace mozilla
++
++#endif // _mozilla_dom_ClientHandle_h
+diff --git a/dom/clients/manager/ClientHandleParent.cpp b/dom/clients/manager/ClientHandleParent.cpp
+--- a/dom/clients/manager/ClientHandleParent.cpp
++++ b/dom/clients/manager/ClientHandleParent.cpp
+@@ -22,16 +22,20 @@ ClientHandleParent::RecvTeardown()
+ {
+   Unused << Send__delete__(this);
+   return IPC_OK();
+ }
+ 
+ void
+ ClientHandleParent::ActorDestroy(ActorDestroyReason aReason)
+ {
++  if (mSource) {
++    mSource->DetachHandle(this);
++    mSource = nullptr;
++  }
+ }
+ 
+ PClientHandleOpParent*
+ ClientHandleParent::AllocPClientHandleOpParent(const ClientOpConstructorArgs& aArgs)
+ {
+   return new ClientHandleOpParent();
+ }
+ 
+@@ -48,22 +52,37 @@ ClientHandleParent::RecvPClientHandleOpC
+ {
+   auto actor = static_cast<ClientHandleOpParent*>(aActor);
+   actor->Init(aArgs);
+   return IPC_OK();
+ }
+ 
+ ClientHandleParent::ClientHandleParent()
+   : mService(ClientManagerService::GetOrCreateInstance())
++  , mSource(nullptr)
+ {
+ }
+ 
+ ClientHandleParent::~ClientHandleParent()
+ {
++  MOZ_DIAGNOSTIC_ASSERT(!mSource);
+ }
+ 
+ void
+ ClientHandleParent::Init(const IPCClientInfo& aClientInfo)
+ {
++  mSource = mService->FindSource(aClientInfo.id(), aClientInfo.principalInfo());
++  if (!mSource) {
++    Unused << Send__delete__(this);
++    return;
++  }
++
++  mSource->AttachHandle(this);
++}
++
++ClientSourceParent*
++ClientHandleParent::GetSource() const
++{
++  return mSource;
+ }
+ 
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/clients/manager/ClientHandleParent.h b/dom/clients/manager/ClientHandleParent.h
+--- a/dom/clients/manager/ClientHandleParent.h
++++ b/dom/clients/manager/ClientHandleParent.h
+@@ -7,20 +7,22 @@
+ #define _mozilla_dom_ClientHandleParent_h
+ 
+ #include "mozilla/dom/PClientHandleParent.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ class ClientManagerService;
++class ClientSourceParent;
+ 
+ class ClientHandleParent final : public PClientHandleParent
+ {
+   RefPtr<ClientManagerService> mService;
++  ClientSourceParent* mSource;
+ 
+   // PClientHandleParent interface
+   mozilla::ipc::IPCResult
+   RecvTeardown() override;
+ 
+   void
+   ActorDestroy(ActorDestroyReason aReason) override;
+ 
+@@ -35,14 +37,17 @@ class ClientHandleParent final : public 
+                                  const ClientOpConstructorArgs& aArgs) override;
+ 
+ public:
+   ClientHandleParent();
+   ~ClientHandleParent();
+ 
+   void
+   Init(const IPCClientInfo& aClientInfo);
++
++  ClientSourceParent*
++  GetSource() const;
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // _mozilla_dom_ClientHandleParent_h
+diff --git a/dom/clients/manager/ClientManager.cpp b/dom/clients/manager/ClientManager.cpp
+--- a/dom/clients/manager/ClientManager.cpp
++++ b/dom/clients/manager/ClientManager.cpp
+@@ -1,16 +1,17 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "ClientManager.h"
+ 
++#include "ClientHandle.h"
+ #include "ClientManagerChild.h"
+ #include "ClientManagerOpChild.h"
+ #include "ClientSource.h"
+ #include "mozilla/dom/WorkerPrivate.h"
+ #include "mozilla/dom/workers/bindings/WorkerHolderToken.h"
+ #include "mozilla/ipc/BackgroundChild.h"
+ #include "mozilla/ipc/PBackgroundChild.h"
+ #include "prthread.h"
+@@ -93,16 +94,34 @@ ClientManager::CreateSourceInternal(Clie
+ 
+   ClientSourceConstructorArgs args(id, aType, aPrincipal, TimeStamp::Now());
+   UniquePtr<ClientSource> source(new ClientSource(this, args));
+   source->Activate(GetActor());
+ 
+   return Move(source);
+ }
+ 
++already_AddRefed<ClientHandle>
++ClientManager::CreateHandleInternal(const ClientInfo& aClientInfo,
++                                    nsISerialEventTarget* aSerialEventTarget)
++{
++  NS_ASSERT_OWNINGTHREAD(ClientManager);
++  MOZ_DIAGNOSTIC_ASSERT(aSerialEventTarget);
++
++  if (IsShutdown()) {
++    return nullptr;
++  }
++
++  RefPtr<ClientHandle> handle = new ClientHandle(this, aSerialEventTarget,
++                                                 aClientInfo);
++  handle->Activate(GetActor());
++
++  return handle.forget();
++}
++
+ already_AddRefed<ClientOpPromise>
+ ClientManager::StartOp(const ClientOpConstructorArgs& aArgs,
+                        nsISerialEventTarget* aSerialEventTarget)
+ {
+   RefPtr<ClientOpPromise::Private> promise =
+     new ClientOpPromise::Private(__func__);
+ 
+   // Hold a ref to the client until the remote operation completes.  Otherwise
+@@ -218,10 +237,19 @@ ClientManager::CreateSource(ClientType a
+ // static
+ UniquePtr<ClientSource>
+ ClientManager::CreateSource(ClientType aType, const PrincipalInfo& aPrincipal)
+ {
+   RefPtr<ClientManager> mgr = GetOrCreateForCurrentThread();
+   return mgr->CreateSourceInternal(aType, aPrincipal);
+ }
+ 
++// static
++already_AddRefed<ClientHandle>
++ClientManager::CreateHandle(const ClientInfo& aClientInfo,
++                            nsISerialEventTarget* aSerialEventTarget)
++{
++  RefPtr<ClientManager> mgr = GetOrCreateForCurrentThread();
++  return mgr->CreateHandleInternal(aClientInfo, aSerialEventTarget);
++}
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/clients/manager/ClientManager.h b/dom/clients/manager/ClientManager.h
+--- a/dom/clients/manager/ClientManager.h
++++ b/dom/clients/manager/ClientManager.h
+@@ -10,16 +10,18 @@
+ #include "mozilla/dom/ClientThing.h"
+ 
+ namespace mozilla {
+ namespace ipc {
+ class PBackgroundChild;
+ } // namespace ipc
+ namespace dom {
+ 
++class ClientHandle;
++class ClientInfo;
+ class ClientManagerChild;
+ class ClientOpConstructorArgs;
+ class ClientSource;
+ enum class ClientType : uint8_t;
+ 
+ namespace workers {
+ class WorkerPrivate;
+ } // workers namespace
+@@ -41,16 +43,20 @@ class ClientManager final : public Clien
+   // is dropped.
+   void
+   Shutdown();
+ 
+   UniquePtr<ClientSource>
+   CreateSourceInternal(ClientType aType,
+                        const mozilla::ipc::PrincipalInfo& aPrincipal);
+ 
++  already_AddRefed<ClientHandle>
++  CreateHandleInternal(const ClientInfo& aClientInfo,
++                       nsISerialEventTarget* aSerialEventTarget);
++
+   // Utility method to perform an IPC operation.  This will create a
+   // PClientManagerOp actor tied to a MozPromise.  The promise will
+   // resolve or reject with the result of the remote operation.
+   already_AddRefed<ClientOpPromise>
+   StartOp(const ClientOpConstructorArgs& aArgs,
+           nsISerialEventTarget* aSerialEventTarget);
+ 
+   // Utility method that handles actor-based initialization.
+@@ -75,15 +81,19 @@ public:
+   Startup();
+ 
+   static UniquePtr<ClientSource>
+   CreateSource(ClientType aType, nsIPrincipal* aPrincipal);
+ 
+   static UniquePtr<ClientSource>
+   CreateSource(ClientType aType, const mozilla::ipc::PrincipalInfo& aPrincipal);
+ 
++  static already_AddRefed<ClientHandle>
++  CreateHandle(const ClientInfo& aClientInfo,
++               nsISerialEventTarget* aSerialEventTarget);
++
+   NS_INLINE_DECL_REFCOUNTING(mozilla::dom::ClientManager)
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // _mozilla_dom_ClientManager_h
+diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/ClientSourceParent.cpp
+--- a/dom/clients/manager/ClientSourceParent.cpp
++++ b/dom/clients/manager/ClientSourceParent.cpp
+@@ -24,16 +24,22 @@ ClientSourceParent::RecvTeardown()
+   Unused << Send__delete__(this);
+   return IPC_OK();
+ }
+ 
+ void
+ ClientSourceParent::ActorDestroy(ActorDestroyReason aReason)
+ {
+   mService->RemoveSource(this);
++
++  nsTArray<ClientHandleParent*> handleList;
++  mHandleList.SwapElements(handleList);
++  for (ClientHandleParent* handle : handleList) {
++    Unused << ClientHandleParent::Send__delete__(handle);
++  }
+ }
+ 
+ PClientSourceOpParent*
+ ClientSourceParent::AllocPClientSourceOpParent(const ClientOpConstructorArgs& aArgs)
+ {
+   MOZ_ASSERT_UNREACHABLE("ClientSourceOpParent should be explicitly constructed.");
+   return nullptr;
+ }
+@@ -49,18 +55,34 @@ ClientSourceParent::ClientSourceParent(c
+   : mClientInfo(aArgs.id(), aArgs.type(), aArgs.principalInfo(), aArgs.creationTime())
+   , mService(ClientManagerService::GetOrCreateInstance())
+ {
+   mService->AddSource(this);
+ }
+ 
+ ClientSourceParent::~ClientSourceParent()
+ {
++  MOZ_DIAGNOSTIC_ASSERT(mHandleList.IsEmpty());
+ }
+ 
+ const ClientInfo&
+ ClientSourceParent::Info() const
+ {
+   return mClientInfo;
+ }
+ 
++void
++ClientSourceParent::AttachHandle(ClientHandleParent* aClientHandle)
++{
++  MOZ_DIAGNOSTIC_ASSERT(aClientHandle);
++  MOZ_ASSERT(!mHandleList.Contains(aClientHandle));
++  mHandleList.AppendElement(aClientHandle);
++}
++
++void
++ClientSourceParent::DetachHandle(ClientHandleParent* aClientHandle)
++{
++  MOZ_DIAGNOSTIC_ASSERT(aClientHandle);
++  mHandleList.RemoveElement(aClientHandle);
++}
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/clients/manager/ClientSourceParent.h b/dom/clients/manager/ClientSourceParent.h
+--- a/dom/clients/manager/ClientSourceParent.h
++++ b/dom/clients/manager/ClientSourceParent.h
+@@ -7,22 +7,24 @@
+ #define _mozilla_dom_ClientSourceParent_h
+ 
+ #include "ClientInfo.h"
+ #include "mozilla/dom/PClientSourceParent.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
++class ClientHandleParent;
+ class ClientManagerService;
+ 
+ class ClientSourceParent final : public PClientSourceParent
+ {
+   ClientInfo mClientInfo;
+   RefPtr<ClientManagerService> mService;
++  nsTArray<ClientHandleParent*> mHandleList;
+ 
+   // PClientSourceParent
+   IPCResult
+   RecvTeardown() override;
+ 
+   void
+   ActorDestroy(ActorDestroyReason aReason) override;
+ 
+@@ -33,14 +35,20 @@ class ClientSourceParent final : public 
+   DeallocPClientSourceOpParent(PClientSourceOpParent* aActor) override;
+ 
+ public:
+   explicit ClientSourceParent(const ClientSourceConstructorArgs& aArgs);
+   ~ClientSourceParent();
+ 
+   const ClientInfo&
+   Info() const;
++
++  void
++  AttachHandle(ClientHandleParent* aClientSource);
++
++  void
++  DetachHandle(ClientHandleParent* aClientSource);
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // _mozilla_dom_ClientSourceParent_h
+diff --git a/dom/clients/manager/moz.build b/dom/clients/manager/moz.build
+--- a/dom/clients/manager/moz.build
++++ b/dom/clients/manager/moz.build
+@@ -1,27 +1,29 @@
+ # -*- Mode: python; indent-tabs-mode: nil; tab-width: 40 -*-
+ # vim: set filetype=python:
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ EXPORTS.mozilla.dom += [
++  'ClientHandle.h',
+   'ClientInfo.h',
+   'ClientIPCUtils.h',
+   'ClientManager.h',
+   'ClientManagerActors.h',
+   'ClientOpenWindowOpActors.h',
+   'ClientOpPromise.h',
+   'ClientSource.h',
+   'ClientState.h',
+   'ClientThing.h',
+ ]
+ 
+ UNIFIED_SOURCES += [
++  'ClientHandle.cpp',
+   'ClientHandleChild.cpp',
+   'ClientHandleOpChild.cpp',
+   'ClientHandleOpParent.cpp',
+   'ClientHandleParent.cpp',
+   'ClientInfo.cpp',
+   'ClientManager.cpp',
+   'ClientManagerActors.cpp',
+   'ClientManagerChild.cpp',
