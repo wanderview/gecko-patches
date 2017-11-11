@@ -1,0 +1,425 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  092ccc6335a529133a8412a8f1bf1cdda872c6a9
+Bug 1293277 P1 Validate ClientSource creation path across IPC boundary. r=baku
+
+diff --git a/dom/clients/manager/ClientManagerParent.cpp b/dom/clients/manager/ClientManagerParent.cpp
+--- a/dom/clients/manager/ClientManagerParent.cpp
++++ b/dom/clients/manager/ClientManagerParent.cpp
+@@ -96,16 +96,25 @@ ClientManagerParent::AllocPClientSourceP
+ 
+ bool
+ ClientManagerParent::DeallocPClientSourceParent(PClientSourceParent* aActor)
+ {
+   delete aActor;
+   return true;
+ }
+ 
++IPCResult
++ClientManagerParent::RecvPClientSourceConstructor(PClientSourceParent* aActor,
++                                                  const ClientSourceConstructorArgs& aArgs)
++{
++  ClientSourceParent* actor = static_cast<ClientSourceParent*>(aActor);
++  actor->Init();
++  return IPC_OK();
++}
++
+ ClientManagerParent::ClientManagerParent()
+   : mService(ClientManagerService::GetOrCreateInstance())
+ {
+ }
+ 
+ ClientManagerParent::~ClientManagerParent()
+ {
+ }
+diff --git a/dom/clients/manager/ClientManagerParent.h b/dom/clients/manager/ClientManagerParent.h
+--- a/dom/clients/manager/ClientManagerParent.h
++++ b/dom/clients/manager/ClientManagerParent.h
+@@ -51,16 +51,20 @@ class ClientManagerParent final : public
+   DeallocPClientNavigateOpParent(PClientNavigateOpParent* aActor) override;
+ 
+   PClientSourceParent*
+   AllocPClientSourceParent(const ClientSourceConstructorArgs& aArgs) override;
+ 
+   bool
+   DeallocPClientSourceParent(PClientSourceParent* aActor) override;
+ 
++  mozilla::ipc::IPCResult
++  RecvPClientSourceConstructor(PClientSourceParent* aActor,
++                               const ClientSourceConstructorArgs& aArgs) override;
++
+ public:
+   ClientManagerParent();
+   ~ClientManagerParent();
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/ClientManagerService.cpp
+--- a/dom/clients/manager/ClientManagerService.cpp
++++ b/dom/clients/manager/ClientManagerService.cpp
+@@ -78,34 +78,43 @@ ClientManagerService::GetOrCreateInstanc
+   if (!sClientManagerServiceInstance) {
+     sClientManagerServiceInstance = new ClientManagerService();
+   }
+ 
+   RefPtr<ClientManagerService> ref(sClientManagerServiceInstance);
+   return ref.forget();
+ }
+ 
+-void
++bool
+ ClientManagerService::AddSource(ClientSourceParent* aSource)
+ {
+   AssertIsOnBackgroundThread();
+   MOZ_ASSERT(aSource);
+   auto entry = mSourceTable.LookupForAdd(aSource->Info().Id());
+-  MOZ_DIAGNOSTIC_ASSERT(!entry);
++  // Do not permit overwriting an existing ClientSource with the same
++  // UUID.  This would allow a spoofed ClientParentSource actor to
++  // intercept postMessage() intended for the real actor.
++  if (entry) {
++    return false;
++  }
+   entry.OrInsert([&] { return aSource; });
++  return true;
+ }
+ 
+-void
++bool
+ ClientManagerService::RemoveSource(ClientSourceParent* aSource)
+ {
+   AssertIsOnBackgroundThread();
+   MOZ_ASSERT(aSource);
+   auto entry = mSourceTable.Lookup(aSource->Info().Id());
+-  MOZ_DIAGNOSTIC_ASSERT(entry);
++  if (!entry) {
++    return false;
++  }
+   entry.Remove();
++  return true;
+ }
+ 
+ ClientSourceParent*
+ ClientManagerService::FindSource(const nsID& aID, const PrincipalInfo& aPrincipalInfo)
+ {
+   AssertIsOnBackgroundThread();
+ 
+   auto entry = mSourceTable.Lookup(aID);
+diff --git a/dom/clients/manager/ClientManagerService.h b/dom/clients/manager/ClientManagerService.h
+--- a/dom/clients/manager/ClientManagerService.h
++++ b/dom/clients/manager/ClientManagerService.h
+@@ -25,20 +25,20 @@ class ClientManagerService final
+ 
+   ClientManagerService();
+   ~ClientManagerService();
+ 
+ public:
+   static already_AddRefed<ClientManagerService>
+   GetOrCreateInstance();
+ 
+-  void
++  bool
+   AddSource(ClientSourceParent* aSource);
+ 
+-  void
++  bool
+   RemoveSource(ClientSourceParent* aSource);
+ 
+   ClientSourceParent*
+   FindSource(const nsID& aID,
+              const mozilla::ipc::PrincipalInfo& aPrincipalInfo);
+ 
+   NS_INLINE_DECL_REFCOUNTING(mozilla::dom::ClientManagerService)
+ };
+diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSource.cpp
+--- a/dom/clients/manager/ClientSource.cpp
++++ b/dom/clients/manager/ClientSource.cpp
+@@ -4,16 +4,17 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "ClientSource.h"
+ 
+ #include "ClientManager.h"
+ #include "ClientManagerChild.h"
+ #include "ClientSourceChild.h"
++#include "ClientValidation.h"
+ #include "mozilla/dom/ClientIPCTypes.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ using mozilla::ipc::PrincipalInfo;
+ 
+ void
+@@ -42,16 +43,25 @@ ClientSource::Activate(PClientManagerChi
+ {
+   NS_ASSERT_OWNINGTHREAD(ClientSource);
+   MOZ_ASSERT(!GetActor());
+ 
+   if (IsShutdown()) {
+     return;
+   }
+ 
++  // Fast fail if we don't understand this particular kind of PrincipalInfo.
++  // This can happen since we use MozURL for validation which does not handle
++  // some of the more obscure internal principal/url combinations.  Normal
++  // content pages will pass this check.
++  if (NS_WARN_IF(!ClientIsValidPrincipalInfo(mClientInfo.PrincipalInfo()))) {
++    Shutdown();
++    return;
++  }
++
+   ClientSourceConstructorArgs args(mClientInfo.Id(), mClientInfo.Type(),
+                                    mClientInfo.PrincipalInfo(),
+                                    mClientInfo.CreationTime());
+   PClientSourceChild* actor = aActor->SendPClientSourceConstructor(args);
+   if (!actor) {
+     Shutdown();
+     return;
+   }
+diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/ClientSourceParent.cpp
+--- a/dom/clients/manager/ClientSourceParent.cpp
++++ b/dom/clients/manager/ClientSourceParent.cpp
+@@ -4,16 +4,17 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "ClientSourceParent.h"
+ 
+ #include "ClientHandleParent.h"
+ #include "ClientManagerService.h"
+ #include "ClientSourceOpParent.h"
++#include "ClientValidation.h"
+ #include "mozilla/dom/ClientIPCTypes.h"
+ #include "mozilla/Unused.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ using mozilla::ipc::IPCResult;
+ using mozilla::ipc::PrincipalInfo;
+@@ -23,17 +24,18 @@ ClientSourceParent::RecvTeardown()
+ {
+   Unused << Send__delete__(this);
+   return IPC_OK();
+ }
+ 
+ void
+ ClientSourceParent::ActorDestroy(ActorDestroyReason aReason)
+ {
+-  mService->RemoveSource(this);
++  DebugOnly<bool> removed = mService->RemoveSource(this);
++  MOZ_ASSERT(removed);
+ 
+   nsTArray<ClientHandleParent*> handleList(mHandleList);
+   for (ClientHandleParent* handle : handleList) {
+     // This should trigger DetachHandle() to be called removing
+     // the entry from the mHandleList.
+     Unused << ClientHandleParent::Send__delete__(handle);
+   }
+   MOZ_DIAGNOSTIC_ASSERT(mHandleList.IsEmpty());
+@@ -52,24 +54,45 @@ ClientSourceParent::DeallocPClientSource
+   delete aActor;
+   return true;
+ }
+ 
+ ClientSourceParent::ClientSourceParent(const ClientSourceConstructorArgs& aArgs)
+   : mClientInfo(aArgs.id(), aArgs.type(), aArgs.principalInfo(), aArgs.creationTime())
+   , mService(ClientManagerService::GetOrCreateInstance())
+ {
+-  mService->AddSource(this);
+ }
+ 
+ ClientSourceParent::~ClientSourceParent()
+ {
+   MOZ_DIAGNOSTIC_ASSERT(mHandleList.IsEmpty());
+ }
+ 
++void
++ClientSourceParent::Init()
++{
++  // Ensure the principal is reasonable before adding ourself to the service.
++  // Since we validate the principal on the child side as well, any failure
++  // here is treated as fatal.
++  if (NS_WARN_IF(!ClientIsValidPrincipalInfo(mClientInfo.PrincipalInfo()))) {
++    MOZ_CRASH("ClientSourceParent::Init() got invalid principal");
++    return;
++  }
++
++  // Its possible for AddSource() to fail if there is already an entry for
++  // our UUID.  This should not normally happen, but could if someone is
++  // spoofing IPC messages.
++  if (NS_WARN_IF(!mService->AddSource(this))) {
++    MOZ_DIAGNOSTIC_ASSERT(false,
++      "ClientSourceParent::Init() failed to add to service");
++    Unused << Send__delete__(this);
++    return;
++  }
++}
++
+ const ClientInfo&
+ ClientSourceParent::Info() const
+ {
+   return mClientInfo;
+ }
+ 
+ void
+ ClientSourceParent::AttachHandle(ClientHandleParent* aClientHandle)
+diff --git a/dom/clients/manager/ClientSourceParent.h b/dom/clients/manager/ClientSourceParent.h
+--- a/dom/clients/manager/ClientSourceParent.h
++++ b/dom/clients/manager/ClientSourceParent.h
+@@ -33,16 +33,19 @@ class ClientSourceParent final : public 
+ 
+   bool
+   DeallocPClientSourceOpParent(PClientSourceOpParent* aActor) override;
+ 
+ public:
+   explicit ClientSourceParent(const ClientSourceConstructorArgs& aArgs);
+   ~ClientSourceParent();
+ 
++  void
++  Init();
++
+   const ClientInfo&
+   Info() const;
+ 
+   void
+   AttachHandle(ClientHandleParent* aClientSource);
+ 
+   void
+   DetachHandle(ClientHandleParent* aClientSource);
+diff --git a/dom/clients/manager/ClientValidation.cpp b/dom/clients/manager/ClientValidation.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/clients/manager/ClientValidation.cpp
+@@ -0,0 +1,78 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "ClientValidation.h"
++
++#include "mozilla/net/MozURL.h"
++
++namespace mozilla {
++namespace dom {
++
++using mozilla::ipc::ContentPrincipalInfo;
++using mozilla::ipc::PrincipalInfo;
++using mozilla::net::MozURL;
++
++bool
++ClientIsValidPrincipalInfo(const PrincipalInfo& aPrincipalInfo)
++{
++  // Ideally we would verify that the source process has permission to
++  // create a window or worker with the given principal, but we don't
++  // currently have any such restriction in place.  Instead, at least
++  // verify the PrincipalInfo is an expected type and has a parsable
++  // origin/spec.
++  switch (aPrincipalInfo.type()) {
++    // Any system and null principal is acceptable.
++    case PrincipalInfo::TSystemPrincipalInfo:
++    case PrincipalInfo::TNullPrincipalInfo:
++    {
++      return true;
++    }
++
++    // Validate content principals to ensure that the origin and spec are sane.
++    case PrincipalInfo::TContentPrincipalInfo:
++    {
++      const ContentPrincipalInfo& content =
++       aPrincipalInfo.get_ContentPrincipalInfo();
++
++      // Verify the principal spec parses.
++      RefPtr<MozURL> specURL;
++      nsresult rv = MozURL::Init(getter_AddRefs(specURL), content.spec());
++      NS_ENSURE_SUCCESS(rv, false);
++
++      // Verify the principal originNoSuffix parses.
++      RefPtr<MozURL> originURL;
++      rv = MozURL::Init(getter_AddRefs(originURL),
++                        content.originNoSuffix().get_nsCString());
++      NS_ENSURE_SUCCESS(rv, false);
++
++      nsAutoCString originOrigin;
++      rv = originURL->GetOrigin(originOrigin);
++      NS_ENSURE_SUCCESS(rv, false);
++
++      nsAutoCString specOrigin;
++      rv = specURL->GetOrigin(specOrigin);
++      NS_ENSURE_SUCCESS(rv, false);
++
++      // For now require Clients to have a principal where both its
++      // originNoSuffix and spec have the same origin.  This will
++      // exclude a variety of unusual combinations within the browser
++      // but its adequate for the features need to support right now.
++      // If necessary we could expand this function to handle more
++      // cases in the future.
++      return specOrigin == originOrigin;
++    }
++    default:
++    {
++      break;
++    }
++  }
++
++  // Windows and workers should not have expanded URLs, etc.
++  return false;
++}
++
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/clients/manager/ClientValidation.h b/dom/clients/manager/ClientValidation.h
+new file mode 100644
+--- /dev/null
++++ b/dom/clients/manager/ClientValidation.h
+@@ -0,0 +1,23 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++#ifndef _mozilla_dom_ClientValidation_h
++#define _mozilla_dom_ClientValidation_h
++
++namespace mozilla {
++
++namespace ipc {
++  class PrincipalInfo;
++} // namespace ipc
++
++namespace dom {
++
++bool
++ClientIsValidPrincipalInfo(const mozilla::ipc::PrincipalInfo& aPrincipalInfo);
++
++} // namespace dom
++} // namespace mozilla
++
++#endif // _mozilla_dom_ClientValidation_h
+diff --git a/dom/clients/manager/moz.build b/dom/clients/manager/moz.build
+--- a/dom/clients/manager/moz.build
++++ b/dom/clients/manager/moz.build
+@@ -37,16 +37,17 @@ UNIFIED_SOURCES += [
+   'ClientOpenWindowOpChild.cpp',
+   'ClientOpenWindowOpParent.cpp',
+   'ClientSource.cpp',
+   'ClientSourceChild.cpp',
+   'ClientSourceOpChild.cpp',
+   'ClientSourceOpParent.cpp',
+   'ClientSourceParent.cpp',
+   'ClientState.cpp',
++  'ClientValidation.cpp',
+ ]
+ 
+ IPDL_SOURCES += [
+   'ClientIPCTypes.ipdlh',
+   'PClientHandle.ipdl',
+   'PClientHandleOp.ipdl',
+   'PClientManager.ipdl',
+   'PClientManagerOp.ipdl',
