@@ -1,0 +1,886 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  648950f5961058f172dfaa0eff03902b1cc76cac
+Bug 1293277 P2 Add a way for the window/worker/docshell to mark a ClientSource execution ready. r=baku
+
+diff --git a/dom/clients/manager/ClientHandle.cpp b/dom/clients/manager/ClientHandle.cpp
+--- a/dom/clients/manager/ClientHandle.cpp
++++ b/dom/clients/manager/ClientHandle.cpp
+@@ -84,16 +84,22 @@ ClientHandle::Activate(PClientManagerChi
+   if (!actor) {
+     Shutdown();
+     return;
+   }
+ 
+   ActivateThing(static_cast<ClientHandleChild*>(actor));
+ }
+ 
++void
++ClientHandle::ExecutionReady(const ClientInfo& aClientInfo)
++{
++  mClientInfo = aClientInfo;
++}
++
+ const ClientInfo&
+ ClientHandle::Info() const
+ {
+   return mClientInfo;
+ }
+ 
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/clients/manager/ClientHandle.h b/dom/clients/manager/ClientHandle.h
+--- a/dom/clients/manager/ClientHandle.h
++++ b/dom/clients/manager/ClientHandle.h
+@@ -27,29 +27,34 @@ class PClientManagerChild;
+ // convert it into a live actor-backed object attached to a particular
+ // ClientSource somewhere in the browser.  If the ClientSource is
+ // destroyed then the ClientHandle will simply begin to reject operations.
+ // We do not currently provide a way to be notified when the ClientSource
+ // is destroyed, but this could be added in the future.
+ class ClientHandle final : public ClientThing<ClientHandleChild>
+ {
+   friend class ClientManager;
++  friend class ClientHandleChild;
+ 
+   RefPtr<ClientManager> mManager;
+   nsCOMPtr<nsISerialEventTarget> mSerialEventTarget;
+   ClientInfo mClientInfo;
+ 
+   ~ClientHandle();
+ 
+   void
+   Shutdown();
+ 
+   already_AddRefed<ClientOpPromise>
+   StartOp(const ClientOpConstructorArgs& aArgs);
+ 
++  // Private methods called by ClientHandleChild
++  void
++  ExecutionReady(const ClientInfo& aClientInfo);
++
+   // Private methods called by ClientManager
+   ClientHandle(ClientManager* aManager,
+                nsISerialEventTarget* aSerialEventTarget,
+                const ClientInfo& aClientInfo);
+ 
+   void
+   Activate(PClientManagerChild* aActor);
+ 
+diff --git a/dom/clients/manager/ClientHandleChild.cpp b/dom/clients/manager/ClientHandleChild.cpp
+--- a/dom/clients/manager/ClientHandleChild.cpp
++++ b/dom/clients/manager/ClientHandleChild.cpp
+@@ -9,16 +9,25 @@
+ #include "ClientHandleOpChild.h"
+ #include "mozilla/dom/ClientIPCTypes.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ using mozilla::ipc::IPCResult;
+ 
++IPCResult
++ClientHandleChild::RecvExecutionReady(const IPCClientInfo& aClientInfo)
++{
++  if (mHandle) {
++    mHandle->ExecutionReady(ClientInfo(aClientInfo));
++  }
++  return IPC_OK();
++}
++
+ void
+ ClientHandleChild::ActorDestroy(ActorDestroyReason aReason)
+ {
+   if (mHandle) {
+     mHandle->RevokeActor(this);
+ 
+     // Revoking the actor link should automatically cause the owner
+     // to call RevokeOwner() as well.
+@@ -45,25 +54,25 @@ ClientHandleChild::ClientHandleChild()
+   , mTeardownStarted(false)
+ {
+ }
+ 
+ void
+ ClientHandleChild::SetOwner(ClientThing<ClientHandleChild>* aThing)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(!mHandle);
+-  mHandle = aThing;
++  mHandle = static_cast<ClientHandle*>(aThing);
+   MOZ_DIAGNOSTIC_ASSERT(mHandle);
+ }
+ 
+ void
+ ClientHandleChild::RevokeOwner(ClientThing<ClientHandleChild>* aThing)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(mHandle);
+-  MOZ_DIAGNOSTIC_ASSERT(mHandle == aThing);
++  MOZ_DIAGNOSTIC_ASSERT(mHandle == static_cast<ClientHandle*>(aThing));
+   mHandle = nullptr;
+ }
+ 
+ void
+ ClientHandleChild::MaybeStartTeardown()
+ {
+   if (mTeardownStarted) {
+     return;
+diff --git a/dom/clients/manager/ClientHandleChild.h b/dom/clients/manager/ClientHandleChild.h
+--- a/dom/clients/manager/ClientHandleChild.h
++++ b/dom/clients/manager/ClientHandleChild.h
+@@ -14,20 +14,23 @@ namespace dom {
+ 
+ class ClientHandle;
+ class ClientInfo;
+ 
+ template <typename ActorType> class ClientThing;
+ 
+ class ClientHandleChild final : public PClientHandleChild
+ {
+-  ClientThing<ClientHandleChild>* mHandle;
++  ClientHandle* mHandle;
+   bool mTeardownStarted;
+ 
+   // PClientHandleChild interface
++  mozilla::ipc::IPCResult
++  RecvExecutionReady(const IPCClientInfo& aClientInfo) override;
++
+   void
+   ActorDestroy(ActorDestroyReason aReason) override;
+ 
+   PClientHandleOpChild*
+   AllocPClientHandleOpChild(const ClientOpConstructorArgs& aArgs) override;
+ 
+   bool
+   DeallocPClientHandleOpChild(PClientHandleOpChild* aActor) override;
+diff --git a/dom/clients/manager/ClientIPCTypes.ipdlh b/dom/clients/manager/ClientIPCTypes.ipdlh
+--- a/dom/clients/manager/ClientIPCTypes.ipdlh
++++ b/dom/clients/manager/ClientIPCTypes.ipdlh
+@@ -45,16 +45,22 @@ struct IPCClientWorkerState
+ };
+ 
+ union IPCClientState
+ {
+   IPCClientWindowState;
+   IPCClientWorkerState;
+ };
+ 
++struct ClientSourceExecutionReadyArgs
++{
++  nsCString url;
++  FrameType frameType;
++};
++
+ struct ClientOpenWindowArgs
+ {
+ };
+ 
+ struct ClientOpConstructorArgs
+ {
+ };
+ 
+diff --git a/dom/clients/manager/ClientManager.cpp b/dom/clients/manager/ClientManager.cpp
+--- a/dom/clients/manager/ClientManager.cpp
++++ b/dom/clients/manager/ClientManager.cpp
+@@ -4,16 +4,17 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "ClientManager.h"
+ 
+ #include "ClientHandle.h"
+ #include "ClientManagerChild.h"
+ #include "ClientManagerOpChild.h"
++#include "ClientPrefs.h"
+ #include "ClientSource.h"
+ #include "mozilla/dom/WorkerPrivate.h"
+ #include "mozilla/dom/workers/bindings/WorkerHolderToken.h"
+ #include "mozilla/ipc/BackgroundChild.h"
+ #include "mozilla/ipc/PBackgroundChild.h"
+ #include "prthread.h"
+ 
+ namespace mozilla {
+@@ -198,16 +199,18 @@ void
+ ClientManager::Startup()
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+ #ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+   PRStatus status =
+ #endif
+     PR_NewThreadPrivateIndex(&sClientManagerThreadLocalIndex, nullptr);
+   MOZ_DIAGNOSTIC_ASSERT(status == PR_SUCCESS);
++
++  ClientPrefsInit();
+ }
+ 
+ // static
+ UniquePtr<ClientSource>
+ ClientManager::CreateSource(ClientType aType, nsIPrincipal* aPrincipal)
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+   MOZ_ASSERT(aPrincipal);
+diff --git a/dom/clients/manager/ClientPrefs.cpp b/dom/clients/manager/ClientPrefs.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/clients/manager/ClientPrefs.cpp
+@@ -0,0 +1,33 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "ClientPrefs.h"
++
++namespace mozilla {
++namespace dom {
++
++namespace {
++
++bool gDataURLUniqueOpaqueOrigin = false;
++
++} // anonymous namespace
++
++void
++ClientPrefsInit()
++{
++  Preferences::AddBoolVarCache(&gDataURLUniqueOpaqueOrigin,
++                               "security.data_uri.unique_opaque_origin",
++                               false);
++}
++
++bool
++ClientPrefsGetDataURLUniqueOpaqueOrigin()
++{
++  return gDataURLUniqueOpaqueOrigin;
++}
++
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/clients/manager/ClientPrefs.h b/dom/clients/manager/ClientPrefs.h
+new file mode 100644
+--- /dev/null
++++ b/dom/clients/manager/ClientPrefs.h
+@@ -0,0 +1,21 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++#ifndef _mozilla_dom_ClientPrefs_h
++#define _mozilla_dom_ClientPrefs_h
++
++namespace mozilla {
++namespace dom {
++
++void
++ClientPrefsInit();
++
++bool
++ClientPrefsGetAllowUniqueOpaqueOrigin();
++
++} // namespace dom
++} // namespace mozilla
++
++#endif // _mozilla_dom_ClientPrefs_h
+diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSource.cpp
+--- a/dom/clients/manager/ClientSource.cpp
++++ b/dom/clients/manager/ClientSource.cpp
+@@ -6,38 +6,83 @@
+ 
+ #include "ClientSource.h"
+ 
+ #include "ClientManager.h"
+ #include "ClientManagerChild.h"
+ #include "ClientSourceChild.h"
+ #include "ClientValidation.h"
+ #include "mozilla/dom/ClientIPCTypes.h"
++#include "mozilla/dom/WorkerPrivate.h"
++#include "nsIDocShell.h"
++#include "nsPIDOMWindow.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
++using mozilla::dom::workers::WorkerPrivate;
+ using mozilla::ipc::PrincipalInfo;
+ 
+ void
+ ClientSource::Shutdown()
+ {
+   NS_ASSERT_OWNINGTHREAD(ClientSource);
+   if (IsShutdown()) {
+     return;
+   }
+ 
+   ShutdownThing();
+ 
+   mManager = nullptr;
+ }
+ 
++void
++ClientSource::ExecutionReady(const ClientSourceExecutionReadyArgs& aArgs)
++{
++  // Fast fail if we don't understand this particular principal/URL combination.
++  // This can happen since we use MozURL for validation which does not handle
++  // some of the more obscure internal principal/url combinations.  Normal
++  // content pages will pass this check.
++  if (NS_WARN_IF(!ClientIsValidCreationURL(mClientInfo.PrincipalInfo(),
++                                           aArgs.url()))) {
++    Shutdown();
++    return;
++  }
++
++  mClientInfo.SetURL(aArgs.url());
++  mClientInfo.SetFrameType(aArgs.frameType());
++  MaybeExecute([aArgs](PClientSourceChild* aActor) {
++    aActor->SendExecutionReady(aArgs);
++  });
++}
++
++WorkerPrivate*
++ClientSource::GetWorkerPrivate() const
++{
++  NS_ASSERT_OWNINGTHREAD(ClientSource);
++  if (!mOwner.is<WorkerPrivate*>()) {
++    return nullptr;
++  }
++  return mOwner.as<WorkerPrivate*>();
++}
++
++nsIDocShell*
++ClientSource::GetDocShell() const
++{
++  NS_ASSERT_OWNINGTHREAD(ClientSource);
++  if (!mOwner.is<nsCOMPtr<nsIDocShell>>()) {
++    return nullptr;
++  }
++  return mOwner.as<nsCOMPtr<nsIDocShell>>();
++}
++
+ ClientSource::ClientSource(ClientManager* aManager,
+                            const ClientSourceConstructorArgs& aArgs)
+   : mManager(aManager)
++  , mOwner(AsVariant(Nothing()))
+   , mClientInfo(aArgs.id(), aArgs.type(), aArgs.principalInfo(), aArgs.creationTime())
+ {
+   MOZ_ASSERT(mManager);
+ }
+ 
+ void
+ ClientSource::Activate(PClientManagerChild* aActor)
+ {
+@@ -69,10 +114,122 @@ ClientSource::Activate(PClientManagerChi
+   ActivateThing(static_cast<ClientSourceChild*>(actor));
+ }
+ 
+ ClientSource::~ClientSource()
+ {
+   Shutdown();
+ }
+ 
++nsPIDOMWindowInner*
++ClientSource::GetInnerWindow() const
++{
++  NS_ASSERT_OWNINGTHREAD(ClientSource);
++  if (!mOwner.is<RefPtr<nsPIDOMWindowInner>>()) {
++    return nullptr;
++  }
++  return mOwner.as<RefPtr<nsPIDOMWindowInner>>();
++}
++
++void
++ClientSource::WorkerExecutionReady(WorkerPrivate* aWorkerPrivate)
++{
++  MOZ_DIAGNOSTIC_ASSERT(aWorkerPrivate);
++  aWorkerPrivate->AssertIsOnWorkerThread();
++
++  // Its safe to store the WorkerPrivate* here because the ClientSource
++  // is explicitly destroyed by WorkerPrivate before exiting its run loop.
++  MOZ_DIAGNOSTIC_ASSERT(mOwner.is<Nothing>());
++  mOwner = AsVariant(aWorkerPrivate);
++
++  ClientSourceExecutionReadyArgs args(
++    aWorkerPrivate->GetLocationInfo().mHref,
++    FrameType::None);
++
++  ExecutionReady(args);
++}
++
++nsresult
++ClientSource::WindowExecutionReady(nsPIDOMWindowInner* aInnerWindow)
++{
++  MOZ_ASSERT(NS_IsMainThread());
++  MOZ_DIAGNOSTIC_ASSERT(aInnerWindow);
++  MOZ_DIAGNOSTIC_ASSERT(aInnerWindow->IsCurrentInnerWindow());
++  MOZ_DIAGNOSTIC_ASSERT(aInnerWindow->HasActiveDocument());
++
++  nsIDocument* doc = aInnerWindow->GetExtantDoc();
++  if (NS_WARN_IF(!doc)) {
++    return NS_ERROR_UNEXPECTED;
++  }
++
++  nsCString spec;
++
++  nsIURI* uri = doc->GetOriginalURI();
++  if (uri) {
++    nsresult rv = uri->GetSpec(spec);
++    if (NS_WARN_IF(NS_FAILED(rv))) {
++      return rv;
++    }
++  }
++
++  nsPIDOMWindowOuter* outer = aInnerWindow->GetOuterWindow();
++  if (NS_WARN_IF(!outer)) {
++    return NS_ERROR_UNEXPECTED;
++  }
++
++  FrameType frameType = FrameType::Top_level;
++  if (!outer->IsTopLevelWindow()) {
++    frameType = FrameType::Nested;
++  } else if(outer->HadOriginalOpener()) {
++    frameType = FrameType::Auxiliary;
++  }
++
++  // We should either be setting a window execution ready for the
++  // first time or setting the same window execution ready again.
++  // The secondary calls are due to initial about:blank replacement.
++  MOZ_DIAGNOSTIC_ASSERT(mOwner.is<Nothing>() ||
++                        mOwner.is<nsCOMPtr<nsIDocShell>>() ||
++                        GetInnerWindow() == aInnerWindow);
++
++  // This creates a cycle with the window.  It is broken when
++  // nsGlobalWindow::FreeInnerObjects() deletes the ClientSource.
++  mOwner = AsVariant(RefPtr<nsPIDOMWindowInner>(aInnerWindow));
++
++  ClientSourceExecutionReadyArgs args(spec, frameType);
++  ExecutionReady(args);
++
++  return NS_OK;
++}
++
++nsresult
++ClientSource::DocShellExecutionReady(nsIDocShell* aDocShell)
++{
++  MOZ_ASSERT(NS_IsMainThread());
++  MOZ_DIAGNOSTIC_ASSERT(aDocShell);
++
++  nsPIDOMWindowOuter* outer = aDocShell->GetWindow();
++  if (NS_WARN_IF(!outer)) {
++    return NS_ERROR_UNEXPECTED;
++  }
++
++  // TODO: dedupe this with WindowExecutionReady
++  FrameType frameType = FrameType::Top_level;
++  if (!outer->IsTopLevelWindow()) {
++    frameType = FrameType::Nested;
++  } else if(outer->HadOriginalOpener()) {
++    frameType = FrameType::Auxiliary;
++  }
++
++  MOZ_DIAGNOSTIC_ASSERT(mOwner.is<Nothing>());
++
++  // This creates a cycle with the docshell.  It is broken when
++  // nsDocShell::Destroy() deletes the ClientSource.
++  mOwner = AsVariant(nsCOMPtr<nsIDocShell>(aDocShell));
++
++  ClientSourceExecutionReadyArgs args(NS_LITERAL_CSTRING("about:blank"),
++                                      frameType);
++  ExecutionReady(args);
++
++  return NS_OK;
++}
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/clients/manager/ClientSource.h b/dom/clients/manager/ClientSource.h
+--- a/dom/clients/manager/ClientSource.h
++++ b/dom/clients/manager/ClientSource.h
+@@ -4,22 +4,26 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ #ifndef _mozilla_dom_ClientSource_h
+ #define _mozilla_dom_ClientSource_h
+ 
+ #include "mozilla/dom/ClientInfo.h"
+ #include "mozilla/dom/ClientThing.h"
+ 
++class nsIDocShell;
++class nsPIDOMWindowInner;
++
+ namespace mozilla {
+ namespace dom {
+ 
+ class ClientManager;
+ class ClientSourceChild;
+ class ClientSourceConstructorArgs;
++class ClientSourceExecutionReadyArgs;
+ class PClientManagerChild;
+ 
+ namespace workers {
+ class WorkerPrivate;
+ } // workers namespace
+ 
+ // ClientSource is an RAII style class that is designed to be held via
+ // a UniquePtr<>.  When created ClientSource will register the existence
+@@ -30,28 +34,54 @@ class WorkerPrivate;
+ class ClientSource final : public ClientThing<ClientSourceChild>
+ {
+   friend class ClientManager;
+ 
+   NS_DECL_OWNINGTHREAD
+ 
+   RefPtr<ClientManager> mManager;
+ 
++  Variant<Nothing,
++          RefPtr<nsPIDOMWindowInner>,
++          nsCOMPtr<nsIDocShell>,
++          mozilla::dom::workers::WorkerPrivate*> mOwner;
++
+   ClientInfo mClientInfo;
+ 
+   void
+   Shutdown();
+ 
++  void
++  ExecutionReady(const ClientSourceExecutionReadyArgs& aArgs);
++
++  mozilla::dom::workers::WorkerPrivate*
++  GetWorkerPrivate() const;
++
++  nsIDocShell*
++  GetDocShell() const;
++
+   // Private methods called by ClientManager
+   ClientSource(ClientManager* aManager,
+                const ClientSourceConstructorArgs& aArgs);
+ 
+   void
+   Activate(PClientManagerChild* aActor);
+ 
+ public:
+   ~ClientSource();
++
++  nsPIDOMWindowInner*
++  GetInnerWindow() const;
++
++  void
++  WorkerExecutionReady(mozilla::dom::workers::WorkerPrivate* aWorkerPrivate);
++
++  nsresult
++  WindowExecutionReady(nsPIDOMWindowInner* aInnerWindow);
++
++  nsresult
++  DocShellExecutionReady(nsIDocShell* aDocShell);
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // _mozilla_dom_ClientSource_h
+diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/ClientSourceParent.cpp
+--- a/dom/clients/manager/ClientSourceParent.cpp
++++ b/dom/clients/manager/ClientSourceParent.cpp
+@@ -21,16 +21,38 @@ using mozilla::ipc::PrincipalInfo;
+ 
+ IPCResult
+ ClientSourceParent::RecvTeardown()
+ {
+   Unused << Send__delete__(this);
+   return IPC_OK();
+ }
+ 
++IPCResult
++ClientSourceParent::RecvExecutionReady(const ClientSourceExecutionReadyArgs& aArgs)
++{
++  // Now that we have the creation URL for the Client we can do some validation
++  // to make sure the child actor is not giving us garbage.  Since we validate
++  // on the child side as well we treat a failure here as fatal.
++  if (!ClientIsValidCreationURL(mClientInfo.PrincipalInfo(), aArgs.url())) {
++    MOZ_CRASH("ClientSourceParent::RecvExecutionReady() got invalid URL");
++    return IPC_OK();
++  }
++
++  mClientInfo.SetURL(aArgs.url());
++  mClientInfo.SetFrameType(aArgs.frameType());
++  mExecutionReady = true;
++
++  for (ClientHandleParent* handle : mHandleList) {
++    Unused << handle->SendExecutionReady(mClientInfo.ToIPC());
++  }
++
++  return IPC_OK();
++};
++
+ void
+ ClientSourceParent::ActorDestroy(ActorDestroyReason aReason)
+ {
+   DebugOnly<bool> removed = mService->RemoveSource(this);
+   MOZ_ASSERT(removed);
+ 
+   nsTArray<ClientHandleParent*> handleList(mHandleList);
+   for (ClientHandleParent* handle : handleList) {
+@@ -53,16 +75,17 @@ ClientSourceParent::DeallocPClientSource
+ {
+   delete aActor;
+   return true;
+ }
+ 
+ ClientSourceParent::ClientSourceParent(const ClientSourceConstructorArgs& aArgs)
+   : mClientInfo(aArgs.id(), aArgs.type(), aArgs.principalInfo(), aArgs.creationTime())
+   , mService(ClientManagerService::GetOrCreateInstance())
++  , mExecutionReady(false)
+ {
+ }
+ 
+ ClientSourceParent::~ClientSourceParent()
+ {
+   MOZ_DIAGNOSTIC_ASSERT(mHandleList.IsEmpty());
+ }
+ 
+diff --git a/dom/clients/manager/ClientSourceParent.h b/dom/clients/manager/ClientSourceParent.h
+--- a/dom/clients/manager/ClientSourceParent.h
++++ b/dom/clients/manager/ClientSourceParent.h
+@@ -15,21 +15,25 @@ namespace dom {
+ class ClientHandleParent;
+ class ClientManagerService;
+ 
+ class ClientSourceParent final : public PClientSourceParent
+ {
+   ClientInfo mClientInfo;
+   RefPtr<ClientManagerService> mService;
+   nsTArray<ClientHandleParent*> mHandleList;
++  bool mExecutionReady;
+ 
+   // PClientSourceParent
+   IPCResult
+   RecvTeardown() override;
+ 
++  IPCResult
++  RecvExecutionReady(const ClientSourceExecutionReadyArgs& aArgs) override;
++
+   void
+   ActorDestroy(ActorDestroyReason aReason) override;
+ 
+   PClientSourceOpParent*
+   AllocPClientSourceOpParent(const ClientOpConstructorArgs& aArgs) override;
+ 
+   bool
+   DeallocPClientSourceOpParent(PClientSourceOpParent* aActor) override;
+diff --git a/dom/clients/manager/ClientValidation.cpp b/dom/clients/manager/ClientValidation.cpp
+--- a/dom/clients/manager/ClientValidation.cpp
++++ b/dom/clients/manager/ClientValidation.cpp
+@@ -1,16 +1,17 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "ClientValidation.h"
+ 
++#include "ClientPrefs.h"
+ #include "mozilla/net/MozURL.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ using mozilla::ipc::ContentPrincipalInfo;
+ using mozilla::ipc::PrincipalInfo;
+ using mozilla::net::MozURL;
+@@ -69,10 +70,115 @@ ClientIsValidPrincipalInfo(const Princip
+       break;
+     }
+   }
+ 
+   // Windows and workers should not have expanded URLs, etc.
+   return false;
+ }
+ 
++bool
++ClientIsValidCreationURL(const PrincipalInfo& aPrincipalInfo,
++                         const nsACString& aURL)
++{
++  RefPtr<MozURL> url;
++  nsresult rv = MozURL::Init(getter_AddRefs(url), aURL);
++  NS_ENSURE_SUCCESS(rv, false);
++
++  switch (aPrincipalInfo.type()) {
++    case PrincipalInfo::TContentPrincipalInfo:
++    {
++      // Any origin can create an about:blank or about:srcdoc Client.
++      if (aURL.LowerCaseEqualsLiteral("about:blank") ||
++          aURL.LowerCaseEqualsLiteral("about:srcdoc")) {
++        return true;
++      }
++
++      const ContentPrincipalInfo& content =
++        aPrincipalInfo.get_ContentPrincipalInfo();
++
++      // Parse the principal origin URL as well.  This ensures any MozURL
++      // parser issues effect both URLs equally.
++      RefPtr<MozURL> principalURL;
++      rv = MozURL::Init(getter_AddRefs(principalURL),
++                        content.originNoSuffix().get_nsCString());
++      NS_ENSURE_SUCCESS(rv, false);
++
++      nsAutoCString origin;
++      rv = url->GetOrigin(origin);
++      NS_ENSURE_SUCCESS(rv, false);
++
++      nsAutoCString principalOrigin;
++      rv = principalURL->GetOrigin(principalOrigin);
++      NS_ENSURE_SUCCESS(rv, false);
++
++      // The vast majority of sites should simply result in the same principal
++      // and URL origin.
++      if (principalOrigin == origin) {
++        return true;
++      }
++
++      nsAutoCString scheme;
++      rv = url->GetScheme(scheme);
++      NS_ENSURE_SUCCESS(rv, false);
++
++      // Generally any origin can also open javascript: windows and workers.
++      if (scheme.LowerCaseEqualsLiteral("javascript")) {
++        return true;
++      }
++
++      // We have some tests that use data: URL windows without an opaque
++      // origin.  This should only happen when a pref is set.
++      if (!ClientPrefsGetDataURLUniqueOpaqueOrigin() &&
++          scheme.LowerCaseEqualsLiteral("data")) {
++        return true;
++      }
++
++      nsAutoCString principalScheme;
++      rv = principalURL->GetScheme(principalScheme);
++      NS_ENSURE_SUCCESS(rv, false);
++
++      // Otherwise don't support this URL type in the clients sub-system for
++      // now.  This will exclude a variety of internal browser clients, but
++      // currently we don't need to support those.  This function can be
++      // expanded to handle more cases as necessary.
++      return false;
++    }
++    case PrincipalInfo::TSystemPrincipalInfo:
++    {
++      nsAutoCString scheme;
++      rv = url->GetScheme(scheme);
++      NS_ENSURE_SUCCESS(rv, false);
++
++      // While many types of documents can be created with a system principal,
++      // there are only a few that can reasonably become windows.  We attempt
++      // to validate the list of known cases here with a simple scheme check.
++      return scheme.LowerCaseEqualsLiteral("about") ||
++             scheme.LowerCaseEqualsLiteral("chrome") ||
++             scheme.LowerCaseEqualsLiteral("resource") ||
++             scheme.LowerCaseEqualsLiteral("blob") ||
++             scheme.LowerCaseEqualsLiteral("javascript") ||
++             scheme.LowerCaseEqualsLiteral("view-source") ||
++
++             (!ClientPrefsGetDataURLUniqueOpaqueOrigin() &&
++              scheme.LowerCaseEqualsLiteral("data"));
++    }
++    case PrincipalInfo::TNullPrincipalInfo:
++    {
++      // A wide variety of clients can have a null principal.  For example,
++      // sandboxed iframes can have a normal content URL.  For now allow
++      // any parsable URL for null principals.  This is relatively safe since
++      // null principals have unique origins and won't most ClientManagerService
++      // queries anyway.
++      return true;
++    }
++    default:
++    {
++      break;
++    }
++  }
++
++  // Clients (windows/workers) should never have an expanded principal type.
++  return false;
++}
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/clients/manager/ClientValidation.h b/dom/clients/manager/ClientValidation.h
+--- a/dom/clients/manager/ClientValidation.h
++++ b/dom/clients/manager/ClientValidation.h
+@@ -12,12 +12,16 @@ namespace ipc {
+   class PrincipalInfo;
+ } // namespace ipc
+ 
+ namespace dom {
+ 
+ bool
+ ClientIsValidPrincipalInfo(const mozilla::ipc::PrincipalInfo& aPrincipalInfo);
+ 
++bool
++ClientIsValidCreationURL(const mozilla::ipc::PrincipalInfo& aPrincipalInfo,
++                         const nsACString& aURL);
++
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // _mozilla_dom_ClientValidation_h
+diff --git a/dom/clients/manager/PClientHandle.ipdl b/dom/clients/manager/PClientHandle.ipdl
+--- a/dom/clients/manager/PClientHandle.ipdl
++++ b/dom/clients/manager/PClientHandle.ipdl
+@@ -20,13 +20,15 @@ protocol PClientHandle
+   manages PClientHandleOp;
+ 
+ parent:
+   async Teardown();
+ 
+   async PClientHandleOp(ClientOpConstructorArgs aArgs);
+ 
+ child:
++  async ExecutionReady(IPCClientInfo aClientInfo);
++
+   async __delete__();
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/clients/manager/PClientSource.ipdl b/dom/clients/manager/PClientSource.ipdl
+--- a/dom/clients/manager/PClientSource.ipdl
++++ b/dom/clients/manager/PClientSource.ipdl
+@@ -16,16 +16,17 @@ namespace dom {
+ sync protocol PClientSource
+ {
+   manager PClientManager;
+ 
+   manages PClientSourceOp;
+ 
+ parent:
+   async Teardown();
++  async ExecutionReady(ClientSourceExecutionReadyArgs aArgs);
+ 
+ child:
+   async PClientSourceOp(ClientOpConstructorArgs aArgs);
+ 
+   async __delete__();
+ };
+ 
+ } // namespace dom
+diff --git a/dom/clients/manager/moz.build b/dom/clients/manager/moz.build
+--- a/dom/clients/manager/moz.build
++++ b/dom/clients/manager/moz.build
+@@ -31,16 +31,17 @@ UNIFIED_SOURCES += [
+   'ClientManagerOpParent.cpp',
+   'ClientManagerParent.cpp',
+   'ClientManagerService.cpp',
+   'ClientNavigateOpChild.cpp',
+   'ClientNavigateOpParent.cpp',
+   'ClientOpenWindowOpActors.cpp',
+   'ClientOpenWindowOpChild.cpp',
+   'ClientOpenWindowOpParent.cpp',
++  'ClientPrefs.cpp',
+   'ClientSource.cpp',
+   'ClientSourceChild.cpp',
+   'ClientSourceOpChild.cpp',
+   'ClientSourceOpParent.cpp',
+   'ClientSourceParent.cpp',
+   'ClientState.cpp',
+   'ClientValidation.cpp',
+ ]
