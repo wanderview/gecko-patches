@@ -1,7 +1,7 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  092ccc6335a529133a8412a8f1bf1cdda872c6a9
-Bug 1293277 P1 Validate ClientSource creation path across IPC boundary. r=baku
+# Parent  4b2751a75926037184031ff9aed2c38f566b83bf
+Bug 1417172 P1 Validate ClientSource creation path across IPC boundary. r=baku
 
 diff --git a/dom/clients/manager/ClientManagerParent.cpp b/dom/clients/manager/ClientManagerParent.cpp
 --- a/dom/clients/manager/ClientManagerParent.cpp
@@ -79,7 +79,7 @@ diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/
 +  // Do not permit overwriting an existing ClientSource with the same
 +  // UUID.  This would allow a spoofed ClientParentSource actor to
 +  // intercept postMessage() intended for the real actor.
-+  if (entry) {
++  if (NS_WARN_IF(!!entry)) {
 +    return false;
 +  }
    entry.OrInsert([&] { return aSource; });
@@ -94,7 +94,7 @@ diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/
    MOZ_ASSERT(aSource);
    auto entry = mSourceTable.Lookup(aSource->Info().Id());
 -  MOZ_DIAGNOSTIC_ASSERT(entry);
-+  if (!entry) {
++  if (NS_WARN_IF(!entry)) {
 +    return false;
 +  }
    entry.Remove();
@@ -183,7 +183,7 @@ diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSo
 diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/ClientSourceParent.cpp
 --- a/dom/clients/manager/ClientSourceParent.cpp
 +++ b/dom/clients/manager/ClientSourceParent.cpp
-@@ -4,16 +4,17 @@
+@@ -4,36 +4,101 @@
   * License, v. 2.0. If a copy of the MPL was not distributed with this
   * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
  
@@ -194,14 +194,79 @@ diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/Cl
  #include "ClientSourceOpParent.h"
 +#include "ClientValidation.h"
  #include "mozilla/dom/ClientIPCTypes.h"
++#include "mozilla/dom/ContentParent.h"
++#include "mozilla/dom/PClientManagerParent.h"
++#include "mozilla/ipc/BackgroundParent.h"
++#include "mozilla/SystemGroup.h"
  #include "mozilla/Unused.h"
  
  namespace mozilla {
  namespace dom {
  
++using mozilla::ipc::BackgroundParent;
  using mozilla::ipc::IPCResult;
  using mozilla::ipc::PrincipalInfo;
-@@ -23,17 +24,18 @@ ClientSourceParent::RecvTeardown()
+ 
++namespace {
++
++// It would be nice to use a lambda instead of this class, but we cannot
++// move capture in lambdas yet and ContentParent cannot be AddRef'd off
++// the main thread.
++class KillContentParentRunnable final : public Runnable
++{
++  RefPtr<ContentParent> mContentParent;
++
++public:
++  explicit KillContentParentRunnable(RefPtr<ContentParent>&& aContentParent)
++    : Runnable("KillContentParentRunnable")
++    , mContentParent(Move(aContentParent))
++  {
++    MOZ_ASSERT(mContentParent);
++  }
++
++  NS_IMETHOD
++  Run()
++  {
++    MOZ_ASSERT(NS_IsMainThread());
++    mContentParent->KillHard("invalid ClientSourceParent actor");
++    mContentParent = nullptr;
++    return NS_OK;
++  }
++};
++
++} // anonymous namespace
++
++void
++ClientSourceParent::KillInvalidChild()
++{
++  // Try to get the content process before we destroy the actor below.
++  RefPtr<ContentParent> process =
++    BackgroundParent::GetContentParent(Manager()->Manager());
++
++  // First, immediately teardown the ClientSource actor.  No matter what
++  // we want to start this process as soon as possible.
++  Unused << ClientSourceParent::Send__delete__(this);
++
++  // If we are running in non-e10s, then there is nothing else to do here.
++  // There is no child process and we don't want to crash the entire browser
++  // in release builds.  In general, though, this should not happen in non-e10s
++  // so we do assert this condition.
++  if (!process) {
++    MOZ_DIAGNOSTIC_ASSERT(false, "invalid ClientSourceParent in non-e10s");
++    return;
++  }
++
++  // In e10s mode we also want to kill the child process.  Validation failures
++  // typically mean someone sent us bogus data over the IPC link.  We can't
++  // trust that process any more.  We have to do this on the main thread, so
++  // there is a small window of time before we kill the process.  This is why
++  // we start the actor destruction immediately above.
++  nsCOMPtr<nsIRunnable> r = new KillContentParentRunnable(Move(process));
++  MOZ_ALWAYS_SUCCEEDS(SystemGroup::Dispatch(TaskCategory::Other, r.forget()));
++}
++
+ IPCResult
+ ClientSourceParent::RecvTeardown()
  {
    Unused << Send__delete__(this);
    return IPC_OK();
@@ -221,7 +286,7 @@ diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/Cl
      Unused << ClientHandleParent::Send__delete__(handle);
    }
    MOZ_DIAGNOSTIC_ASSERT(mHandleList.IsEmpty());
-@@ -52,24 +54,45 @@ ClientSourceParent::DeallocPClientSource
+@@ -52,24 +117,43 @@ ClientSourceParent::DeallocPClientSource
    delete aActor;
    return true;
  }
@@ -245,7 +310,7 @@ diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/Cl
 +  // Since we validate the principal on the child side as well, any failure
 +  // here is treated as fatal.
 +  if (NS_WARN_IF(!ClientIsValidPrincipalInfo(mClientInfo.PrincipalInfo()))) {
-+    MOZ_CRASH("ClientSourceParent::Init() got invalid principal");
++    KillInvalidChild();
 +    return;
 +  }
 +
@@ -253,9 +318,7 @@ diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/Cl
 +  // our UUID.  This should not normally happen, but could if someone is
 +  // spoofing IPC messages.
 +  if (NS_WARN_IF(!mService->AddSource(this))) {
-+    MOZ_DIAGNOSTIC_ASSERT(false,
-+      "ClientSourceParent::Init() failed to add to service");
-+    Unused << Send__delete__(this);
++    KillInvalidChild();
 +    return;
 +  }
 +}
@@ -271,7 +334,27 @@ diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/Cl
 diff --git a/dom/clients/manager/ClientSourceParent.h b/dom/clients/manager/ClientSourceParent.h
 --- a/dom/clients/manager/ClientSourceParent.h
 +++ b/dom/clients/manager/ClientSourceParent.h
-@@ -33,16 +33,19 @@ class ClientSourceParent final : public 
+@@ -16,16 +16,19 @@ class ClientHandleParent;
+ class ClientManagerService;
+ 
+ class ClientSourceParent final : public PClientSourceParent
+ {
+   ClientInfo mClientInfo;
+   RefPtr<ClientManagerService> mService;
+   nsTArray<ClientHandleParent*> mHandleList;
+ 
++  void
++  KillInvalidChild();
++
+   // PClientSourceParent
+   IPCResult
+   RecvTeardown() override;
+ 
+   void
+   ActorDestroy(ActorDestroyReason aReason) override;
+ 
+   PClientSourceOpParent*
+@@ -33,16 +36,19 @@ class ClientSourceParent final : public 
  
    bool
    DeallocPClientSourceOpParent(PClientSourceOpParent* aActor) override;
@@ -390,7 +473,7 @@ new file mode 100644
 +namespace mozilla {
 +
 +namespace ipc {
-+  class PrincipalInfo;
++class PrincipalInfo;
 +} // namespace ipc
 +
 +namespace dom {
