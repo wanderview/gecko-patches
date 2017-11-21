@@ -1,92 +1,20 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  63ebc027673fe6c094ed1c0038e85de183dcfe36
+# Parent  d91344a03ff0d4f79c8967947078867d4c19d484
 wip
 
 diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
 --- a/docshell/base/nsDocShell.cpp
 +++ b/docshell/base/nsDocShell.cpp
-@@ -8,16 +8,21 @@
+@@ -3441,16 +3441,36 @@ nsDocShell::MaybeCreateInitialClientSour
+     ClientManager::CreateSource(ClientType::Window,
+                                 win->EventTargetFor(TaskCategory::Other),
+                                 principal);
  
- #include <algorithm>
- 
- #include "mozilla/ArrayUtils.h"
- #include "mozilla/Attributes.h"
- #include "mozilla/AutoRestore.h"
- #include "mozilla/BasePrincipal.h"
- #include "mozilla/Casting.h"
-+#include "mozilla/dom/ClientChannelHelper.h"
-+#include "mozilla/dom/ClientHandle.h"
-+#include "mozilla/dom/ClientInfo.h"
-+#include "mozilla/dom/ClientManager.h"
-+#include "mozilla/dom/ClientSource.h"
- #include "mozilla/dom/ContentChild.h"
- #include "mozilla/dom/Element.h"
- #include "mozilla/dom/HTMLAnchorElement.h"
- #include "mozilla/dom/PendingGlobalHistoryEntry.h"
- #include "mozilla/dom/TabChild.h"
- #include "mozilla/dom/ProfileTimelineMarkerBinding.h"
- #include "mozilla/dom/ScreenOrientation.h"
- #include "mozilla/dom/ToJSValue.h"
-@@ -3381,16 +3386,109 @@ nsDocShell::GetParent(nsIDocShellTreeIte
- already_AddRefed<nsDocShell>
- nsDocShell::GetParentDocshell()
- {
-   nsCOMPtr<nsIDocShell> docshell = do_QueryInterface(GetAsSupports(mParent));
-   return docshell.forget().downcast<nsDocShell>();
- }
- 
- void
-+nsDocShell::MaybeCreateInitialClientSource(nsIPrincipal* aPrincipal)
-+{
-+  // If there is an existing document then there is no need to create
-+  // a client for a future initial about:blank document.
-+  if (mScriptGlobal && mScriptGlobal->GetExtantDoc()) {
-+    MOZ_DIAGNOSTIC_ASSERT(mScriptGlobal->GetCurrentInnerWindowInternal()->GetClientInfo().isSome());
-+    MOZ_DIAGNOSTIC_ASSERT(!mInitialClientSource);
-+    return;
-+  }
-+
-+  // Don't recreate the initial client source.  We call this multiple times
-+  // when DoChannelLoad() is called before CreateAboutBlankContentViewer.
-+  if (mInitialClientSource) {
-+    return;
-+  }
-+
-+  // Don't pre-allocate the client when we are sandboxed.  The inherited
-+  // principal does not take sandboxing into account.
-+  // TODO: Refactor sandboxing principal code out so we can use it here.
-+  if (!aPrincipal && (mSandboxFlags & SANDBOXED_ORIGIN)) {
-+    return;
-+  }
-+
-+  nsIPrincipal* principal = aPrincipal ? aPrincipal
-+                                       : GetInheritedPrincipal(false);
-+
-+  // Sometimes there is no principal available when we are called from
-+  // CreateAboutBlankContentViewer.  For example, sometimes the principal
-+  // is only extracted from the load context after the document is created
-+  // in nsDocument::ResetToURI().  Ideally we would do something similar
-+  // here, but for now lets just avoid the issue by not preallocating the
-+  // client.
-+  if (!principal) {
-+    return;
-+  }
-+
-+  nsCOMPtr<nsPIDOMWindowOuter> win = GetWindow();
-+  if (!win) {
-+    return;
-+  }
-+
-+  mInitialClientSource =
-+    ClientManager::CreateSource(ClientType::Window,
-+                                win->EventTargetFor(TaskCategory::Other),
-+                                principal);
-+
-+  // Mark the initial client as execution ready, but owned by the docshell.
-+  // If the client is actually used this will cause ClientSource to force
-+  // the creation of the initial about:blank by calling nsDocShell::GetDocument().
-+  mInitialClientSource->DocShellExecutionReady(this);
+   // Mark the initial client as execution ready, but owned by the docshell.
+   // If the client is actually used this will cause ClientSource to force
+   // the creation of the initial about:blank by calling nsDocShell::GetDocument().
+   mInitialClientSource->DocShellExecutionReady(this);
 +
 +  // Next, check to see if the parent is controlled.
 +  nsCOMPtr<nsIDocShell> parent = GetParentDocshell();
@@ -107,295 +35,14 @@ diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
 +    ClientManager::CreateHandle(mInitialClientSource->Info(),
 +                                parentInner->EventTargetFor(TaskCategory::Other));
 +  RefPtr<GenericPromise> ref = handle->Control(controller.ref());
-+}
-+
-+Maybe<ClientInfo>
-+nsDocShell::GetInitialClientInfo() const
-+{
-+  if (mInitialClientSource) {
-+    Maybe<ClientInfo> result;
-+    result.emplace(mInitialClientSource->Info());
-+    return Move(result);
-+  }
-+
-+  nsGlobalWindow* innerWindow =
-+    mScriptGlobal ? mScriptGlobal->GetCurrentInnerWindowInternal() : nullptr;
-+  nsIDocument* doc = innerWindow ? innerWindow->GetExtantDoc() : nullptr;
-+
-+  if (!doc || !doc->IsInitialDocument()) {
-+    return Maybe<ClientInfo>();
-+  }
-+
-+  return innerWindow->GetClientInfo();
-+}
-+
-+void
- nsDocShell::RecomputeCanExecuteScripts()
- {
-   bool old = mCanExecuteScripts;
-   RefPtr<nsDocShell> parent = GetParentDocshell();
- 
-   // If we have no tree owner, that means that we've been detached from the
-   // docshell tree (this is distinct from having no parent dochshell, which
-   // is the case for root docshells). It would be nice to simply disallow
-@@ -5912,16 +6010,19 @@ nsDocShell::Destroy()
-       const char* msg = mItemType == typeContent ?
-         NS_WEBNAVIGATION_DESTROY : NS_CHROME_WEBNAVIGATION_DESTROY;
-       serv->NotifyObservers(GetAsSupports(this), msg, nullptr);
-     }
-   }
- 
-   mIsBeingDestroyed = true;
- 
-+  // Break the cycle with the initial client, if present.
-+  mInitialClientSource = nullptr;
-+
-   // Make sure we don't record profile timeline markers anymore
-   SetRecordProfileTimelineMarkers(false);
- 
-   // Remove our pref observers
-   if (mObserveErrorPages) {
-     mObserveErrorPages = false;
-   }
- 
-@@ -7747,16 +7848,20 @@ nsDocShell::EndPageLoad(nsIWebProgress* 
-         internalLoadGroup->OnEndPageLoad(aChannel);
-       }
-     }
-   }
- 
-   // Timing is picked up by the window, we don't need it anymore
-   mTiming = nullptr;
- 
-+  // Make sure to discard the initial Client if we never created the initial
-+  // about:blank document.
-+  mInitialClientSource.reset();
-+
-   // clean up reload state for meta charset
-   if (eCharsetReloadRequested == mCharsetReloadState) {
-     mCharsetReloadState = eCharsetReloadStopOrigional;
-   } else {
-     mCharsetReloadState = eCharsetReloadInit;
-   }
- 
-   // Save a pointer to the currently-loading history entry.
-@@ -8243,16 +8348,19 @@ nsDocShell::CreateAboutBlankContentViewe
-       if (aPrincipal) {
-         principal = NullPrincipal::CreateWithInheritedAttributes(aPrincipal);
-       } else {
-         principal = NullPrincipal::CreateWithInheritedAttributes(this);
-       }
-     } else {
-       principal = aPrincipal;
-     }
-+
-+    MaybeCreateInitialClientSource(principal);
-+
-     // generate (about:blank) document to load
-     blankDoc = nsContentDLF::CreateBlankDocument(mLoadGroup, principal, this);
-     if (blankDoc) {
-       // Hack: set the base URI manually, since this document never
-       // got Reset() with a channel.
-       blankDoc->SetBaseURI(aBaseURI);
- 
-       // Copy our sandbox flags to the document. These are immutable
-@@ -11738,16 +11846,29 @@ nsDocShell::DoChannelLoad(nsIChannel* aC
- 
-   uint32_t openFlags = 0;
-   if (mLoadType == LOAD_LINK) {
-     openFlags |= nsIURILoader::IS_CONTENT_PREFERRED;
-   }
-   if (!mAllowContentRetargeting) {
-     openFlags |= nsIURILoader::DONT_RETARGET;
-   }
-+
-+  nsCOMPtr<nsPIDOMWindowOuter> win = GetWindow();
-+  NS_ENSURE_TRUE(win, NS_ERROR_FAILURE);
-+
-+  MaybeCreateInitialClientSource();
-+
-+  Maybe<ClientInfo> noReservedClient;
-+  rv = AddClientChannelHelper(aChannel,
-+                              Move(noReservedClient),
-+                              GetInitialClientInfo(),
-+                              win->EventTargetFor(TaskCategory::Other));
-+  NS_ENSURE_SUCCESS(rv, rv);
-+
-   rv = aURILoader->OpenURI(aChannel, openFlags, this);
-   NS_ENSURE_SUCCESS(rv, rv);
- 
-   // We're about to load a new page and it may take time before necko
-   // gives back any data, so main thread might have a chance to process a
-   // collector slice
-   nsJSContext::MaybeRunNextCollectorSlice(this, JS::gcreason::DOCSHELL);
- 
-@@ -15140,16 +15261,22 @@ nsDocShell::InFrameSwap()
-     if (shell->mInFrameSwap) {
-       return true;
-     }
-     shell = shell->GetParentDocshell();
-   } while (shell);
-   return false;
  }
  
-+UniquePtr<ClientSource>
-+nsDocShell::TakeInitialClientSource()
-+{
-+  return Move(mInitialClientSource);
-+}
-+
- NS_IMETHODIMP
- nsDocShell::IssueWarning(uint32_t aWarning, bool aAsError)
+ Maybe<ClientInfo>
+ nsDocShell::GetInitialClientInfo() const
  {
-   if (mContentViewer) {
-     nsCOMPtr<nsIDocument> doc = mContentViewer->GetDocument();
-     if (doc) {
-       doc->WarnOnceAbout(nsIDocument::DeprecatedOperations(aWarning), aAsError);
-     }
-diff --git a/docshell/base/nsDocShell.h b/docshell/base/nsDocShell.h
---- a/docshell/base/nsDocShell.h
-+++ b/docshell/base/nsDocShell.h
-@@ -14,16 +14,17 @@
- #include "nsIBaseWindow.h"
- #include "nsINetworkInterceptController.h"
- #include "nsIScrollable.h"
- #include "nsITextScroll.h"
- #include "nsIContentViewerContainer.h"
- #include "nsIDOMStorageManager.h"
- #include "nsDocLoader.h"
- #include "mozilla/BasePrincipal.h"
-+#include "mozilla/Maybe.h"
- #include "mozilla/Move.h"
- #include "mozilla/UniquePtr.h"
- #include "mozilla/WeakPtr.h"
- #include "mozilla/TimeStamp.h"
- #include "GeckoProfiler.h"
- #include "mozilla/dom/ProfileTimelineMarkerBinding.h"
- #include "mozilla/LinkedList.h"
- #include "jsapi.h"
-@@ -64,16 +65,18 @@
- #include "nsIDeprecationWarner.h"
- #include "nsILoadURIDelegate.h"
- 
- namespace mozilla {
- class Encoding;
- class HTMLEditor;
- enum class TaskCategory;
- namespace dom {
-+class ClientInfo;
-+class ClientSource;
- class EventTarget;
- class PendingGlobalHistoryEntry;
- typedef uint32_t ScreenOrientationInternal;
- } // namespace dom
- } // namespace mozilla
- 
- class nsDocShell;
- class nsDOMNavigationTiming;
-@@ -818,16 +821,19 @@ protected:
- 
-   nsIChannel* GetCurrentDocChannel();
- 
-   bool ShouldBlockLoadingForBackButton();
- 
-   // Convenience method for getting our parent docshell. Can return null
-   already_AddRefed<nsDocShell> GetParentDocshell();
- 
-+  void MaybeCreateInitialClientSource(nsIPrincipal* aPrincipal = nullptr);
-+  mozilla::Maybe<mozilla::dom::ClientInfo> GetInitialClientInfo() const;
-+
- protected:
-   nsresult GetCurScrollPos(int32_t aScrollOrientation, int32_t* aCurPos);
-   nsresult SetCurScrollPosEx(int32_t aCurHorizontalPos,
-                              int32_t aCurVerticalPos);
- 
-   // Override the parent setter from nsDocLoader
-   virtual nsresult SetDocLoaderParent(nsDocLoader* aLoader) override;
- 
-@@ -1145,16 +1151,18 @@ private:
-   nsTObserverArray<nsWeakPtr> mReflowObservers;
-   nsTObserverArray<nsWeakPtr> mScrollObservers;
-   nsCString mOriginalUriString;
-   nsWeakPtr mOpener;
-   mozilla::OriginAttributes mOriginAttributes;
- 
-   mozilla::UniquePtr<mozilla::dom::PendingGlobalHistoryEntry> mPrerenderGlobalHistory;
- 
-+  mozilla::UniquePtr<mozilla::dom::ClientSource> mInitialClientSource;
-+
-   // A depth count of how many times NotifyRunToCompletionStart
-   // has been called without a matching NotifyRunToCompletionStop.
-   uint32_t mJSRunToCompletionDepth;
- 
-   // Whether or not touch events are overridden. Possible values are defined
-   // as constants in the nsIDocShell.idl file.
-   uint32_t mTouchEventsOverride;
- 
-diff --git a/docshell/base/nsIDocShell.idl b/docshell/base/nsIDocShell.idl
---- a/docshell/base/nsIDocShell.idl
-+++ b/docshell/base/nsIDocShell.idl
-@@ -7,34 +7,39 @@
- #include "domstubs.idl"
- #include "nsIDocShellTreeItem.idl"
- #include "nsIRequest.idl"
- 
- %{ C++
- #include "js/TypeDecls.h"
- #include "mozilla/Maybe.h"
- #include "mozilla/NotNull.h"
-+#include "mozilla/UniquePtr.h"
- #include "nsCOMPtr.h"
- #include "nsIURI.h"
- class nsPresContext;
- class nsIPresShell;
- namespace mozilla {
- class Encoding;
- class HTMLEditor;
-+namespace dom {
-+class ClientSource;
-+} // namespace dom
- }
- %}
- 
- /**
-  * The nsIDocShell interface.
-  */
- 
- [ptr] native nsPresContext(nsPresContext);
- [ptr] native nsIPresShell(nsIPresShell);
- [ref] native MaybeURI(mozilla::Maybe<nsCOMPtr<nsIURI>>);
- [ref] native Encoding(const mozilla::Encoding*);
-+      native UniqueClientSource(mozilla::UniquePtr<mozilla::dom::ClientSource>);
- 
- interface nsIURI;
- interface nsIChannel;
- interface nsIContentViewer;
- interface nsIDOMEventTarget;
- interface nsIDocShellLoadInfo;
- interface nsIEditor;
- interface nsIEditingSession;
-@@ -1167,16 +1172,21 @@ interface nsIDocShell : nsIDocShellTreeI
-    */
-   attribute boolean useTrackingProtection;
- 
-  /**
-   * Fire a dummy location change event asynchronously.
-   */
-   [noscript] void dispatchLocationChangeEvent();
- 
-+
-+  [noscript, nostdcall, notxpcom]
-+  UniqueClientSource TakeInitialClientSource();
-+
-+
- %{C++
-   /**
-    * These methods call nsDocShell::GetHTMLEditorInternal() and
-    * nsDocShell::SetHTMLEditorInternal() with static_cast.
-    */
-   mozilla::HTMLEditor* GetHTMLEditor();
-   nsresult SetHTMLEditor(mozilla::HTMLEditor* aHTMLEditor);
- %}
+   if (mInitialClientSource) {
+     Maybe<ClientInfo> result;
+     result.emplace(mInitialClientSource->Info());
 diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 --- a/dom/base/nsGlobalWindow.cpp
 +++ b/dom/base/nsGlobalWindow.cpp
@@ -419,132 +66,18 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
  #include "mozilla/dom/StorageEventBinding.h"
  #include "mozilla/dom/StorageNotifierService.h"
  #include "mozilla/dom/StorageUtils.h"
-@@ -2148,16 +2151,19 @@ nsGlobalWindow::FreeInnerObjects()
-   DisableGamepadUpdates();
-   mHasGamepad = false;
-   mGamepads.Clear();
-   DisableVRUpdates();
-   mHasVREvents = false;
-   mHasVRDisplayActivateEvents = false;
-   mVRDisplays.Clear();
- 
-+  // This breaks a cycle between the window and the ClientSource object.
-+  mClientSource = nullptr;
-+
-   if (mTabChild) {
-     while (mBeforeUnloadListenerCount-- > 0) {
-       mTabChild->BeforeUnloadRemoved();
+diff --git a/dom/base/nsGlobalWindowInner.cpp b/dom/base/nsGlobalWindowInner.cpp
+--- a/dom/base/nsGlobalWindowInner.cpp
++++ b/dom/base/nsGlobalWindowInner.cpp
+@@ -1566,26 +1566,45 @@ nsGlobalWindowInner::EnsureClientSource(
      }
    }
- }
  
- //*****************************************************************************
-@@ -2416,16 +2422,18 @@ NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(ns
- 
-   NS_IMPL_CYCLE_COLLECTION_UNLINK(mDocShell)
- 
-   tmp->UnlinkHostObjectURIs();
- 
-   NS_IMPL_CYCLE_COLLECTION_UNLINK(mIdleRequestExecutor)
-   tmp->DisableIdleCallbackRequests();
- 
-+  tmp->mClientSource.reset();
-+
-   if (tmp->IsChromeWindow()) {
-     NS_IMPL_CYCLE_COLLECTION_UNLINK(mChromeFields.mBrowserDOMWindow)
-     if (tmp->mChromeFields.mMessageManager) {
-       static_cast<nsFrameMessageManager*>(
-         tmp->mChromeFields.mMessageManager.get())->Disconnect();
-       NS_IMPL_CYCLE_COLLECTION_UNLINK(mChromeFields.mMessageManager)
-     }
-     tmp->DisconnectAndClearGroupMessageManagers();
-@@ -3294,24 +3302,32 @@ nsGlobalWindow::SetNewDocument(nsIDocume
-         newInnerWindow->mDoc = aDocument;
- 
-         // The storage objects contain the URL of the window. We have to
-         // recreate them when the innerWindow is reused.
-         newInnerWindow->mLocalStorage = nullptr;
-         newInnerWindow->mSessionStorage = nullptr;
- 
-         newInnerWindow->ClearDocumentDependentSlots(cx);
-+
-+        // Its unclear if we need to mark execution ready again here:
-+        // https://github.com/whatwg/html/issues/2456
-+        rv = newInnerWindow->InnerExecutionReady();
-+        NS_ENSURE_SUCCESS(rv, rv);
-       }
-     } else {
-       newInnerWindow->InnerSetNewDocument(cx, aDocument);
- 
-       // Initialize DOM classes etc on the inner window.
-       JS::Rooted<JSObject*> obj(cx, newInnerGlobal);
-       rv = kungFuDeathGrip->InitClasses(obj);
-       NS_ENSURE_SUCCESS(rv, rv);
-+
-+      rv = newInnerWindow->InnerExecutionReady();
-+      NS_ENSURE_SUCCESS(rv, rv);
-     }
- 
-     // If the document comes from a JAR, check if the channel was determined
-     // to be unsafe. If so, permanently disable script on the compartment by
-     // calling Block() and throwing away the key.
-     nsCOMPtr<nsIJARChannel> jarChannel = do_QueryInterface(aDocument->GetChannel());
-     if (jarChannel && jarChannel->GetIsUnsafe()) {
-       xpc::Scriptability::Get(newInnerGlobal).Block();
-@@ -3475,16 +3491,113 @@ nsGlobalWindow::InnerSetNewDocument(JSCo
- 
-   Telemetry::Accumulate(Telemetry::INNERWINDOWS_WITH_MUTATION_LISTENERS,
-                         mMutationBits ? 1 : 0);
- 
-   // Clear our mutation bitfield.
-   mMutationBits = 0;
- }
- 
-+nsresult
-+nsGlobalWindow::EnsureClientSource()
-+{
-+  MOZ_DIAGNOSTIC_ASSERT(IsInnerWindow());
-+  MOZ_DIAGNOSTIC_ASSERT(mDoc);
-+
-+  bool newClientSource = false;
-+
-+  nsCOMPtr<nsIChannel> channel = mDoc->GetChannel();
-+  nsCOMPtr<nsILoadInfo> loadInfo = channel ? channel->GetLoadInfo() : nullptr;
-+
-+  // Try to get the reserved client from the LoadInfo.  A Client is
-+  // reserved at the start of the channel load if there is not an
-+  // initial about:blank document that will be reused.  It is also
-+  // created if the channel load encounters a cross-origin redirect.
-+  if (loadInfo) {
-+    UniquePtr<ClientSource> reservedClient = loadInfo->TakeReservedClientSource();
-+    if (reservedClient) {
-+      mClientSource.reset();
-+      mClientSource = Move(reservedClient);
-+      newClientSource = true;
-+    }
-+  }
-+
-+  // We don't have a LoadInfo reserved client, but maybe we should
-+  // be inheriting an initial one from the docshell.  This means
-+  // that the docshell started the channel load before creating the
-+  // initial about:blank document.  This is an optimization, though,
-+  // and it created an initial Client as a placeholder for the document.
-+  // In this case we want to inherit this placeholder Client here.
-+  if (!mClientSource) {
-+    nsIDocShell* docshell = GetDocShell();
-+    if (docshell) {
-+      mClientSource = docshell->TakeInitialClientSource();
-+      if (mClientSource) {
-+        newClientSource = true;
-+      }
-+    }
-+  }
-+
-+  // If we don't have a reserved client or an initial client, then create
-+  // one now.  This can happen in certain cases where we avoid preallocating
-+  // the client in the docshell.  This mainly occurs in situations where
-+  // the principal is not clearly inherited from the parent; e.g. sandboxed
-+  // iframes, window.open(), etc.
+   // If we don't have a reserved client or an initial client, then create
+   // one now.  This can happen in certain cases where we avoid preallocating
+   // the client in the docshell.  This mainly occurs in situations where
+   // the principal is not clearly inherited from the parent; e.g. sandboxed
+   // iframes, window.open(), etc.
 +  // TODO: We may not be marking initial about:blank documents created
 +  //       this way as controlled by a service worker properly.  The
 +  //       controller should be coming from the same place as the inheritted
@@ -552,16 +85,16 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 +  //       smart enough to handle all cases yet.  For example, a
 +  //       window.open() with new URL should inherit the controller from
 +  //       the opener, but we probably don't handle that yet.
-+  if (!mClientSource) {
-+    mClientSource = ClientManager::CreateSource(ClientType::Window,
-+                                                EventTargetFor(TaskCategory::Other),
-+                                                mDoc->NodePrincipal());
-+    if (NS_WARN_IF(!mClientSource)) {
-+      return NS_ERROR_FAILURE;
-+    }
-+    newClientSource = true;
-+  }
-+
+   if (!mClientSource) {
+     mClientSource = ClientManager::CreateSource(ClientType::Window,
+                                                 EventTargetFor(TaskCategory::Other),
+                                                 mDoc->NodePrincipal());
+     if (NS_WARN_IF(!mClientSource)) {
+       return NS_ERROR_FAILURE;
+     }
+     newClientSource = true;
+   }
+ 
 +  // The load may have started controlling the Client as well.  If
 +  // so mark it as controlled immediately here.  The actor may
 +  // or may not have been notified by the parent side about being
@@ -574,134 +107,54 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 +    }
 +  }
 +
-+  // Its possible that we got a client just after being frozen in
-+  // the bfcache.  In that case freeze the client immediately.
-+  if (newClientSource && IsFrozen()) {
-+    mClientSource->Freeze();
-+  }
-+
-+  return NS_OK;
-+}
-+
-+nsresult
-+nsGlobalWindow::InnerExecutionReady()
-+{
-+  MOZ_DIAGNOSTIC_ASSERT(IsInnerWindow());
-+
-+  nsresult rv = EnsureClientSource();
-+  NS_ENSURE_SUCCESS(rv, rv);
-+
-+  rv = mClientSource->WindowExecutionReady(AsInner());
-+  NS_ENSURE_SUCCESS(rv, rv);
-+
-+  return NS_OK;
-+}
-+
- void
- nsGlobalWindow::SetDocShell(nsIDocShell* aDocShell)
- {
-   NS_ASSERTION(IsOuterWindow(), "Uh, SetDocShell() called on inner window!");
-   MOZ_ASSERT(aDocShell);
+   // Its possible that we got a client just after being frozen in
+   // the bfcache.  In that case freeze the client immediately.
+   if (newClientSource && IsFrozen()) {
+     mClientSource->Freeze();
+   }
  
-   if (aDocShell == mDocShell) {
-     return;
-@@ -4362,16 +4475,34 @@ nsPIDOMWindowInner::Thaw()
+   return NS_OK;
+ }
+@@ -2094,16 +2113,28 @@ nsPIDOMWindowInner::SyncStateFromParentW
  }
  
- void
- nsPIDOMWindowInner::SyncStateFromParentWindow()
+ Maybe<ClientInfo>
+ nsPIDOMWindowInner::GetClientInfo() const
  {
-   nsGlobalWindowInner::Cast(this)->SyncStateFromParentWindow();
+   return Move(nsGlobalWindowInner::Cast(this)->GetClientInfo());
  }
  
-+Maybe<ClientInfo>
-+nsPIDOMWindowInner::GetClientInfo() const
-+{
-+  return nsGlobalWindowInner::Cast(this)->GetClientInfo();
-+}
-+
 +Maybe<ClientState>
 +nsPIDOMWindowInner::GetClientState() const
 +{
-+  return nsGlobalWindowInner::Cast(this)->GetClientState();
++  return Move(nsGlobalWindowInner::Cast(this)->GetClientState());
 +}
 +
 +Maybe<ServiceWorkerDescriptor>
 +nsPIDOMWindowInner::GetController() const
 +{
-+  return nsGlobalWindowInner::Cast(this)->GetController();
++  return Move(nsGlobalWindowInner::Cast(this)->GetController());
 +}
 +
  void
- nsGlobalWindow::UpdateTopInnerWindow()
+ nsGlobalWindowInner::UpdateTopInnerWindow()
  {
-   if (!IsInnerWindow() || AsInner()->IsTopInnerWindow() || !mTopInnerWindow) {
+   if (!IsInnerWindow() || IsTopInnerWindow() || !mTopInnerWindow) {
      return;
    }
  
    mTopInnerWindow->UpdateWebSocketCount(-(int32_t)mNumOfOpenWebSockets);
-@@ -12566,16 +12697,19 @@ nsGlobalWindow::FreezeInternal()
-   MOZ_ASSERT(mSuspendDepth >= mFreezeDepth);
-   if (mFreezeDepth != 1) {
-     return;
-   }
- 
-   mozilla::dom::workers::FreezeWorkersForWindow(AsInner());
- 
-   mTimeoutManager->Freeze();
-+  if (mClientSource) {
-+    mClientSource->Freeze();
-+  }
- 
-   NotifyDOMWindowFrozen(this);
- }
- 
- void
- nsGlobalWindow::Thaw()
- {
+@@ -6222,16 +6253,42 @@ nsGlobalWindowInner::GetClientInfo() con
    MOZ_ASSERT(NS_IsMainThread());
-@@ -12595,16 +12729,19 @@ nsGlobalWindow::ThawInternal()
- 
-   MOZ_ASSERT(mFreezeDepth != 0);
-   mFreezeDepth -= 1;
-   MOZ_ASSERT(mSuspendDepth >= mFreezeDepth);
-   if (mFreezeDepth != 0) {
-     return;
+   Maybe<ClientInfo> clientInfo;
+   if (mClientSource) {
+     clientInfo.emplace(mClientSource->Info());
    }
- 
-+  if (mClientSource) {
-+    mClientSource->Thaw();
-+  }
-   mTimeoutManager->Thaw();
- 
-   mozilla::dom::workers::ThawWorkersForWindow(AsInner());
- 
-   NotifyDOMWindowThawed(this);
+   return Move(clientInfo);
  }
  
- bool
-@@ -12703,16 +12840,53 @@ nsGlobalWindow::CallOnChildren(Method aM
-     if (!mDoc || !frame || mDoc != frame->OwnerDoc() || !inner) {
-       continue;
-     }
- 
-     (inner->*aMethod)();
-   }
- }
- 
-+Maybe<ClientInfo>
-+nsGlobalWindow::GetClientInfo() const
-+{
-+  MOZ_ASSERT(NS_IsMainThread());
-+  Maybe<ClientInfo> clientInfo;
-+  if (mClientSource) {
-+    clientInfo.emplace(mClientSource->Info());
-+  }
-+  return Move(clientInfo);
-+}
-+
 +Maybe<ClientState>
-+nsGlobalWindow::GetClientState() const
++nsGlobalWindowInner::GetClientState() const
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
 +  Maybe<ClientState> clientState;
@@ -716,7 +169,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 +}
 +
 +Maybe<ServiceWorkerDescriptor>
-+nsGlobalWindow::GetController() const
++nsGlobalWindowInner::GetController() const
 +{
 +  MOZ_ASSERT(NS_IsMainThread());
 +  Maybe<ServiceWorkerDescriptor> controller;
@@ -727,36 +180,17 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 +}
 +
  nsresult
- nsGlobalWindow::FireDelayedDOMEvents()
+ nsGlobalWindowInner::FireDelayedDOMEvents()
  {
-   FORWARD_TO_INNER(FireDelayedDOMEvents, (), NS_ERROR_UNEXPECTED);
- 
    if (mApplicationCache) {
      static_cast<nsDOMOfflineResourceList*>(mApplicationCache.get())->FirePendingEvents();
    }
-diff --git a/dom/base/nsGlobalWindow.h b/dom/base/nsGlobalWindow.h
---- a/dom/base/nsGlobalWindow.h
-+++ b/dom/base/nsGlobalWindow.h
-@@ -107,16 +107,17 @@ class IdleRequestExecutor;
  
- namespace mozilla {
- class AbstractThread;
- class DOMEventTargetHelper;
- class ThrottledEventQueue;
- namespace dom {
- class BarProp;
- struct ChannelPixelLayout;
-+class ClientSource;
- class Console;
- class Crypto;
- class CustomElementRegistry;
- class DocGroup;
- class External;
- class Function;
- class Gamepad;
- enum class ImageBitmapFormat : uint8_t;
-@@ -380,16 +381,20 @@ public:
-   void Suspend();
+   // Fires an offline status event if the offline status has changed
+diff --git a/dom/base/nsGlobalWindowInner.h b/dom/base/nsGlobalWindowInner.h
+--- a/dom/base/nsGlobalWindowInner.h
++++ b/dom/base/nsGlobalWindowInner.h
+@@ -368,16 +368,18 @@ public:
    void Resume();
    virtual bool IsSuspended() const override;
    void Freeze();
@@ -764,66 +198,21 @@ diff --git a/dom/base/nsGlobalWindow.h b/dom/base/nsGlobalWindow.h
    virtual bool IsFrozen() const override;
    void SyncStateFromParentWindow();
  
-+  mozilla::Maybe<mozilla::dom::ClientInfo> GetClientInfo() const;
+   mozilla::Maybe<mozilla::dom::ClientInfo> GetClientInfo() const;
 +  mozilla::Maybe<mozilla::dom::ClientState> GetClientState() const;
 +  mozilla::Maybe<mozilla::dom::ServiceWorkerDescriptor> GetController() const;
-+
+ 
    virtual nsresult FireDelayedDOMEvents() override;
  
-   // Outer windows only.
-   virtual bool WouldReuseInnerWindow(nsIDocument* aNewDocument) override;
- 
-   virtual void SetDocShell(nsIDocShell* aDocShell) override;
-   virtual void DetachFromDocShell() override;
    virtual nsresult SetNewDocument(nsIDocument *aDocument,
-@@ -1388,16 +1393,22 @@ protected:
+                                   nsISupports *aState,
+                                   bool aForceReuseInnerWindow) override;
  
-   void FreeInnerObjects();
-   nsGlobalWindowInner *CallerInnerWindow();
- 
-   // Only to be called on an inner window.
-   // aDocument must not be null.
-   void InnerSetNewDocument(JSContext* aCx, nsIDocument* aDocument);
- 
-+  // inner window only
-+  nsresult EnsureClientSource();
-+
-+  // inner window only
-+  nsresult InnerExecutionReady();
-+
-   // Inner windows only.
-   nsresult DefineArgumentsProperty(nsIArray *aArguments);
- 
-   // Get the parent, returns null if this is a toplevel window
-   nsPIDOMWindowOuter* GetParentInternal();
- 
- public:
-   // popup tracking
-@@ -1964,16 +1975,19 @@ protected:
-   // When non-zero, the document should receive a vrdisplayactivate event
-   // after loading.  The value is the ID of the VRDisplay that content should
-   // begin presentation on.
-   uint32_t mAutoActivateVRDisplayID; // Outer windows only
-   int64_t mBeforeUnloadListenerCount; // Inner windows only
- 
-   RefPtr<mozilla::dom::IntlUtils> mIntlUtils;
- 
-+  // inner window only
-+  mozilla::UniquePtr<mozilla::dom::ClientSource> mClientSource;
-+
-   // Members in the mChromeFields member should only be used in chrome windows.
-   // All accesses to this field should be guarded by a check of mIsChrome.
-   struct ChromeFields {
-     ChromeFields()
-       : mGroupMessageManagers(1)
-     {}
- 
-     nsCOMPtr<nsIBrowserDOMWindow> mBrowserDOMWindow;
+   virtual void SetOpenerWindow(nsPIDOMWindowOuter* aOpener,
 diff --git a/dom/base/nsPIDOMWindow.h b/dom/base/nsPIDOMWindow.h
 --- a/dom/base/nsPIDOMWindow.h
 +++ b/dom/base/nsPIDOMWindow.h
-@@ -40,20 +40,23 @@ class nsPIWindowRoot;
- class nsXBLPrototypeHandler;
+@@ -42,20 +42,22 @@ class nsXBLPrototypeHandler;
  
  typedef uint32_t SuspendTypes;
  
@@ -831,7 +220,7 @@ diff --git a/dom/base/nsPIDOMWindow.h b/dom/base/nsPIDOMWindow.h
  class ThrottledEventQueue;
  namespace dom {
  class AudioContext;
-+class ClientInfo;
+ class ClientInfo;
 +class ClientState;
  class DocGroup;
  class TabGroup;
@@ -846,8 +235,7 @@ diff --git a/dom/base/nsPIDOMWindow.h b/dom/base/nsPIDOMWindow.h
  } // namespace dom
  } // namespace mozilla
  
-@@ -934,16 +937,20 @@ public:
- 
+@@ -928,16 +930,18 @@ public:
    // Increase/Decrease the number of open WebSockets.
    void UpdateWebSocketCount(int32_t aDelta);
  
@@ -855,18 +243,17 @@ diff --git a/dom/base/nsPIDOMWindow.h b/dom/base/nsPIDOMWindow.h
    // timeout-throttling.
    bool HasOpenWebSockets() const;
  
-+  mozilla::Maybe<mozilla::dom::ClientInfo> GetClientInfo() const;
+   mozilla::Maybe<mozilla::dom::ClientInfo> GetClientInfo() const;
 +  mozilla::Maybe<mozilla::dom::ClientState> GetClientState() const;
 +  mozilla::Maybe<mozilla::dom::ServiceWorkerDescriptor> GetController() const;
-+
+ 
+   mozilla::dom::TabGroup* TabGroup();
  protected:
    void CreatePerformanceObjectIfNeeded();
  };
  
  NS_DEFINE_STATIC_IID_ACCESSOR(nsPIDOMWindowInner, NS_PIDOMWINDOWINNER_IID)
  
- // NB: It's very very important that these two classes have identical vtables
- // and memory layout!
 diff --git a/dom/bindings/Bindings.conf b/dom/bindings/Bindings.conf
 --- a/dom/bindings/Bindings.conf
 +++ b/dom/bindings/Bindings.conf
@@ -1782,312 +1169,10 @@ new file mode 100644
 +
 +XPCSHELL_TESTS_MANIFESTS += [
 +]
-diff --git a/dom/clients/manager/ClientChannelHelper.cpp b/dom/clients/manager/ClientChannelHelper.cpp
-new file mode 100644
---- /dev/null
-+++ b/dom/clients/manager/ClientChannelHelper.cpp
-@@ -0,0 +1,263 @@
-+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
-+/* vim: set ts=8 sts=2 et sw=2 tw=80: */
-+/* This Source Code Form is subject to the terms of the Mozilla Public
-+ * License, v. 2.0. If a copy of the MPL was not distributed with this
-+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
-+
-+#include "ClientChannelHelper.h"
-+
-+#include "ClientManager.h"
-+#include "ClientSource.h"
-+#include "MainThreadUtils.h"
-+#include "mozilla/ipc/BackgroundUtils.h"
-+#include "nsContentUtils.h"
-+#include "nsIAsyncVerifyRedirectCallback.h"
-+#include "nsIChannel.h"
-+#include "nsIChannelEventSink.h"
-+#include "nsIDocShell.h"
-+#include "nsIInterfaceRequestor.h"
-+#include "nsIInterfaceRequestorUtils.h"
-+
-+namespace mozilla {
-+namespace dom {
-+
-+using mozilla::ipc::PrincipalInfoToPrincipal;
-+
-+namespace {
-+
-+class ClientChannelHelper final : public nsIInterfaceRequestor
-+                                , public nsIChannelEventSink
-+{
-+  nsCOMPtr<nsIInterfaceRequestor> mOuter;
-+  nsCOMPtr<nsISerialEventTarget> mEventTarget;
-+
-+  ~ClientChannelHelper()
-+  {
-+  }
-+
-+  NS_IMETHOD
-+  GetInterface(const nsIID & aIID, void **aResultOut) override
-+  {
-+    if (aIID.Equals(NS_GET_IID(nsIChannelEventSink))) {
-+      *aResultOut = static_cast<nsIChannelEventSink*>(this);
-+      NS_ADDREF_THIS();
-+      return NS_OK;
-+    }
-+
-+    if (mOuter) {
-+      return mOuter->GetInterface(aIID, aResultOut);
-+    }
-+
-+    return NS_ERROR_NO_INTERFACE;
-+  }
-+
-+  NS_IMETHOD
-+  AsyncOnChannelRedirect(nsIChannel *aOldChannel,
-+                         nsIChannel *aNewChannel,
-+                         uint32_t aFlags,
-+                         nsIAsyncVerifyRedirectCallback *aCallback) override
-+  {
-+    MOZ_ASSERT(NS_IsMainThread());
-+
-+    nsCOMPtr<nsILoadInfo> oldLoadInfo;
-+    nsresult rv = aOldChannel->GetLoadInfo(getter_AddRefs(oldLoadInfo));
-+    if (NS_WARN_IF(NS_FAILED(rv))) {
-+      return rv;
-+    }
-+
-+    nsCOMPtr<nsILoadInfo> newLoadInfo;
-+    rv = aNewChannel->GetLoadInfo(getter_AddRefs(newLoadInfo));
-+    if (NS_WARN_IF(NS_FAILED(rv))) {
-+      return rv;
-+    }
-+
-+    rv = nsContentUtils::CheckSameOrigin(aOldChannel, aNewChannel);
-+    if (NS_WARN_IF(NS_FAILED(rv) && rv != NS_ERROR_DOM_BAD_URI)) {
-+      return rv;
-+    }
-+
-+    UniquePtr<ClientSource> reservedClient = oldLoadInfo->TakeReservedClientSource();
-+
-+    // If its a same-origin redirect we just move our reserved client to the
-+    // new channel.
-+    if (NS_SUCCEEDED(rv)) {
-+      if (reservedClient) {
-+        newLoadInfo->GiveReservedClientSource(Move(reservedClient));
-+      }
-+
-+      // It seems sometimes necko passes two channels with the same LoadInfo.
-+      // We only need to move the reserved/initial ClientInfo over if we
-+      // actually have a different LoadInfo.
-+      else if (oldLoadInfo != newLoadInfo) {
-+        const Maybe<ClientInfo>& reservedClientInfo =
-+          oldLoadInfo->GetReservedClientInfo();
-+        if (reservedClientInfo.isSome()) {
-+          newLoadInfo->SetReservedClientInfo(reservedClientInfo.ref());
-+        } else {
-+          const Maybe<ClientInfo>& initialClientInfo =
-+            oldLoadInfo->GetInitialClientInfo();
-+          if (initialClientInfo.isSome()) {
-+            newLoadInfo->SetInitialClientInfo(initialClientInfo.ref());
-+          }
-+        }
-+      }
-+
-+      // Make sure we keep the service worker controller on same-origin
-+      // internal redirects.
-+      if (oldLoadInfo != newLoadInfo &&
-+          aFlags & nsIChannelEventSink::REDIRECT_INTERNAL) {
-+        const Maybe<ServiceWorkerDescriptor>& controller = oldLoadInfo->GetController();
-+        if (controller.isSome()) {
-+          newLoadInfo->SetController(controller.ref());
-+        }
-+      }
-+    }
-+
-+    // If its a cross-origin redirect then we discard the old reserved client
-+    // and create a new one.
-+    else {
-+      // If CheckSameOrigin() worked, then the security manager must exist.
-+      nsIScriptSecurityManager* ssm = nsContentUtils::GetSecurityManager();
-+      MOZ_DIAGNOSTIC_ASSERT(ssm);
-+
-+      nsCOMPtr<nsIPrincipal> principal;
-+      rv = ssm->GetChannelResultPrincipal(aNewChannel, getter_AddRefs(principal));
-+      if (NS_WARN_IF(NS_FAILED(rv))) {
-+        return rv;
-+      }
-+
-+      reservedClient.reset();
-+      reservedClient = ClientManager::CreateSource(ClientType::Window,
-+                                                   mEventTarget, principal);
-+
-+      newLoadInfo->GiveReservedClientSource(Move(reservedClient));
-+    }
-+
-+    // TODO: We need to do this for worker channels as well.
-+    nsCOMPtr<nsIChannelEventSink> outerSink = do_GetInterface(mOuter);
-+    if (outerSink) {
-+      return outerSink->AsyncOnChannelRedirect(aOldChannel, aNewChannel, aFlags,
-+                                               aCallback);
-+    }
-+
-+    aCallback->OnRedirectVerifyCallback(NS_OK);
-+    return NS_OK;
-+  }
-+
-+public:
-+  ClientChannelHelper(nsIInterfaceRequestor* aOuter,
-+                      nsISerialEventTarget* aEventTarget)
-+    : mOuter(aOuter)
-+    , mEventTarget(aEventTarget)
-+  {
-+  }
-+
-+  NS_DECL_ISUPPORTS
-+};
-+
-+NS_IMPL_ISUPPORTS(ClientChannelHelper, nsIInterfaceRequestor,
-+                                       nsIChannelEventSink);
-+
-+} // anonymous namespace
-+
-+nsresult
-+AddClientChannelHelper(nsIChannel* aChannel,
-+                       Maybe<ClientInfo>&& aReservedClientInfo,
-+                       Maybe<ClientInfo>&& aInitialClientInfo,
-+                       nsISerialEventTarget* aEventTarget)
-+{
-+  MOZ_ASSERT(NS_IsMainThread());
-+
-+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->GetLoadInfo();
-+  if (NS_WARN_IF(!loadInfo)) {
-+    return NS_ERROR_FAILURE;
-+  }
-+
-+  nsIScriptSecurityManager* ssm = nsContentUtils::GetSecurityManager();
-+  if (NS_WARN_IF(!ssm)) {
-+    return NS_ERROR_FAILURE;
-+  }
-+
-+  nsCOMPtr<nsIPrincipal> channelPrincipal;
-+  nsresult rv = ssm->GetChannelResultPrincipal(aChannel, getter_AddRefs(channelPrincipal));
-+  if (NS_WARN_IF(NS_FAILED(rv))) {
-+    return rv;
-+  }
-+
-+  Maybe<ClientInfo> initialClientInfo(Move(aInitialClientInfo));
-+  Maybe<ClientInfo> reservedClientInfo(Move(aReservedClientInfo));
-+  MOZ_DIAGNOSTIC_ASSERT(reservedClientInfo.isNothing() ||
-+                        initialClientInfo.isNothing());
-+
-+  if (initialClientInfo.isSome()) {
-+    nsCOMPtr<nsIPrincipal> initialPrincipal =
-+      PrincipalInfoToPrincipal(initialClientInfo.ref().PrincipalInfo(), nullptr);
-+
-+    bool equals = false;
-+    rv = initialPrincipal ? initialPrincipal->Equals(channelPrincipal, &equals)
-+                          : NS_ERROR_FAILURE;
-+    if (NS_FAILED(rv) || !equals) {
-+      initialClientInfo.reset();
-+    }
-+  }
-+
-+  if (reservedClientInfo.isSome()) {
-+    nsCOMPtr<nsIPrincipal> reservedPrincipal =
-+      PrincipalInfoToPrincipal(reservedClientInfo.ref().PrincipalInfo(), nullptr);
-+
-+    bool equals = false;
-+    rv = reservedPrincipal ? reservedPrincipal->Equals(channelPrincipal, &equals)
-+                           : NS_ERROR_FAILURE;
-+    if (NS_FAILED(rv) || !equals) {
-+      reservedClientInfo.reset();
-+    }
-+  }
-+
-+  nsCOMPtr<nsIInterfaceRequestor> outerCallbacks;
-+  rv = aChannel->GetNotificationCallbacks(getter_AddRefs(outerCallbacks));
-+  if (NS_WARN_IF(NS_FAILED(rv))) {
-+    return rv;
-+  }
-+
-+  UniquePtr<ClientSource> reservedClient;
-+  if (initialClientInfo.isNothing() && reservedClientInfo.isNothing()) {
-+    // Wait to reserve the client until we are reasonably sure this method
-+    // will succeed.  We should only follow this path for window clients.
-+    // Workers should always provide a reserved ClientInfo.
-+    reservedClient = ClientManager::CreateSource(ClientType::Window,
-+                                                 aEventTarget,
-+                                                 channelPrincipal);
-+    if (!reservedClient) {
-+      return NS_ERROR_FAILURE;
-+    }
-+  }
-+
-+  RefPtr<ClientChannelHelper> helper =
-+    new ClientChannelHelper(outerCallbacks, aEventTarget);
-+
-+  // Only set the callbacks helper if we are able to reserve the client
-+  // successfully.
-+  rv = aChannel->SetNotificationCallbacks(helper);
-+  if (NS_WARN_IF(NS_FAILED(rv))) {
-+    return rv;
-+  }
-+
-+  // Finally preserve the reserved client on the nsILoadInfo once the
-+  // redirect helper has been added to the channel.
-+  if (reservedClient) {
-+    loadInfo->GiveReservedClientSource(Move(reservedClient));
-+  }
-+
-+  if (initialClientInfo.isSome()) {
-+    loadInfo->SetInitialClientInfo(initialClientInfo.ref());
-+  }
-+
-+  if (reservedClientInfo.isSome()) {
-+    loadInfo->SetReservedClientInfo(reservedClientInfo.ref());
-+  }
-+
-+  return NS_OK;
-+}
-+
-+} // namespace dom
-+} // namespace mozilla
-diff --git a/dom/clients/manager/ClientChannelHelper.h b/dom/clients/manager/ClientChannelHelper.h
-new file mode 100644
---- /dev/null
-+++ b/dom/clients/manager/ClientChannelHelper.h
-@@ -0,0 +1,29 @@
-+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
-+/* vim: set ts=8 sts=2 et sw=2 tw=80: */
-+/* This Source Code Form is subject to the terms of the Mozilla Public
-+ * License, v. 2.0. If a copy of the MPL was not distributed with this
-+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
-+#ifndef _mozilla_dom_ClientChannelHelper_h
-+#define _mozilla_dom_ClientChannelHelper_h
-+
-+#include "mozilla/Maybe.h"
-+#include "nsError.h"
-+
-+class nsIChannel;
-+class nsISerialEventTarget;
-+
-+namespace mozilla {
-+namespace dom {
-+
-+class ClientInfo;
-+
-+nsresult
-+AddClientChannelHelper(nsIChannel* aChannel,
-+                       Maybe<ClientInfo>&& aReservedClientInfo,
-+                       Maybe<ClientInfo>&& aInitialClientInfo,
-+                       nsISerialEventTarget* aEventTarget);
-+
-+} // namespace dom
-+} // namespace mozilla
-+
-+#endif // _mozilla_dom_ClientChannelHelper_h
 diff --git a/dom/clients/manager/ClientHandle.cpp b/dom/clients/manager/ClientHandle.cpp
 --- a/dom/clients/manager/ClientHandle.cpp
 +++ b/dom/clients/manager/ClientHandle.cpp
-@@ -4,21 +4,27 @@
+@@ -4,22 +4,26 @@
   * License, v. 2.0. If a copy of the MPL was not distributed with this
   * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
  
@@ -2098,9 +1183,8 @@ diff --git a/dom/clients/manager/ClientHandle.cpp b/dom/clients/manager/ClientHa
  #include "ClientManager.h"
 +#include "ClientState.h"
  #include "mozilla/dom/PClientManagerChild.h"
-+#include "mozilla/dom/ServiceWorkerDescriptor.h"
+ #include "mozilla/dom/ServiceWorkerDescriptor.h"
 +#include "mozilla/dom/ipc/StructuredCloneData.h"
-+#include "mozilla/Unused.h"
  
  namespace mozilla {
  namespace dom {
@@ -2115,35 +1199,15 @@ diff --git a/dom/clients/manager/ClientHandle.cpp b/dom/clients/manager/ClientHa
  void
  ClientHandle::Shutdown()
  {
-@@ -96,10 +102,84 @@ ClientHandle::ExecutionReady(const Clien
+@@ -117,10 +121,64 @@ ClientHandle::Control(const ServiceWorke
+     },
+     [outerPromise](const ClientOpResult& aResult) {
+       outerPromise->Reject(aResult.get_nsresult(), __func__);
+     });
+ 
+   return outerPromise.forget();
  }
  
- const ClientInfo&
- ClientHandle::Info() const
- {
-   return mClientInfo;
- }
- 
-+already_AddRefed<GenericPromise>
-+ClientHandle::Control(const ServiceWorkerDescriptor& aServiceWorker)
-+{
-+  RefPtr<GenericPromise::Private> outerPromise =
-+    new GenericPromise::Private(__func__);
-+
-+  RefPtr<ClientOpPromise> innerPromise =
-+    StartOp(ClientControlledArgs(aServiceWorker.ToIPC()));
-+
-+  innerPromise->Then(mSerialEventTarget, __func__,
-+    [outerPromise](const ClientOpResult& aResult) {
-+      outerPromise->Resolve(true, __func__);
-+    }, [outerPromise](const ClientOpResult& aResult) {
-+      outerPromise->Reject(aResult.get_nsresult(), __func__);
-+    });
-+
-+  RefPtr<GenericPromise> ref = outerPromise.get();
-+  return ref.forget();
-+}
-+
 +already_AddRefed<ClientStatePromise>
 +ClientHandle::Focus()
 +{
@@ -2203,18 +1267,7 @@ diff --git a/dom/clients/manager/ClientHandle.cpp b/dom/clients/manager/ClientHa
 diff --git a/dom/clients/manager/ClientHandle.h b/dom/clients/manager/ClientHandle.h
 --- a/dom/clients/manager/ClientHandle.h
 +++ b/dom/clients/manager/ClientHandle.h
-@@ -4,29 +4,37 @@
-  * License, v. 2.0. If a copy of the MPL was not distributed with this
-  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
- #ifndef _mozilla_dom_ClientHandle_h
- #define _mozilla_dom_ClientHandle_h
- 
- #include "mozilla/dom/ClientInfo.h"
- #include "mozilla/dom/ClientOpPromise.h"
- #include "mozilla/dom/ClientThing.h"
-+#include "mozilla/MozPromise.h"
-+#include "nsTArray.h"
- 
+@@ -14,22 +14,27 @@
  #ifdef XP_WIN
  #undef PostMessage
  #endif
@@ -2228,12 +1281,12 @@ diff --git a/dom/clients/manager/ClientHandle.h b/dom/clients/manager/ClientHand
  class ClientHandleChild;
  class ClientOpConstructorArgs;
  class PClientManagerChild;
-+class ServiceWorkerDescriptor;
-+
+ class ServiceWorkerDescriptor;
+ 
 +namespace ipc {
 +class StructuredCloneData;
 +}
- 
++
  // The ClientHandle allows code to take a simple ClientInfo struct and
  // convert it into a live actor-backed object attached to a particular
  // ClientSource somewhere in the browser.  If the ClientSource is
@@ -2241,38 +1294,16 @@ diff --git a/dom/clients/manager/ClientHandle.h b/dom/clients/manager/ClientHand
  // We do not currently provide a way to be notified when the ClientSource
  // is destroyed, but this could be added in the future.
  class ClientHandle final : public ClientThing<ClientHandleChild>
-@@ -41,31 +49,41 @@ class ClientHandle final : public Client
-   ~ClientHandle();
- 
-   void
-   Shutdown();
- 
-   already_AddRefed<ClientOpPromise>
-   StartOp(const ClientOpConstructorArgs& aArgs);
- 
--  // Private methods called by ClientHandleChild
--  void
--  ExecutionReady(const ClientInfo& aClientInfo);
--
-   // Private methods called by ClientManager
-   ClientHandle(ClientManager* aManager,
-                nsISerialEventTarget* aSerialEventTarget,
-                const ClientInfo& aClientInfo);
- 
-   void
-   Activate(PClientManagerChild* aActor);
- 
-+  // Private methods called by ClientHandleChild
-+  void
-+  ExecutionReady(const ClientInfo& aClientInfo);
-+
- public:
-   const ClientInfo&
+ {
+@@ -65,15 +70,22 @@ public:
    Info() const;
  
-+  already_AddRefed<GenericPromise>
-+  Control(const ServiceWorkerDescriptor& aServiceWorker);
-+
+   // Mark the ClientSource attached to this handle as controlled by the
+   // given service worker.  The promise will resolve true if the ClientSource
+   // is successfully marked or reject if the operation could not be completed.
+   RefPtr<GenericPromise>
+   Control(const ServiceWorkerDescriptor& aServiceWorker);
+ 
 +  already_AddRefed<ClientStatePromise>
 +  Focus();
 +
@@ -2290,44 +1321,34 @@ diff --git a/dom/clients/manager/ClientHandle.h b/dom/clients/manager/ClientHand
 diff --git a/dom/clients/manager/ClientHandleOpParent.cpp b/dom/clients/manager/ClientHandleOpParent.cpp
 --- a/dom/clients/manager/ClientHandleOpParent.cpp
 +++ b/dom/clients/manager/ClientHandleOpParent.cpp
-@@ -1,23 +1,80 @@
- /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
- /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+@@ -3,16 +3,17 @@
  /* This Source Code Form is subject to the terms of the Mozilla Public
   * License, v. 2.0. If a copy of the MPL was not distributed with this
   * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
  
  #include "ClientHandleOpParent.h"
  
-+#include "ClientHandleParent.h"
-+#include "ClientSourceParent.h"
+ #include "ClientHandleParent.h"
+ #include "ClientSourceParent.h"
 +#include "mozilla/dom/PClientManagerParent.h"
-+
+ 
  namespace mozilla {
  namespace dom {
  
-+ClientSourceParent*
-+ClientHandleOpParent::GetSource() const
-+{
-+  auto handle = static_cast<ClientHandleParent*>(Manager());
-+  return handle->GetSource();
-+}
-+
- void
- ClientHandleOpParent::ActorDestroy(ActorDestroyReason aReason)
+ ClientSourceParent*
+ ClientHandleOpParent::GetSource() const
  {
-+  mPromiseRequestHolder.DisconnectIfExists();
- }
- 
- void
+   auto handle = static_cast<ClientHandleParent*>(Manager());
+@@ -29,17 +30,43 @@ void
  ClientHandleOpParent::Init(const ClientOpConstructorArgs& aArgs)
  {
-+  ClientSourceParent* source = GetSource();
-+  if (!source) {
-+    Unused << PClientHandleOpParent::Send__delete__(this, NS_ERROR_ABORT);
-+    return;
-+  }
-+
+   ClientSourceParent* source = GetSource();
+   if (!source) {
+     Unused << PClientHandleOpParent::Send__delete__(this, NS_ERROR_DOM_ABORT_ERR);
+     return;
+   }
+ 
+-  RefPtr<ClientOpPromise> p = source->StartOp(aArgs);
 +  RefPtr<ClientOpPromise> p;
 +
 +  // ClientPostMessageArgs can contain PBlob actors.  This means we
@@ -2355,60 +1376,18 @@ diff --git a/dom/clients/manager/ClientHandleOpParent.cpp b/dom/clients/manager/
 +  else {
 +    p = source->StartOp(aArgs);
 +  }
-+
-+  // Capturing `this` is safe here because we disconnect the promise in
-+  // ActorDestroy() which ensures neither lambda is called if the actor
-+  // is destroyed before the source operation completes.
-+  p->Then(GetCurrentThreadSerialEventTarget(), __func__,
-+      [this] (const ClientOpResult& aResult) {
-+        mPromiseRequestHolder.Complete();
-+        Unused << PClientHandleOpParent::Send__delete__(this, aResult);
-+      }, [this] (const ClientOpResult& aResult) {
-+        mPromiseRequestHolder.Complete();
-+        Unused << PClientHandleOpParent::Send__delete__(this, aResult);
-+    })->Track(mPromiseRequestHolder);
- }
  
- } // namespace dom
- } // namespace mozilla
-diff --git a/dom/clients/manager/ClientHandleOpParent.h b/dom/clients/manager/ClientHandleOpParent.h
---- a/dom/clients/manager/ClientHandleOpParent.h
-+++ b/dom/clients/manager/ClientHandleOpParent.h
-@@ -3,21 +3,30 @@
- /* This Source Code Form is subject to the terms of the Mozilla Public
-  * License, v. 2.0. If a copy of the MPL was not distributed with this
-  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
- #ifndef _mozilla_dom_ClientHandleOpParent_h
- #define _mozilla_dom_ClientHandleOpParent_h
- 
- #include "mozilla/dom/PClientHandleOpParent.h"
- 
-+#include "mozilla/MozPromise.h"
-+
- namespace mozilla {
- namespace dom {
- 
-+class ClientSourceParent;
-+
- class ClientHandleOpParent final : public PClientHandleOpParent
- {
-+  MozPromiseRequestHolder<ClientOpPromise> mPromiseRequestHolder;
-+
-+  ClientSourceParent*
-+  GetSource() const;
-+
-   // PClientHandleOpParent interface
-   void
-   ActorDestroy(ActorDestroyReason aReason) override;
- 
- public:
-   ClientHandleOpParent() = default;
-   ~ClientHandleOpParent() = default;
- 
+   // Capturing 'this' is safe here because we disconnect the promise in
+   // ActorDestroy() which ensures neither lambda is called if the actor
+   // is destroyed before the source operation completes.
+   p->Then(GetCurrentThreadSerialEventTarget(), __func__,
+     [this] (const ClientOpResult& aResult) {
+       mPromiseRequestHolder.Complete();
+       Unused << PClientHandleOpParent::Send__delete__(this, aResult);
 diff --git a/dom/clients/manager/ClientIPCTypes.ipdlh b/dom/clients/manager/ClientIPCTypes.ipdlh
 --- a/dom/clients/manager/ClientIPCTypes.ipdlh
 +++ b/dom/clients/manager/ClientIPCTypes.ipdlh
-@@ -45,33 +45,113 @@ struct IPCClientWorkerState
+@@ -45,39 +45,113 @@ struct IPCClientWorkerState
  };
  
  union IPCClientState
@@ -2429,12 +1408,11 @@ diff --git a/dom/clients/manager/ClientIPCTypes.ipdlh b/dom/clients/manager/Clie
    FrameType frameType;
  };
  
--struct ClientOpenWindowArgs
-+struct ClientControlledArgs
-+{
-+  IPCServiceWorkerDescriptor serviceWorker;
-+};
-+
+ struct ClientControlledArgs
+ {
+   IPCServiceWorkerDescriptor serviceWorker;
+ };
+ 
 +struct ClientFocusArgs
 +{
 +};
@@ -2459,10 +1437,9 @@ diff --git a/dom/clients/manager/ClientIPCTypes.ipdlh b/dom/clients/manager/Clie
 +};
 +
 +struct ClientGetStateArgs
- {
- };
- 
--struct ClientOpConstructorArgs
++{
++};
++
 +struct ClientMatchAllArgs
 +{
 +  ClientEndPoint endpoint;
@@ -2482,16 +1459,16 @@ diff --git a/dom/clients/manager/ClientIPCTypes.ipdlh b/dom/clients/manager/Clie
 +  PrincipalInfo principalInfo;
 +};
 +
-+struct ClientOpenWindowArgs
+ struct ClientOpenWindowArgs
  {
 +  PrincipalInfo principalInfo;
 +  nsCString url;
 +  nsCString baseURL;
-+};
-+
-+union ClientOpConstructorArgs
-+{
-+  ClientControlledArgs;
+ };
+ 
+ union ClientOpConstructorArgs
+ {
+   ClientControlledArgs;
 +  ClientFocusArgs;
 +  ClientNavigateArgs;
 +  ClientPostMessageArgs;
@@ -2527,80 +1504,7 @@ diff --git a/dom/clients/manager/ClientIPCTypes.ipdlh b/dom/clients/manager/Clie
 diff --git a/dom/clients/manager/ClientManager.cpp b/dom/clients/manager/ClientManager.cpp
 --- a/dom/clients/manager/ClientManager.cpp
 +++ b/dom/clients/manager/ClientManager.cpp
-@@ -93,32 +93,33 @@ ClientManager::Shutdown()
-     return;
-   }
- 
-   ShutdownThing();
- }
- 
- UniquePtr<ClientSource>
- ClientManager::CreateSourceInternal(ClientType aType,
-+                                    nsISerialEventTarget* aEventTarget,
-                                     const PrincipalInfo& aPrincipal)
- {
-   NS_ASSERT_OWNINGTHREAD(ClientManager);
- 
-   if (IsShutdown()) {
-     return nullptr;
-   }
- 
-   nsID id;
-   nsresult rv = nsContentUtils::GenerateUUIDInPlace(id);
-   if (NS_WARN_IF(NS_FAILED(rv))) {
-     return nullptr;
-   }
- 
-   ClientSourceConstructorArgs args(id, aType, aPrincipal, TimeStamp::Now());
--  UniquePtr<ClientSource> source(new ClientSource(this, args));
-+  UniquePtr<ClientSource> source(new ClientSource(this, aEventTarget, args));
-   source->Activate(GetActor());
- 
-   return Move(source);
- }
- 
- already_AddRefed<ClientHandle>
- ClientManager::CreateHandleInternal(const ClientInfo& aClientInfo,
-                                     nsISerialEventTarget* aSerialEventTarget)
-@@ -205,42 +206,89 @@ ClientManager::Startup()
-     PR_NewThreadPrivateIndex(&sClientManagerThreadLocalIndex, nullptr);
-   MOZ_DIAGNOSTIC_ASSERT(status == PR_SUCCESS);
- 
-   ClientPrefsInit();
- }
- 
- // static
- UniquePtr<ClientSource>
--ClientManager::CreateSource(ClientType aType, nsIPrincipal* aPrincipal)
-+ClientManager::CreateSource(ClientType aType, nsISerialEventTarget* aEventTarget,
-+                            nsIPrincipal* aPrincipal)
- {
-   MOZ_ASSERT(NS_IsMainThread());
-   MOZ_ASSERT(aPrincipal);
- 
-   PrincipalInfo principalInfo;
-   nsresult rv = PrincipalToPrincipalInfo(aPrincipal, &principalInfo);
-   if (NS_WARN_IF(NS_FAILED(rv))) {
-     return nullptr;
-   }
- 
-   RefPtr<ClientManager> mgr = GetOrCreateForCurrentThread();
--  return mgr->CreateSourceInternal(aType, principalInfo);
-+  return mgr->CreateSourceInternal(aType, aEventTarget, principalInfo);
- }
- 
- // static
- UniquePtr<ClientSource>
--ClientManager::CreateSource(ClientType aType, const PrincipalInfo& aPrincipal)
-+ClientManager::CreateSource(ClientType aType, nsISerialEventTarget* aEventTarget,
-+                            const PrincipalInfo& aPrincipal)
- {
-   RefPtr<ClientManager> mgr = GetOrCreateForCurrentThread();
--  return mgr->CreateSourceInternal(aType, aPrincipal);
-+  return mgr->CreateSourceInternal(aType, aEventTarget, aPrincipal);
- }
- 
- // static
+@@ -240,10 +240,55 @@ ClientManager::CreateSource(ClientType a
  already_AddRefed<ClientHandle>
  ClientManager::CreateHandle(const ClientInfo& aClientInfo,
                              nsISerialEventTarget* aSerialEventTarget)
@@ -2659,8 +1563,7 @@ diff --git a/dom/clients/manager/ClientManager.cpp b/dom/clients/manager/ClientM
 diff --git a/dom/clients/manager/ClientManager.h b/dom/clients/manager/ClientManager.h
 --- a/dom/clients/manager/ClientManager.h
 +++ b/dom/clients/manager/ClientManager.h
-@@ -4,53 +4,64 @@
-  * License, v. 2.0. If a copy of the MPL was not distributed with this
+@@ -5,43 +5,50 @@
   * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
  #ifndef _mozilla_dom_ClientManager_h
  #define _mozilla_dom_ClientManager_h
@@ -2668,13 +1571,13 @@ diff --git a/dom/clients/manager/ClientManager.h b/dom/clients/manager/ClientMan
  #include "mozilla/dom/ClientOpPromise.h"
  #include "mozilla/dom/ClientThing.h"
  
-+class nsIPrincipal;
+ class nsIPrincipal;
 +class nsIURI;
-+
+ 
  namespace mozilla {
  namespace ipc {
  class PBackgroundChild;
-+class PrincipalInfo;
+ class PrincipalInfo;
  } // namespace ipc
  namespace dom {
  
@@ -2711,36 +1614,10 @@ diff --git a/dom/clients/manager/ClientManager.h b/dom/clients/manager/ClientMan
    // is called in various error conditions or when the last reference
    // is dropped.
    void
-   Shutdown();
- 
-   UniquePtr<ClientSource>
-   CreateSourceInternal(ClientType aType,
-+                       nsISerialEventTarget* aEventTarget,
-                        const mozilla::ipc::PrincipalInfo& aPrincipal);
- 
-   already_AddRefed<ClientHandle>
-   CreateHandleInternal(const ClientInfo& aClientInfo,
-                        nsISerialEventTarget* aSerialEventTarget);
- 
-   // Utility method to perform an IPC operation.  This will create a
-   // PClientManagerOp actor tied to a MozPromise.  The promise will
-@@ -72,24 +83,42 @@ class ClientManager final : public Clien
- public:
-   // Initialize the ClientManager at process start.  This
-   // does book-keeping like creating a TLS identifier, etc.
-   // This should only be called by process startup code.
-   static void
-   Startup();
- 
+@@ -87,15 +94,31 @@ public:
    static UniquePtr<ClientSource>
--  CreateSource(ClientType aType, nsIPrincipal* aPrincipal);
-+  CreateSource(ClientType aType, nsISerialEventTarget* aEventTarget,
-+               nsIPrincipal* aPrincipal);
- 
-   static UniquePtr<ClientSource>
--  CreateSource(ClientType aType, const mozilla::ipc::PrincipalInfo& aPrincipal);
-+  CreateSource(ClientType aType, nsISerialEventTarget* aEventTarget,
-+               const mozilla::ipc::PrincipalInfo& aPrincipal);
+   CreateSource(ClientType aType, nsISerialEventTarget* aEventTarget,
+                const mozilla::ipc::PrincipalInfo& aPrincipal);
  
    static already_AddRefed<ClientHandle>
    CreateHandle(const ClientInfo& aClientInfo,
@@ -2858,8 +1735,7 @@ diff --git a/dom/clients/manager/ClientManagerChild.h b/dom/clients/manager/Clie
 diff --git a/dom/clients/manager/ClientManagerOpParent.cpp b/dom/clients/manager/ClientManagerOpParent.cpp
 --- a/dom/clients/manager/ClientManagerOpParent.cpp
 +++ b/dom/clients/manager/ClientManagerOpParent.cpp
-@@ -1,29 +1,94 @@
- /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+@@ -2,30 +2,93 @@
  /* vim: set ts=8 sts=2 et sw=2 tw=80: */
  /* This Source Code Form is subject to the terms of the Mozilla Public
   * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -2867,9 +1743,9 @@ diff --git a/dom/clients/manager/ClientManagerOpParent.cpp b/dom/clients/manager
  
  #include "ClientManagerOpParent.h"
  
-+#include "ClientManagerService.h"
+ #include "ClientManagerService.h"
 +#include "mozilla/ipc/BackgroundParent.h"
-+
+ 
  namespace mozilla {
  namespace dom {
  
@@ -2991,7 +1867,7 @@ diff --git a/dom/clients/manager/ClientManagerOpParent.h b/dom/clients/manager/C
 diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/ClientManagerService.cpp
 --- a/dom/clients/manager/ClientManagerService.cpp
 +++ b/dom/clients/manager/ClientManagerService.cpp
-@@ -1,17 +1,25 @@
+@@ -1,19 +1,26 @@
  /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
  /* vim: set ts=8 sts=2 et sw=2 tw=80: */
  /* This Source Code Form is subject to the terms of the Mozilla Public
@@ -3003,23 +1879,24 @@ diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/
 +#include "ClientNavigateOpParent.h"
 +#include "ClientOpenWindowOpParent.h"
 +#include "ClientOpenWindowUtils.h"
+ #include "ClientSourceParent.h"
 +#include "mozilla/dom/ContentParent.h"
  #include "mozilla/ipc/BackgroundParent.h"
+ #include "mozilla/ipc/PBackgroundSharedTypes.h"
 +#include "mozilla/Unused.h"
 +#include "nsIXULRuntime.h"
 +#include "nsProxyRelease.h"
-+#include "nsURLParsers.h"
  
  namespace mozilla {
  namespace dom {
  
  using mozilla::ipc::AssertIsOnBackgroundThread;
  using mozilla::ipc::ContentPrincipalInfo;
+ using mozilla::ipc::PrincipalInfo;
  
- namespace {
-@@ -125,10 +133,352 @@ ClientManagerService::FindSource(const n
-   ClientSourceParent* source = entry.Data();
-   if (!MatchPrincipalInfo(source->Info().PrincipalInfo(), aPrincipalInfo)) {
+@@ -129,10 +136,352 @@ ClientManagerService::FindSource(const n
+   if (source->IsFrozen() ||
+       !MatchPrincipalInfo(source->Info().PrincipalInfo(), aPrincipalInfo)) {
      return nullptr;
    }
  
@@ -3115,9 +1992,9 @@ diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/
 +  }
 +
 +  void
-+  AddPromise(already_AddRefed<ClientOpPromise> aPromise)
++  AddPromise(RefPtr<ClientOpPromise>&& aPromise)
 +  {
-+    mPromiseList.AppendElement(aPromise);
++    mPromiseList.AppendElement(Move(aPromise));
 +    MOZ_DIAGNOSTIC_ASSERT(mPromiseList.LastElement());
 +    mOutstandingPromiseCount += 1;
 +
@@ -3208,8 +2085,8 @@ diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/
 +    }
 +
 +    promiseList->AddPromise(
-+      source->StartOp(ClientGetInfoAndStateArgs(source->Info().Id(),
-+                                                source->Info().PrincipalInfo())));
++      source->StartOp(Move(ClientGetInfoAndStateArgs(source->Info().Id(),
++                                                     source->Info().PrincipalInfo()))));
 +  }
 +
 +  // Maybe finish the promise now in case we didn't find any matching clients.
@@ -3266,7 +2143,7 @@ diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/
 +  return promiseList->GetResultPromise();
 +}
 +
-+already_AddRefed<ClientOpPromise>
++RefPtr<ClientOpPromise>
 +ClientManagerService::GetInfoAndState(const ClientGetInfoAndStateArgs& aArgs)
 +{
 +  RefPtr<ClientOpPromise> ref;
@@ -3373,7 +2250,7 @@ diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/
 diff --git a/dom/clients/manager/ClientManagerService.h b/dom/clients/manager/ClientManagerService.h
 --- a/dom/clients/manager/ClientManagerService.h
 +++ b/dom/clients/manager/ClientManagerService.h
-@@ -1,20 +1,25 @@
+@@ -1,21 +1,25 @@
  /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
  /* vim: set ts=8 sts=2 et sw=2 tw=80: */
  /* This Source Code Form is subject to the terms of the Mozilla Public
@@ -3382,6 +2259,7 @@ diff --git a/dom/clients/manager/ClientManagerService.h b/dom/clients/manager/Cl
  #ifndef _mozilla_dom_ClientManagerService_h
  #define _mozilla_dom_ClientManagerService_h
  
+-#include "mozilla/ipc/PBackgroundSharedTypes.h"
 +#include "ClientOpPromise.h"
  #include "nsDataHashtable.h"
  
@@ -3399,7 +2277,7 @@ diff --git a/dom/clients/manager/ClientManagerService.h b/dom/clients/manager/Cl
  // browser.  This service runs on the PBackground thread.  To interact
  // it with it please use the ClientManager and ClientHandle classes.
  class ClientManagerService final
-@@ -35,15 +40,31 @@ public:
+@@ -36,15 +40,31 @@ public:
  
    bool
    RemoveSource(ClientSourceParent* aSource);
@@ -3417,7 +2295,7 @@ diff --git a/dom/clients/manager/ClientManagerService.h b/dom/clients/manager/Cl
 +  already_AddRefed<ClientOpPromise>
 +  Claim(const ClientClaimArgs& aArgs);
 +
-+  already_AddRefed<ClientOpPromise>
++  RefPtr<ClientOpPromise>
 +  GetInfoAndState(const ClientGetInfoAndStateArgs& aArgs);
 +
 +  already_AddRefed<ClientOpPromise>
@@ -4437,7 +3315,7 @@ diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSo
      return nullptr;
    }
    return mOwner.as<WorkerPrivate*>();
-@@ -69,23 +114,38 @@ ClientSource::GetDocShell() const
+@@ -69,16 +114,28 @@ ClientSource::GetDocShell() const
  {
    NS_ASSERT_OWNINGTHREAD(ClientSource);
    if (!mOwner.is<nsCOMPtr<nsIDocShell>>()) {
@@ -4459,55 +3337,22 @@ diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSo
 +}
 +
  ClientSource::ClientSource(ClientManager* aManager,
-+                           nsISerialEventTarget* aEventTarget,
+                            nsISerialEventTarget* aEventTarget,
                             const ClientSourceConstructorArgs& aArgs)
    : mManager(aManager)
-+  , mEventTarget(aEventTarget)
+   , mEventTarget(aEventTarget)
    , mOwner(AsVariant(Nothing()))
    , mClientInfo(aArgs.id(), aArgs.type(), aArgs.principalInfo(), aArgs.creationTime())
  {
-   MOZ_ASSERT(mManager);
-+  MOZ_ASSERT(mEventTarget);
- }
+@@ -253,26 +310,54 @@ ClientSource::Thaw()
  
- void
- ClientSource::Activate(PClientManagerChild* aActor)
- {
-   NS_ASSERT_OWNINGTHREAD(ClientSource);
-   MOZ_ASSERT(!GetActor());
- 
-@@ -227,16 +287,390 @@ ClientSource::DocShellExecutionReady(nsI
- 
-   ClientSourceExecutionReadyArgs args(NS_LITERAL_CSTRING("about:blank"),
-                                       frameType);
-   ExecutionReady(args);
- 
-   return NS_OK;
- }
- 
-+void
-+ClientSource::Freeze()
-+{
-+  MaybeExecute([](PClientSourceChild* aActor) {
-+    aActor->SendFreeze();
-+  });
-+}
-+
-+void
-+ClientSource::Thaw()
-+{
-+  MaybeExecute([](PClientSourceChild* aActor) {
-+    aActor->SendThaw();
-+  });
-+}
-+
  const ClientInfo&
  ClientSource::Info() const
  {
    return mClientInfo;
  }
  
-+void
+ void
 +ClientSource::WorkerSyncPing(WorkerPrivate* aWorkerPrivate)
 +{
 +  NS_ASSERT_OWNINGTHREAD(ClientSource);
@@ -4519,16 +3364,16 @@ diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSo
 +}
 +
 +void
-+ClientSource::SetController(const ServiceWorkerDescriptor& aServiceWorker)
-+{
-+  NS_ASSERT_OWNINGTHREAD(ClientSource);
-+
-+  if (mController.isSome() && mController.ref() == aServiceWorker) {
-+    return;
-+  }
-+
-+  mController.reset();
-+  mController.emplace(aServiceWorker);
+ ClientSource::SetController(const ServiceWorkerDescriptor& aServiceWorker)
+ {
+   NS_ASSERT_OWNINGTHREAD(ClientSource);
+ 
+   if (mController.isSome() && mController.ref() == aServiceWorker) {
+     return;
+   }
+ 
+   mController.reset();
+   mController.emplace(aServiceWorker);
 +
 +  RefPtr<ServiceWorkerContainer> swc;
 +  nsPIDOMWindowInner* window = GetInnerWindow();
@@ -4546,26 +3391,23 @@ diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSo
 +    IgnoredErrorResult ignored;
 +    swc->ControllerChanged(ignored);
 +  }
-+}
-+
-+already_AddRefed<ClientOpPromise>
-+ClientSource::Control(const ClientControlledArgs& aArgs)
-+{
-+  NS_ASSERT_OWNINGTHREAD(ClientSource);
-+
-+  SetController(ServiceWorkerDescriptor(aArgs.serviceWorker()));
-+
-+  RefPtr<ClientOpPromise> ref =
-+    ClientOpPromise::CreateAndResolve(NS_OK, __func__);
-+  return ref.forget();;
-+}
-+
-+const Maybe<ServiceWorkerDescriptor>&
-+ClientSource::GetController() const
-+{
-+  return mController;
-+}
-+
+ }
+ 
+ RefPtr<ClientOpPromise>
+ ClientSource::Control(const ClientControlledArgs& aArgs)
+ {
+   NS_ASSERT_OWNINGTHREAD(ClientSource);
+ 
+   SetController(ServiceWorkerDescriptor(aArgs.serviceWorker()));
+@@ -283,16 +368,309 @@ ClientSource::Control(const ClientContro
+ }
+ 
+ const Maybe<ServiceWorkerDescriptor>&
+ ClientSource::GetController() const
+ {
+   return mController;
+ }
+ 
 +already_AddRefed<ClientOpPromise>
 +ClientSource::Focus(const ClientFocusArgs& aArgs)
 +{
@@ -4859,44 +3701,39 @@ diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSo
 +  return NS_OK;
 +}
 +
-+nsISerialEventTarget*
-+ClientSource::EventTargetFor(TaskCategory aCat) const
-+{
-+  return mEventTarget;
-+}
-+
+ nsISerialEventTarget*
+ ClientSource::EventTarget() const
+ {
+   return mEventTarget;
+ }
+ 
  } // namespace dom
  } // namespace mozilla
 diff --git a/dom/clients/manager/ClientSource.h b/dom/clients/manager/ClientSource.h
 --- a/dom/clients/manager/ClientSource.h
 +++ b/dom/clients/manager/ClientSource.h
-@@ -3,68 +3,95 @@
- /* This Source Code Form is subject to the terms of the Mozilla Public
-  * License, v. 2.0. If a copy of the MPL was not distributed with this
-  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
- #ifndef _mozilla_dom_ClientSource_h
+@@ -7,28 +7,39 @@
  #define _mozilla_dom_ClientSource_h
  
  #include "mozilla/dom/ClientInfo.h"
+ #include "mozilla/dom/ClientOpPromise.h"
  #include "mozilla/dom/ClientThing.h"
-+#include "mozilla/dom/ServiceWorkerDescriptor.h"
-+#include "mozilla/TaskCategory.h"
-+#include "mozilla/Variant.h"
-+#include "ClientOpPromise.h"
-+
+ #include "mozilla/dom/ServiceWorkerDescriptor.h"
+ #include "mozilla/Variant.h"
+ 
 +#ifdef XP_WIN
 +#undef PostMessage
 +#endif
- 
++
  class nsIDocShell;
-+class nsISerialEventTarget;
+ class nsISerialEventTarget;
  class nsPIDOMWindowInner;
  
  namespace mozilla {
  namespace dom {
  
 +class ClientClaimArgs;
-+class ClientControlledArgs;
+ class ClientControlledArgs;
 +class ClientFocusArgs;
 +class ClientGetInfoAndStateArgs;
 +class ClientGetStateArgs;
@@ -4915,37 +3752,9 @@ diff --git a/dom/clients/manager/ClientSource.h b/dom/clients/manager/ClientSour
  
  // ClientSource is an RAII style class that is designed to be held via
  // a UniquePtr<>.  When created ClientSource will register the existence
- // of a client in the cross-process ClientManagerService.  When the
- // ClientSource is destroyed then client entry will be removed.  Code
- // that represents globals or browsing environments, such as nsGlobalWindow
- // or WorkerPrivate, should use ClientManager to create a ClientSource.
- class ClientSource final : public ClientThing<ClientSourceChild>
- {
-   friend class ClientManager;
-+  friend class ClientSourceChild;
- 
-   NS_DECL_OWNINGTHREAD
- 
-   RefPtr<ClientManager> mManager;
-+  nsCOMPtr<nsISerialEventTarget> mEventTarget;
- 
-   Variant<Nothing,
-           RefPtr<nsPIDOMWindowInner>,
-           nsCOMPtr<nsIDocShell>,
-           mozilla::dom::workers::WorkerPrivate*> mOwner;
- 
-   ClientInfo mClientInfo;
-+  Maybe<ServiceWorkerDescriptor> mController;
- 
-   void
-   Shutdown();
- 
-   void
+@@ -60,16 +71,22 @@ class ClientSource final : public Client
    ExecutionReady(const ClientSourceExecutionReadyArgs& aArgs);
  
-+  nsresult
-+  SnapshotWindowState(ClientState* aStateOut);
-+
    mozilla::dom::workers::WorkerPrivate*
    GetWorkerPrivate() const;
  
@@ -4955,47 +3764,46 @@ diff --git a/dom/clients/manager/ClientSource.h b/dom/clients/manager/ClientSour
 +  void
 +  MaybeCreateInitialDocument();
 +
++  nsresult
++  SnapshotWindowState(ClientState* aStateOut);
++
    // Private methods called by ClientManager
    ClientSource(ClientManager* aManager,
-+               nsISerialEventTarget* aEventTarget,
+                nsISerialEventTarget* aEventTarget,
                 const ClientSourceConstructorArgs& aArgs);
  
    void
    Activate(PClientManagerChild* aActor);
  
- public:
-   ~ClientSource();
+@@ -92,16 +109,19 @@ public:
+   Freeze();
  
-@@ -75,16 +102,55 @@ public:
-   WorkerExecutionReady(mozilla::dom::workers::WorkerPrivate* aWorkerPrivate);
+   void
+   Thaw();
  
-   nsresult
-   WindowExecutionReady(nsPIDOMWindowInner* aInnerWindow);
- 
-   nsresult
-   DocShellExecutionReady(nsIDocShell* aDocShell);
- 
-+  void
-+  Freeze();
-+
-+  void
-+  Thaw();
-+
    const ClientInfo&
    Info() const;
-+
+ 
 +  void
 +  WorkerSyncPing(mozilla::dom::workers::WorkerPrivate* aWorkerPrivate);
 +
-+  void
-+  SetController(const ServiceWorkerDescriptor& aServiceWorker);
-+
-+  already_AddRefed<ClientOpPromise>
-+  Control(const ClientControlledArgs& aArgs);
-+
-+  const Maybe<ServiceWorkerDescriptor>&
-+  GetController() const;
-+
+   // Synchronously mark the ClientSource as controlled by the given service
+   // worker.  This can happen as a result of a remote operation or directly
+   // by local code.  For example, if a client's initial network load is
+   // intercepted by a controlling service worker then this should be called
+   // immediately.
+   //
+   // Note, there is no way to clear the controlling service worker because
+   // the specification does not allow that operation.
+@@ -113,16 +133,34 @@ public:
+   RefPtr<ClientOpPromise>
+   Control(const ClientControlledArgs& aArgs);
+ 
+   // Get the ClientSource's current controlling service worker, if one has
+   // been set.
+   const Maybe<ServiceWorkerDescriptor>&
+   GetController() const;
+ 
 +  already_AddRefed<ClientOpPromise>
 +  Focus(const ClientFocusArgs& aArgs);
 +
@@ -5014,198 +3822,26 @@ diff --git a/dom/clients/manager/ClientSource.h b/dom/clients/manager/ClientSour
 +  nsresult
 +  SnapshotState(ClientState* aStateOut);
 +
-+  nsISerialEventTarget*
-+  EventTargetFor(TaskCategory aCat) const;
+   nsISerialEventTarget*
+   EventTarget() const;
  };
  
  } // namespace dom
  } // namespace mozilla
  
  #endif // _mozilla_dom_ClientSource_h
-diff --git a/dom/clients/manager/ClientSourceChild.cpp b/dom/clients/manager/ClientSourceChild.cpp
---- a/dom/clients/manager/ClientSourceChild.cpp
-+++ b/dom/clients/manager/ClientSourceChild.cpp
-@@ -1,18 +1,18 @@
- /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
- /* vim: set ts=8 sts=2 et sw=2 tw=80: */
- /* This Source Code Form is subject to the terms of the Mozilla Public
-  * License, v. 2.0. If a copy of the MPL was not distributed with this
-  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
- 
- #include "ClientSourceChild.h"
- 
-+#include "ClientSource.h"
- #include "ClientSourceOpChild.h"
--#include "ClientThing.h"
- #include "mozilla/dom/ClientIPCTypes.h"
- #include "mozilla/Unused.h"
- 
- namespace mozilla {
- namespace dom {
- 
- using mozilla::ipc::IPCResult;
- 
-@@ -56,27 +56,33 @@ ClientSourceChild::ClientSourceChild(con
- {
- }
- 
- void
- ClientSourceChild::SetOwner(ClientThing<ClientSourceChild>* aThing)
- {
-   MOZ_DIAGNOSTIC_ASSERT(aThing);
-   MOZ_DIAGNOSTIC_ASSERT(!mSource);
--  mSource = aThing;
-+  mSource = static_cast<ClientSource*>(aThing);
- }
- 
- void
- ClientSourceChild::RevokeOwner(ClientThing<ClientSourceChild>* aThing)
- {
-   MOZ_DIAGNOSTIC_ASSERT(mSource);
--  MOZ_DIAGNOSTIC_ASSERT(mSource == aThing);
-+  MOZ_DIAGNOSTIC_ASSERT(mSource == static_cast<ClientSource*>(aThing));
-   mSource = nullptr;
- }
- 
-+ClientSource*
-+ClientSourceChild::GetSource() const
-+{
-+  return mSource;
-+}
-+
- void
- ClientSourceChild::MaybeStartTeardown()
- {
-   if (mTeardownStarted) {
-     return;
-   }
-   mTeardownStarted = true;
-   Unused << SendTeardown();
-diff --git a/dom/clients/manager/ClientSourceChild.h b/dom/clients/manager/ClientSourceChild.h
---- a/dom/clients/manager/ClientSourceChild.h
-+++ b/dom/clients/manager/ClientSourceChild.h
-@@ -6,22 +6,23 @@
- #ifndef _mozilla_dom_ClientSourceChild_h
- #define _mozilla_dom_ClientSourceChild_h
- 
- #include "mozilla/dom/PClientSourceChild.h"
- 
- namespace mozilla {
- namespace dom {
- 
-+class ClientSource;
- class ClientSourceConstructorArgs;
- template <typename ActorType> class ClientThing;
- 
- class ClientSourceChild final : public PClientSourceChild
- {
--  ClientThing<ClientSourceChild>* mSource;
-+  ClientSource* mSource;
-   bool mTeardownStarted;
- 
-   // PClientSourceChild interface
-   void
-   ActorDestroy(ActorDestroyReason aReason) override;
- 
-   PClientSourceOpChild*
-   AllocPClientSourceOpChild(const ClientOpConstructorArgs& aArgs) override;
-@@ -37,16 +38,19 @@ public:
-   explicit ClientSourceChild(const ClientSourceConstructorArgs& aArgs);
- 
-   void
-   SetOwner(ClientThing<ClientSourceChild>* aThing);
- 
-   void
-   RevokeOwner(ClientThing<ClientSourceChild>* aThing);
- 
-+  ClientSource*
-+  GetSource() const;
-+
-   void
-   MaybeStartTeardown();
- };
- 
- } // namespace dom
- } // namespace mozilla
- 
- #endif // _mozilla_dom_ClientSourceChild_h
 diff --git a/dom/clients/manager/ClientSourceOpChild.cpp b/dom/clients/manager/ClientSourceOpChild.cpp
 --- a/dom/clients/manager/ClientSourceOpChild.cpp
 +++ b/dom/clients/manager/ClientSourceOpChild.cpp
-@@ -1,23 +1,109 @@
- /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
- /* vim: set ts=8 sts=2 et sw=2 tw=80: */
- /* This Source Code Form is subject to the terms of the Mozilla Public
-  * License, v. 2.0. If a copy of the MPL was not distributed with this
-  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
- 
- #include "ClientSourceOpChild.h"
- 
-+#include "ClientSource.h"
-+#include "ClientSourceChild.h"
-+#include "mozilla/Unused.h"
-+
- namespace mozilla {
- namespace dom {
- 
-+ClientSource*
-+ClientSourceOpChild::GetSource() const
-+{
-+  auto actor = static_cast<ClientSourceChild*>(Manager());
-+  return actor->GetSource();
-+}
-+
-+template <typename Method, typename Args>
-+void
-+ClientSourceOpChild::DoSourceOp(Method aMethod, const Args& aArgs)
-+{
-+  RefPtr<ClientOpPromise> promise;
-+  nsCOMPtr<nsISerialEventTarget> target;
-+
-+  // Limit the scope of the source variable since running the operation
-+  // can cause the ClientSource object to be destroyed.
-+  {
-+    ClientSource* source = GetSource();
-+    if (!source) {
-+      Unused << PClientSourceOpChild::Send__delete__(this, NS_ERROR_ABORT);
-+      return;
-+    }
-+
-+    target = source->EventTargetFor(TaskCategory::Other);
-+
-+    // This may cause the ClientSource object to be destroyed.  Do not
-+    // use the source variable after this call.
-+    promise = (source->*aMethod)(aArgs);
-+  }
-+
-+  // Capturing `this` is safe here because we disconnect the promise in
-+  // ActorDestroy() which ensures neither lambda is called if the actor
-+  // is destroyed before the source operation completes.
-+  promise->Then(target, __func__,
-+    [this, aArgs] (const mozilla::dom::ClientOpResult& aResult) {
-+      mPromiseRequestHolder.Complete();
-+      Unused << PClientSourceOpChild::Send__delete__(this, aResult);
-+    }, [this] (nsresult aRv) {
-+      mPromiseRequestHolder.Complete();
-+      Unused << PClientSourceOpChild::Send__delete__(this, aRv);
-+    })->Track(mPromiseRequestHolder);
-+}
-+
- void
- ClientSourceOpChild::ActorDestroy(ActorDestroyReason aReason)
- {
-+  mPromiseRequestHolder.DisconnectIfExists();
- }
- 
- void
+@@ -69,16 +69,42 @@ void
  ClientSourceOpChild::Init(const ClientOpConstructorArgs& aArgs)
  {
-+  switch (aArgs.type()) {
-+    case ClientOpConstructorArgs::TClientControlledArgs:
-+    {
-+      DoSourceOp(&ClientSource::Control, aArgs.get_ClientControlledArgs());
-+      break;
-+    }
+   switch (aArgs.type()) {
+     case ClientOpConstructorArgs::TClientControlledArgs:
+     {
+       DoSourceOp(&ClientSource::Control, aArgs.get_ClientControlledArgs());
+       break;
+     }
 +    case ClientOpConstructorArgs::TClientFocusArgs:
 +    {
 +      DoSourceOp(&ClientSource::Focus, aArgs.get_ClientFocusArgs());
@@ -5232,48 +3868,13 @@ diff --git a/dom/clients/manager/ClientSourceOpChild.cpp b/dom/clients/manager/C
 +                 aArgs.get_ClientGetInfoAndStateArgs());
 +      break;
 +    }
-+    default:
-+    {
-+      MOZ_ASSERT_UNREACHABLE("Unknown Client operation!");
-+      break;
-+    }
-+  }
+     default:
+     {
+       MOZ_ASSERT_UNREACHABLE("unknown client operation!");
+       break;
+     }
+   }
  }
- 
- } // namespace dom
- } // namespace mozilla
-diff --git a/dom/clients/manager/ClientSourceOpChild.h b/dom/clients/manager/ClientSourceOpChild.h
---- a/dom/clients/manager/ClientSourceOpChild.h
-+++ b/dom/clients/manager/ClientSourceOpChild.h
-@@ -7,18 +7,29 @@
- #define _mozilla_dom_ClientSourceOpChild_h
- 
- #include "mozilla/dom/PClientSourceOpChild.h"
- #include "ClientOpPromise.h"
- 
- namespace mozilla {
- namespace dom {
- 
-+class ClientSource;
-+
- class ClientSourceOpChild final : public PClientSourceOpChild
- {
-+  MozPromiseRequestHolder<ClientOpPromise> mPromiseRequestHolder;
-+
-+  ClientSource*
-+  GetSource() const;
-+
-+  template <typename Method, typename Args>
-+  void
-+  DoSourceOp(Method aMethod, const Args& aArgs);
-+
-   // PClientSourceOpChild interface
-   void
-   ActorDestroy(ActorDestroyReason aReason) override;
- 
- public:
-   ClientSourceOpChild() = default;
-   ~ClientSourceOpChild() = default;
  
 diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/ClientSourceParent.cpp
 --- a/dom/clients/manager/ClientSourceParent.cpp
@@ -5303,82 +3904,13 @@ diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/Cl
  
  IPCResult
  ClientSourceParent::RecvExecutionReady(const ClientSourceExecutionReadyArgs& aArgs)
-@@ -106,16 +114,38 @@ ClientSourceParent::RecvExecutionReady(c
- 
-   for (ClientHandleParent* handle : mHandleList) {
-     Unused << handle->SendExecutionReady(mClientInfo.ToIPC());
-   }
- 
-   return IPC_OK();
- };
- 
-+IPCResult
-+ClientSourceParent::RecvFreeze()
-+{
-+  MOZ_DIAGNOSTIC_ASSERT(!mFrozen);
-+  mFrozen = true;
-+
-+  nsTArray<ClientHandleParent*> handleList(mHandleList);
-+  for (ClientHandleParent* handle : handleList) {
-+    Unused << ClientHandleParent::Send__delete__(handle);
-+  }
-+
-+  return IPC_OK();
-+}
-+
-+IPCResult
-+ClientSourceParent::RecvThaw()
-+{
-+  MOZ_DIAGNOSTIC_ASSERT(mFrozen);
-+  mFrozen = false;
-+  return IPC_OK();
-+}
-+
- void
- ClientSourceParent::ActorDestroy(ActorDestroyReason aReason)
- {
-   DebugOnly<bool> removed = mService->RemoveSource(this);
-   MOZ_ASSERT(removed);
- 
-   nsTArray<ClientHandleParent*> handleList(mHandleList);
-   for (ClientHandleParent* handle : handleList) {
-@@ -139,16 +169,17 @@ ClientSourceParent::DeallocPClientSource
-   delete aActor;
-   return true;
+@@ -204,16 +212,28 @@ ClientSourceParent::Info() const
  }
  
- ClientSourceParent::ClientSourceParent(const ClientSourceConstructorArgs& aArgs)
-   : mClientInfo(aArgs.id(), aArgs.type(), aArgs.principalInfo(), aArgs.creationTime())
-   , mService(ClientManagerService::GetOrCreateInstance())
-   , mExecutionReady(false)
-+  , mFrozen(false)
+ bool
+ ClientSourceParent::IsFrozen() const
  {
- }
- 
- ClientSourceParent::~ClientSourceParent()
- {
-   MOZ_DIAGNOSTIC_ASSERT(mHandleList.IsEmpty());
- }
- 
-@@ -167,32 +198,71 @@ ClientSourceParent::Init()
-   // our UUID.  This should not normally happen, but could if someone is
-   // spoofing IPC messages.
-   if (NS_WARN_IF(!mService->AddSource(this))) {
-     KillInvalidChild();
-     return;
-   }
- }
- 
-+bool
-+ClientSourceParent::IsFrozen() const
-+{
-+  return mFrozen;
-+}
-+
- const ClientInfo&
- ClientSourceParent::Info() const
- {
-   return mClientInfo;
+   return mFrozen;
  }
  
 +bool
@@ -5397,111 +3929,42 @@ diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/Cl
  ClientSourceParent::AttachHandle(ClientHandleParent* aClientHandle)
  {
    MOZ_DIAGNOSTIC_ASSERT(aClientHandle);
+   MOZ_DIAGNOSTIC_ASSERT(!mFrozen);
    MOZ_ASSERT(!mHandleList.Contains(aClientHandle));
    mHandleList.AppendElement(aClientHandle);
  }
- 
- void
- ClientSourceParent::DetachHandle(ClientHandleParent* aClientHandle)
- {
-   MOZ_DIAGNOSTIC_ASSERT(aClientHandle);
-   MOZ_ASSERT(mHandleList.Contains(aClientHandle));
-   mHandleList.RemoveElement(aClientHandle);
- }
- 
-+already_AddRefed<ClientOpPromise>
-+ClientSourceParent::StartOp(const ClientOpConstructorArgs& aArgs)
-+{
-+  RefPtr<ClientOpPromise::Private> promise =
-+    new ClientOpPromise::Private(__func__);
-+
-+  // If we are being controlled, remember that data before propagating
-+  // on to the ClientSource.
-+  if (aArgs.type() == ClientOpConstructorArgs::TClientControlledArgs) {
-+    mController.reset();
-+    mController.emplace(aArgs.get_ClientControlledArgs().serviceWorker());
-+  }
-+
-+  // Constructor failure will reject promise via ActorDestroy()
-+  ClientSourceOpParent* actor = new ClientSourceOpParent(aArgs, promise);
-+  Unused << SendPClientSourceOpConstructor(actor, aArgs);
-+
-+  RefPtr<ClientOpPromise> ref = promise.get();
-+  return ref.forget();
-+}
-+
- } // namespace dom
- } // namespace mozilla
 diff --git a/dom/clients/manager/ClientSourceParent.h b/dom/clients/manager/ClientSourceParent.h
 --- a/dom/clients/manager/ClientSourceParent.h
 +++ b/dom/clients/manager/ClientSourceParent.h
-@@ -2,41 +2,54 @@
- /* vim: set ts=8 sts=2 et sw=2 tw=80: */
- /* This Source Code Form is subject to the terms of the Mozilla Public
-  * License, v. 2.0. If a copy of the MPL was not distributed with this
-  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
- #ifndef _mozilla_dom_ClientSourceParent_h
- #define _mozilla_dom_ClientSourceParent_h
- 
- #include "ClientInfo.h"
-+#include "mozilla/dom/ClientOpPromise.h"
- #include "mozilla/dom/PClientSourceParent.h"
-+#include "mozilla/dom/ServiceWorkerDescriptor.h"
- 
- namespace mozilla {
- namespace dom {
- 
- class ClientHandleParent;
- class ClientManagerService;
- 
- class ClientSourceParent final : public PClientSourceParent
- {
-   ClientInfo mClientInfo;
-+  Maybe<ServiceWorkerDescriptor> mController;
-   RefPtr<ClientManagerService> mService;
-   nsTArray<ClientHandleParent*> mHandleList;
+@@ -26,16 +26,19 @@ class ClientSourceParent final : public 
    bool mExecutionReady;
-+  bool mFrozen;
+   bool mFrozen;
  
    void
    KillInvalidChild();
  
    // PClientSourceParent
-   IPCResult
+   mozilla::ipc::IPCResult
 +  RecvWorkerSyncPing() override;
 +
-+  IPCResult
++  mozilla::ipc::IPCResult
    RecvTeardown() override;
  
-   IPCResult
+   mozilla::ipc::IPCResult
    RecvExecutionReady(const ClientSourceExecutionReadyArgs& aArgs) override;
  
-+  IPCResult
-+  RecvFreeze() override;
-+
-+  IPCResult
-+  RecvThaw() override;
-+
-   void
-   ActorDestroy(ActorDestroyReason aReason) override;
+   mozilla::ipc::IPCResult
+   RecvFreeze() override;
  
-   PClientSourceOpParent*
-   AllocPClientSourceOpParent(const ClientOpConstructorArgs& aArgs) override;
- 
-   bool
-   DeallocPClientSourceOpParent(PClientSourceOpParent* aActor) override;
-@@ -46,19 +59,31 @@ public:
-   ~ClientSourceParent();
- 
-   void
+@@ -59,16 +62,22 @@ public:
    Init();
  
    const ClientInfo&
    Info() const;
  
-+  bool
-+  IsFrozen() const;
-+
+   bool
+   IsFrozen() const;
+ 
 +  bool
 +  ExecutionReady() const;
 +
@@ -5513,19 +3976,13 @@ diff --git a/dom/clients/manager/ClientSourceParent.h b/dom/clients/manager/Clie
  
    void
    DetachHandle(ClientHandleParent* aClientSource);
-+
-+  already_AddRefed<ClientOpPromise>
-+  StartOp(const ClientOpConstructorArgs& aArgs);
- };
  
- } // namespace dom
- } // namespace mozilla
- 
- #endif // _mozilla_dom_ClientSourceParent_h
+   RefPtr<ClientOpPromise>
+   StartOp(const ClientOpConstructorArgs& aArgs);
 diff --git a/dom/clients/manager/PClientSource.ipdl b/dom/clients/manager/PClientSource.ipdl
 --- a/dom/clients/manager/PClientSource.ipdl
 +++ b/dom/clients/manager/PClientSource.ipdl
-@@ -15,18 +15,21 @@ namespace dom {
+@@ -15,16 +15,17 @@ namespace dom {
  
  sync protocol PClientSource
  {
@@ -5537,51 +3994,16 @@ diff --git a/dom/clients/manager/PClientSource.ipdl b/dom/clients/manager/PClien
 +  sync WorkerSyncPing();
    async Teardown();
    async ExecutionReady(ClientSourceExecutionReadyArgs aArgs);
-+  async Freeze();
-+  async Thaw();
+   async Freeze();
+   async Thaw();
  
  child:
    async PClientSourceOp(ClientOpConstructorArgs aArgs);
  
-   async __delete__();
- };
- 
- } // namespace dom
 diff --git a/dom/clients/manager/moz.build b/dom/clients/manager/moz.build
 --- a/dom/clients/manager/moz.build
 +++ b/dom/clients/manager/moz.build
-@@ -1,28 +1,30 @@
- # -*- Mode: python; indent-tabs-mode: nil; tab-width: 40 -*-
- # vim: set filetype=python:
- # This Source Code Form is subject to the terms of the Mozilla Public
- # License, v. 2.0. If a copy of the MPL was not distributed with this
- # file, You can obtain one at http://mozilla.org/MPL/2.0/.
- 
- EXPORTS.mozilla.dom += [
-+  'ClientChannelHelper.h',
-   'ClientHandle.h',
-   'ClientInfo.h',
-   'ClientIPCUtils.h',
-   'ClientManager.h',
-   'ClientManagerActors.h',
-   'ClientOpenWindowOpActors.h',
-   'ClientOpPromise.h',
-   'ClientSource.h',
-   'ClientState.h',
-   'ClientThing.h',
- ]
- 
- UNIFIED_SOURCES += [
-+  'ClientChannelHelper.cpp',
-   'ClientHandle.cpp',
-   'ClientHandleChild.cpp',
-   'ClientHandleOpChild.cpp',
-   'ClientHandleOpParent.cpp',
-   'ClientHandleParent.cpp',
-   'ClientInfo.cpp',
-   'ClientManager.cpp',
-   'ClientManagerActors.cpp',
-@@ -31,16 +33,17 @@ UNIFIED_SOURCES += [
+@@ -33,16 +33,17 @@ UNIFIED_SOURCES += [
    'ClientManagerOpParent.cpp',
    'ClientManagerParent.cpp',
    'ClientManagerService.cpp',
@@ -5599,7 +4021,7 @@ diff --git a/dom/clients/manager/moz.build b/dom/clients/manager/moz.build
    'ClientSourceParent.cpp',
    'ClientState.cpp',
    'ClientValidation.cpp',
-@@ -56,17 +59,19 @@ IPDL_SOURCES += [
+@@ -58,17 +59,19 @@ IPDL_SOURCES += [
    'PClientOpenWindowOp.ipdl',
    'PClientSource.ipdl',
    'PClientSourceOp.ipdl',
@@ -5819,7 +4241,7 @@ diff --git a/dom/webidl/Client.webidl b/dom/webidl/Client.webidl
 diff --git a/dom/webidl/Clients.webidl b/dom/webidl/Clients.webidl
 --- a/dom/webidl/Clients.webidl
 +++ b/dom/webidl/Clients.webidl
-@@ -10,27 +10,29 @@
+@@ -10,18 +10,18 @@
  
  [Exposed=ServiceWorker]
  interface Clients {
@@ -5840,17 +4262,6 @@ diff --git a/dom/webidl/Clients.webidl b/dom/webidl/Clients.webidl
  dictionary ClientQueryOptions {
    boolean includeUncontrolled = false;
    ClientType type = "window";
- };
- 
- enum ClientType {
-   "window",
-   "worker",
-   "sharedworker",
-+  // https://github.com/w3c/ServiceWorker/issues/1036
-+  "serviceworker",
-   "all"
- };
- 
 diff --git a/dom/webidl/ServiceWorkerGlobalScope.webidl b/dom/webidl/ServiceWorkerGlobalScope.webidl
 --- a/dom/webidl/ServiceWorkerGlobalScope.webidl
 +++ b/dom/webidl/ServiceWorkerGlobalScope.webidl
@@ -5877,44 +4288,7 @@ diff --git a/dom/webidl/ServiceWorkerGlobalScope.webidl b/dom/webidl/ServiceWork
 diff --git a/dom/workers/ScriptLoader.cpp b/dom/workers/ScriptLoader.cpp
 --- a/dom/workers/ScriptLoader.cpp
 +++ b/dom/workers/ScriptLoader.cpp
-@@ -45,16 +45,18 @@
- #include "mozilla/LoadContext.h"
- #include "mozilla/Maybe.h"
- #include "mozilla/ipc/BackgroundUtils.h"
- #include "mozilla/dom/CacheBinding.h"
- #include "mozilla/dom/cache/CacheTypes.h"
- #include "mozilla/dom/cache/Cache.h"
- #include "mozilla/dom/cache/CacheStorage.h"
- #include "mozilla/dom/ChannelInfo.h"
-+#include "mozilla/dom/ClientChannelHelper.h"
-+#include "mozilla/dom/ClientInfo.h"
- #include "mozilla/dom/Exceptions.h"
- #include "mozilla/dom/InternalResponse.h"
- #include "mozilla/dom/nsCSPService.h"
- #include "mozilla/dom/nsCSPUtils.h"
- #include "mozilla/dom/Promise.h"
- #include "mozilla/dom/PromiseNativeHandler.h"
- #include "mozilla/dom/Response.h"
- #include "mozilla/dom/ScriptLoader.h"
-@@ -254,16 +256,17 @@ struct ScriptLoadInfo
-   // resolution.
-   RefPtr<Promise> mCachePromise;
- 
-   // The reader stream the cache entry should be filled from, for those cases
-   // when we're going to have an mCachePromise.
-   nsCOMPtr<nsIInputStream> mCacheReadStream;
- 
-   nsCOMPtr<nsIChannel> mChannel;
-+  Maybe<ClientInfo> mReservedClientInfo;
-   char16_t* mScriptTextBuf;
-   size_t mScriptTextLength;
- 
-   nsresult mLoadResult;
-   bool mLoadingFinished;
-   bool mExecutionScheduled;
-   bool mExecutionResult;
- 
-@@ -562,16 +565,17 @@ class ScriptLoaderRunnable final : publi
+@@ -565,16 +565,17 @@ class ScriptLoaderRunnable final : publi
    friend class CachePromiseHandler;
    friend class CacheScriptLoader;
    friend class LoaderListener;
@@ -5932,35 +4306,7 @@ diff --git a/dom/workers/ScriptLoader.cpp b/dom/workers/ScriptLoader.cpp
  
  public:
    NS_DECL_THREADSAFE_ISUPPORTS
-@@ -984,16 +988,27 @@ private:
-     // We don't care about progress so just use the simple stream loader for
-     // OnStreamComplete notification only.
-     nsCOMPtr<nsIStreamLoader> loader;
-     rv = NS_NewStreamLoader(getter_AddRefs(loader), listener);
-     if (NS_WARN_IF(NS_FAILED(rv))) {
-       return rv;
-     }
- 
-+    if (IsMainWorkerScript()) {
-+      MOZ_DIAGNOSTIC_ASSERT(loadInfo.mReservedClientInfo.isSome());
-+      rv = AddClientChannelHelper(channel,
-+                                  Move(loadInfo.mReservedClientInfo),
-+                                  Maybe<ClientInfo>(),
-+                                  mWorkerPrivate->HybridEventTarget());
-+      if (NS_WARN_IF(NS_FAILED(rv))) {
-+        return rv;
-+      }
-+    }
-+
-     if (loadInfo.mCacheStatus != ScriptLoadInfo::ToBeCached) {
-       rv = channel->AsyncOpen2(loader);
-       if (NS_WARN_IF(NS_FAILED(rv))) {
-         return rv;
-       }
-     } else {
-       nsCOMPtr<nsIOutputStream> writer;
- 
-@@ -1197,16 +1212,20 @@ private:
+@@ -1211,16 +1212,20 @@ private:
  
        mWorkerPrivate->SetReferrerPolicyFromHeaderValue(tRPHeaderCValue);
  
@@ -5981,7 +4327,7 @@ diff --git a/dom/workers/ScriptLoader.cpp b/dom/workers/ScriptLoader.cpp
    void
    DataReceivedFromCache(uint32_t aIndex, const uint8_t* aString,
                          uint32_t aStringLen,
-@@ -1961,16 +1980,26 @@ ScriptExecutorRunnable::WorkerRun(JSCont
+@@ -1976,19 +1981,22 @@ ScriptExecutorRunnable::WorkerRun(JSCont
                                      loadInfo.mLoadResult, loadInfo.mURL);
        // Top level scripts only!
        if (mIsWorkerScript) {
@@ -5990,45 +4336,22 @@ diff --git a/dom/workers/ScriptLoader.cpp b/dom/workers/ScriptLoader.cpp
        return true;
      }
  
+-    // If this is a top level scropt that succeeded, then mark the
+-    // Client execution ready.
 +    // If this is a top level script that succeeded, then mark the
 +    // Client execution ready and possibly controlled by a service worker.
-+    if (mIsWorkerScript) {
+     if (mIsWorkerScript) {
 +      if (mScriptLoader.mController.isSome()) {
 +        aWorkerPrivate->Control(mScriptLoader.mController.ref());
 +      }
-+
-+      aWorkerPrivate->ExecutionReady();
-+    }
-+
+       aWorkerPrivate->ExecutionReady();
+     }
+ 
      NS_ConvertUTF16toUTF8 filename(loadInfo.mURL);
  
      JS::CompileOptions options(aCx);
      options.setFileAndLine(filename.get(), 1)
             .setNoScriptRval(true);
- 
-     if (mScriptLoader.mWorkerScriptType == DebuggerScript) {
-       options.setVersion(JSVERSION_DEFAULT);
-@@ -2259,16 +2288,20 @@ LoadMainScript(WorkerPrivate* aWorkerPri
-                ErrorResult& aRv)
- {
-   nsTArray<ScriptLoadInfo> loadInfos;
- 
-   ScriptLoadInfo* info = loadInfos.AppendElement();
-   info->mURL = aScriptURL;
-   info->mLoadFlags = aWorkerPrivate->GetLoadFlags();
- 
-+  // We are loading the main script, so the worker's Client must be
-+  // reserved.
-+  info->mReservedClientInfo.emplace(aWorkerPrivate->GetClientInfo());
-+
-   LoadAllScripts(aWorkerPrivate, loadInfos, true, aWorkerScriptType, aRv);
- }
- 
- void
- Load(WorkerPrivate* aWorkerPrivate,
-      const nsTArray<nsString>& aScriptURLs, WorkerScriptType aWorkerScriptType,
-      ErrorResult& aRv)
- {
 diff --git a/dom/workers/ServiceWorker.cpp b/dom/workers/ServiceWorker.cpp
 --- a/dom/workers/ServiceWorker.cpp
 +++ b/dom/workers/ServiceWorker.cpp
@@ -7023,7 +5346,7 @@ diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPri
  NS_IMPL_CYCLE_COLLECTION_UNROOT_NATIVE(ServiceWorkerPrivate, Release)
  
  // Tracks the "dom.serviceWorkers.disable_open_click_delay" preference.  Modified
-@@ -480,29 +483,28 @@ public:
+@@ -481,29 +484,28 @@ public:
  
      return NS_OK;
    }
@@ -7056,7 +5379,7 @@ diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPri
      JS::Rooted<JS::Value> messageData(aCx);
      nsCOMPtr<nsIGlobalObject> sgo = aWorkerPrivate->GlobalScope();
      ErrorResult rv;
-@@ -511,26 +513,25 @@ public:
+@@ -512,26 +514,25 @@ public:
        return true;
      }
  
@@ -7085,7 +5408,7 @@ diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPri
      if (NS_WARN_IF(rv.Failed())) {
        rv.SuppressException();
        return false;
-@@ -546,17 +547,17 @@ public:
+@@ -547,17 +548,17 @@ public:
  };
  
  } // anonymous namespace
@@ -7104,7 +5427,7 @@ diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPri
      return rv.StealNSResult();
    }
  
-@@ -565,17 +566,17 @@ ServiceWorkerPrivate::SendMessageEvent(J
+@@ -566,17 +567,17 @@ ServiceWorkerPrivate::SendMessageEvent(J
    rv = nsContentUtils::CreateJSValueFromSequenceOfObject(aCx, aTransferable,
                                                           &transferable);
    if (NS_WARN_IF(rv.Failed())) {
@@ -7123,7 +5446,7 @@ diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPri
  
    if (!runnable->Dispatch()) {
      return NS_ERROR_FAILURE;
-@@ -1336,24 +1337,24 @@ class FetchEventRunnable : public Extend
+@@ -1339,24 +1340,24 @@ class FetchEventRunnable : public Extend
  public:
    FetchEventRunnable(WorkerPrivate* aWorkerPrivate,
                       KeepAliveToken* aKeepAliveToken,
@@ -7150,7 +5473,7 @@ diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPri
      // By default we set it to same-origin since normal HTTP fetches always
      // send credentials to same-origin websites unless explicitly forbidden.
      , mRequestCredentials(RequestCredentials::Same_origin)
-@@ -1616,17 +1617,20 @@ private:
+@@ -1619,17 +1620,20 @@ private:
  
      MOZ_ASSERT_IF(internalReq->IsNavigationRequest(),
                    request->Redirect() == RequestRedirect::Manual);
@@ -7172,7 +5495,7 @@ diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPri
      if (NS_WARN_IF(result.Failed())) {
        result.SuppressException();
        return false;
-@@ -1662,18 +1666,17 @@ private:
+@@ -1665,18 +1669,17 @@ private:
  
  NS_IMPL_ISUPPORTS_INHERITED(FetchEventRunnable, WorkerRunnable, nsIHttpHeaderVisitor)
  
@@ -7192,7 +5515,7 @@ diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPri
      return NS_ERROR_FAILURE;
    }
  
-@@ -1740,17 +1743,17 @@ ServiceWorkerPrivate::SendFetchEvent(nsI
+@@ -1743,17 +1746,17 @@ ServiceWorkerPrivate::SendFetchEvent(nsI
        "ServiceWorkerRegistrationInfo", registration, false));
  
    RefPtr<KeepAliveToken> token = CreateEventKeepAliveToken();
@@ -7211,7 +5534,7 @@ diff --git a/dom/workers/ServiceWorkerPrivate.cpp b/dom/workers/ServiceWorkerPri
    if (mInfo->State() == ServiceWorkerState::Activating) {
      mPendingFunctionalEvents.AppendElement(r.forget());
      return NS_OK;
-@@ -1889,17 +1892,17 @@ ServiceWorkerPrivate::SpawnWorkerIfNeede
+@@ -1892,17 +1895,17 @@ ServiceWorkerPrivate::SpawnWorkerIfNeede
    jsapi.Init();
    ErrorResult error;
    NS_ConvertUTF8toUTF16 scriptSpec(mInfo->ScriptSpec());
@@ -7327,127 +5650,15 @@ diff --git a/dom/workers/ServiceWorkerRegistrationInfo.cpp b/dom/workers/Service
 diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
 --- a/dom/workers/WorkerPrivate.cpp
 +++ b/dom/workers/WorkerPrivate.cpp
-@@ -43,23 +43,26 @@
- #include "mozilla/Attributes.h"
- #include "mozilla/ContentEvents.h"
- #include "mozilla/EventDispatcher.h"
- #include "mozilla/Likely.h"
- #include "mozilla/LoadContext.h"
- #include "mozilla/Move.h"
- #include "mozilla/dom/BindingUtils.h"
- #include "mozilla/dom/Console.h"
-+#include "mozilla/dom/ClientManager.h"
-+#include "mozilla/dom/ClientSource.h"
- #include "mozilla/dom/DocGroup.h"
- #include "mozilla/dom/ErrorEvent.h"
- #include "mozilla/dom/ErrorEventBinding.h"
- #include "mozilla/dom/Exceptions.h"
- #include "mozilla/dom/ExtendableMessageEventBinding.h"
- #include "mozilla/dom/FunctionBinding.h"
- #include "mozilla/dom/IndexedDatabaseManager.h"
-+#include "mozilla/dom/IPCServiceWorkerDescriptor.h"
- #include "mozilla/dom/MessageEvent.h"
- #include "mozilla/dom/MessageEventBinding.h"
- #include "mozilla/dom/MessagePort.h"
- #include "mozilla/dom/MessagePortBinding.h"
- #include "mozilla/dom/nsCSPUtils.h"
- #include "mozilla/dom/Performance.h"
- #include "mozilla/dom/PMessagePort.h"
- #include "mozilla/dom/Promise.h"
-@@ -593,16 +596,18 @@ private:
-   // run we have not yet done our load so don't know things like our final
-   // principal and whatnot.
+@@ -5321,27 +5321,60 @@ WorkerPrivate::EnsureClientSource()
+       MOZ_CRASH("unknown worker type!");
+   }
  
-   virtual bool
-   WorkerRun(JSContext* aCx, WorkerPrivate* aWorkerPrivate) override
-   {
-     aWorkerPrivate->AssertIsOnWorkerThread();
- 
-+    aWorkerPrivate->EnsureClientSource();
-+
-     ErrorResult rv;
-     scriptloader::LoadMainScript(aWorkerPrivate, mScriptURL, WorkerScript, rv);
-     rv.WouldReportJSException();
-     // Explicitly ignore NS_BINDING_ABORTED on rv.  Or more precisely, still
-     // return false and don't SetWorkerScriptExecutedSuccessfully() in that
-     // case, but don't throw anything on aCx.  The idea is to not dispatch error
-     // events if our load is canceled with that error code.
-     if (rv.ErrorCodeIs(NS_BINDING_ABORTED)) {
-@@ -663,16 +668,18 @@ private:
- 
-     WorkerDebuggerGlobalScope* globalScope =
-       aWorkerPrivate->CreateDebuggerGlobalScope(aCx);
-     if (!globalScope) {
-       NS_WARNING("Failed to make global!");
-       return false;
-     }
- 
-+    aWorkerPrivate->EnsureClientSource();
-+
-     JS::Rooted<JSObject*> global(aCx, globalScope->GetWrapper());
- 
-     ErrorResult rv;
-     JSAutoCompartment ac(aCx, global);
-     scriptloader::LoadMainScript(aWorkerPrivate, mScriptURL,
-                                  DebuggerScript, rv);
-     rv.WouldReportJSException();
-     // Explicitly ignore NS_BINDING_ABORTED on rv.  Or more precisely, still
-@@ -5119,16 +5126,18 @@ WorkerPrivate::DoRunLoop(JSContext* aCx)
-       }
- 
-       // If we're supposed to die then we should exit the loop.
-       if (currentStatus == Killing) {
-         // Flush uncaught rejections immediately, without
-         // waiting for a next tick.
-         PromiseDebugging::FlushUncaughtRejections();
- 
-+        mClientSource = nullptr;
-+
-         ShutdownGCTimers();
- 
-         DisableMemoryReporter();
- 
-         {
-           MutexAutoLock lock(mMutex);
- 
-           mStatus = Dead;
-@@ -5281,16 +5290,96 @@ WorkerPrivate::ControlEventTarget()
- 
- nsISerialEventTarget*
- WorkerPrivate::HybridEventTarget()
- {
-   return mWorkerHybridEventTarget;
- }
- 
- void
-+WorkerPrivate::EnsureClientSource()
-+{
-+  AssertIsOnWorkerThread();
-+
-+  if (mClientSource) {
-+    return;
-+  }
-+
-+  ClientType type;
-+  switch(Type()) {
-+    case WorkerTypeDedicated:
-+      type = ClientType::Worker;
-+      break;
-+    case WorkerTypeShared:
-+      type = ClientType::Sharedworker;
-+      break;
-+    case WorkerTypeService:
-+      type = ClientType::Serviceworker;
-+      break;
-+    default:
-+      MOZ_CRASH("unknown worker type!");
-+  }
-+
-+  mClientSource = ClientManager::CreateSource(type, mWorkerHybridEventTarget,
-+                                              GetPrincipalInfo());
-+  if (mFrozen) {
-+    mClientSource->Freeze();
-+  }
+   mClientSource = ClientManager::CreateSource(type, mWorkerHybridEventTarget,
+                                               GetPrincipalInfo());
+   if (mFrozen) {
+     mClientSource->Freeze();
+   }
 +
 +  // Shortly after the client is reserved we will try loading the main script
 +  // for the worker.  This may get intercepted by the ServiceWorkerManager
@@ -7471,17 +5682,17 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
 +  if (Type() != WorkerTypeService && !IsChromeWorker()) {
 +    mClientSource->WorkerSyncPing(this);
 +  }
-+}
-+
-+const ClientInfo&
-+WorkerPrivate::GetClientInfo() const
-+{
-+  AssertIsOnWorkerThread();
-+  MOZ_DIAGNOSTIC_ASSERT(mClientSource);
-+  return mClientSource->Info();
-+}
-+
-+void
+ }
+ 
+ const ClientInfo&
+ WorkerPrivate::GetClientInfo() const
+ {
+   AssertIsOnWorkerThread();
+   MOZ_DIAGNOSTIC_ASSERT(mClientSource);
+   return mClientSource->Info();
+ }
+ 
+ void
 +WorkerPrivate::Control(const ServiceWorkerDescriptor& aServiceWorker)
 +{
 +  AssertIsOnWorkerThread();
@@ -7492,134 +5703,37 @@ diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
 +}
 +
 +void
-+WorkerPrivate::ExecutionReady()
-+{
-+  AssertIsOnWorkerThread();
-+  MOZ_DIAGNOSTIC_ASSERT(mClientSource);
-+  mClientSource->WorkerExecutionReady(this);
-+}
-+
-+void
- WorkerPrivate::InitializeGCTimers()
+ WorkerPrivate::ExecutionReady()
  {
    AssertIsOnWorkerThread();
- 
-   // We need a timer for GC. The basic plan is to run a non-shrinking GC
-   // periodically (PERIODIC_GC_TIMER_DELAY_SEC) while the worker is running.
-   // Once the worker goes idle we set a short (IDLE_GC_TIMER_DELAY_SEC) timer to
-   // run a shrinking GC. If the worker receives more messages then the short
-@@ -5619,16 +5708,20 @@ WorkerPrivate::ClearDebuggerEventQueue()
- 
- bool
- WorkerPrivate::FreezeInternal()
- {
-   AssertIsOnWorkerThread();
- 
-   NS_ASSERTION(!mFrozen, "Already frozen!");
- 
-+  if (mClientSource) {
-+    mClientSource->Freeze();
-+  }
-+
-   mFrozen = true;
- 
-   for (uint32_t index = 0; index < mChildWorkers.Length(); index++) {
-     mChildWorkers[index]->Freeze(nullptr);
-   }
- 
-   return true;
- }
-@@ -5640,16 +5733,21 @@ WorkerPrivate::ThawInternal()
- 
-   NS_ASSERTION(mFrozen, "Not yet frozen!");
- 
-   for (uint32_t index = 0; index < mChildWorkers.Length(); index++) {
-     mChildWorkers[index]->Thaw(nullptr);
-   }
- 
-   mFrozen = false;
-+
-+  if (mClientSource) {
-+    mClientSource->Thaw();
-+  }
-+
-   return true;
+   MOZ_DIAGNOSTIC_ASSERT(mClientSource);
+   mClientSource->WorkerExecutionReady(this);
  }
  
  void
- WorkerPrivate::TraverseTimeouts(nsCycleCollectionTraversalCallback& cb)
- {
-   for (uint32_t i = 0; i < mTimeouts.Length(); ++i) {
-     TimeoutInfo* tmp = mTimeouts[i];
 diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
 --- a/dom/workers/WorkerPrivate.h
 +++ b/dom/workers/WorkerPrivate.h
-@@ -58,16 +58,18 @@ template<class T> class nsMainThreadPtrH
+@@ -1499,16 +1499,19 @@ public:
  
- namespace JS {
- struct RuntimeStats;
- } // namespace JS
+   void
+   EnsureClientSource();
  
- namespace mozilla {
- class ThrottledEventQueue;
- namespace dom {
-+class ClientInfo;
-+class ClientSource;
- class Function;
- class MessagePort;
- class MessagePortIdentifier;
- class PromiseNativeHandler;
- class StructuredCloneHolder;
- class WorkerDebuggerGlobalScope;
- class WorkerGlobalScope;
- struct WorkerOptions;
-@@ -1044,16 +1046,17 @@ class WorkerPrivate : public WorkerPriva
-   // fired on the main thread if the worker script fails to load
-   nsCOMPtr<nsIRunnable> mLoadFailedRunnable;
+   const ClientInfo&
+   GetClientInfo() const;
  
-   JS::UniqueChars mDefaultLocale; // nulled during worker JSContext init
-   TimeStamp mKillTime;
-   uint32_t mErrorHandlerRecursionCount;
-   uint32_t mNextTimeoutId;
-   Status mStatus;
-+  UniquePtr<ClientSource> mClientSource;
-   bool mFrozen;
-   bool mTimerRunning;
-   bool mRunningExpiredTimeouts;
-   bool mPendingEventQueueClearing;
-   bool mCancelAllPendingRunnables;
-   bool mPeriodicGCTimerRunning;
-   bool mIdleGCTimerRunning;
-   bool mWorkerScriptExecutedSuccessfully;
-@@ -1475,16 +1478,28 @@ public:
-   nsISerialEventTarget*
-   ControlEventTarget();
- 
-   // Get an event target that will attempt to dispatch a normal WorkerRunnable,
-   // but if that fails will then fall back to a control runnable.
-   nsISerialEventTarget*
-   HybridEventTarget();
- 
-+  void
-+  EnsureClientSource();
-+
-+  const ClientInfo&
-+  GetClientInfo() const;
-+
-+  void
+   void
 +  Control(const ServiceWorkerDescriptor& aServiceWorker);
 +
 +  void
-+  ExecutionReady();
-+
+   ExecutionReady();
+ 
  private:
    WorkerPrivate(WorkerPrivate* aParent,
                  const nsAString& aScriptURL, bool aIsChromeWorker,
                  WorkerType aWorkerType, const nsAString& aWorkerName,
                  const nsACString& aServiceWorkerScope,
                  WorkerLoadInfo& aLoadInfo);
- 
-   bool
 diff --git a/dom/workers/WorkerScope.cpp b/dom/workers/WorkerScope.cpp
 --- a/dom/workers/WorkerScope.cpp
 +++ b/dom/workers/WorkerScope.cpp
@@ -7963,7 +6077,7 @@ diff --git a/ipc/ipdl/sync-messages.ini b/ipc/ipdl/sync-messages.ini
 diff --git a/modules/libpref/init/all.js b/modules/libpref/init/all.js
 --- a/modules/libpref/init/all.js
 +++ b/modules/libpref/init/all.js
-@@ -5881,16 +5881,23 @@ pref("layers.advanced.image-layers", 2);
+@@ -5874,16 +5874,23 @@ pref("layers.advanced.image-layers", 2);
  pref("layers.advanced.outline-layers", 2);
  pref("layers.advanced.solid-color", false);
  pref("layers.advanced.table", false);
@@ -7987,35 +6101,10 @@ diff --git a/modules/libpref/init/all.js b/modules/libpref/init/all.js
  pref("toolkit.crashreporter.include_context_heap", true);
  #endif
  
-diff --git a/netwerk/base/LoadInfo.cpp b/netwerk/base/LoadInfo.cpp
---- a/netwerk/base/LoadInfo.cpp
-+++ b/netwerk/base/LoadInfo.cpp
-@@ -108,16 +108,21 @@ LoadInfo::LoadInfo(nsIPrincipal* aLoadin
-   // if the load is sandboxed, we can not also inherit the principal
-   if (mSecurityFlags & nsILoadInfo::SEC_SANDBOXED) {
-     mForceInheritPrincipalDropped =
-       (mSecurityFlags & nsILoadInfo::SEC_FORCE_INHERIT_PRINCIPAL);
-     mSecurityFlags &= ~nsILoadInfo::SEC_FORCE_INHERIT_PRINCIPAL;
-   }
- 
-   if (aLoadingContext) {
-+    nsCOMPtr<nsPIDOMWindowInner> contextInner = aLoadingContext->OwnerDoc()->GetInnerWindow();
-+    if (contextInner) {
-+      mClientInfo = contextInner->GetClientInfo();
-+    }
-+
-     nsCOMPtr<nsPIDOMWindowOuter> contextOuter = aLoadingContext->OwnerDoc()->GetWindow();
-     if (contextOuter) {
-       ComputeIsThirdPartyContext(contextOuter);
-       mOuterWindowID = contextOuter->WindowID();
-       nsCOMPtr<nsPIDOMWindowOuter> parent = contextOuter->GetScriptableParent();
-       mParentOuterWindowID = parent ? parent->WindowID() : mOuterWindowID;
-       mTopOuterWindowID = FindTopOuterWindowID(contextOuter);
-     }
 diff --git a/testing/web-platform/meta/MANIFEST.json b/testing/web-platform/meta/MANIFEST.json
 --- a/testing/web-platform/meta/MANIFEST.json
 +++ b/testing/web-platform/meta/MANIFEST.json
-@@ -280926,16 +280926,36 @@
+@@ -280948,16 +280948,36 @@
       {}
      ]
     ],
@@ -8052,7 +6141,7 @@ diff --git a/testing/web-platform/meta/MANIFEST.json b/testing/web-platform/meta
     "service-workers/service-worker/resources/appcache-ordering.is-appcached.html": [
      [
       {}
-@@ -351221,16 +351241,24 @@
+@@ -351243,16 +351263,24 @@
      ]
     ],
     "service-workers/service-worker/ServiceWorkerGlobalScope/update.https.html": [
@@ -8077,7 +6166,7 @@ diff --git a/testing/web-platform/meta/MANIFEST.json b/testing/web-platform/meta
     ],
     "service-workers/service-worker/activation-after-registration.https.html": [
      [
-@@ -578070,16 +578098,20 @@
+@@ -578110,16 +578138,20 @@
    "service-workers/service-worker/ServiceWorkerGlobalScope/unregister.https.html": [
     "9fe4c10b921a84dc086cea47d48bb34fdbb28eee",
     "testharness"
@@ -8098,7 +6187,7 @@ diff --git a/testing/web-platform/meta/MANIFEST.json b/testing/web-platform/meta
     "913c58ba58de077b82d0ec9cc21258610b26fe97",
     "testharness"
    ],
-@@ -578718,16 +578750,32 @@
+@@ -578758,16 +578790,32 @@
    "service-workers/service-worker/resource-timing.https.html": [
     "a835a0baeb4fcc0c44e6be28502f89308464acc5",
     "testharness"
