@@ -1,0 +1,244 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  aca863bffe6cbb04b8c5eb76b57d0db4806b88ca
+Bug 1420594 P1 Make ClientManagerService track active ClientManagerParent actors. r=baku
+
+diff --git a/dom/clients/manager/ClientManagerActors.cpp b/dom/clients/manager/ClientManagerActors.cpp
+--- a/dom/clients/manager/ClientManagerActors.cpp
++++ b/dom/clients/manager/ClientManagerActors.cpp
+@@ -32,10 +32,17 @@ AllocClientManagerParent()
+ 
+ bool
+ DeallocClientManagerParent(PClientManagerParent* aActor)
+ {
+   delete aActor;
+   return true;
+ }
+ 
++void
++InitClientManagerParent(PClientManagerParent* aActor)
++{
++  auto actor = static_cast<ClientManagerParent*>(aActor);
++  actor->Init();
++}
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/clients/manager/ClientManagerActors.h b/dom/clients/manager/ClientManagerActors.h
+--- a/dom/clients/manager/ClientManagerActors.h
++++ b/dom/clients/manager/ClientManagerActors.h
+@@ -19,13 +19,16 @@ bool
+ DeallocClientManagerChild(PClientManagerChild* aActor);
+ 
+ PClientManagerParent*
+ AllocClientManagerParent();
+ 
+ bool
+ DeallocClientManagerParent(PClientManagerParent* aActor);
+ 
++void
++InitClientManagerParent(PClientManagerParent* aActor);
++
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // _mozilla_dom_ClientManagerActors_h
+diff --git a/dom/clients/manager/ClientManagerParent.cpp b/dom/clients/manager/ClientManagerParent.cpp
+--- a/dom/clients/manager/ClientManagerParent.cpp
++++ b/dom/clients/manager/ClientManagerParent.cpp
+@@ -112,12 +112,19 @@ ClientManagerParent::RecvPClientSourceCo
+ 
+ ClientManagerParent::ClientManagerParent()
+   : mService(ClientManagerService::GetOrCreateInstance())
+ {
+ }
+ 
+ ClientManagerParent::~ClientManagerParent()
+ {
++  mService->RemoveManager(this);
++}
++
++void
++ClientManagerParent::Init()
++{
++  mService->AddManager(this);
+ }
+ 
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/clients/manager/ClientManagerParent.h b/dom/clients/manager/ClientManagerParent.h
+--- a/dom/clients/manager/ClientManagerParent.h
++++ b/dom/clients/manager/ClientManagerParent.h
+@@ -58,14 +58,17 @@ class ClientManagerParent final : public
+ 
+   mozilla::ipc::IPCResult
+   RecvPClientSourceConstructor(PClientSourceParent* aActor,
+                                const ClientSourceConstructorArgs& aArgs) override;
+ 
+ public:
+   ClientManagerParent();
+   ~ClientManagerParent();
++
++  void
++  Init();
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // _mozilla_dom_ClientManagerParent_h
+diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/ClientManagerService.cpp
+--- a/dom/clients/manager/ClientManagerService.cpp
++++ b/dom/clients/manager/ClientManagerService.cpp
+@@ -62,16 +62,17 @@ ClientManagerService::ClientManagerServi
+ {
+   AssertIsOnBackgroundThread();
+ }
+ 
+ ClientManagerService::~ClientManagerService()
+ {
+   AssertIsOnBackgroundThread();
+   MOZ_DIAGNOSTIC_ASSERT(mSourceTable.Count() == 0);
++  MOZ_DIAGNOSTIC_ASSERT(mManagerList.IsEmpty());
+ 
+   MOZ_DIAGNOSTIC_ASSERT(sClientManagerServiceInstance == this);
+   sClientManagerServiceInstance = nullptr;
+ }
+ 
+ // static
+ already_AddRefed<ClientManagerService>
+ ClientManagerService::GetOrCreateInstance()
+@@ -129,10 +130,28 @@ ClientManagerService::FindSource(const n
+   if (source->IsFrozen() ||
+       !MatchPrincipalInfo(source->Info().PrincipalInfo(), aPrincipalInfo)) {
+     return nullptr;
+   }
+ 
+   return source;
+ }
+ 
++void
++ClientManagerService::AddManager(ClientManagerParent* aManager)
++{
++  AssertIsOnBackgroundThread();
++  MOZ_DIAGNOSTIC_ASSERT(aManager);
++  MOZ_ASSERT(!mManagerList.Contains(aManager));
++  mManagerList.AppendElement(aManager);
++}
++
++void
++ClientManagerService::RemoveManager(ClientManagerParent* aManager)
++{
++  AssertIsOnBackgroundThread();
++  MOZ_DIAGNOSTIC_ASSERT(aManager);
++  DebugOnly<bool> removed = mManagerList.RemoveElement(aManager);
++  MOZ_ASSERT(removed);
++}
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/clients/manager/ClientManagerService.h b/dom/clients/manager/ClientManagerService.h
+--- a/dom/clients/manager/ClientManagerService.h
++++ b/dom/clients/manager/ClientManagerService.h
+@@ -8,27 +8,30 @@
+ 
+ #include "mozilla/ipc/PBackgroundSharedTypes.h"
+ #include "nsDataHashtable.h"
+ 
+ namespace mozilla {
+ 
+ namespace dom {
+ 
++class ClientManagerParent;
+ class ClientSourceParent;
+ 
+ // Define a singleton service to manage client activity throughout the
+ // browser.  This service runs on the PBackground thread.  To interact
+ // it with it please use the ClientManager and ClientHandle classes.
+ class ClientManagerService final
+ {
+   // Store the ClientSourceParent objects in a hash table.  We want to
+   // optimize for insertion, removal, and lookup by UUID.
+   nsDataHashtable<nsIDHashKey, ClientSourceParent*> mSourceTable;
+ 
++  nsTArray<ClientManagerParent*> mManagerList;
++
+   ClientManagerService();
+   ~ClientManagerService();
+ 
+ public:
+   static already_AddRefed<ClientManagerService>
+   GetOrCreateInstance();
+ 
+   bool
+@@ -36,15 +39,21 @@ public:
+ 
+   bool
+   RemoveSource(ClientSourceParent* aSource);
+ 
+   ClientSourceParent*
+   FindSource(const nsID& aID,
+              const mozilla::ipc::PrincipalInfo& aPrincipalInfo);
+ 
++  void
++  AddManager(ClientManagerParent* aManager);
++
++  void
++  RemoveManager(ClientManagerParent* aManager);
++
+   NS_INLINE_DECL_REFCOUNTING(mozilla::dom::ClientManagerService)
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // _mozilla_dom_ClientManagerService_h
+diff --git a/ipc/glue/BackgroundParentImpl.cpp b/ipc/glue/BackgroundParentImpl.cpp
+--- a/ipc/glue/BackgroundParentImpl.cpp
++++ b/ipc/glue/BackgroundParentImpl.cpp
+@@ -975,16 +975,23 @@ BackgroundParentImpl::AllocPClientManage
+ }
+ 
+ bool
+ BackgroundParentImpl::DeallocPClientManagerParent(mozilla::dom::PClientManagerParent* aActor)
+ {
+   return mozilla::dom::DeallocClientManagerParent(aActor);
+ }
+ 
++mozilla::ipc::IPCResult
++BackgroundParentImpl::RecvPClientManagerConstructor(mozilla::dom::PClientManagerParent* aActor)
++{
++  mozilla::dom::InitClientManagerParent(aActor);
++  return IPC_OK();
++}
++
+ } // namespace ipc
+ } // namespace mozilla
+ 
+ void
+ TestParent::ActorDestroy(ActorDestroyReason aWhy)
+ {
+   mozilla::ipc::AssertIsInMainProcess();
+   AssertIsOnBackgroundThread();
+diff --git a/ipc/glue/BackgroundParentImpl.h b/ipc/glue/BackgroundParentImpl.h
+--- a/ipc/glue/BackgroundParentImpl.h
++++ b/ipc/glue/BackgroundParentImpl.h
+@@ -263,14 +263,17 @@ protected:
+   virtual bool
+   DeallocPHttpBackgroundChannelParent(PHttpBackgroundChannelParent *aActor) override;
+ 
+   virtual PClientManagerParent*
+   AllocPClientManagerParent() override;
+ 
+   virtual bool
+   DeallocPClientManagerParent(PClientManagerParent* aActor) override;
++
++  virtual mozilla::ipc::IPCResult
++  RecvPClientManagerConstructor(PClientManagerParent* aActor) override;
+ };
+ 
+ } // namespace ipc
+ } // namespace mozilla
+ 
+ #endif // mozilla_ipc_backgroundparentimpl_h__
