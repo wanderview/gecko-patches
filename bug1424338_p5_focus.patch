@@ -1,0 +1,292 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  9fa83158cf4505c23ebd0b8b969ecc88e302e71f
+Bug 1424338 P5 Implement ClientHandle::Focus(). r=baku
+
+diff --git a/dom/clients/manager/ClientHandle.cpp b/dom/clients/manager/ClientHandle.cpp
+--- a/dom/clients/manager/ClientHandle.cpp
++++ b/dom/clients/manager/ClientHandle.cpp
+@@ -4,16 +4,17 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "ClientHandle.h"
+ 
+ #include "ClientHandleChild.h"
+ #include "ClientHandleOpChild.h"
+ #include "ClientManager.h"
++#include "ClientState.h"
+ #include "mozilla/dom/PClientManagerChild.h"
+ #include "mozilla/dom/ServiceWorkerDescriptor.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ ClientHandle::~ClientHandle()
+ {
+@@ -117,10 +118,29 @@ ClientHandle::Control(const ServiceWorke
+     },
+     [outerPromise](const ClientOpResult& aResult) {
+       outerPromise->Reject(aResult.get_nsresult(), __func__);
+     });
+ 
+   return outerPromise.forget();
+ }
+ 
++RefPtr<ClientStatePromise>
++ClientHandle::Focus()
++{
++  RefPtr<ClientStatePromise::Private> outerPromise =
++    new ClientStatePromise::Private(__func__);
++
++  RefPtr<ClientOpPromise> innerPromise = StartOp(ClientFocusArgs());
++
++  innerPromise->Then(mSerialEventTarget, __func__,
++    [outerPromise](const ClientOpResult& aResult) {
++      outerPromise->Resolve(ClientState::FromIPC(aResult.get_IPCClientState()), __func__);
++    }, [outerPromise](const ClientOpResult& aResult) {
++      outerPromise->Reject(aResult.get_nsresult(), __func__);
++    });
++
++  RefPtr<ClientStatePromise> ref = outerPromise.get();
++  return ref.forget();
++}
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/clients/manager/ClientHandle.h b/dom/clients/manager/ClientHandle.h
+--- a/dom/clients/manager/ClientHandle.h
++++ b/dom/clients/manager/ClientHandle.h
+@@ -65,15 +65,21 @@ public:
+   Info() const;
+ 
+   // Mark the ClientSource attached to this handle as controlled by the
+   // given service worker.  The promise will resolve true if the ClientSource
+   // is successfully marked or reject if the operation could not be completed.
+   RefPtr<GenericPromise>
+   Control(const ServiceWorkerDescriptor& aServiceWorker);
+ 
++  // Focus the Client if possible.  If successful the promise will resolve with
++  // a new ClientState snapshot after focus has completed.  If focusing fails
++  // for any reason then the promise will reject.
++  RefPtr<ClientStatePromise>
++  Focus();
++
+   NS_INLINE_DECL_REFCOUNTING(ClientHandle);
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // _mozilla_dom_ClientHandle_h
+diff --git a/dom/clients/manager/ClientIPCTypes.ipdlh b/dom/clients/manager/ClientIPCTypes.ipdlh
+--- a/dom/clients/manager/ClientIPCTypes.ipdlh
++++ b/dom/clients/manager/ClientIPCTypes.ipdlh
+@@ -62,16 +62,20 @@ struct ClientSourceExecutionReadyArgs
+   FrameType frameType;
+ };
+ 
+ struct ClientControlledArgs
+ {
+   IPCServiceWorkerDescriptor serviceWorker;
+ };
+ 
++struct ClientFocusArgs
++{
++};
++
+ struct ClientNavigateArgs
+ {
+   IPCClientInfo target;
+   nsCString url;
+   nsCString baseURL;
+ };
+ 
+ union ClientEndPoint
+@@ -103,16 +107,17 @@ struct ClientOpenWindowArgs
+   PrincipalInfo principalInfo;
+   nsCString url;
+   nsCString baseURL;
+ };
+ 
+ union ClientOpConstructorArgs
+ {
+   ClientControlledArgs;
++  ClientFocusArgs;
+   ClientNavigateArgs;
+   ClientMatchAllArgs;
+   ClientClaimArgs;
+   ClientGetInfoAndStateArgs;
+   ClientOpenWindowArgs;
+ };
+ 
+ struct ClientList
+@@ -125,14 +130,15 @@ struct ClientNavigateOpConstructorArgs
+   PClientSource target;
+   nsCString url;
+   nsCString baseURL;
+ };
+ 
+ union ClientOpResult
+ {
+   nsresult;
++  IPCClientState;
+   ClientInfoAndState;
+   ClientList;
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSource.cpp
+--- a/dom/clients/manager/ClientSource.cpp
++++ b/dom/clients/manager/ClientSource.cpp
+@@ -8,16 +8,17 @@
+ 
+ #include "ClientManager.h"
+ #include "ClientManagerChild.h"
+ #include "ClientSourceChild.h"
+ #include "ClientState.h"
+ #include "ClientValidation.h"
+ #include "mozilla/dom/ClientIPCTypes.h"
+ #include "mozilla/dom/WorkerPrivate.h"
++#include "nsContentUtils.h"
+ #include "nsIDocShell.h"
+ #include "nsPIDOMWindow.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ using mozilla::dom::workers::WorkerPrivate;
+ using mozilla::ipc::PrincipalInfo;
+@@ -357,16 +358,65 @@ ClientSource::Control(const ClientContro
+ 
+ const Maybe<ServiceWorkerDescriptor>&
+ ClientSource::GetController() const
+ {
+   return mController;
+ }
+ 
+ RefPtr<ClientOpPromise>
++ClientSource::Focus(const ClientFocusArgs& aArgs)
++{
++  NS_ASSERT_OWNINGTHREAD(ClientSource);
++
++  RefPtr<ClientOpPromise> ref;
++
++  if (mClientInfo.Type() != ClientType::Window) {
++    ref = ClientOpPromise::CreateAndReject(NS_ERROR_DOM_NOT_SUPPORTED_ERR,
++                                           __func__);
++    return ref.forget();
++  }
++  nsPIDOMWindowOuter* outer = nullptr;
++
++  nsPIDOMWindowInner* inner = GetInnerWindow();
++  if (inner) {
++    outer = inner->GetOuterWindow();
++  } else {
++    nsIDocShell* docshell = GetDocShell();
++    if (docshell) {
++      outer = docshell->GetWindow();
++    }
++  }
++
++  if (!outer) {
++    ref = ClientOpPromise::CreateAndReject(NS_ERROR_DOM_INVALID_STATE_ERR,
++                                           __func__);
++    return ref.forget();
++  }
++
++  MOZ_ASSERT(NS_IsMainThread());
++
++  nsresult rv = nsContentUtils::DispatchFocusChromeEvent(outer);
++  if (NS_FAILED(rv)) {
++    ref = ClientOpPromise::CreateAndReject(rv, __func__);
++    return ref.forget();
++  }
++
++  ClientState state;
++  rv = SnapshotState(&state);
++  if (NS_FAILED(rv)) {
++    ref = ClientOpPromise::CreateAndReject(rv, __func__);
++    return ref.forget();
++  }
++
++  ref = ClientOpPromise::CreateAndResolve(state.ToIPC(), __func__);
++  return ref.forget();
++}
++
++RefPtr<ClientOpPromise>
+ ClientSource::Claim(const ClientClaimArgs& aArgs)
+ {
+   SetController(ServiceWorkerDescriptor(aArgs.serviceWorker()));
+ 
+   RefPtr<ClientOpPromise> ref =
+     ClientOpPromise::CreateAndResolve(NS_OK, __func__);
+ 
+   return ref.forget();
+diff --git a/dom/clients/manager/ClientSource.h b/dom/clients/manager/ClientSource.h
+--- a/dom/clients/manager/ClientSource.h
++++ b/dom/clients/manager/ClientSource.h
+@@ -16,16 +16,17 @@ class nsIDocShell;
+ class nsISerialEventTarget;
+ class nsPIDOMWindowInner;
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ class ClientClaimArgs;
+ class ClientControlledArgs;
++class ClientFocusArgs;
+ class ClientManager;
+ class ClientSourceChild;
+ class ClientSourceConstructorArgs;
+ class ClientSourceExecutionReadyArgs;
+ class PClientManagerChild;
+ 
+ namespace workers {
+ class WorkerPrivate;
+@@ -128,16 +129,19 @@ public:
+   Control(const ClientControlledArgs& aArgs);
+ 
+   // Get the ClientSource's current controlling service worker, if one has
+   // been set.
+   const Maybe<ServiceWorkerDescriptor>&
+   GetController() const;
+ 
+   RefPtr<ClientOpPromise>
++  Focus(const ClientFocusArgs& aArgs);
++
++  RefPtr<ClientOpPromise>
+   Claim(const ClientClaimArgs& aArgs);
+ 
+   RefPtr<ClientOpPromise>
+   GetInfoAndState(const ClientGetInfoAndStateArgs& aArgs);
+ 
+   nsresult
+   SnapshotState(ClientState* aStateOut);
+ 
+diff --git a/dom/clients/manager/ClientSourceOpChild.cpp b/dom/clients/manager/ClientSourceOpChild.cpp
+--- a/dom/clients/manager/ClientSourceOpChild.cpp
++++ b/dom/clients/manager/ClientSourceOpChild.cpp
+@@ -74,16 +74,21 @@ void
+ ClientSourceOpChild::Init(const ClientOpConstructorArgs& aArgs)
+ {
+   switch (aArgs.type()) {
+     case ClientOpConstructorArgs::TClientControlledArgs:
+     {
+       DoSourceOp(&ClientSource::Control, aArgs.get_ClientControlledArgs());
+       break;
+     }
++    case ClientOpConstructorArgs::TClientFocusArgs:
++    {
++      DoSourceOp(&ClientSource::Focus, aArgs.get_ClientFocusArgs());
++      break;
++    }
+     case ClientOpConstructorArgs::TClientClaimArgs:
+     {
+       DoSourceOp(&ClientSource::Claim, aArgs.get_ClientClaimArgs());
+       break;
+     }
+     case ClientOpConstructorArgs::TClientGetInfoAndStateArgs:
+     {
+       DoSourceOp(&ClientSource::GetInfoAndState,

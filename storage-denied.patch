@@ -1,0 +1,617 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  84a1d8804bcb4ae07037bce16a2b24433954e418
+
+diff --git a/dom/base/nsContentUtils.h b/dom/base/nsContentUtils.h
+--- a/dom/base/nsContentUtils.h
++++ b/dom/base/nsContentUtils.h
+@@ -2952,16 +2952,18 @@ public:
+     eDeny = 0,
+     // Allow access to the storage, but only if it is secure to do so in a
+     // private browsing context.
+     ePrivateBrowsing = 1,
+     // Allow access to the storage, but only persist it for the current session
+     eSessionScoped = 2,
+     // Allow access to the storage
+     eAllow = 3,
++    // Keep this at the end.  Used for serialization, but not a valid value.
++    eNumValues = 4,
+   };
+ 
+   /*
+    * Checks if storage for the given window is permitted by a combination of
+    * the user's preferences, and whether the window is a third-party iframe.
+    *
+    * This logic is intended to be shared between the different forms of
+    * persistent storage which are available to web pages. Cookies don't use
+diff --git a/dom/clients/api/Client.cpp b/dom/clients/api/Client.cpp
+--- a/dom/clients/api/Client.cpp
++++ b/dom/clients/api/Client.cpp
+@@ -63,16 +63,23 @@ TimeStamp
+ Client::LastFocusTime() const
+ {
+   if (mData->info().type() != ClientType::Window) {
+     return TimeStamp();
+   }
+   return mData->state().get_IPCClientWindowState().lastFocusTime();
+ }
+ 
++nsContentUtils::StorageAccess
++Client::GetStorageAccess() const
++{
++  ClientState state(ClientState::FromIPC(mData->state()));
++  return state.GetStorageAccess();
++}
++
+ JSObject*
+ Client::WrapObject(JSContext* aCx, JS::Handle<JSObject*> aGivenProto)
+ {
+   if (mData->info().type() == ClientType::Window) {
+     return WindowClientBinding::Wrap(aCx, this, aGivenProto);
+   }
+   return ClientBinding::Wrap(aCx, this, aGivenProto);
+ }
+diff --git a/dom/clients/api/Client.h b/dom/clients/api/Client.h
+--- a/dom/clients/api/Client.h
++++ b/dom/clients/api/Client.h
+@@ -3,16 +3,17 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ #ifndef _mozilla_dom_Client_h
+ #define _mozilla_dom_Client_h
+ 
+ #include "mozilla/dom/ClientBinding.h"
+ #include "nsCOMPtr.h"
++#include "nsContentUtils.h"
+ #include "nsISupports.h"
+ #include "nsWrapperCache.h"
+ 
+ class nsIGlobalObject;
+ 
+ namespace mozilla {
+ 
+ class ErrorResult;
+@@ -41,16 +42,19 @@ public:
+   Client(nsIGlobalObject* aGlobal, const ClientInfoAndState& aData);
+ 
+   TimeStamp
+   CreationTime() const;
+ 
+   TimeStamp
+   LastFocusTime() const;
+ 
++  nsContentUtils::StorageAccess
++  GetStorageAccess() const;
++
+   // nsWrapperCache interface methods
+   JSObject*
+   WrapObject(JSContext* aCx, JS::Handle<JSObject*> aGivenProto) override;
+ 
+   // DOM bindings methods
+   nsIGlobalObject*
+   GetParentObject() const;
+ 
+diff --git a/dom/clients/api/Clients.cpp b/dom/clients/api/Clients.cpp
+--- a/dom/clients/api/Clients.cpp
++++ b/dom/clients/api/Clients.cpp
+@@ -8,24 +8,27 @@
+ 
+ #include "ClientDOMUtil.h"
+ #include "mozilla/dom/ClientIPCTypes.h"
+ #include "mozilla/dom/ClientManager.h"
+ #include "mozilla/dom/ClientsBinding.h"
+ #include "mozilla/dom/Promise.h"
+ #include "mozilla/dom/ServiceWorkerDescriptor.h"
+ #include "mozilla/dom/WorkerPrivate.h"
++#include "mozilla/dom/workers/ServiceWorkerManager.h"
++#include "mozilla/SystemGroup.h"
+ #include "nsIGlobalObject.h"
+ #include "nsString.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ using mozilla::dom::workers::GetCurrentThreadWorkerPrivate;
+ using mozilla::dom::workers::WorkerPrivate;
++using mozilla::dom::workers::ServiceWorkerManager;
+ using mozilla::ipc::PrincipalInfo;
+ 
+ NS_IMPL_CYCLE_COLLECTING_ADDREF(Clients);
+ NS_IMPL_CYCLE_COLLECTING_RELEASE(Clients);
+ NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(Clients, mGlobal);
+ 
+ NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Clients)
+   NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+@@ -57,16 +60,24 @@ Clients::GetParentObject() const
+ already_AddRefed<Promise>
+ Clients::Get(const nsAString& aClientID, ErrorResult& aRv)
+ {
+   RefPtr<Promise> outerPromise = Promise::Create(mGlobal, aRv);
+   if (aRv.Failed()) {
+     return outerPromise.forget();
+   }
+ 
++  WorkerPrivate* workerPrivate = GetCurrentThreadWorkerPrivate();
++  if (!workerPrivate || !workerPrivate->IsServiceWorker()) {
++    outerPromise->MaybeReject(NS_ERROR_DOM_INVALID_STATE_ERR);
++    return outerPromise.forget();
++  }
++
++  const ServiceWorkerDescriptor& swd(workerPrivate->GetServiceWorkerDescriptor());
++
+   nsID id;
+   if (!id.Parse(NS_ConvertUTF16toUTF8(aClientID).get())) {
+     // Invalid ID means we will definitely not find a match, so just
+     // resolve with undefined indicating "not found".
+     outerPromise->MaybeResolveWithUndefined();
+     return outerPromise.forget();
+   }
+ 
+@@ -83,20 +94,34 @@ Clients::Get(const nsAString& aClientID,
+ 
+   nsCOMPtr<nsIGlobalObject> global = mGlobal;
+   nsCOMPtr<nsISerialEventTarget> target =
+     mGlobal->EventTargetFor(TaskCategory::Other);
+ 
+   RefPtr<ClientOpPromise> innerPromise =
+     ClientManager::GetInfoAndState(ClientGetInfoAndStateArgs(id, principalInfo),
+                                    target);
++
++  nsCString scope = swd.Scope();
++
+   innerPromise->Then(target, __func__,
+-    [outerPromise, global] (const ClientOpResult& aResult) {
+-      outerPromise->MaybeResolve(
+-        new Client(global, aResult.get_ClientInfoAndState()));
++    [outerPromise, global, scope] (const ClientOpResult& aResult) {
++      RefPtr<Client> client = new Client(global, aResult.get_ClientInfoAndState());
++      if (client->GetStorageAccess() == nsContentUtils::StorageAccess::eAllow) {
++        outerPromise->MaybeResolve(Move(client));
++        return;
++      }
++      nsCOMPtr<nsIRunnable> r =
++        NS_NewRunnableFunction("Clients::MatchAll() storage denied",
++        [scope] {
++          ServiceWorkerManager::LocalizeAndReportToAllClients(
++            scope, "ServiceWorkerGetClientStorageError", nsTArray<nsString>());
++        });
++      SystemGroup::Dispatch(TaskCategory::Other, r.forget());
++      outerPromise->MaybeResolveWithUndefined();
+     }, [outerPromise] (nsresult aResult) {
+       outerPromise->MaybeResolveWithUndefined();
+     });
+ 
+   return outerPromise.forget();
+ }
+ 
+ namespace {
+@@ -151,28 +176,44 @@ Clients::MatchAll(const ClientQueryOptio
+   }
+ 
+   if (info.ref().Type() != ClientType::Serviceworker) {
+     aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+     return outerPromise.forget();
+   }
+ 
+   WorkerPrivate* workerPrivate = GetCurrentThreadWorkerPrivate();
++  nsCString scope = workerPrivate->ServiceWorkerScope();
+ 
+   nsCOMPtr<nsIGlobalObject> global = mGlobal;
+ 
+   ClientMatchAllArgs args(workerPrivate->GetServiceWorkerDescriptor().ToIPC(),
+                           aOptions.mType,
+                           aOptions.mIncludeUncontrolled);
+   StartClientManagerOp(&ClientManager::MatchAll, args,
+     mGlobal->EventTargetFor(TaskCategory::Other),
+-    [outerPromise, global] (const ClientOpResult& aResult) {
++    [outerPromise, global, scope] (const ClientOpResult& aResult) {
+       nsTArray<RefPtr<Client>> clientList;
++      bool storageDenied = false;
+       for (const ClientInfoAndState& value : aResult.get_ClientList().values()) {
+-        clientList.AppendElement(new Client(global, value));
++        RefPtr<Client> client = new Client(global, value);
++        if (client->GetStorageAccess() != nsContentUtils::StorageAccess::eAllow) {
++          storageDenied = true;
++          continue;
++        }
++        clientList.AppendElement(Move(client));
++      }
++      if (storageDenied) {
++        nsCOMPtr<nsIRunnable> r =
++          NS_NewRunnableFunction("Clients::MatchAll() storage denied",
++          [scope] {
++            ServiceWorkerManager::LocalizeAndReportToAllClients(
++              scope, "ServiceWorkerGetClientStorageError", nsTArray<nsString>());
++          });
++        SystemGroup::Dispatch(TaskCategory::Other, r.forget());
+       }
+       clientList.Sort(MatchAllComparator());
+       outerPromise->MaybeResolve(clientList);
+     }, [outerPromise] (nsresult aResult) {
+       outerPromise->MaybeReject(aResult);
+     });
+ 
+   return outerPromise.forget();
+diff --git a/dom/clients/manager/ClientIPCTypes.ipdlh b/dom/clients/manager/ClientIPCTypes.ipdlh
+--- a/dom/clients/manager/ClientIPCTypes.ipdlh
++++ b/dom/clients/manager/ClientIPCTypes.ipdlh
+@@ -5,16 +5,17 @@
+ include protocol PClientSource;
+ include DOMTypes;
+ include PBackgroundSharedTypes;
+ include IPCServiceWorkerDescriptor;
+ include ProtocolTypes;
+ using class mozilla::TimeStamp from "mozilla/TimeStamp.h";
+ using ClientType from "mozilla/dom/ClientIPCUtils.h";
+ using FrameType from "mozilla/dom/ClientIPCUtils.h";
++using nsContentUtils::StorageAccess from "mozilla/dom/ClientIPCUtils.h";
+ using VisibilityState from "mozilla/dom/ClientIPCUtils.h";
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ struct ClientSourceConstructorArgs
+ {
+   nsID id;
+@@ -32,21 +33,23 @@ struct IPCClientInfo
+   nsCString url;
+   FrameType frameType;
+ };
+ 
+ struct IPCClientWindowState
+ {
+   VisibilityState visibilityState;
+   TimeStamp lastFocusTime;
++  StorageAccess storageAccess;
+   bool focused;
+ };
+ 
+ struct IPCClientWorkerState
+ {
++  StorageAccess storageAccess;
+ };
+ 
+ union IPCClientState
+ {
+   IPCClientWindowState;
+   IPCClientWorkerState;
+ };
+ 
+diff --git a/dom/clients/manager/ClientIPCUtils.h b/dom/clients/manager/ClientIPCUtils.h
+--- a/dom/clients/manager/ClientIPCUtils.h
++++ b/dom/clients/manager/ClientIPCUtils.h
+@@ -9,16 +9,17 @@
+ #include "ipc/IPCMessageUtils.h"
+ 
+ // Fix X11 header brain damage that conflicts with FrameType::None
+ #undef None
+ 
+ #include "mozilla/dom/ClientBinding.h"
+ #include "mozilla/dom/ClientsBinding.h"
+ #include "mozilla/dom/DocumentBinding.h"
++#include "nsContentUtils.h"
+ 
+ namespace IPC {
+   template<>
+   struct ParamTraits<mozilla::dom::ClientType> :
+     public ContiguousEnumSerializer<mozilla::dom::ClientType,
+                                     mozilla::dom::ClientType::Window,
+                                     mozilla::dom::ClientType::EndGuard_>
+   {};
+@@ -31,11 +32,18 @@ namespace IPC {
+   {};
+ 
+   template<>
+   struct ParamTraits<mozilla::dom::VisibilityState> :
+     public ContiguousEnumSerializer<mozilla::dom::VisibilityState,
+                                     mozilla::dom::VisibilityState::Hidden,
+                                     mozilla::dom::VisibilityState::EndGuard_>
+   {};
++
++  template<>
++  struct ParamTraits<nsContentUtils::StorageAccess> :
++    public ContiguousEnumSerializer<nsContentUtils::StorageAccess,
++                                    nsContentUtils::StorageAccess::eDeny,
++                                    nsContentUtils::StorageAccess::eNumValues>
++  {};
+ } // namespace IPC
+ 
+ #endif // _mozilla_dom_ClientIPCUtils_h
+diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSource.cpp
+--- a/dom/clients/manager/ClientSource.cpp
++++ b/dom/clients/manager/ClientSource.cpp
+@@ -73,34 +73,40 @@ nsresult
+ ClientSource::SnapshotWindowState(ClientState* aStateOut)
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+ 
+   nsPIDOMWindowInner* window = GetInnerWindow();
+   if (!window || !window->IsCurrentInnerWindow() ||
+       !window->HasActiveDocument()) {
+     *aStateOut = ClientState(ClientWindowState(VisibilityState::Hidden,
+-                                               TimeStamp(), false));
++                                               TimeStamp(),
++                                               nsContentUtils::StorageAccess::eDeny,
++                                               false));
+     return NS_OK;
+   }
+ 
+   nsIDocument* doc = window->GetExtantDoc();
+   if (NS_WARN_IF(!doc)) {
+     return NS_ERROR_UNEXPECTED;
+   }
+ 
+   ErrorResult rv;
+   bool focused = doc->HasFocus(rv);
+   if (NS_WARN_IF(rv.Failed())) {
+     rv.SuppressException();
+     return rv.StealNSResult();
+   }
+ 
++  nsContentUtils::StorageAccess storage =
++    nsContentUtils::StorageAllowedForDocument(doc);
++
+   *aStateOut = ClientState(ClientWindowState(doc->VisibilityState(),
+-                                             doc->LastFocusTime(), focused));
++                                             doc->LastFocusTime(), storage,
++                                             focused));
+ 
+   return NS_OK;
+ }
+ 
+ WorkerPrivate*
+ ClientSource::GetWorkerPrivate() const
+ {
+   NS_ASSERT_OWNINGTHREAD(ClientSource);
+@@ -629,17 +635,28 @@ ClientSource::SnapshotState(ClientState*
+     MaybeCreateInitialDocument();
+     nsresult rv = SnapshotWindowState(aStateOut);
+     if (NS_FAILED(rv)) {
+       return rv;
+     }
+     return NS_OK;
+   }
+ 
+-  *aStateOut = ClientState(ClientWorkerState());
++  WorkerPrivate* workerPrivate = GetWorkerPrivate();
++  if (!workerPrivate) {
++    return NS_ERROR_DOM_INVALID_STATE_ERR;
++  }
++
++  // Workers only keep a boolean for storage access at the moment.
++  // Map this back to eAllow or eDeny for now.
++  nsContentUtils::StorageAccess storage =
++    workerPrivate->IsStorageAllowed() ? nsContentUtils::StorageAccess::eAllow
++                                      : nsContentUtils::StorageAccess::eDeny;
++
++  *aStateOut = ClientState(ClientWorkerState(storage));
+   return NS_OK;
+ }
+ 
+ nsISerialEventTarget*
+ ClientSource::EventTarget() const
+ {
+   return mEventTarget;
+ }
+diff --git a/dom/clients/manager/ClientState.cpp b/dom/clients/manager/ClientState.cpp
+--- a/dom/clients/manager/ClientState.cpp
++++ b/dom/clients/manager/ClientState.cpp
+@@ -8,19 +8,20 @@
+ 
+ #include "mozilla/dom/ClientIPCTypes.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ ClientWindowState::ClientWindowState(mozilla::dom::VisibilityState aVisibilityState,
+                                      const TimeStamp& aLastFocusTime,
++                                     nsContentUtils::StorageAccess aStorageAccess,
+                                      bool aFocused)
+   : mData(MakeUnique<IPCClientWindowState>(aVisibilityState, aLastFocusTime,
+-                                           aFocused))
++                                           aStorageAccess, aFocused))
+ {
+ }
+ 
+ ClientWindowState::ClientWindowState(const IPCClientWindowState& aData)
+   : mData(MakeUnique<IPCClientWindowState>(aData))
+ {
+ }
+ 
+@@ -67,24 +68,30 @@ ClientWindowState::LastFocusTime() const
+ }
+ 
+ bool
+ ClientWindowState::Focused() const
+ {
+   return mData->focused();
+ }
+ 
++nsContentUtils::StorageAccess
++ClientWindowState::GetStorageAccess() const
++{
++  return mData->storageAccess();
++}
++
+ const IPCClientWindowState&
+ ClientWindowState::ToIPC() const
+ {
+   return *mData;
+ }
+ 
+-ClientWorkerState::ClientWorkerState()
+-  : mData(MakeUnique<IPCClientWorkerState>())
++ClientWorkerState::ClientWorkerState(nsContentUtils::StorageAccess aStorageAccess)
++  : mData(MakeUnique<IPCClientWorkerState>(aStorageAccess))
+ {
+ }
+ 
+ ClientWorkerState::ClientWorkerState(const IPCClientWorkerState& aData)
+   : mData(MakeUnique<IPCClientWorkerState>(aData))
+ {
+ }
+ 
+@@ -113,16 +120,22 @@ ClientWorkerState::operator=(ClientWorke
+   mData = Move(aRight.mData);
+   return *this;
+ }
+ 
+ ClientWorkerState::~ClientWorkerState()
+ {
+ }
+ 
++nsContentUtils::StorageAccess
++ClientWorkerState::GetStorageAccess() const
++{
++  return mData->storageAccess();
++}
++
+ const IPCClientWorkerState&
+ ClientWorkerState::ToIPC() const
+ {
+   return *mData;
+ }
+ 
+ ClientState::ClientState()
+ {
+@@ -197,16 +210,26 @@ ClientState::IsWorkerState() const
+ }
+ 
+ const ClientWorkerState&
+ ClientState::AsWorkerState() const
+ {
+   return mData.ref().as<ClientWorkerState>();
+ }
+ 
++nsContentUtils::StorageAccess
++ClientState::GetStorageAccess() const
++{
++  if (IsWindowState()) {
++    return AsWindowState().GetStorageAccess();
++  }
++
++  return AsWorkerState().GetStorageAccess();
++}
++
+ const IPCClientState
+ ClientState::ToIPC() const
+ {
+   if (IsWindowState()) {
+     return IPCClientState(AsWindowState().ToIPC());
+   }
+ 
+   return IPCClientState(AsWorkerState().ToIPC());
+diff --git a/dom/clients/manager/ClientState.h b/dom/clients/manager/ClientState.h
+--- a/dom/clients/manager/ClientState.h
++++ b/dom/clients/manager/ClientState.h
+@@ -6,16 +6,17 @@
+ 
+ #ifndef _mozilla_dom_ClientState_h
+ #define _mozilla_dom_ClientState_h
+ 
+ #include "mozilla/dom/DocumentBinding.h"
+ #include "mozilla/Maybe.h"
+ #include "mozilla/TimeStamp.h"
+ #include "mozilla/UniquePtr.h"
++#include "nsContentUtils.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ class IPCClientState;
+ class IPCClientWindowState;
+ class IPCClientWorkerState;
+ 
+@@ -24,16 +25,17 @@ class IPCClientWorkerState;
+ // is not live updated.
+ class ClientWindowState final
+ {
+   UniquePtr<IPCClientWindowState> mData;
+ 
+ public:
+   ClientWindowState(mozilla::dom::VisibilityState aVisibilityState,
+                     const TimeStamp& aLastFocusTime,
++                    nsContentUtils::StorageAccess aStorageAccess,
+                     bool aFocused);
+ 
+   explicit ClientWindowState(const IPCClientWindowState& aData);
+ 
+   ClientWindowState(const ClientWindowState& aRight);
+   ClientWindowState(ClientWindowState&& aRight);
+ 
+   ClientWindowState&
+@@ -48,46 +50,52 @@ public:
+   VisibilityState() const;
+ 
+   const TimeStamp&
+   LastFocusTime() const;
+ 
+   bool
+   Focused() const;
+ 
++  nsContentUtils::StorageAccess
++  GetStorageAccess() const;
++
+   const IPCClientWindowState&
+   ToIPC() const;
+ };
+ 
+ // This class defines the mutable worker state we support querying
+ // through the ClientManagerService.  It is a snapshot of the state and
+ // is not live updated.  Right now, we don't actually providate any
+ // worker specific state values, but we may in the future.  This
+ // class also services as a placeholder that the state is referring
+ // to a worker in ClientState.
+ class ClientWorkerState final
+ {
+   UniquePtr<IPCClientWorkerState> mData;
+ 
+ public:
+-  ClientWorkerState();
++  explicit ClientWorkerState(nsContentUtils::StorageAccess aStorageAccess);
+ 
+   explicit ClientWorkerState(const IPCClientWorkerState& aData);
+ 
+   ClientWorkerState(const ClientWorkerState& aRight);
+   ClientWorkerState(ClientWorkerState&& aRight);
+ 
+   ClientWorkerState&
+   operator=(const ClientWorkerState& aRight);
+ 
+   ClientWorkerState&
+   operator=(ClientWorkerState&& aRight);
+ 
+   ~ClientWorkerState();
+ 
++  nsContentUtils::StorageAccess
++  GetStorageAccess() const;
++
+   const IPCClientWorkerState&
+   ToIPC() const;
+ };
+ 
+ // This is a union of the various types of mutable state we support
+ // querying in ClientManagerService.  Right now it can contain either
+ // window or worker states.
+ class ClientState final
+@@ -123,16 +131,19 @@ public:
+   AsWindowState() const;
+ 
+   bool
+   IsWorkerState() const;
+ 
+   const ClientWorkerState&
+   AsWorkerState() const;
+ 
++  nsContentUtils::StorageAccess
++  GetStorageAccess() const;
++
+   const IPCClientState
+   ToIPC() const;
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // _mozilla_dom_ClientState_h
