@@ -1,0 +1,166 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  93bf529d9c70dafdc34e73ac0c17e8176b0f96ce
+Bug 1424754 Fix some corner cases in PartiallySeekableInputStream cloning and serialization. r=baku
+
+diff --git a/netwerk/base/PartiallySeekableInputStream.cpp b/netwerk/base/PartiallySeekableInputStream.cpp
+--- a/netwerk/base/PartiallySeekableInputStream.cpp
++++ b/netwerk/base/PartiallySeekableInputStream.cpp
+@@ -15,17 +15,17 @@ NS_IMPL_ADDREF(PartiallySeekableInputStr
+ NS_IMPL_RELEASE(PartiallySeekableInputStream);
+ 
+ NS_INTERFACE_MAP_BEGIN(PartiallySeekableInputStream)
+   NS_INTERFACE_MAP_ENTRY(nsIInputStream)
+   NS_INTERFACE_MAP_ENTRY(nsISeekableStream)
+   NS_INTERFACE_MAP_ENTRY_CONDITIONAL(nsICloneableInputStream,
+                                      mWeakCloneableInputStream)
+   NS_INTERFACE_MAP_ENTRY_CONDITIONAL(nsIIPCSerializableInputStream,
+-                                     mWeakIPCSerializableInputStream)
++                                     mWeakIPCSerializableInputStream && mCachedBuffer.IsEmpty())
+   NS_INTERFACE_MAP_ENTRY_CONDITIONAL(nsIAsyncInputStream,
+                                      mWeakAsyncInputStream)
+   NS_INTERFACE_MAP_ENTRY_CONDITIONAL(nsIInputStreamCallback,
+                                      mWeakAsyncInputStream)
+   NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIInputStream)
+ NS_INTERFACE_MAP_END
+ 
+ PartiallySeekableInputStream::PartiallySeekableInputStream(already_AddRefed<nsIInputStream> aInputStream,
+@@ -33,16 +33,36 @@ PartiallySeekableInputStream::PartiallyS
+   : mInputStream(Move(aInputStream))
+   , mWeakCloneableInputStream(nullptr)
+   , mWeakIPCSerializableInputStream(nullptr)
+   , mWeakAsyncInputStream(nullptr)
+   , mBufferSize(aBufferSize)
+   , mPos(0)
+   , mClosed(false)
+ {
++  Init();
++}
++
++PartiallySeekableInputStream::PartiallySeekableInputStream(already_AddRefed<nsIInputStream> aClonedBaseStream,
++                                                           PartiallySeekableInputStream* aClonedFrom)
++  : mInputStream(Move(aClonedBaseStream))
++  , mWeakCloneableInputStream(nullptr)
++  , mWeakIPCSerializableInputStream(nullptr)
++  , mWeakAsyncInputStream(nullptr)
++  , mCachedBuffer(aClonedFrom->mCachedBuffer)
++  , mBufferSize(aClonedFrom->mBufferSize)
++  , mPos(aClonedFrom->mPos)
++  , mClosed(aClonedFrom->mClosed)
++{
++  Init();
++}
++
++void
++PartiallySeekableInputStream::Init()
++{
+   MOZ_ASSERT(mInputStream);
+ 
+ #ifdef DEBUG
+   nsCOMPtr<nsISeekableStream> seekableStream = do_QueryInterface(mInputStream);
+   MOZ_ASSERT(!seekableStream);
+ #endif
+ 
+   nsCOMPtr<nsICloneableInputStream> cloneableStream =
+@@ -60,19 +80,16 @@ PartiallySeekableInputStream::PartiallyS
+ 
+   nsCOMPtr<nsIAsyncInputStream> asyncInputStream =
+     do_QueryInterface(mInputStream);
+   if (asyncInputStream && SameCOMIdentity(mInputStream, asyncInputStream)) {
+     mWeakAsyncInputStream = asyncInputStream;
+   }
+ }
+ 
+-PartiallySeekableInputStream::~PartiallySeekableInputStream()
+-{}
+-
+ NS_IMETHODIMP
+ PartiallySeekableInputStream::Close()
+ {
+   mInputStream->Close();
+   mCachedBuffer.Clear();
+   mPos = 0;
+   mClosed = true;
+   return NS_OK;
+@@ -162,33 +179,32 @@ PartiallySeekableInputStream::IsNonBlock
+ 
+ // nsICloneableInputStream interface
+ 
+ NS_IMETHODIMP
+ PartiallySeekableInputStream::GetCloneable(bool* aCloneable)
+ {
+   NS_ENSURE_STATE(mWeakCloneableInputStream);
+ 
+-  *aCloneable = true;
+-  return NS_OK;
++  return mWeakCloneableInputStream->GetCloneable(aCloneable);
+ }
+ 
+ NS_IMETHODIMP
+ PartiallySeekableInputStream::Clone(nsIInputStream** aResult)
+ {
+   NS_ENSURE_STATE(mWeakCloneableInputStream);
+ 
+   nsCOMPtr<nsIInputStream> clonedStream;
+   nsresult rv = mWeakCloneableInputStream->Clone(getter_AddRefs(clonedStream));
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return rv;
+   }
+ 
+   nsCOMPtr<nsIInputStream> stream =
+-    new PartiallySeekableInputStream(clonedStream.forget(), mBufferSize);
++    new PartiallySeekableInputStream(clonedStream.forget(), this);
+ 
+   stream.forget(aResult);
+   return NS_OK;
+ }
+ 
+ // nsIAsyncInputStream interface
+ 
+ NS_IMETHODIMP
+@@ -247,16 +263,17 @@ PartiallySeekableInputStream::OnInputStr
+ 
+ // nsIIPCSerializableInputStream
+ 
+ void
+ PartiallySeekableInputStream::Serialize(mozilla::ipc::InputStreamParams& aParams,
+                                         FileDescriptorArray& aFileDescriptors)
+ {
+   MOZ_ASSERT(mWeakIPCSerializableInputStream);
++  MOZ_DIAGNOSTIC_ASSERT(mCachedBuffer.IsEmpty());
+   mozilla::ipc::InputStreamHelper::SerializeInputStream(mInputStream, aParams,
+                                                         aFileDescriptors);
+ }
+ 
+ bool
+ PartiallySeekableInputStream::Deserialize(const mozilla::ipc::InputStreamParams& aParams,
+                                           const FileDescriptorArray& aFileDescriptors)
+ {
+diff --git a/netwerk/base/PartiallySeekableInputStream.h b/netwerk/base/PartiallySeekableInputStream.h
+--- a/netwerk/base/PartiallySeekableInputStream.h
++++ b/netwerk/base/PartiallySeekableInputStream.h
+@@ -33,17 +33,23 @@ public:
+   NS_DECL_NSICLONEABLEINPUTSTREAM
+   NS_DECL_NSIIPCSERIALIZABLEINPUTSTREAM
+   NS_DECL_NSIINPUTSTREAMCALLBACK
+ 
+   explicit PartiallySeekableInputStream(already_AddRefed<nsIInputStream> aInputStream,
+                                         uint64_t aBufferSize = 4096);
+ 
+ private:
+-  ~PartiallySeekableInputStream();
++  PartiallySeekableInputStream(already_AddRefed<nsIInputStream> aClonedBaseStream,
++                               PartiallySeekableInputStream* aClonedFrom);
++
++  ~PartiallySeekableInputStream() = default;
++
++  void
++  Init();
+ 
+   nsCOMPtr<nsIInputStream> mInputStream;
+ 
+   // Raw pointers because these are just QI of mInputStream.
+   nsICloneableInputStream* mWeakCloneableInputStream;
+   nsIIPCSerializableInputStream* mWeakIPCSerializableInputStream;
+   nsIAsyncInputStream* mWeakAsyncInputStream;
+ 
