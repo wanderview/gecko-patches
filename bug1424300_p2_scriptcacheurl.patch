@@ -1,0 +1,160 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  36865ebcfc40e23b9ef787e740b028f2ef6ee165
+Bug 1424300 P2 Store response URLs in the service worker script cache. r=edenchuang
+
+diff --git a/dom/workers/ServiceWorkerScriptCache.cpp b/dom/workers/ServiceWorkerScriptCache.cpp
+--- a/dom/workers/ServiceWorkerScriptCache.cpp
++++ b/dom/workers/ServiceWorkerScriptCache.cpp
+@@ -159,16 +159,22 @@ public:
+   }
+ 
+   bool
+   Succeeded() const
+   {
+     return NS_SUCCEEDED(mNetworkResult);
+   }
+ 
++  const nsTArray<nsCString>&
++  URLList() const
++  {
++    return mURLList;
++  }
++
+ private:
+   ~CompareNetwork()
+   {
+     AssertIsOnMainThread();
+     MOZ_ASSERT(!mCC);
+   }
+ 
+   void
+@@ -182,16 +188,17 @@ private:
+   RefPtr<ServiceWorkerRegistrationInfo> mRegistration;
+ 
+   nsCOMPtr<nsIChannel> mChannel;
+   nsString mBuffer;
+   nsString mURL;
+   ChannelInfo mChannelInfo;
+   RefPtr<InternalHeaders> mInternalHeaders;
+   UniquePtr<PrincipalInfo> mPrincipalInfo;
++  nsTArray<nsCString> mURLList;
+ 
+   nsCString mMaxScope;
+   nsLoadFlags mLoadFlags;
+ 
+   enum {
+     WaitingForInitialization,
+     WaitingForBothFinished,
+     WaitingForNetworkFinished,
+@@ -597,16 +604,17 @@ private:
+     if (NS_WARN_IF(result.Failed())) {
+       MOZ_ASSERT(!result.IsErrorWithMessage());
+       return result.StealNSResult();
+     }
+ 
+     RefPtr<InternalResponse> ir =
+       new InternalResponse(200, NS_LITERAL_CSTRING("OK"));
+     ir->SetBody(body, aCN->Buffer().Length());
++    ir->SetURLList(aCN->URLList());
+ 
+     ir->InitChannelInfo(aCN->GetChannelInfo());
+     UniquePtr<PrincipalInfo> principalInfo = aCN->TakePrincipalInfo();
+     if (principalInfo) {
+       ir->SetPrincipalInfo(Move(principalInfo));
+     }
+ 
+     IgnoredErrorResult ignored;
+@@ -682,16 +690,17 @@ CompareNetwork::Initialize(nsIPrincipal*
+ 
+   nsCOMPtr<nsIURI> uri;
+   nsresult rv = NS_NewURI(getter_AddRefs(uri), aURL, nullptr, nullptr);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return rv;
+   }
+ 
+   mURL = aURL;
++  mURLList.AppendElement(NS_ConvertUTF16toUTF8(mURL));
+ 
+   nsCOMPtr<nsILoadGroup> loadGroup;
+   rv = NS_NewLoadGroup(getter_AddRefs(loadGroup), aPrincipal);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return rv;
+   }
+ 
+   // Update LoadFlags for propagating to ServiceWorkerInfo.
+@@ -775,17 +784,17 @@ CompareNetwork::Finish()
+   if (mState == Finished) {
+     return;
+   }
+ 
+   bool same = true;
+   nsresult rv = NS_OK;
+ 
+   // mNetworkResult is prior to mCacheResult, since it's needed for reporting
+-  // various errors to web contenet.
++  // various errors to web content.
+   if (NS_FAILED(mNetworkResult)) {
+     // An imported script could become offline, since it might no longer be
+     // needed by the new importing script. In that case, the importing script
+     // must be different, and thus, it's okay to report same script found here.
+     rv = mIsMainScript ? mNetworkResult : NS_OK;
+     same = true;
+   } else if (mCC && NS_FAILED(mCacheResult)) {
+     rv = mCacheResult;
+@@ -984,35 +993,52 @@ CompareNetwork::OnStreamComplete(nsIStre
+ 
+   // [9.2 Update]4.13, If response's cache state is not "local",
+   // set registration's last update check time to the current time
+   if (!mIsFromCache) {
+     mRegistration->RefreshLastUpdateCheckTime();
+   }
+ 
+   nsAutoCString mimeType;
+-  nsresult rv2 = httpChannel->GetContentType(mimeType);
++  rv = httpChannel->GetContentType(mimeType);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     // We should only end up here if !mResponseHead in the channel.  If headers
+     // were received but no content type was specified, we'll be given
+     // UNKNOWN_CONTENT_TYPE "application/x-unknown-content-type" and so fall
+     // into the next case with its better error message.
+     rv = NS_ERROR_DOM_SECURITY_ERR;
+-    return rv2;
++    return rv;
+   }
+ 
+   if (!mimeType.LowerCaseEqualsLiteral("text/javascript") &&
+       !mimeType.LowerCaseEqualsLiteral("application/x-javascript") &&
+       !mimeType.LowerCaseEqualsLiteral("application/javascript")) {
+     ServiceWorkerManager::LocalizeAndReportToAllClients(
+       mRegistration->mScope, "ServiceWorkerRegisterMimeTypeError",
+       nsTArray<nsString> { NS_ConvertUTF8toUTF16(mRegistration->mScope),
+         NS_ConvertUTF8toUTF16(mimeType), mURL });
+     rv = NS_ERROR_DOM_SECURITY_ERR;
+-    return rv2;
++    return rv;
++  }
++
++  nsCOMPtr<nsIURI> channelURL;
++  rv = httpChannel->GetURI(getter_AddRefs(channelURL));
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return rv;
++  }
++
++  nsCString channelURLSpec;
++  MOZ_ALWAYS_SUCCEEDS(channelURL->GetSpec(channelURLSpec));
++
++  // Append the final URL if its different from the original
++  // request URL.  This lets us note that a redirect occurred
++  // even though we don't track every redirect URL here.
++  MOZ_DIAGNOSTIC_ASSERT(!mURLList.IsEmpty());
++  if (channelURLSpec != mURLList[0]) {
++    mURLList.AppendElement(channelURLSpec);
+   }
+ 
+   char16_t* buffer = nullptr;
+   size_t len = 0;
+ 
+   rv = ScriptLoader::ConvertToUTF16(httpChannel, aString, aLen,
+                                     NS_LITERAL_STRING("UTF-8"), nullptr,
+                                     buffer, len);
