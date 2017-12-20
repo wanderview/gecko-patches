@@ -1,0 +1,136 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  c66724a89bf08559b3fbd5cd6227a816846a5e17
+Bug 1425316 P5 Match service worker console reports against currently loading navigation channel. r=asuth
+
+diff --git a/dom/base/nsGlobalWindowInner.cpp b/dom/base/nsGlobalWindowInner.cpp
+--- a/dom/base/nsGlobalWindowInner.cpp
++++ b/dom/base/nsGlobalWindowInner.cpp
+@@ -38,16 +38,17 @@
+ #include "nsISizeOfEventTarget.h"
+ #include "nsDOMJSUtils.h"
+ #include "nsArrayUtils.h"
+ #include "nsIDOMWindowCollection.h"
+ #include "nsDOMWindowList.h"
+ #include "mozilla/dom/WakeLock.h"
+ #include "mozilla/dom/power/PowerManagerService.h"
+ #include "nsIDocShellTreeOwner.h"
++#include "nsIDocumentLoader.h"
+ #include "nsIInterfaceRequestorUtils.h"
+ #include "nsIPermissionManager.h"
+ #include "nsIScriptContext.h"
+ #include "nsIScriptTimeoutHandler.h"
+ #include "nsITimeoutHandler.h"
+ #include "nsIController.h"
+ #include "nsScriptNameSpaceManager.h"
+ #include "nsISlowScriptDebug.h"
+@@ -75,17 +76,16 @@
+ #include "mozilla/Sprintf.h"
+ #include "mozilla/Unused.h"
+ 
+ // Other Classes
+ #include "mozilla/dom/BarProps.h"
+ #include "nsContentCID.h"
+ #include "nsLayoutStatics.h"
+ #include "nsCCUncollectableMarker.h"
+-#include "mozilla/dom/workers/ServiceWorkerManager.h"
+ #include "mozilla/dom/workers/Workers.h"
+ #include "mozilla/dom/ToJSValue.h"
+ #include "nsJSPrincipals.h"
+ #include "mozilla/Attributes.h"
+ #include "mozilla/Debug.h"
+ #include "mozilla/EventListenerManager.h"
+ #include "mozilla/EventStates.h"
+ #include "mozilla/MouseEvents.h"
+@@ -2346,30 +2346,17 @@ nsGlobalWindowInner::ShouldReportForServ
+   NS_ENSURE_TRUE(topOuter, false);
+ 
+   nsGlobalWindowInner* topInner =
+     nsGlobalWindowInner::Cast(topOuter->GetCurrentInnerWindow());
+   NS_ENSURE_TRUE(topInner, false);
+ 
+   topInner->ShouldReportForServiceWorkerScopeInternal(NS_ConvertUTF16toUTF8(aScope),
+                                                       &result);
+-  if (result) {
+-    return true;
+-  }
+-
+-  RefPtr<workers::ServiceWorkerManager> swm =
+-    workers::ServiceWorkerManager::GetInstance();
+-  NS_ENSURE_TRUE(swm, false);
+-
+-  bool aResult = false;
+-  nsresult rv = swm->ShouldReportToWindow(topOuter,
+-                                          NS_ConvertUTF16toUTF8(aScope), &aResult);
+-  NS_ENSURE_SUCCESS(rv, false);
+-
+-  return aResult;
++  return result;
+ }
+ 
+ nsGlobalWindowInner::CallState
+ nsGlobalWindowInner::ShouldReportForServiceWorkerScopeInternal(const nsACString& aScope,
+                                                                bool* aResultOut)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(aResultOut);
+ 
+@@ -2384,16 +2371,59 @@ nsGlobalWindowInner::ShouldReportForServ
+   // Next, check to see if this window has called navigator.serviceWorker.register()
+   // for this scope.  If so, then treat this as a match so console reports
+   // appear in the devtools console.
+   if (mClientSource && mClientSource->CalledRegisterForServiceWorkerScope(aScope)) {
+     *aResultOut = true;
+     return CallState::Stop;
+   }
+ 
++  // Finally check the current docshell nsILoadGroup to see if there are any
++  // outstanding navigation requests.  If so, match the scope against the
++  // channel's URL.  We want to show console reports during the FetchEvent
++  // intercepting the navigation itself.
++  nsCOMPtr<nsIDocumentLoader> loader(do_QueryInterface(GetDocShell()));
++  if (loader) {
++    nsCOMPtr<nsILoadGroup> loadgroup;
++    Unused << loader->GetLoadGroup(getter_AddRefs(loadgroup));
++    if (loadgroup) {
++      nsCOMPtr<nsISimpleEnumerator> iter;
++      Unused << loadgroup->GetRequests(getter_AddRefs(iter));
++      if (iter) {
++        nsCOMPtr<nsISupports> tmp;
++        bool hasMore = true;
++        // Check each network request in the load group.
++        while (NS_SUCCEEDED(iter->HasMoreElements(&hasMore)) && hasMore) {
++          iter->GetNext(getter_AddRefs(tmp));
++          nsCOMPtr<nsIChannel> loadingChannel(do_QueryInterface(tmp));
++          // Ignore subresource requests.  Logging for a subresource
++          // FetchEvent should be handled above since the client is
++          // already controlled.
++          if (!loadingChannel ||
++              !nsContentUtils::IsNonSubresourceRequest(loadingChannel)) {
++            continue;
++          }
++          nsCOMPtr<nsIURI> loadingURL;
++          Unused << loadingChannel->GetURI(getter_AddRefs(loadingURL));
++          if (!loadingURL) {
++            continue;
++          }
++          nsAutoCString loadingSpec;
++          Unused << loadingURL->GetSpec(loadingSpec);
++          // Perform a simple substring comparison to match the scope
++          // against the channel URL.
++          if (StringBeginsWith(loadingSpec, aScope)) {
++            *aResultOut = true;
++            return CallState::Stop;
++          }
++        }
++      }
++    }
++  }
++
+   // The current window doesn't care about this service worker, but maybe
+   // one of our child frames does.
+   return CallOnChildren(&nsGlobalWindowInner::ShouldReportForServiceWorkerScopeInternal,
+                         aScope, aResultOut);
+ }
+ 
+ void
+ nsGlobalWindowInner::NoteCalledRegisterForServiceWorkerScope(const nsACString& aScope)

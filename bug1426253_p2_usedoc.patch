@@ -1,0 +1,153 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  38466072b0bdc37251a4bd6a28c096d3782e6158
+Bug 1426253 P2 Use nsIDocument::GetClientInfo() where possible. r=asuth
+
+diff --git a/dom/clients/manager/ClientOpenWindowUtils.cpp b/dom/clients/manager/ClientOpenWindowUtils.cpp
+--- a/dom/clients/manager/ClientOpenWindowUtils.cpp
++++ b/dom/clients/manager/ClientOpenWindowUtils.cpp
+@@ -75,25 +75,18 @@ public:
+     nsresult rv = securityManager->CheckSameOriginURI(doc->GetOriginalURI(),
+                                                       mBaseURI, false);
+     if (NS_FAILED(rv)) {
+       mPromise->Resolve(NS_OK, __func__);
+       mPromise = nullptr;
+       return NS_OK;
+     }
+ 
+-    nsPIDOMWindowInner* innerWindow = doc->GetInnerWindow();
+-    if (NS_WARN_IF(!innerWindow)) {
+-      mPromise->Reject(NS_ERROR_FAILURE, __func__);
+-      mPromise = nullptr;
+-      return NS_OK;
+-    }
+-
+-    Maybe<ClientInfo> info = innerWindow->GetClientInfo();
+-    Maybe<ClientState> state = innerWindow->GetClientState();
++    Maybe<ClientInfo> info(doc->GetClientInfo());
++    Maybe<ClientState> state(doc->GetClientState());
+ 
+     if (NS_WARN_IF(info.isNothing() || state.isNothing())) {
+       mPromise->Reject(NS_ERROR_FAILURE, __func__);
+       mPromise = nullptr;
+       return NS_OK;
+     }
+ 
+     mPromise->Resolve(ClientInfoAndState(info.ref().ToIPC(), state.ref().ToIPC()),
+diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
+--- a/dom/workers/ServiceWorkerManager.cpp
++++ b/dom/workers/ServiceWorkerManager.cpp
+@@ -2367,25 +2367,22 @@ ServiceWorkerManager::StartControllingAD
+   aRegistration->StartControllingADocument();
+   mControlledDocuments.Put(aDoc, aRegistration);
+ 
+   // Mark the document's ClientSource as controlled using the ClientHandle
+   // interface.  While we could get at the ClientSource directly from the
+   // document here, our goal is to move ServiceWorkerManager to a separate
+   // process.  Using the ClientHandle supports this remote operation.
+   ServiceWorkerInfo* activeWorker = aRegistration->GetActive();
+-  nsPIDOMWindowInner* innerWindow = aDoc->GetInnerWindow();
+-  if (activeWorker && innerWindow) {
+-    Maybe<ClientInfo> clientInfo = innerWindow->GetClientInfo();
+-    if (clientInfo.isSome()) {
+-      RefPtr<ClientHandle> clientHandle =
+-        ClientManager::CreateHandle(clientInfo.ref(),
+-                                    SystemGroup::EventTargetFor(TaskCategory::Other));
+-      ref = Move(clientHandle->Control(activeWorker->Descriptor()));
+-    }
++  Maybe<ClientInfo> clientInfo = aDoc->GetClientInfo();
++  if (activeWorker && clientInfo.isSome()) {
++    RefPtr<ClientHandle> clientHandle =
++      ClientManager::CreateHandle(clientInfo.ref(),
++                                  SystemGroup::EventTargetFor(TaskCategory::Other));
++    ref = Move(clientHandle->Control(activeWorker->Descriptor()));
+   }
+ 
+   Telemetry::Accumulate(Telemetry::SERVICE_WORKER_CONTROLLED_DOCUMENTS, 1);
+   return Move(ref);
+ }
+ 
+ void
+ ServiceWorkerManager::StopControllingADocument(ServiceWorkerRegistrationInfo* aRegistration)
+@@ -3268,45 +3265,41 @@ ServiceWorkerManager::SetSkipWaitingFlag
+ void
+ ServiceWorkerManager::UpdateClientControllers(ServiceWorkerRegistrationInfo* aRegistration)
+ {
+   AssertIsOnMainThread();
+ 
+   RefPtr<ServiceWorkerInfo> activeWorker = aRegistration->GetActive();
+   MOZ_DIAGNOSTIC_ASSERT(activeWorker);
+ 
+-  AutoTArray<nsCOMPtr<nsPIDOMWindowInner>, 16> innerWindows;
++  AutoTArray<nsCOMPtr<nsIDocument>, 16> docList;
+   for (auto iter = mControlledDocuments.Iter(); !iter.Done(); iter.Next()) {
+     if (iter.UserData() != aRegistration) {
+       continue;
+     }
+ 
+     nsCOMPtr<nsIDocument> doc = do_QueryInterface(iter.Key());
+     if (NS_WARN_IF(!doc)) {
+       continue;
+     }
+ 
+-    nsPIDOMWindowInner* innerWindow = doc->GetInnerWindow();
+-    if (NS_WARN_IF(!innerWindow)) {
+-      continue;
+-    }
+-
+-    innerWindows.AppendElement(innerWindow);
++    docList.AppendElement(doc.forget());
+   }
+ 
+   // Fire event after iterating mControlledDocuments is done to prevent
+   // modification by reentering from the event handlers during iteration.
+-  for (auto& innerWindow : innerWindows) {
+-    Maybe<ClientInfo> clientInfo = innerWindow->GetClientInfo();
+-    if (clientInfo.isSome()) {
+-      RefPtr<ClientHandle> clientHandle =
+-        ClientManager::CreateHandle(clientInfo.ref(),
+-                                    innerWindow->EventTargetFor(TaskCategory::Other));
+-      clientHandle->Control(activeWorker->Descriptor());
++  for (auto& doc : docList) {
++    Maybe<ClientInfo> clientInfo = doc->GetClientInfo();
++    if (clientInfo.isNothing()) {
++      continue;
+     }
++    RefPtr<ClientHandle> clientHandle =
++      ClientManager::CreateHandle(clientInfo.ref(),
++                                  SystemGroup::EventTargetFor(TaskCategory::Other));
++    clientHandle->Control(activeWorker->Descriptor());
+   }
+ }
+ 
+ already_AddRefed<ServiceWorkerRegistrationInfo>
+ ServiceWorkerManager::GetRegistration(nsIPrincipal* aPrincipal,
+                                       const nsACString& aScope) const
+ {
+   MOZ_ASSERT(aPrincipal);
+diff --git a/netwerk/base/LoadInfo.cpp b/netwerk/base/LoadInfo.cpp
+--- a/netwerk/base/LoadInfo.cpp
++++ b/netwerk/base/LoadInfo.cpp
+@@ -112,21 +112,17 @@ LoadInfo::LoadInfo(nsIPrincipal* aLoadin
+       (mSecurityFlags & nsILoadInfo::SEC_FORCE_INHERIT_PRINCIPAL);
+     mSecurityFlags &= ~nsILoadInfo::SEC_FORCE_INHERIT_PRINCIPAL;
+   }
+ 
+   if (aLoadingContext) {
+     // Ensure that all network requests for a window client have the ClientInfo
+     // properly set.
+     // TODO: The ClientInfo is not set properly for worker initiated requests yet.
+-    nsCOMPtr<nsPIDOMWindowInner> contextInner =
+-      aLoadingContext->OwnerDoc()->GetInnerWindow();
+-    if (contextInner) {
+-      mClientInfo = contextInner->GetClientInfo();
+-    }
++    mClientInfo = aLoadingContext->OwnerDoc()->GetClientInfo();
+ 
+     nsCOMPtr<nsPIDOMWindowOuter> contextOuter = aLoadingContext->OwnerDoc()->GetWindow();
+     if (contextOuter) {
+       ComputeIsThirdPartyContext(contextOuter);
+       mOuterWindowID = contextOuter->WindowID();
+       nsCOMPtr<nsPIDOMWindowOuter> parent = contextOuter->GetScriptableParent();
+       mParentOuterWindowID = parent ? parent->WindowID() : mOuterWindowID;
+       mTopOuterWindowID = FindTopOuterWindowID(contextOuter);
