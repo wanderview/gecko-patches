@@ -1,0 +1,511 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  481b91ed82ef09a909fef9828b551e1eb50d0515
+
+diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
+--- a/docshell/base/nsDocShell.cpp
++++ b/docshell/base/nsDocShell.cpp
+@@ -150,16 +150,17 @@
+ #include "nsIStructuredCloneContainer.h"
+ #include "nsISupportsPrimitives.h"
+ #ifdef MOZ_PLACES
+ #include "nsIFaviconService.h"
+ #include "mozIPlacesPendingOperation.h"
+ #include "mozIAsyncFavicons.h"
+ #endif
+ #include "nsINetworkPredictor.h"
++#include "nsIServiceWorkerManager.h"
+ 
+ // Editor-related
+ #include "nsIEditingSession.h"
+ 
+ #include "nsPIDOMWindow.h"
+ #include "nsGlobalWindow.h"
+ #include "nsPIWindowRoot.h"
+ #include "nsICachingChannel.h"
+@@ -3455,27 +3456,41 @@ nsDocShell::MaybeCreateInitialClientSour
+   nsPIDOMWindowOuter* parentOuter = parent ? parent->GetWindow() : nullptr;
+   nsPIDOMWindowInner* parentInner =
+     parentOuter ? parentOuter->GetCurrentInnerWindow() : nullptr;
+   if (!parentInner) {
+     return;
+   }
+ 
+   Maybe<ServiceWorkerDescriptor> controller(parentInner->GetController());
+-  if (controller.isNothing()) {
++  if (controller.isNothing() || (mSandboxFlags & SANDBOXED_ORIGIN)) {
++    return;
++  }
++
++  nsCOMPtr<nsIServiceWorkerManager> swm = mozilla::services::GetServiceWorkerManager();
++  if (!swm) {
+     return;
+   }
+ 
+   // If the parent is controlled then propagate that controller to the
+   // initial about:blank client as well.  This will set the controller
+   // in the ClientManagerService in the parent.
+-  RefPtr<ClientHandle> handle =
+-    ClientManager::CreateHandle(mInitialClientSource->Info(),
+-                                parentInner->EventTargetFor(TaskCategory::Other));
+-  handle->Control(controller.ref());
++  //
++  // Note: If the registration is missing from the SWM we avoid setting
++  //       the controller on the client.  We can do this synchronously
++  //       for now since SWM is in the child process.  In the future
++  //       when SWM is in the parent process we will probably have to
++  //       always set the initial client source and then somehow clear
++  //       it if we find the registration is acutally gone.  Its also
++  //       possible this race only occurs in cases where the resulting
++  //       window is no longer exposed.  For example, in theory the SW
++  //       should not go away if our parent window is controlled.
++  if (!swm->StartControlling(mInitialClientSource->Info(), controller.ref())) {
++    return;
++  }
+ 
+   // Also mark the ClientSource as controlled directly in case script
+   // immediately accesses navigator.serviceWorker.controller.
+   mInitialClientSource->SetController(controller.ref());
+ }
+ 
+ Maybe<ClientInfo>
+ nsDocShell::GetInitialClientInfo() const
+diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSource.cpp
+--- a/dom/clients/manager/ClientSource.cpp
++++ b/dom/clients/manager/ClientSource.cpp
+@@ -201,16 +201,26 @@ ClientSource::WorkerExecutionReady(Worke
+ {
+   MOZ_DIAGNOSTIC_ASSERT(aWorkerPrivate);
+   aWorkerPrivate->AssertIsOnWorkerThread();
+ 
+   if (IsShutdown()) {
+     return;
+   }
+ 
++  // A client without access to storage should never be controlled a
++  // a service worker.  Check this here in case we were controlled before
++  // execution ready.  We can't tell what our storage policy is before
++  // execution ready.
++#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
++  if (mController.isSome()) {
++    MOZ_DIAGNOSTIC_ASSERT(aWorkerPrivate->IsStorageAllowed());
++  }
++#endif // MOZ_DIAGNOSTIC_ASSERT_ENABLED
++
+   // Its safe to store the WorkerPrivate* here because the ClientSource
+   // is explicitly destroyed by WorkerPrivate before exiting its run loop.
+   MOZ_DIAGNOSTIC_ASSERT(mOwner.is<Nothing>());
+   mOwner = AsVariant(aWorkerPrivate);
+ 
+   ClientSourceExecutionReadyArgs args(
+     aWorkerPrivate->GetLocationInfo().mHref,
+     FrameType::None);
+@@ -230,16 +240,27 @@ ClientSource::WindowExecutionReady(nsPID
+     return NS_OK;
+   }
+ 
+   nsIDocument* doc = aInnerWindow->GetExtantDoc();
+   if (NS_WARN_IF(!doc)) {
+     return NS_ERROR_UNEXPECTED;
+   }
+ 
++  // A client without access to storage should never be controlled a
++  // a service worker.  Check this here in case we were controlled before
++  // execution ready.  We can't tell what our storage policy is before
++  // execution ready.
++#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
++  if (mController.isSome()) {
++    MOZ_DIAGNOSTIC_ASSERT(nsContentUtils::StorageAllowedForWindow(aInnerWindow) ==
++                          nsContentUtils::StorageAccess::eAllow);
++  }
++#endif // MOZ_DIAGNOSTIC_ASSERT_ENABLED
++
+   // Don't use nsAutoCString here since IPC requires a full nsCString anyway.
+   nsCString spec;
+ 
+   nsIURI* uri = doc->GetOriginalURI();
+   if (uri) {
+     nsresult rv = uri->GetSpec(spec);
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       return rv;
+@@ -285,16 +306,22 @@ ClientSource::DocShellExecutionReady(nsI
+     return NS_OK;
+   }
+ 
+   nsPIDOMWindowOuter* outer = aDocShell->GetWindow();
+   if (NS_WARN_IF(!outer)) {
+     return NS_ERROR_UNEXPECTED;
+   }
+ 
++  // Note: We don't assert storage access for a controlled client here
++  // since this case is simply inheriting the parents principal for an
++  // about:blank.  If the parent is prevented storage access then it
++  // won't be controlled and the initial about:blank won't be controlled
++  // either.
++
+   // TODO: dedupe this with WindowExecutionReady
+   FrameType frameType = FrameType::Top_level;
+   if (!outer->IsTopLevelWindow()) {
+     frameType = FrameType::Nested;
+   } else if(outer->HadOriginalOpener()) {
+     frameType = FrameType::Auxiliary;
+   }
+ 
+@@ -355,16 +382,27 @@ ClientSource::SetController(const Servic
+ {
+   NS_ASSERT_OWNINGTHREAD(ClientSource);
+ 
+   // A client in private browsing mode should never be controlled by
+   // a service worker.  The principal origin attributes should guarantee
+   // this invariant.
+   MOZ_DIAGNOSTIC_ASSERT(!mClientInfo.IsPrivateBrowsing());
+ 
++  // A client without access to storage should never be controlled a
++  // a service worker.
++#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
++  if (GetInnerWindow() || GetWorkerPrivate()) {
++    ClientState state;
++    MOZ_ALWAYS_SUCCEEDS(SnapshotState(&state));
++    MOZ_DIAGNOSTIC_ASSERT(state.GetStorageAccess() ==
++                          nsContentUtils::StorageAccess::eAllow);
++  }
++#endif // MOZ_DIAGNOSTIC_ASSERT_ENABLED
++
+   if (mController.isSome() && mController.ref() == aServiceWorker) {
+     return;
+   }
+ 
+   mController.reset();
+   mController.emplace(aServiceWorker);
+ 
+   RefPtr<ServiceWorkerContainer> swc;
+diff --git a/dom/interfaces/base/nsIServiceWorkerManager.idl b/dom/interfaces/base/nsIServiceWorkerManager.idl
+--- a/dom/interfaces/base/nsIServiceWorkerManager.idl
++++ b/dom/interfaces/base/nsIServiceWorkerManager.idl
+@@ -10,16 +10,27 @@ interface mozIDOMWindow;
+ interface nsPIDOMWindowInner;
+ interface mozIDOMWindowProxy;
+ interface nsIArray;
+ interface nsIDocument;
+ interface nsIInterceptedChannel;
+ interface nsIPrincipal;
+ interface nsIRunnable;
+ interface nsIURI;
++%{C++
++namespace mozilla {
++namespace dom {
++class ClientInfo;
++class ServiceWorkerDescriptor;
++} // namespace dom
++} // namespace mozilla
++%}
++
++[ref] native const_ClientInfoRef(const mozilla::dom::ClientInfo);
++[ref] native const_ServiceWorkerDescriptorRef(const mozilla::dom::ServiceWorkerDescriptor);
+ 
+ [scriptable, uuid(52ee2c9d-ee87-4caf-9588-23ae77ff8798)]
+ interface nsIServiceWorkerUnregisterCallback : nsISupports
+ {
+   // aState is true if the unregistration succeded.
+   // It's false if this ServiceWorkerRegistration doesn't exist.
+   void unregisterSucceeded(in bool aState);
+   void unregisterFailed();
+@@ -145,16 +156,19 @@ interface nsIServiceWorkerManager : nsIS
+   /**
+    * Call this to request that document `aDoc` be controlled by a ServiceWorker
+    * if a registration exists for it's scope.
+    *
+    * This MUST only be called once per document!
+    */
+   [notxpcom,nostdcall] void MaybeStartControlling(in nsIDocument aDoc);
+ 
++  [notxpcom, nostdcall] bool StartControlling(in const_ClientInfoRef aClientInfo,
++                                              in const_ServiceWorkerDescriptorRef aServiceWorker);
++
+   /**
+    * Documents that have called MaybeStartControlling() should call this when
+    * they are destroyed. This function may be called multiple times, and is
+    * idempotent.
+    */
+   [notxpcom,nostdcall] void MaybeStopControlling(in nsIDocument aDoc);
+ 
+   /*
+diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
+--- a/dom/workers/ServiceWorkerManager.cpp
++++ b/dom/workers/ServiceWorkerManager.cpp
+@@ -308,50 +308,67 @@ ServiceWorkerManager::Init(ServiceWorker
+   if (!actor) {
+     MaybeStartShutdown();
+     return;
+   }
+ 
+   mActor = static_cast<ServiceWorkerManagerChild*>(actor);
+ }
+ 
+-void
++RefPtr<GenericPromise>
+ ServiceWorkerManager::StartControllingClient(const ClientInfo& aClientInfo,
+                                              ServiceWorkerRegistrationInfo* aRegistrationInfo)
+ {
+-  RefPtr<ClientHandle> clientHandle =
+-    ClientManager::CreateHandle(aClientInfo,
+-                                SystemGroup::EventTargetFor(TaskCategory::Other));
++  MOZ_DIAGNOSTIC_ASSERT(aRegistrationInfo->GetActive());
++
++  RefPtr<GenericPromise> ref;
++
++  const ServiceWorkerDescriptor& active =
++    aRegistrationInfo->GetActive()->Descriptor();
+ 
+   auto entry = mControlledClients.LookupForAdd(aClientInfo.Id());
+   if (entry) {
+     RefPtr<ServiceWorkerRegistrationInfo> old =
+       entry.Data()->mRegistrationInfo.forget();
+ 
++    ref = Move(entry.Data()->mClientHandle->Control(active));
+     entry.Data()->mRegistrationInfo = aRegistrationInfo;
+ 
+     if (old != aRegistrationInfo) {
+       StopControllingRegistration(old);
+       aRegistrationInfo->StartControllingClient();
+     }
+ 
+-  } else {
+-    aRegistrationInfo->StartControllingClient();
+-
+-    entry.OrInsert([&] {
+-      return new ControlledClientData(clientHandle, aRegistrationInfo);
++    Telemetry::Accumulate(Telemetry::SERVICE_WORKER_CONTROLLED_DOCUMENTS, 1);
++
++    return Move(ref);
++  }
++
++  RefPtr<ClientHandle> clientHandle =
++    ClientManager::CreateHandle(aClientInfo,
++                                SystemGroup::EventTargetFor(TaskCategory::Other));
++
++  ref = Move(clientHandle->Control(active));
++
++  aRegistrationInfo->StartControllingClient();
++
++  entry.OrInsert([&] {
++    return new ControlledClientData(clientHandle, aRegistrationInfo);
++  });
++
++  RefPtr<ServiceWorkerManager> self(this);
++  clientHandle->OnDetach()->Then(
++    SystemGroup::EventTargetFor(TaskCategory::Other), __func__,
++    [self = Move(self), aClientInfo] {
++      self->StopControllingClient(aClientInfo);
+     });
+ 
+-    RefPtr<ServiceWorkerManager> self(this);
+-    clientHandle->OnDetach()->Then(
+-      SystemGroup::EventTargetFor(TaskCategory::Other), __func__,
+-      [self = Move(self), aClientInfo] {
+-        self->StopControllingClient(aClientInfo);
+-      });
+-  }
++  Telemetry::Accumulate(Telemetry::SERVICE_WORKER_CONTROLLED_DOCUMENTS, 1);
++
++  return Move(ref);
+ }
+ 
+ void
+ ServiceWorkerManager::StopControllingClient(const ClientInfo& aClientInfo)
+ {
+   auto entry = mControlledClients.Lookup(aClientInfo.Id());
+   if (!entry) {
+     return;
+@@ -2371,22 +2388,47 @@ ServiceWorkerManager::MaybeRemoveRegistr
+ 
+ void
+ ServiceWorkerManager::MaybeStartControlling(nsIDocument* aDoc)
+ {
+   AssertIsOnMainThread();
+   MOZ_ASSERT(aDoc);
+   RefPtr<ServiceWorkerRegistrationInfo> registration =
+     GetServiceWorkerRegistrationInfo(aDoc);
+-  if (registration) {
++  if (registration && registration->GetActive() &&
++      aDoc->GetSandboxFlags() == 0) {
+     MOZ_ASSERT(!mControlledDocuments.Contains(aDoc));
+     StartControllingADocument(registration, aDoc);
+   }
+ }
+ 
++bool
++ServiceWorkerManager::StartControlling(const ClientInfo& aClientInfo,
++                                       const ServiceWorkerDescriptor& aServiceWorker)
++{
++  AssertIsOnMainThread();
++
++  nsCOMPtr<nsIPrincipal> principal =
++    PrincipalInfoToPrincipal(aServiceWorker.PrincipalInfo());
++  NS_ENSURE_TRUE(principal, false);
++
++  nsCOMPtr<nsIURI> scope;
++  nsresult rv =
++    NS_NewURI(getter_AddRefs(scope), aServiceWorker.Scope(), nullptr, nullptr);
++  NS_ENSURE_SUCCESS(rv, false);
++
++  RefPtr<ServiceWorkerRegistrationInfo> registration =
++    GetServiceWorkerRegistrationInfo(principal, scope);
++  NS_ENSURE_TRUE(registration, false);
++
++  StartControllingClient(aClientInfo, registration);
++
++  return true;
++}
++
+ void
+ ServiceWorkerManager::MaybeStopControlling(nsIDocument* aDoc)
+ {
+   AssertIsOnMainThread();
+   MOZ_ASSERT(aDoc);
+   mControlledDocuments.Remove(aDoc);
+ }
+ 
+@@ -2406,58 +2448,24 @@ ServiceWorkerManager::MaybeCheckNavigati
+   //    algorithm.
+   RefPtr<ServiceWorkerRegistrationInfo> registration;
+   mControlledDocuments.Get(aDoc, getter_AddRefs(registration));
+   if (registration) {
+     registration->MaybeScheduleUpdate();
+   }
+ }
+ 
+-RefPtr<GenericPromise>
++void
+ ServiceWorkerManager::StartControllingADocument(ServiceWorkerRegistrationInfo* aRegistration,
+                                                 nsIDocument* aDoc)
+ {
+   MOZ_ASSERT(aRegistration);
+   MOZ_ASSERT(aDoc);
+ 
+-#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+-  auto storageAllowed = nsContentUtils::StorageAllowedForDocument(aDoc);
+-  MOZ_DIAGNOSTIC_ASSERT(storageAllowed == nsContentUtils::StorageAccess::eAllow);
+-#endif // MOZ_DIAGNOSTIC_ASSERT_ENABLED
+-
+-  RefPtr<GenericPromise> ref;
+-
+-  ServiceWorkerInfo* activeWorker = aRegistration->GetActive();
+-  if (NS_WARN_IF(!activeWorker)) {
+-    ref = GenericPromise::CreateAndReject(NS_ERROR_DOM_INVALID_STATE_ERR,
+-                                          __func__);
+-    return ref.forget();
+-  }
+-
+-  Maybe<ClientInfo> clientInfo = aDoc->GetClientInfo();
+-  if (NS_WARN_IF(clientInfo.isNothing())) {
+-    ref = GenericPromise::CreateAndReject(NS_ERROR_DOM_INVALID_STATE_ERR,
+-                                          __func__);
+-    return ref.forget();
+-  }
+-
+-  StartControllingClient(clientInfo.ref(), aRegistration);
+   mControlledDocuments.Put(aDoc, aRegistration);
+-
+-  // Mark the document's ClientSource as controlled using the ClientHandle
+-  // interface.  While we could get at the ClientSource directly from the
+-  // document here, our goal is to move ServiceWorkerManager to a separate
+-  // process.  Using the ClientHandle supports this remote operation.
+-  RefPtr<ClientHandle> clientHandle =
+-    ClientManager::CreateHandle(clientInfo.ref(),
+-                                SystemGroup::EventTargetFor(TaskCategory::Other));
+-  ref = Move(clientHandle->Control(activeWorker->Descriptor()));
+-
+-  Telemetry::Accumulate(Telemetry::SERVICE_WORKER_CONTROLLED_DOCUMENTS, 1);
+-  return Move(ref);
+ }
+ 
+ void
+ ServiceWorkerManager::StopControllingRegistration(ServiceWorkerRegistrationInfo* aRegistration)
+ {
+   aRegistration->StopControllingClient();
+   if (aRegistration->IsControllingClients() || !aRegistration->IsIdle()) {
+     return;
+@@ -2784,20 +2792,17 @@ ServiceWorkerManager::DispatchFetchEvent
+         //       initial about:blank global.  See bug 1419620 and the spec
+         //       issue here: https://github.com/w3c/ServiceWorker/issues/1232
+       }
+ 
+       if (clientInfo.isSome()) {
+         // First, attempt to mark the reserved client controlled directly.  This
+         // will update the controlled status in the ClientManagerService in the
+         // parent.  It will also eventually propagate back to the ClientSource.
+-        RefPtr<ClientHandle> clientHandle =
+-          ClientManager::CreateHandle(clientInfo.ref(),
+-                                      SystemGroup::EventTargetFor(TaskCategory::Other));
+-        clientHandle->Control(serviceWorker->Descriptor());
++        StartControllingClient(clientInfo.ref(), registration);
+       }
+ 
+       // But we also note the reserved state on the LoadInfo.  This allows the
+       // ClientSource to be updated immediately after the nsIChannel starts.
+       // This is necessary to have the correct controller in place for immediate
+       // follow-on requests.
+       loadInfo->SetController(serviceWorker->Descriptor());
+     }
+@@ -3258,17 +3263,18 @@ ServiceWorkerManager::MaybeClaimClient(n
+                         getter_AddRefs(controllingRegistration));
+ 
+   if (aWorkerRegistration != matchingRegistration ||
+       aWorkerRegistration == controllingRegistration) {
+     ref = GenericPromise::CreateAndResolve(true, __func__);
+     return ref.forget();
+   }
+ 
+-  ref = StartControllingADocument(aWorkerRegistration, aDocument);
++  StartControllingADocument(aWorkerRegistration, aDocument);
++  ref = StartControllingClient(clientInfo.ref(), aWorkerRegistration);
+   return ref.forget();
+ }
+ 
+ already_AddRefed<GenericPromise>
+ ServiceWorkerManager::MaybeClaimClient(nsIDocument* aDoc,
+                                        const ServiceWorkerDescriptor& aServiceWorker)
+ {
+   RefPtr<GenericPromise> ref;
+diff --git a/dom/workers/ServiceWorkerManager.h b/dom/workers/ServiceWorkerManager.h
+--- a/dom/workers/ServiceWorkerManager.h
++++ b/dom/workers/ServiceWorkerManager.h
+@@ -339,17 +339,17 @@ public:
+ 
+ private:
+   ServiceWorkerManager();
+   ~ServiceWorkerManager();
+ 
+   void
+   Init(ServiceWorkerRegistrar* aRegistrar);
+ 
+-  void
++  RefPtr<GenericPromise>
+   StartControllingClient(const ClientInfo& aClientInfo,
+                          ServiceWorkerRegistrationInfo* aRegistrationInfo);
+ 
+   void
+   StopControllingClient(const ClientInfo& aClientInfo);
+ 
+   void
+   MaybeStartShutdown();
+@@ -393,17 +393,17 @@ private:
+                                             WhichServiceWorker aWhichOne);
+   void
+   InvalidateServiceWorkerRegistrationWorker(ServiceWorkerRegistrationInfo* aRegistration,
+                                             WhichServiceWorker aWhichOnes);
+ 
+   void
+   NotifyServiceWorkerRegistrationRemoved(ServiceWorkerRegistrationInfo* aRegistration);
+ 
+-  RefPtr<GenericPromise>
++  void
+   StartControllingADocument(ServiceWorkerRegistrationInfo* aRegistration,
+                             nsIDocument* aDoc);
+ 
+   void
+   StopControllingRegistration(ServiceWorkerRegistrationInfo* aRegistration);
+ 
+   already_AddRefed<ServiceWorkerRegistrationInfo>
+   GetServiceWorkerRegistrationInfo(nsPIDOMWindowInner* aWindow);

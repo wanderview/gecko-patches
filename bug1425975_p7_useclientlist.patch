@@ -1,0 +1,159 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  489e0d751446ad08160ad4c86b8c4cfdeba26753
+Bug 1425975 P7 Use the mControlledClients list to drive controller start and stop logic. r=asuth
+
+diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
+--- a/dom/workers/ServiceWorkerManager.cpp
++++ b/dom/workers/ServiceWorkerManager.cpp
+@@ -318,18 +318,29 @@ ServiceWorkerManager::StartControllingCl
+                                              ServiceWorkerRegistrationInfo* aRegistrationInfo)
+ {
+   RefPtr<ClientHandle> clientHandle =
+     ClientManager::CreateHandle(aClientInfo,
+                                 SystemGroup::EventTargetFor(TaskCategory::Other));
+ 
+   auto entry = mControlledClients.LookupForAdd(aClientInfo.Id());
+   if (entry) {
++    RefPtr<ServiceWorkerRegistrationInfo> old =
++      entry.Data()->mRegistrationInfo.forget();
++
+     entry.Data()->mRegistrationInfo = aRegistrationInfo;
++
++    if (old != aRegistrationInfo) {
++      StopControllingRegistration(old);
++      aRegistrationInfo->StartControllingClient();
++    }
++
+   } else {
++    aRegistrationInfo->StartControllingClient();
++
+     entry.OrInsert([&] {
+       return new ControlledClientData(clientHandle, aRegistrationInfo);
+     });
+ 
+     RefPtr<ServiceWorkerManager> self(this);
+     clientHandle->OnDetach()->Then(
+       SystemGroup::EventTargetFor(TaskCategory::Other), __func__,
+       [self = Move(self), aClientInfo] {
+@@ -340,17 +351,23 @@ ServiceWorkerManager::StartControllingCl
+ 
+ void
+ ServiceWorkerManager::StopControllingClient(const ClientInfo& aClientInfo)
+ {
+   auto entry = mControlledClients.Lookup(aClientInfo.Id());
+   if (!entry) {
+     return;
+   }
++
++  RefPtr<ServiceWorkerRegistrationInfo> reg =
++    entry.Data()->mRegistrationInfo.forget();
++
+   entry.Remove();
++
++  StopControllingRegistration(reg);
+ }
+ 
+ void
+ ServiceWorkerManager::MaybeStartShutdown()
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+ 
+   if (mShuttingDown) {
+@@ -2315,16 +2332,26 @@ ServiceWorkerManager::RemoveScopeAndRegi
+     ServiceWorkerRegistrationInfo* reg = iter.UserData();
+     if (reg->mScope.Equals(aRegistration->mScope)) {
+       MOZ_DIAGNOSTIC_ASSERT(false,
+                             "controlled document when removing registration");
+       iter.Remove();
+       break;
+     }
+   }
++
++  for (auto iter = swm->mControlledClients.Iter(); !iter.Done(); iter.Next()) {
++    auto& reg = iter.UserData()->mRegistrationInfo;
++    if (reg->mScope.Equals(aRegistration->mScope)) {
++      MOZ_DIAGNOSTIC_ASSERT(false,
++                            "controlled client when removing registration");
++      iter.Remove();
++      break;
++    }
++  }
+ #endif
+ 
+   RefPtr<ServiceWorkerRegistrationInfo> info;
+   data->mInfos.Remove(aRegistration->mScope, getter_AddRefs(info));
+   data->mOrderedScopes.RemoveElement(aRegistration->mScope);
+   swm->NotifyListenersOnUnregister(info);
+ 
+   swm->MaybeRemoveRegistrationInfo(scopeKey);
+@@ -2355,24 +2382,17 @@ ServiceWorkerManager::MaybeStartControll
+   }
+ }
+ 
+ void
+ ServiceWorkerManager::MaybeStopControlling(nsIDocument* aDoc)
+ {
+   AssertIsOnMainThread();
+   MOZ_ASSERT(aDoc);
+-  RefPtr<ServiceWorkerRegistrationInfo> registration;
+-  mControlledDocuments.Remove(aDoc, getter_AddRefs(registration));
+-  // A document which was uncontrolled does not maintain that state itself, so
+-  // it will always call MaybeStopControlling() even if there isn't an
+-  // associated registration. So this check is required.
+-  if (registration) {
+-    StopControllingRegistration(registration);
+-  }
++  mControlledDocuments.Remove(aDoc);
+ }
+ 
+ void
+ ServiceWorkerManager::MaybeCheckNavigationUpdate(nsIDocument* aDoc)
+ {
+   AssertIsOnMainThread();
+   MOZ_ASSERT(aDoc);
+   // We perform these success path navigation update steps when the
+@@ -2414,21 +2434,19 @@ ServiceWorkerManager::StartControllingAD
+ 
+   Maybe<ClientInfo> clientInfo = aDoc->GetClientInfo();
+   if (NS_WARN_IF(clientInfo.isNothing())) {
+     ref = GenericPromise::CreateAndReject(NS_ERROR_DOM_INVALID_STATE_ERR,
+                                           __func__);
+     return ref.forget();
+   }
+ 
+-  aRegistration->StartControllingClient();
++  StartControllingClient(clientInfo.ref(), aRegistration);
+   mControlledDocuments.Put(aDoc, aRegistration);
+ 
+-  StartControllingClient(clientInfo.ref(), aRegistration);
+-
+   // Mark the document's ClientSource as controlled using the ClientHandle
+   // interface.  While we could get at the ClientSource directly from the
+   // document here, our goal is to move ServiceWorkerManager to a separate
+   // process.  Using the ClientHandle supports this remote operation.
+   RefPtr<ClientHandle> clientHandle =
+     ClientManager::CreateHandle(clientInfo.ref(),
+                                 SystemGroup::EventTargetFor(TaskCategory::Other));
+   ref = Move(clientHandle->Control(activeWorker->Descriptor()));
+@@ -3240,20 +3258,16 @@ ServiceWorkerManager::MaybeClaimClient(n
+                         getter_AddRefs(controllingRegistration));
+ 
+   if (aWorkerRegistration != matchingRegistration ||
+       aWorkerRegistration == controllingRegistration) {
+     ref = GenericPromise::CreateAndResolve(true, __func__);
+     return ref.forget();
+   }
+ 
+-  if (controllingRegistration) {
+-    StopControllingRegistration(controllingRegistration);
+-  }
+-
+   ref = StartControllingADocument(aWorkerRegistration, aDocument);
+   return ref.forget();
+ }
+ 
+ already_AddRefed<GenericPromise>
+ ServiceWorkerManager::MaybeClaimClient(nsIDocument* aDoc,
+                                        const ServiceWorkerDescriptor& aServiceWorker)
+ {
