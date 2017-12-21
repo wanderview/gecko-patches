@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  481b91ed82ef09a909fef9828b551e1eb50d0515
+# Parent  82c2672fdfb05ff7408e57cc6ecf6235aec0143c
 
 diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
 --- a/docshell/base/nsDocShell.cpp
@@ -70,6 +70,114 @@ diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
  
  Maybe<ClientInfo>
  nsDocShell::GetInitialClientInfo() const
+diff --git a/dom/base/nsGlobalWindowInner.cpp b/dom/base/nsGlobalWindowInner.cpp
+--- a/dom/base/nsGlobalWindowInner.cpp
++++ b/dom/base/nsGlobalWindowInner.cpp
+@@ -256,16 +256,17 @@
+ 
+ #ifdef MOZ_WEBSPEECH
+ #include "mozilla/dom/SpeechSynthesis.h"
+ #endif
+ 
+ #include "mozilla/dom/ClientManager.h"
+ #include "mozilla/dom/ClientSource.h"
+ #include "mozilla/dom/ClientState.h"
++#include "mozilla/ipc/BackgroundUtils.h"
+ 
+ // Apple system headers seem to have a check() macro.  <sigh>
+ #ifdef check
+ class nsIScriptTimeoutHandler;
+ #undef check
+ #endif // check
+ #include "AccessCheck.h"
+ 
+@@ -281,16 +282,17 @@ class nsIScriptTimeoutHandler;
+ #endif
+ 
+ using namespace mozilla;
+ using namespace mozilla::dom;
+ using namespace mozilla::dom::ipc;
+ using mozilla::TimeStamp;
+ using mozilla::TimeDuration;
+ using mozilla::dom::cache::CacheStorage;
++using mozilla::ipc::PrincipalInfoToPrincipal;
+ 
+ #define FORWARD_TO_OUTER(method, args, err_rval)                        \
+   PR_BEGIN_MACRO                                                        \
+   nsGlobalWindowOuter *outer = GetOuterWindowInternal();                \
+   if (!HasActiveDocument()) {                                           \
+     NS_WARNING(outer ?                                                  \
+                "Inner window does not have active document." :          \
+                "No outer window available!");                           \
+@@ -1781,21 +1783,44 @@ nsGlobalWindowInner::EnsureClientSource(
+   // In this case we want to inherit this placeholder Client here.
+   if (!mClientSource) {
+     mClientSource = Move(initialClientSource);
+     if (mClientSource) {
+       newClientSource = true;
+     }
+   }
+ 
++  // Verify the final ClientSource principal matches the final document
++  // principal.  The ClientChannelHelper handles things like network
++  // redirects, but there are other ways the document principal can change.
++  // For example, if we sniff a json content type and show the viewer, then
++  // the page ends up with a null principal.
++  //
++  // For now we handle this just by reseting the ClientSource.  This will
++  // result in a new ClientSource with the correct principal being created.
++  // To APIs like ServiceWorker and Clients API it will look like there was
++  // an initial content page created that was then immediately replaced.
++  // This is pretty close to what we are actually doing.
++  if (mClientSource) {
++    nsCOMPtr<nsIPrincipal> clientPrincipal =
++      PrincipalInfoToPrincipal(mClientSource->Info().PrincipalInfo());
++    if (!clientPrincipal || !clientPrincipal->Equals(mDoc->NodePrincipal())) {
++      mClientSource.reset();
++    }
++  }
++
+   // If we don't have a reserved client or an initial client, then create
+   // one now.  This can happen in certain cases where we avoid preallocating
+   // the client in the docshell.  This mainly occurs in situations where
+   // the principal is not clearly inherited from the parent; e.g. sandboxed
+   // iframes, window.open(), etc.
++  //
++  // We also do this late ClientSource creation if the final document ended
++  // up with a different principal.
++  //
+   // TODO: We may not be marking initial about:blank documents created
+   //       this way as controlled by a service worker properly.  The
+   //       controller should be coming from the same place as the inheritted
+   //       principal.  We do this in docshell, but as mentioned we aren't
+   //       smart enough to handle all cases yet.  For example, a
+   //       window.open() with new URL should inherit the controller from
+   //       the opener, but we probably don't handle that yet.
+   if (!mClientSource) {
+@@ -1805,17 +1830,22 @@ nsGlobalWindowInner::EnsureClientSource(
+     MOZ_DIAGNOSTIC_ASSERT(mClientSource);
+     newClientSource = true;
+   }
+ 
+   // The load may have started controlling the Client as well.  If
+   // so, mark it as controlled immediately here.  The actor may
+   // or may not have been notified by the parent side about being
+   // controlled yet.
+-  if (loadInfo) {
++  //
++  // Note: We should be careful not to control a client that was created late.
++  //       This client was not seen by the load info the ServiceWorkerManager
++  //       won't know about.  Its also possible we are creating the client
++  //       late due to the final principal changing, etc.
++  else if (loadInfo) {
+     const Maybe<ServiceWorkerDescriptor> controller = loadInfo->GetController();
+     if (controller.isSome()) {
+       mClientSource->SetController(controller.ref());
+     }
+ 
+     // We also have to handle the case where te initial about:blank is
+     // controlled due to inheritting the service worker from its parent,
+     // but the actual nsIChannel load is not covered by any service worker.
 diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSource.cpp
 --- a/dom/clients/manager/ClientSource.cpp
 +++ b/dom/clients/manager/ClientSource.cpp
@@ -317,7 +425,58 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
    auto entry = mControlledClients.Lookup(aClientInfo.Id());
    if (!entry) {
      return;
-@@ -2371,22 +2388,47 @@ ServiceWorkerManager::MaybeRemoveRegistr
+@@ -2321,38 +2338,37 @@ ServiceWorkerManager::RemoveScopeAndRegi
+     return;
+   }
+ 
+   if (auto entry = data->mUpdateTimers.Lookup(aRegistration->mScope)) {
+     entry.Data()->Cancel();
+     entry.Remove();
+   }
+ 
+-  // Verify there are no controlled documents for the purged registration.
+-#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+-  for (auto iter = swm->mControlledDocuments.Iter(); !iter.Done(); iter.Next()) {
+-    ServiceWorkerRegistrationInfo* reg = iter.UserData();
+-    if (reg->mScope.Equals(aRegistration->mScope)) {
+-      MOZ_DIAGNOSTIC_ASSERT(false,
+-                            "controlled document when removing registration");
+-      iter.Remove();
+-      break;
+-    }
+-  }
+-
++  // Verify there are no controlled clients for the purged registration.
+   for (auto iter = swm->mControlledClients.Iter(); !iter.Done(); iter.Next()) {
+     auto& reg = iter.UserData()->mRegistrationInfo;
+     if (reg->mScope.Equals(aRegistration->mScope)) {
+       MOZ_DIAGNOSTIC_ASSERT(false,
+                             "controlled client when removing registration");
+       iter.Remove();
+       break;
+     }
+   }
+-#endif
++
++  // Registration lifecycle is managed via mControlledClients now.  Do not
++  // assert on on mControlledDocuments as races may cause this to still be
++  // set when the registration is destroyed.
++  for (auto iter = swm->mControlledDocuments.Iter(); !iter.Done(); iter.Next()) {
++    ServiceWorkerRegistrationInfo* reg = iter.UserData();
++    if (reg->mScope.Equals(aRegistration->mScope)) {
++      iter.Remove();
++      break;
++    }
++  }
+ 
+   RefPtr<ServiceWorkerRegistrationInfo> info;
+   data->mInfos.Remove(aRegistration->mScope, getter_AddRefs(info));
+   data->mOrderedScopes.RemoveElement(aRegistration->mScope);
+   swm->NotifyListenersOnUnregister(info);
+ 
+   swm->MaybeRemoveRegistrationInfo(scopeKey);
+   swm->NotifyServiceWorkerRegistrationRemoved(aRegistration);
+@@ -2371,22 +2387,47 @@ ServiceWorkerManager::MaybeRemoveRegistr
  
  void
  ServiceWorkerManager::MaybeStartControlling(nsIDocument* aDoc)
@@ -366,12 +525,12 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
    mControlledDocuments.Remove(aDoc);
  }
  
-@@ -2406,58 +2448,24 @@ ServiceWorkerManager::MaybeCheckNavigati
+@@ -2404,58 +2445,24 @@ ServiceWorkerManager::MaybeCheckNavigati
+   //    If request is a non-subresource request, then: Invoke Soft Update
    //    algorithm.
-   RefPtr<ServiceWorkerRegistrationInfo> registration;
-   mControlledDocuments.Get(aDoc, getter_AddRefs(registration));
-   if (registration) {
-     registration->MaybeScheduleUpdate();
+   ControlledClientData* data = mControlledClients.Get(aClientInfo.Id());
+   if (data && data->mRegistrationInfo) {
+     data->mRegistrationInfo->MaybeScheduleUpdate();
    }
  }
  
@@ -426,7 +585,7 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
    aRegistration->StopControllingClient();
    if (aRegistration->IsControllingClients() || !aRegistration->IsIdle()) {
      return;
-@@ -2784,20 +2792,17 @@ ServiceWorkerManager::DispatchFetchEvent
+@@ -2782,20 +2789,17 @@ ServiceWorkerManager::DispatchFetchEvent
          //       initial about:blank global.  See bug 1419620 and the spec
          //       issue here: https://github.com/w3c/ServiceWorker/issues/1232
        }
@@ -448,7 +607,7 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
        // follow-on requests.
        loadInfo->SetController(serviceWorker->Descriptor());
      }
-@@ -3258,17 +3263,18 @@ ServiceWorkerManager::MaybeClaimClient(n
+@@ -3256,17 +3260,18 @@ ServiceWorkerManager::MaybeClaimClient(n
                          getter_AddRefs(controllingRegistration));
  
    if (aWorkerRegistration != matchingRegistration ||
