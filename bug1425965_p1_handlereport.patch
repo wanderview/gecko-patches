@@ -1,0 +1,232 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  53e80776dbc71a7dc3b7105ced2a6161ad4e48ea
+Bug 1425965 P1 Add a ClientHandle::ReportToConsole() method. r=asuth
+
+diff --git a/dom/clients/manager/ClientHandle.cpp b/dom/clients/manager/ClientHandle.cpp
+--- a/dom/clients/manager/ClientHandle.cpp
++++ b/dom/clients/manager/ClientHandle.cpp
+@@ -203,10 +203,29 @@ ClientHandle::OnDetach()
+       mDetachPromise->Resolve(true, __func__);
+     }
+   }
+ 
+   RefPtr<GenericPromise> ref(mDetachPromise);
+   return Move(ref);
+ }
+ 
++void
++ClientHandle::ReportToConsole(const nsACString& aCategory,
++                              const nsAString& aMessage,
++                              const nsAString& aFilename,
++                              const nsAString& aLine,
++                              uint32_t aLineNumber,
++                              uint32_t aColumnNumber,
++                              uint32_t aFlags)
++{
++  RefPtr<ClientOpPromise> innerPromise =
++    StartOp(ClientReportArgs(nsCString(aCategory),
++                             nsString(aMessage),
++                             nsString(aFilename),
++                             nsString(aLine),
++                             aLineNumber,
++                             aColumnNumber,
++                             aFlags));
++}
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/clients/manager/ClientHandle.h b/dom/clients/manager/ClientHandle.h
+--- a/dom/clients/manager/ClientHandle.h
++++ b/dom/clients/manager/ClientHandle.h
+@@ -101,15 +101,24 @@ public:
+   // happen when the ClientHandle is de-referenced and tears down its own
+   // actors.
+   //
+   // Note: This method can only be called on the ClientHandle owning thread,
+   //       but the MozPromise lets you Then() to another thread.
+   RefPtr<GenericPromise>
+   OnDetach();
+ 
++  void
++  ReportToConsole(const nsACString& aCategory,
++                  const nsAString& aMessage,
++                  const nsAString& aFilename,
++                  const nsAString& aLine,
++                  uint32_t aLineNumber,
++                  uint32_t aColumnNumber,
++                  uint32_t aFlags);
++
+   NS_INLINE_DECL_REFCOUNTING(ClientHandle);
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // _mozilla_dom_ClientHandle_h
+diff --git a/dom/clients/manager/ClientIPCTypes.ipdlh b/dom/clients/manager/ClientIPCTypes.ipdlh
+--- a/dom/clients/manager/ClientIPCTypes.ipdlh
++++ b/dom/clients/manager/ClientIPCTypes.ipdlh
+@@ -107,26 +107,38 @@ struct ClientGetInfoAndStateArgs
+ 
+ struct ClientOpenWindowArgs
+ {
+   PrincipalInfo principalInfo;
+   nsCString url;
+   nsCString baseURL;
+ };
+ 
++struct ClientReportArgs
++{
++  nsCString category;
++  nsString message;
++  nsString filename;
++  nsString line;
++  uint32_t lineNumber;
++  uint32_t columnNumber;
++  uint32_t flags;
++};
++
+ union ClientOpConstructorArgs
+ {
+   ClientControlledArgs;
+   ClientFocusArgs;
+   ClientNavigateArgs;
+   ClientPostMessageArgs;
+   ClientMatchAllArgs;
+   ClientClaimArgs;
+   ClientGetInfoAndStateArgs;
+   ClientOpenWindowArgs;
++  ClientReportArgs;
+ };
+ 
+ struct ClientList
+ {
+   ClientInfoAndState[] values;
+ };
+ 
+ struct ClientNavigateOpConstructorArgs
+diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSource.cpp
+--- a/dom/clients/manager/ClientSource.cpp
++++ b/dom/clients/manager/ClientSource.cpp
+@@ -656,16 +656,53 @@ ClientSource::GetInfoAndState(const Clie
+     return ref.forget();
+   }
+ 
+   ref = ClientOpPromise::CreateAndResolve(ClientInfoAndState(mClientInfo.ToIPC(),
+                                                              state.ToIPC()), __func__);
+   return ref.forget();
+ }
+ 
++RefPtr<ClientOpPromise>
++ClientSource::Report(const ClientReportArgs& aArgs)
++{
++  RefPtr<ClientOpPromise> ref;
++  uint64_t windowId = 0;
++
++  if (GetInnerWindow()) {
++    windowId = GetInnerWindow()->WindowID();
++  } else if (GetWorkerPrivate()) {
++    windowId = GetWorkerPrivate()->WindowID();
++  } else if (GetDocShell()) {
++    nsPIDOMWindowOuter* outer = GetDocShell()->GetWindow();
++    if (outer) {
++      windowId = outer->WindowID();
++    }
++  }
++
++  nsCOMPtr<nsIURI> filename;
++  nsresult rv = NS_NewURI(getter_AddRefs(filename), aArgs.filename());
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    ref = ClientOpPromise::CreateAndReject(rv, __func__);
++    return ref.forget();
++  }
++
++  nsContentUtils::ReportToConsoleByWindowID(aArgs.message(),
++                                            aArgs.flags(),
++                                            aArgs.category(),
++                                            windowId,
++                                            filename,
++                                            aArgs.line(),
++                                            aArgs.lineNumber(),
++                                            aArgs.columnNumber());
++
++  ref = ClientOpPromise::CreateAndResolve(NS_OK, __func__);
++  return ref.forget();
++}
++
+ nsresult
+ ClientSource::SnapshotState(ClientState* aStateOut)
+ {
+   NS_ASSERT_OWNINGTHREAD(ClientSource);
+   MOZ_DIAGNOSTIC_ASSERT(aStateOut);
+ 
+   if (mClientInfo.Type() == ClientType::Window) {
+     MaybeCreateInitialDocument();
+diff --git a/dom/clients/manager/ClientSource.h b/dom/clients/manager/ClientSource.h
+--- a/dom/clients/manager/ClientSource.h
++++ b/dom/clients/manager/ClientSource.h
+@@ -24,16 +24,17 @@ namespace mozilla {
+ namespace dom {
+ 
+ class ClientClaimArgs;
+ class ClientControlledArgs;
+ class ClientFocusArgs;
+ class ClientGetInfoAndStateArgs;
+ class ClientManager;
+ class ClientPostMessageArgs;
++class ClientReportArgs;
+ class ClientSourceChild;
+ class ClientSourceConstructorArgs;
+ class ClientSourceExecutionReadyArgs;
+ class ClientState;
+ class ClientWindowState;
+ class PClientManagerChild;
+ 
+ namespace workers {
+@@ -154,16 +155,19 @@ public:
+   PostMessage(const ClientPostMessageArgs& aArgs);
+ 
+   RefPtr<ClientOpPromise>
+   Claim(const ClientClaimArgs& aArgs);
+ 
+   RefPtr<ClientOpPromise>
+   GetInfoAndState(const ClientGetInfoAndStateArgs& aArgs);
+ 
++  RefPtr<ClientOpPromise>
++  Report(const ClientReportArgs& aArgs);
++
+   nsresult
+   SnapshotState(ClientState* aStateOut);
+ 
+   nsISerialEventTarget*
+   EventTarget() const;
+ 
+   void
+   Traverse(nsCycleCollectionTraversalCallback& aCallback,
+diff --git a/dom/clients/manager/ClientSourceOpChild.cpp b/dom/clients/manager/ClientSourceOpChild.cpp
+--- a/dom/clients/manager/ClientSourceOpChild.cpp
++++ b/dom/clients/manager/ClientSourceOpChild.cpp
+@@ -95,16 +95,22 @@ ClientSourceOpChild::Init(const ClientOp
+       break;
+     }
+     case ClientOpConstructorArgs::TClientGetInfoAndStateArgs:
+     {
+       DoSourceOp(&ClientSource::GetInfoAndState,
+                  aArgs.get_ClientGetInfoAndStateArgs());
+       break;
+     }
++    case ClientOpConstructorArgs::TClientReportArgs:
++    {
++      DoSourceOp(&ClientSource::Report,
++                 aArgs.get_ClientReportArgs());
++      break;
++    }
+     default:
+     {
+       MOZ_ASSERT_UNREACHABLE("unknown client operation!");
+       break;
+     }
+   }
+ }
+ 
