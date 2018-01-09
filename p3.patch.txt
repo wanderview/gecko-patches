@@ -1,0 +1,133 @@
+# HG changeset patch
+# User Andrew Sutherland <asutherland@asutherland.org>
+# Date 1515092353 18000
+#      Thu Jan 04 13:59:13 2018 -0500
+# Node ID 9981bafe22db91a5ab2f80ddfda04b57abab026e
+# Parent  f5be87c3273f5248979c286c8371c1f31a2c44d6
+Bug 1416879 - Part 3: (Also Bug 1418795) SyntheticDiversionListener should handle !mIPCOpen. r=bkelly
+
+The SyntheticDiversionListener needs to handle the case where the IPC
+connection is gone.  This patch avoids calling Send* methods which will
+crash the content process if the actor has already been destroyed.
+Additionally, OnDataAvailable will return an error in such a case so
+that the caller can properly handle the error rather than continuing to
+attempt to send data to a listener that doesn't care.  This latter
+change is an artifact of a previous hack attempt to fix a related
+diversion issue that is probably not required for this stack, but makes
+sense as a fix, so I've left it in.
+
+diff --git a/netwerk/protocol/http/HttpChannelChild.cpp b/netwerk/protocol/http/HttpChannelChild.cpp
+--- a/netwerk/protocol/http/HttpChannelChild.cpp
++++ b/netwerk/protocol/http/HttpChannelChild.cpp
+@@ -610,18 +610,16 @@ HttpChannelChild::OnStartRequest(const n
+   //
+   // gHttpHandler->OnExamineResponse(this);
+ 
+   mTracingEnabled = false;
+ 
+   DoOnStartRequest(this, mListenerContext);
+ }
+ 
+-namespace {
+-
+ class SyntheticDiversionListener final : public nsIStreamListener
+ {
+   RefPtr<HttpChannelChild> mChannel;
+ 
+   ~SyntheticDiversionListener()
+   {
+   }
+ 
+@@ -638,44 +636,49 @@ public:
+     MOZ_ASSERT_UNREACHABLE("SyntheticDiversionListener should never see OnStartRequest");
+     return NS_OK;
+   }
+ 
+   NS_IMETHOD
+   OnStopRequest(nsIRequest* aRequest, nsISupports* aContext,
+                 nsresult aStatus) override
+   {
+-    mChannel->SendDivertOnStopRequest(aStatus);
+-    mChannel->SendDivertComplete();
++    if (mChannel->mIPCOpen) {
++      mChannel->SendDivertOnStopRequest(aStatus);
++      mChannel->SendDivertComplete();
++    }
+     return NS_OK;
+   }
+ 
+   NS_IMETHOD
+   OnDataAvailable(nsIRequest* aRequest, nsISupports* aContext,
+                   nsIInputStream* aInputStream, uint64_t aOffset,
+                   uint32_t aCount) override
+   {
++    if (!mChannel->mIPCOpen) {
++      aRequest->Cancel(NS_ERROR_ABORT);
++      return NS_ERROR_ABORT;
++    }
++
+     nsAutoCString data;
+     nsresult rv = NS_ConsumeStream(aInputStream, aCount, data);
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       aRequest->Cancel(rv);
+       return rv;
+     }
+ 
+     mChannel->SendDivertOnDataAvailable(data, aOffset, aCount);
+     return NS_OK;
+   }
+ 
+   NS_DECL_ISUPPORTS
+ };
+ 
+ NS_IMPL_ISUPPORTS(SyntheticDiversionListener, nsIStreamListener);
+ 
+-} // anonymous namespace
+-
+ void
+ HttpChannelChild::DoOnStartRequest(nsIRequest* aRequest, nsISupports* aContext)
+ {
+   LOG(("HttpChannelChild::DoOnStartRequest [this=%p]\n", this));
+ 
+   // In theory mListener should not be null, but in practice sometimes it is.
+   MOZ_ASSERT(mListener);
+   if (!mListener) {
+diff --git a/netwerk/protocol/http/HttpChannelChild.h b/netwerk/protocol/http/HttpChannelChild.h
+--- a/netwerk/protocol/http/HttpChannelChild.h
++++ b/netwerk/protocol/http/HttpChannelChild.h
+@@ -42,16 +42,17 @@ class nsInputStreamPump;
+ class nsIInterceptedBodyCallback;
+ 
+ namespace mozilla {
+ namespace net {
+ 
+ class HttpBackgroundChannelChild;
+ class InterceptedChannelContent;
+ class InterceptStreamListener;
++class SyntheticDiversionListener;
+ 
+ class HttpChannelChild final : public PHttpChannelChild
+                              , public HttpBaseChannel
+                              , public HttpAsyncAborter<HttpChannelChild>
+                              , public nsICacheInfoChannel
+                              , public nsIProxiedChannel
+                              , public nsIApplicationCacheChannel
+                              , public nsIAsyncVerifyRedirectCallback
+@@ -469,16 +470,17 @@ private:
+   friend class Redirect1Event;
+   friend class Redirect3Event;
+   friend class DeleteSelfEvent;
+   friend class HttpFlushedForDiversionEvent;
+   friend class CancelEvent;
+   friend class HttpAsyncAborter<HttpChannelChild>;
+   friend class InterceptStreamListener;
+   friend class InterceptedChannelContent;
++  friend class SyntheticDiversionListener;
+   friend class HttpBackgroundChannelChild;
+   friend class NeckoTargetChannelEvent<HttpChannelChild>;
+ };
+ 
+ // A stream listener interposed between the nsInputStreamPump used for intercepted channels
+ // and this channel's original listener. This is only used to ensure the original listener
+ // sees the channel as the request object, and to synthesize OnStatus and OnProgress notifications.
+ class InterceptStreamListener : public nsIStreamListener
