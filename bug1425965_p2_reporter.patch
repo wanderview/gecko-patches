@@ -1,0 +1,192 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  88050ba6016ef78292c84d554c1ebb58063a5210
+Bug 1425965 P2 Add nsIConsoleReportCollector::FlushReportsToConsoleForServiceWorkerScope(). r=baku
+
+diff --git a/dom/console/ConsoleReportCollector.cpp b/dom/console/ConsoleReportCollector.cpp
+--- a/dom/console/ConsoleReportCollector.cpp
++++ b/dom/console/ConsoleReportCollector.cpp
+@@ -1,22 +1,25 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/ConsoleReportCollector.h"
+ 
++#include "ConsoleUtils.h"
+ #include "nsIConsoleService.h"
+ #include "nsIScriptError.h"
+ #include "nsNetUtil.h"
+ 
+ namespace mozilla {
+ 
++using mozilla::dom::ConsoleUtils;
++
+ NS_IMPL_ISUPPORTS(ConsoleReportCollector, nsIConsoleReportCollector)
+ 
+ ConsoleReportCollector::ConsoleReportCollector()
+   : mMutex("mozilla::ConsoleReportCollector")
+ {
+ }
+ 
+ void
+@@ -90,16 +93,58 @@ ConsoleReportCollector::FlushReportsToCo
+                                               uri,
+                                               EmptyString(),
+                                               report.mLineNumber,
+                                               report.mColumnNumber);
+   }
+ }
+ 
+ void
++ConsoleReportCollector::FlushReportsToConsoleForServiceWorkerScope(const nsACString& aScope,
++                                                                   ReportAction aAction)
++{
++  nsTArray<PendingReport> reports;
++
++  {
++    MutexAutoLock lock(mMutex);
++    if (aAction == ReportAction::Forget) {
++      mPendingReports.SwapElements(reports);
++    } else {
++      reports = mPendingReports;
++    }
++  }
++
++  for (uint32_t i = 0; i < reports.Length(); ++i) {
++    PendingReport& report = reports[i];
++
++    nsAutoString errorText;
++    nsresult rv;
++    if (!report.mStringParams.IsEmpty()) {
++      rv = nsContentUtils::FormatLocalizedString(report.mPropertiesFile,
++                                                 report.mMessageName.get(),
++                                                 report.mStringParams,
++                                                 errorText);
++    } else {
++      rv = nsContentUtils::GetLocalizedString(report.mPropertiesFile,
++                                              report.mMessageName.get(),
++                                              errorText);
++    }
++    if (NS_WARN_IF(NS_FAILED(rv))) {
++      continue;
++    }
++
++    ConsoleUtils::ReportForServiceWorkerScope(NS_ConvertUTF8toUTF16(aScope),
++                                              errorText,
++                                              NS_ConvertUTF8toUTF16(report.mSourceFileURI),
++                                              report.mLineNumber,
++                                              report.mColumnNumber);
++  }
++}
++
++void
+ ConsoleReportCollector::FlushConsoleReports(nsIDocument* aDocument,
+                                             ReportAction aAction)
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+ 
+   FlushReportsToConsole(aDocument ? aDocument->InnerWindowID() : 0, aAction);
+ }
+ 
+diff --git a/dom/console/ConsoleReportCollector.h b/dom/console/ConsoleReportCollector.h
+--- a/dom/console/ConsoleReportCollector.h
++++ b/dom/console/ConsoleReportCollector.h
+@@ -26,16 +26,20 @@ public:
+                    const nsACString& aMessageName,
+                    const nsTArray<nsString>& aStringParams) override;
+ 
+   void
+   FlushReportsToConsole(uint64_t aInnerWindowID,
+                         ReportAction aAction = ReportAction::Forget) override;
+ 
+   void
++  FlushReportsToConsoleForServiceWorkerScope(const nsACString& aScope,
++                                             ReportAction aAction = ReportAction::Forget) override;
++
++  void
+   FlushConsoleReports(nsIDocument* aDocument,
+                       ReportAction aAction = ReportAction::Forget) override;
+ 
+   void
+   FlushConsoleReports(nsILoadGroup* aLoadGroup,
+                       ReportAction aAction = ReportAction::Forget) override;
+ 
+   void
+diff --git a/dom/console/nsIConsoleReportCollector.h b/dom/console/nsIConsoleReportCollector.h
+--- a/dom/console/nsIConsoleReportCollector.h
++++ b/dom/console/nsIConsoleReportCollector.h
+@@ -77,16 +77,20 @@ public:
+   //
+   // aInnerWindowID A inner window ID representing where to flush the reports.
+   // aAction        An action to determine whether to reserve the pending
+   //                reports. Defalut action is to forget the report.
+   virtual void
+   FlushReportsToConsole(uint64_t aInnerWindowID,
+                         ReportAction aAction = ReportAction::Forget) = 0;
+ 
++  virtual void
++  FlushReportsToConsoleForServiceWorkerScope(const nsACString& aScope,
++                                             ReportAction aAction = ReportAction::Forget) = 0;
++
+   // Flush all pending reports to the console.  Main thread only.
+   //
+   // aDocument      An optional document representing where to flush the
+   //                reports.  If provided, then the corresponding window's
+   //                web console will get the reports.  Otherwise the reports
+   //                go to the browser console.
+   // aAction        An action to determine whether to reserve the pending
+   //                reports. Defalut action is to forget the report.
+diff --git a/netwerk/protocol/http/HttpBaseChannel.cpp b/netwerk/protocol/http/HttpBaseChannel.cpp
+--- a/netwerk/protocol/http/HttpBaseChannel.cpp
++++ b/netwerk/protocol/http/HttpBaseChannel.cpp
+@@ -2975,16 +2975,23 @@ HttpBaseChannel::AddConsoleReport(uint32
+ void
+ HttpBaseChannel::FlushReportsToConsole(uint64_t aInnerWindowID,
+                                        ReportAction aAction)
+ {
+   mReportCollector->FlushReportsToConsole(aInnerWindowID, aAction);
+ }
+ 
+ void
++HttpBaseChannel::FlushReportsToConsoleForServiceWorkerScope(const nsACString& aScope,
++                                                            ReportAction aAction)
++{
++  mReportCollector->FlushReportsToConsoleForServiceWorkerScope(aScope, aAction);
++}
++
++void
+ HttpBaseChannel::FlushConsoleReports(nsIDocument* aDocument,
+                                      ReportAction aAction)
+ {
+   mReportCollector->FlushConsoleReports(aDocument, aAction);
+ }
+ 
+ void
+ HttpBaseChannel::FlushConsoleReports(nsILoadGroup* aLoadGroup,
+diff --git a/netwerk/protocol/http/HttpBaseChannel.h b/netwerk/protocol/http/HttpBaseChannel.h
+--- a/netwerk/protocol/http/HttpBaseChannel.h
++++ b/netwerk/protocol/http/HttpBaseChannel.h
+@@ -294,16 +294,20 @@ public:
+                    const nsACString& aMessageName,
+                    const nsTArray<nsString>& aStringParams) override;
+ 
+   void
+   FlushReportsToConsole(uint64_t aInnerWindowID,
+                         ReportAction aAction = ReportAction::Forget) override;
+ 
+   void
++  FlushReportsToConsoleForServiceWorkerScope(const nsACString& aScope,
++                                             ReportAction aAction = ReportAction::Forget) override;
++
++  void
+   FlushConsoleReports(nsIDocument* aDocument,
+                       ReportAction aAction = ReportAction::Forget) override;
+ 
+   void
+   FlushConsoleReports(nsILoadGroup* aLoadGroup,
+                       ReportAction aAction = ReportAction::Forget) override;
+ 
+   void
