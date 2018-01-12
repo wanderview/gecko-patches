@@ -1,0 +1,533 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  d028f215e1bf9c33c8b0461bbb6361358b9540e1
+Bug 1231211 P2 Pass the controller ServiceWorkerDescriptor on the channel LoadInfo and back in PHttpChannel's OnStartRequest message. r=valentin
+
+diff --git a/dom/workers/IPCServiceWorkerDescriptor.ipdlh b/dom/workers/IPCServiceWorkerDescriptor.ipdlh
+--- a/dom/workers/IPCServiceWorkerDescriptor.ipdlh
++++ b/dom/workers/IPCServiceWorkerDescriptor.ipdlh
+@@ -15,10 +15,16 @@ namespace dom {
+ struct IPCServiceWorkerDescriptor
+ {
+   uint64_t id;
+   PrincipalInfo principalInfo;
+   nsCString scope;
+   ServiceWorkerState state;
+ };
+ 
++union OptionalIPCServiceWorkerDescriptor
++{
++  IPCServiceWorkerDescriptor;
++  void_t;
++};
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/ipc/glue/BackgroundUtils.cpp b/ipc/glue/BackgroundUtils.cpp
+--- a/ipc/glue/BackgroundUtils.cpp
++++ b/ipc/glue/BackgroundUtils.cpp
+@@ -26,16 +26,18 @@
+ #include "URIUtils.h"
+ 
+ namespace mozilla {
+ namespace net {
+ class OptionalLoadInfoArgs;
+ }
+ 
+ using mozilla::BasePrincipal;
++using mozilla::Maybe;
++using mozilla::dom::ServiceWorkerDescriptor;
+ using namespace mozilla::net;
+ 
+ namespace ipc {
+ 
+ already_AddRefed<nsIPrincipal>
+ PrincipalInfoToPrincipal(const PrincipalInfo& aPrincipalInfo,
+                          nsresult* aOptionalResult)
+ {
+@@ -361,16 +363,22 @@ LoadInfoToLoadInfoArgs(nsILoadInfo *aLoa
+ 
+   nsTArray<PrincipalInfo> ancestorPrincipals;
+   ancestorPrincipals.SetCapacity(aLoadInfo->AncestorPrincipals().Length());
+   for (const auto& principal : aLoadInfo->AncestorPrincipals()) {
+     rv = PrincipalToPrincipalInfo(principal, ancestorPrincipals.AppendElement());
+     NS_ENSURE_SUCCESS(rv, rv);
+   }
+ 
++  OptionalIPCServiceWorkerDescriptor ipcController = mozilla::void_t();
++  const Maybe<ServiceWorkerDescriptor>& controller = aLoadInfo->GetController();
++  if(controller.isSome()) {
++    ipcController = controller.ref().ToIPC();
++  }
++
+   *aOptionalLoadInfoArgs =
+     LoadInfoArgs(
+       loadingPrincipalInfo,
+       triggeringPrincipalInfo,
+       principalToInheritInfo,
+       sandboxedLoadingPrincipalInfo,
+       optionalResultPrincipalURI,
+       aLoadInfo->GetSecurityFlags(),
+@@ -390,16 +398,17 @@ LoadInfoToLoadInfoArgs(nsILoadInfo *aLoa
+       aLoadInfo->GetInitialSecurityCheckDone(),
+       aLoadInfo->GetIsInThirdPartyContext(),
+       aLoadInfo->GetIsDocshellReload(),
+       aLoadInfo->GetOriginAttributes(),
+       redirectChainIncludingInternalRedirects,
+       redirectChain,
+       ancestorPrincipals,
+       aLoadInfo->AncestorOuterWindowIDs(),
++      ipcController,
+       aLoadInfo->CorsUnsafeHeaders(),
+       aLoadInfo->GetForcePreflight(),
+       aLoadInfo->GetIsPreflight(),
+       aLoadInfo->GetLoadTriggeredFromExternal(),
+       aLoadInfo->GetServiceWorkerTaintingSynthesized()
+       );
+ 
+   return NS_OK;
+@@ -469,22 +478,29 @@ LoadInfoArgsToLoadInfo(const OptionalLoa
+   ancestorPrincipals.SetCapacity(loadInfoArgs.ancestorPrincipals().Length());
+   for (const PrincipalInfo& principalInfo : loadInfoArgs.ancestorPrincipals()) {
+     nsCOMPtr<nsIPrincipal> ancestorPrincipal =
+       PrincipalInfoToPrincipal(principalInfo, &rv);
+     NS_ENSURE_SUCCESS(rv, rv);
+     ancestorPrincipals.AppendElement(ancestorPrincipal.forget());
+   }
+ 
++  Maybe<ServiceWorkerDescriptor> controller;
++  if (loadInfoArgs.controller().type() != OptionalIPCServiceWorkerDescriptor::Tvoid_t) {
++    controller.emplace(ServiceWorkerDescriptor(
++      loadInfoArgs.controller().get_IPCServiceWorkerDescriptor()));
++  }
++
+   nsCOMPtr<nsILoadInfo> loadInfo =
+     new mozilla::LoadInfo(loadingPrincipal,
+                           triggeringPrincipal,
+                           principalToInherit,
+                           sandboxedLoadingPrincipal,
+                           resultPrincipalURI,
++                          controller,
+                           loadInfoArgs.securityFlags(),
+                           loadInfoArgs.contentPolicyType(),
+                           static_cast<LoadTainting>(loadInfoArgs.tainting()),
+                           loadInfoArgs.upgradeInsecureRequests(),
+                           loadInfoArgs.verifySignedContent(),
+                           loadInfoArgs.enforceSRI(),
+                           loadInfoArgs.forceAllowDataURI(),
+                           loadInfoArgs.forceInheritPrincipalDropped(),
+diff --git a/netwerk/base/LoadInfo.cpp b/netwerk/base/LoadInfo.cpp
+--- a/netwerk/base/LoadInfo.cpp
++++ b/netwerk/base/LoadInfo.cpp
+@@ -347,16 +347,17 @@ LoadInfo::LoadInfo(const LoadInfo& rhs)
+ {
+ }
+ 
+ LoadInfo::LoadInfo(nsIPrincipal* aLoadingPrincipal,
+                    nsIPrincipal* aTriggeringPrincipal,
+                    nsIPrincipal* aPrincipalToInherit,
+                    nsIPrincipal* aSandboxedLoadingPrincipal,
+                    nsIURI* aResultPrincipalURI,
++                   const Maybe<ServiceWorkerDescriptor>& aController,
+                    nsSecurityFlags aSecurityFlags,
+                    nsContentPolicyType aContentPolicyType,
+                    LoadTainting aTainting,
+                    bool aUpgradeInsecureRequests,
+                    bool aVerifySignedContent,
+                    bool aEnforceSRI,
+                    bool aForceAllowDataURI,
+                    bool aForceInheritPrincipalDropped,
+@@ -378,16 +379,17 @@ LoadInfo::LoadInfo(nsIPrincipal* aLoadin
+                    bool aForcePreflight,
+                    bool aIsPreflight,
+                    bool aLoadTriggeredFromExternal,
+                    bool aServiceWorkerTaintingSynthesized)
+   : mLoadingPrincipal(aLoadingPrincipal)
+   , mTriggeringPrincipal(aTriggeringPrincipal)
+   , mPrincipalToInherit(aPrincipalToInherit)
+   , mResultPrincipalURI(aResultPrincipalURI)
++  , mController(aController)
+   , mSecurityFlags(aSecurityFlags)
+   , mInternalContentPolicyType(aContentPolicyType)
+   , mTainting(aTainting)
+   , mUpgradeInsecureRequests(aUpgradeInsecureRequests)
+   , mVerifySignedContent(aVerifySignedContent)
+   , mEnforceSRI(aEnforceSRI)
+   , mForceAllowDataURI(aForceAllowDataURI)
+   , mOriginalFrameSrcLoad(false)
+diff --git a/netwerk/base/LoadInfo.h b/netwerk/base/LoadInfo.h
+--- a/netwerk/base/LoadInfo.h
++++ b/netwerk/base/LoadInfo.h
+@@ -94,16 +94,17 @@ private:
+   // HttpChannelParent and FTPChannelParent declared as friends undeneath.
+   // In e10s we can not serialize nsINode, hence we store the innerWindowID.
+   // Please note that aRedirectChain uses swapElements.
+   LoadInfo(nsIPrincipal* aLoadingPrincipal,
+            nsIPrincipal* aTriggeringPrincipal,
+            nsIPrincipal* aPrincipalToInherit,
+            nsIPrincipal* aSandboxedLoadingPrincipal,
+            nsIURI* aResultPrincipalURI,
++           const Maybe<mozilla::dom::ServiceWorkerDescriptor>& aController,
+            nsSecurityFlags aSecurityFlags,
+            nsContentPolicyType aContentPolicyType,
+            LoadTainting aTainting,
+            bool aUpgradeInsecureRequests,
+            bool aVerifySignedContent,
+            bool aEnforceSRI,
+            bool aForceAllowDataURI,
+            bool aForceInheritPrincipalDropped,
+diff --git a/netwerk/ipc/NeckoChannelParams.ipdlh b/netwerk/ipc/NeckoChannelParams.ipdlh
+--- a/netwerk/ipc/NeckoChannelParams.ipdlh
++++ b/netwerk/ipc/NeckoChannelParams.ipdlh
+@@ -5,16 +5,17 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ include protocol PHttpChannel;
+ include protocol PFTPChannel;
+ include protocol PChildToParentStream;
+ include BlobTypes;
+ include URIParams;
++include IPCServiceWorkerDescriptor;
+ include IPCStream;
+ include PBackgroundSharedTypes;
+ 
+ using mozilla::OriginAttributes from "mozilla/ipc/BackgroundUtils.h";
+ using struct mozilla::void_t from "ipc/IPCMessageUtils.h";
+ using RequestHeaderTuples from "mozilla/net/PHttpChannelParams.h";
+ using struct nsHttpAtom from "nsHttp.h";
+ using class nsHttpResponseHead from "nsHttpResponseHead.h";
+@@ -64,16 +65,23 @@ struct LoadInfoArgs
+ 
+   /**
+    * Ancestor data for use with the WebRequest API.
+    * See nsILoadInfo.idl for details.
+    */
+   PrincipalInfo[]             ancestorPrincipals;
+   uint64_t[]                  ancestorOuterWindowIDs;
+ 
++  /**
++   * Subresource loads may have a controller set based on their owning
++   * window/worker client.  We must send this across IPC to support
++   * performing interception in the parent.
++   */
++  OptionalIPCServiceWorkerDescriptor controller;
++
+   nsCString[]                 corsUnsafeHeaders;
+   bool                        forcePreflight;
+   bool                        isPreflight;
+   bool                        loadTriggeredFromExternal;
+   bool                        serviceWorkerTaintingSynthesized;
+ };
+ 
+ /**
+diff --git a/netwerk/protocol/http/HttpChannelChild.cpp b/netwerk/protocol/http/HttpChannelChild.cpp
+--- a/netwerk/protocol/http/HttpChannelChild.cpp
++++ b/netwerk/protocol/http/HttpChannelChild.cpp
+@@ -416,17 +416,18 @@ class StartRequestEvent : public NeckoTa
+                     const int32_t& aCacheFetchCount,
+                     const uint32_t& aCacheExpirationTime,
+                     const nsCString& aCachedCharset,
+                     const nsCString& aSecurityInfoSerialization,
+                     const NetAddr& aSelfAddr,
+                     const NetAddr& aPeerAddr,
+                     const uint32_t& aCacheKey,
+                     const nsCString& altDataType,
+-                    const int64_t& altDataLen)
++                    const int64_t& altDataLen,
++                    Maybe<ServiceWorkerDescriptor>&& aController)
+   : NeckoTargetChannelEvent<HttpChannelChild>(aChild)
+   , mChannelStatus(aChannelStatus)
+   , mResponseHead(aResponseHead)
+   , mRequestHeaders(aRequestHeaders)
+   , mUseResponseHead(aUseResponseHead)
+   , mIsFromCache(aIsFromCache)
+   , mCacheEntryAvailable(aCacheEntryAvailable)
+   , mCacheEntryId(aCacheEntryId)
+@@ -434,27 +435,29 @@ class StartRequestEvent : public NeckoTa
+   , mCacheExpirationTime(aCacheExpirationTime)
+   , mCachedCharset(aCachedCharset)
+   , mSecurityInfoSerialization(aSecurityInfoSerialization)
+   , mSelfAddr(aSelfAddr)
+   , mPeerAddr(aPeerAddr)
+   , mCacheKey(aCacheKey)
+   , mAltDataType(altDataType)
+   , mAltDataLen(altDataLen)
++  , mController(Move(aController))
+   {}
+ 
+   void Run()
+   {
+     LOG(("StartRequestEvent [this=%p]\n", mChild));
+     mChild->OnStartRequest(mChannelStatus, mResponseHead, mUseResponseHead,
+                            mRequestHeaders, mIsFromCache, mCacheEntryAvailable,
+                            mCacheEntryId, mCacheFetchCount,
+                            mCacheExpirationTime, mCachedCharset,
+                            mSecurityInfoSerialization, mSelfAddr, mPeerAddr,
+-                           mCacheKey, mAltDataType, mAltDataLen);
++                           mCacheKey, mAltDataType, mAltDataLen,
++                           mController);
+   }
+ 
+  private:
+   nsresult mChannelStatus;
+   nsHttpResponseHead mResponseHead;
+   nsHttpHeaderArray mRequestHeaders;
+   bool mUseResponseHead;
+   bool mIsFromCache;
+@@ -464,16 +467,17 @@ class StartRequestEvent : public NeckoTa
+   uint32_t mCacheExpirationTime;
+   nsCString mCachedCharset;
+   nsCString mSecurityInfoSerialization;
+   NetAddr mSelfAddr;
+   NetAddr mPeerAddr;
+   uint32_t mCacheKey;
+   nsCString mAltDataType;
+   int64_t mAltDataLen;
++  Maybe<ServiceWorkerDescriptor> mController;
+ };
+ 
+ mozilla::ipc::IPCResult
+ HttpChannelChild::RecvOnStartRequest(const nsresult& channelStatus,
+                                      const nsHttpResponseHead& responseHead,
+                                      const bool& useResponseHead,
+                                      const nsHttpHeaderArray& requestHeaders,
+                                      const bool& isFromCache,
+@@ -483,37 +487,44 @@ HttpChannelChild::RecvOnStartRequest(con
+                                      const uint32_t& cacheExpirationTime,
+                                      const nsCString& cachedCharset,
+                                      const nsCString& securityInfoSerialization,
+                                      const NetAddr& selfAddr,
+                                      const NetAddr& peerAddr,
+                                      const int16_t& redirectCount,
+                                      const uint32_t& cacheKey,
+                                      const nsCString& altDataType,
+-                                     const int64_t& altDataLen)
++                                     const int64_t& altDataLen,
++                                     const OptionalIPCServiceWorkerDescriptor& aController)
+ {
+   LOG(("HttpChannelChild::RecvOnStartRequest [this=%p]\n", this));
+   // mFlushedForDiversion and mDivertingToParent should NEVER be set at this
+   // stage, as they are set in the listener's OnStartRequest.
+   MOZ_RELEASE_ASSERT(!mFlushedForDiversion,
+     "mFlushedForDiversion should be unset before OnStartRequest!");
+   MOZ_RELEASE_ASSERT(!mDivertingToParent,
+     "mDivertingToParent should be unset before OnStartRequest!");
+ 
+ 
+   mRedirectCount = redirectCount;
++  Maybe<ServiceWorkerDescriptor> controller;
++  if (aController.type() != OptionalIPCServiceWorkerDescriptor::Tvoid_t) {
++    controller.emplace(ServiceWorkerDescriptor(
++      aController.get_IPCServiceWorkerDescriptor()));
++  }
+ 
+   mEventQ->RunOrEnqueue(new StartRequestEvent(this, channelStatus, responseHead,
+                                               useResponseHead, requestHeaders,
+                                               isFromCache, cacheEntryAvailable,
+                                               cacheEntryId, cacheFetchCount,
+                                               cacheExpirationTime, cachedCharset,
+                                               securityInfoSerialization,
+                                               selfAddr, peerAddr, cacheKey,
+-                                              altDataType, altDataLen));
++                                              altDataType, altDataLen,
++                                              Move(controller)));
+ 
+   {
+     // Child's mEventQ is to control the execution order of the IPC messages
+     // from both main thread IPDL and PBackground IPDL.
+     // To guarantee the ordering, PBackground IPC messages that are sent after
+     // OnStartRequest will be throttled until OnStartRequest hits the Child's
+     // mEventQ.
+     MutexAutoLock lock(mBgChildMutex);
+@@ -543,17 +554,18 @@ HttpChannelChild::OnStartRequest(const n
+                                  const int32_t& cacheFetchCount,
+                                  const uint32_t& cacheExpirationTime,
+                                  const nsCString& cachedCharset,
+                                  const nsCString& securityInfoSerialization,
+                                  const NetAddr& selfAddr,
+                                  const NetAddr& peerAddr,
+                                  const uint32_t& cacheKey,
+                                  const nsCString& altDataType,
+-                                 const int64_t& altDataLen)
++                                 const int64_t& altDataLen,
++                                 const Maybe<ServiceWorkerDescriptor>& aController)
+ {
+   LOG(("HttpChannelChild::OnStartRequest [this=%p]\n", this));
+ 
+   // mFlushedForDiversion and mDivertingToParent should NEVER be set at this
+   // stage, as they are set in the listener's OnStartRequest.
+   MOZ_RELEASE_ASSERT(!mFlushedForDiversion,
+     "mFlushedForDiversion should be unset before OnStartRequest!");
+   MOZ_RELEASE_ASSERT(!mDivertingToParent,
+@@ -578,16 +590,36 @@ HttpChannelChild::OnStartRequest(const n
+   mCacheExpirationTime = cacheExpirationTime;
+   mCachedCharset = cachedCharset;
+   mSelfAddr = selfAddr;
+   mPeerAddr = peerAddr;
+ 
+   mAvailableCachedAltDataType = altDataType;
+   mAltDataLength = altDataLen;
+ 
++  const Maybe<ServiceWorkerDescriptor>& prevController =
++    mLoadInfo->GetController();
++
++  // If we got a service worker controller from the parent, then note
++  // it on the LoadInfo.  This may indicate that a non-subresource request
++  // was intercepted and the resulting window/worker should be controlled.
++  if (aController.isSome() && prevController.isNothing()) {
++    mLoadInfo->SetController(aController.ref());
++  }
++
++  // If we did not set a controller, then verify it was either because:
++  //  1. Neither the parent or child know about a controlling service worker.
++  //  2. The parent and child both have the same controlling service worker.
++  else {
++    MOZ_DIAGNOSTIC_ASSERT((prevController.isNothing() && aController.isNothing()) ||
++                          (prevController.ref().Id() == aController.ref().Id() &&
++                           prevController.ref().Scope() == aController.ref().Scope() &&
++                           prevController.ref().PrincipalInfo() == aController.ref().PrincipalInfo()));
++  }
++
+   mAfterOnStartRequestBegun = true;
+ 
+   AutoEventEnqueuer ensureSerialDispatch(mEventQ);
+ 
+   nsresult rv;
+   nsCOMPtr<nsISupportsPRUint32> container =
+     do_CreateInstance(NS_SUPPORTS_PRUINT32_CONTRACTID, &rv);
+   if (NS_FAILED(rv)) {
+diff --git a/netwerk/protocol/http/HttpChannelChild.h b/netwerk/protocol/http/HttpChannelChild.h
+--- a/netwerk/protocol/http/HttpChannelChild.h
++++ b/netwerk/protocol/http/HttpChannelChild.h
+@@ -139,17 +139,18 @@ protected:
+                                              const uint32_t& cacheExpirationTime,
+                                              const nsCString& cachedCharset,
+                                              const nsCString& securityInfoSerialization,
+                                              const NetAddr& selfAddr,
+                                              const NetAddr& peerAddr,
+                                              const int16_t& redirectCount,
+                                              const uint32_t& cacheKey,
+                                              const nsCString& altDataType,
+-                                             const int64_t& altDataLen) override;
++                                             const int64_t& altDataLen,
++                                             const OptionalIPCServiceWorkerDescriptor& aController) override;
+   mozilla::ipc::IPCResult RecvFailedAsyncOpen(const nsresult& status) override;
+   mozilla::ipc::IPCResult RecvRedirect1Begin(const uint32_t& registrarId,
+                                              const URIParams& newURI,
+                                              const uint32_t& redirectFlags,
+                                              const nsHttpResponseHead& responseHead,
+                                              const nsCString& securityInfoSerialization,
+                                              const uint64_t& channelId,
+                                              const NetAddr& oldPeerAddr) override;
+@@ -405,17 +406,18 @@ private:
+                       const int32_t& cacheFetchCount,
+                       const uint32_t& cacheExpirationTime,
+                       const nsCString& cachedCharset,
+                       const nsCString& securityInfoSerialization,
+                       const NetAddr& selfAddr,
+                       const NetAddr& peerAddr,
+                       const uint32_t& cacheKey,
+                       const nsCString& altDataType,
+-                      const int64_t& altDataLen);
++                      const int64_t& altDataLen,
++                      const Maybe<mozilla::dom::ServiceWorkerDescriptor>& aController);
+   void MaybeDivertOnData(const nsCString& data,
+                          const uint64_t& offset,
+                          const uint32_t& count);
+   void OnTransportAndData(const nsresult& channelStatus,
+                           const nsresult& status,
+                           const uint64_t& offset,
+                           const uint32_t& count,
+                           const nsCString& data);
+diff --git a/netwerk/protocol/http/HttpChannelParent.cpp b/netwerk/protocol/http/HttpChannelParent.cpp
+--- a/netwerk/protocol/http/HttpChannelParent.cpp
++++ b/netwerk/protocol/http/HttpChannelParent.cpp
+@@ -1507,16 +1507,26 @@ HttpChannelParent::OnStartRequest(nsIReq
+   nsCString secInfoSerialization;
+   UpdateAndSerializeSecurityInfo(secInfoSerialization);
+ 
+   uint8_t redirectCount = 0;
+   chan->GetRedirectCount(&redirectCount);
+ 
+   int64_t altDataLen = chan->GetAltDataLength();
+ 
++  OptionalIPCServiceWorkerDescriptor ipcController = void_t();
++  nsCOMPtr<nsILoadInfo> loadInfo;
++  Unused << chan->GetLoadInfo(getter_AddRefs(loadInfo));
++  if (loadInfo) {
++    const Maybe<ServiceWorkerDescriptor>& controller = loadInfo->GetController();
++    if (controller.isSome()) {
++      ipcController = controller.ref().ToIPC();
++    }
++  }
++
+   // !!! We need to lock headers and please don't forget to unlock them !!!
+   requestHead->Enter();
+   nsresult rv = NS_OK;
+   if (mIPCClosed ||
+       !SendOnStartRequest(channelStatus,
+                           responseHead ? *responseHead : nsHttpResponseHead(),
+                           !!responseHead,
+                           requestHead->Headers(),
+@@ -1524,17 +1534,18 @@ HttpChannelParent::OnStartRequest(nsIReq
+                           mCacheEntry ? true : false,
+                           cacheEntryId,
+                           fetchCount, expirationTime,
+                           cachedCharset, secInfoSerialization,
+                           chan->GetSelfAddr(), chan->GetPeerAddr(),
+                           redirectCount,
+                           cacheKeyValue,
+                           altDataType,
+-                          altDataLen))
++                          altDataLen,
++                          ipcController))
+   {
+     rv = NS_ERROR_UNEXPECTED;
+   }
+   requestHead->Exit();
+ 
+   // OnStartRequest is sent to content process successfully.
+   // Notify PHttpBackgroundChannelChild that all following IPC mesasges
+   // should be run after OnStartRequest is handled.
+diff --git a/netwerk/protocol/http/PHttpChannel.ipdl b/netwerk/protocol/http/PHttpChannel.ipdl
+--- a/netwerk/protocol/http/PHttpChannel.ipdl
++++ b/netwerk/protocol/http/PHttpChannel.ipdl
+@@ -6,16 +6,17 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ include protocol PNecko;
+ include protocol PStreamFilter;
+ include InputStreamParams;
+ include URIParams;
+ include PBackgroundSharedTypes;
+ include NeckoChannelParams;
++include IPCServiceWorkerDescriptor;
+ 
+ include "mozilla/net/NeckoMessageUtils.h";
+ 
+ using class nsHttpHeaderArray from "nsHttpHeaderArray.h";
+ using mozilla::net::NetAddr from "mozilla/net/DNS.h";
+ using struct mozilla::net::ResourceTimingStruct from "mozilla/net/TimingStruct.h";
+ 
+ namespace mozilla {
+@@ -103,17 +104,18 @@ child:
+                        uint32_t            cacheExpirationTime,
+                        nsCString           cachedCharset,
+                        nsCString           securityInfoSerialization,
+                        NetAddr             selfAddr,
+                        NetAddr             peerAddr,
+                        int16_t             redirectCount,
+                        uint32_t            cacheKey,
+                        nsCString           altDataType,
+-                       int64_t             altDataLength);
++                       int64_t             altDataLength,
++                       OptionalIPCServiceWorkerDescriptor controller);
+ 
+   // Used to cancel child channel if we hit errors during creating and
+   // AsyncOpen of nsHttpChannel on the parent.
+   async FailedAsyncOpen(nsresult status);
+ 
+   // Called to initiate content channel redirect, starts talking to sinks
+   // on the content process and reports result via Redirect2Verify above
+   async Redirect1Begin(uint32_t           registrarId,
