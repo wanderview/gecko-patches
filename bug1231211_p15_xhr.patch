@@ -1,0 +1,217 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  61eace0bddf93b1aaf57b3021483113286c5f202
+Bug 1231211 P15 Make xhr pass worker ClientInfo and ServiceWorkerDescriptor to NS_NewChannel(). r=asuth
+
+diff --git a/dom/xhr/XMLHttpRequestMainThread.cpp b/dom/xhr/XMLHttpRequestMainThread.cpp
+--- a/dom/xhr/XMLHttpRequestMainThread.cpp
++++ b/dom/xhr/XMLHttpRequestMainThread.cpp
+@@ -315,16 +315,28 @@ XMLHttpRequestMainThread::InitParameters
+       return;
+     }
+   }
+ 
+   SetParameters(aAnon, aSystem);
+ }
+ 
+ void
++XMLHttpRequestMainThread::SetClientInfoAndController(const ClientInfo& aClientInfo,
++                                                     const Maybe<ServiceWorkerDescriptor>& aController)
++{
++#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
++  nsCOMPtr<nsIPrincipal> clientPrincipal(aClientInfo.GetPrincipal());
++  MOZ_DIAGNOSTIC_ASSERT(mPrincipal->Equals(clientPrincipal));
++#endif
++  mClientInfo.emplace(aClientInfo);
++  mController = aController;
++}
++
++void
+ XMLHttpRequestMainThread::ResetResponse()
+ {
+   mResponseXML = nullptr;
+   mResponseBody.Truncate();
+   TruncateResponseText();
+   mResponseBlob = nullptr;
+   mBlobStorage = nullptr;
+   mResultArrayBuffer = nullptr;
+@@ -2498,16 +2510,26 @@ XMLHttpRequestMainThread::CreateChannel(
+     rv = NS_NewChannel(getter_AddRefs(mChannel),
+                        mRequestURL,
+                        responsibleDocument,
+                        secFlags,
+                        nsIContentPolicy::TYPE_INTERNAL_XMLHTTPREQUEST,
+                        loadGroup,
+                        nullptr,   // aCallbacks
+                        loadFlags);
++  } else if (mClientInfo.isSome()) {
++    rv = NS_NewChannel(getter_AddRefs(mChannel),
++                       mRequestURL,
++                       mClientInfo.ref(),
++                       mController,
++                       secFlags,
++                       nsIContentPolicy::TYPE_INTERNAL_XMLHTTPREQUEST,
++                       loadGroup,
++                       nullptr,   // aCallbacks
++                       loadFlags);
+   } else {
+     // Otherwise use the principal.
+     rv = NS_NewChannel(getter_AddRefs(mChannel),
+                        mRequestURL,
+                        mPrincipal,
+                        secFlags,
+                        nsIContentPolicy::TYPE_INTERNAL_XMLHTTPREQUEST,
+                        loadGroup,
+diff --git a/dom/xhr/XMLHttpRequestMainThread.h b/dom/xhr/XMLHttpRequestMainThread.h
+--- a/dom/xhr/XMLHttpRequestMainThread.h
++++ b/dom/xhr/XMLHttpRequestMainThread.h
+@@ -27,23 +27,26 @@
+ #include "nsIPrincipal.h"
+ #include "nsIScriptObjectPrincipal.h"
+ #include "nsISizeOfEventTarget.h"
+ #include "nsIXPConnect.h"
+ #include "nsIInputStream.h"
+ #include "mozilla/Assertions.h"
+ #include "mozilla/Attributes.h"
+ #include "mozilla/DOMEventTargetHelper.h"
++#include "mozilla/Maybe.h"
+ #include "mozilla/MemoryReporting.h"
+ #include "mozilla/NotNull.h"
+ #include "mozilla/dom/MutableBlobStorage.h"
+ #include "mozilla/dom/BodyExtractor.h"
++#include "mozilla/dom/ClientInfo.h"
+ #include "mozilla/dom/TypedArray.h"
+ #include "mozilla/dom/File.h"
+ #include "mozilla/dom/FormData.h"
++#include "mozilla/dom/ServiceWorkerDescriptor.h"
+ #include "mozilla/dom/URLSearchParams.h"
+ #include "mozilla/dom/XMLHttpRequest.h"
+ #include "mozilla/dom/XMLHttpRequestBinding.h"
+ #include "mozilla/dom/XMLHttpRequestEventTarget.h"
+ #include "mozilla/dom/XMLHttpRequestString.h"
+ #include "mozilla/Encoding.h"
+ 
+ #ifdef Status
+@@ -216,16 +219,19 @@ public:
+   void InitParameters(bool aAnon, bool aSystem);
+ 
+   void SetParameters(bool aAnon, bool aSystem)
+   {
+     mIsAnon = aAnon || aSystem;
+     mIsSystem = aSystem;
+   }
+ 
++  void SetClientInfoAndController(const ClientInfo& aClientInfo,
++                                  const Maybe<ServiceWorkerDescriptor>& aController);
++
+   NS_DECL_ISUPPORTS_INHERITED
+ 
+   // nsIXMLHttpRequest
+   NS_DECL_NSIXMLHTTPREQUEST
+ 
+   NS_FORWARD_NSIXMLHTTPREQUESTEVENTTARGET(XMLHttpRequestEventTarget::)
+ 
+   // nsIStreamListener
+@@ -685,16 +691,19 @@ protected:
+   nsCOMPtr<nsIChannelEventSink> mChannelEventSink;
+   nsCOMPtr<nsIProgressEventSink> mProgressEventSink;
+ 
+   nsIRequestObserver* mRequestObserver;
+ 
+   nsCOMPtr<nsIURI> mBaseURI;
+   nsCOMPtr<nsILoadGroup> mLoadGroup;
+ 
++  Maybe<ClientInfo> mClientInfo;
++  Maybe<ServiceWorkerDescriptor> mController;
++
+   State mState;
+ 
+   StyleBackendType mStyleBackend;
+ 
+   bool mFlagSynchronous;
+   bool mFlagAborted;
+   bool mFlagParseBody;
+   bool mFlagSyncLooping;
+diff --git a/dom/xhr/XMLHttpRequestWorker.cpp b/dom/xhr/XMLHttpRequestWorker.cpp
+--- a/dom/xhr/XMLHttpRequestWorker.cpp
++++ b/dom/xhr/XMLHttpRequestWorker.cpp
+@@ -92,16 +92,18 @@ XMLHttpRequestWorker::StateData::trace(J
+  */
+ 
+ class Proxy final : public nsIDOMEventListener
+ {
+ public:
+   // Read on multiple threads.
+   WorkerPrivate* mWorkerPrivate;
+   XMLHttpRequestWorker* mXMLHttpRequestPrivate;
++  const ClientInfo mClientInfo;
++  const Maybe<ServiceWorkerDescriptor> mController;
+ 
+   // XHR Params:
+   bool mMozAnon;
+   bool mMozSystem;
+ 
+   // Only touched on the main thread.
+   RefPtr<XMLHttpRequestMainThread> mXHR;
+   nsCOMPtr<nsIXMLHttpRequestUpload> mXHRUpload;
+@@ -127,18 +129,21 @@ public:
+ 
+   // Only touched on the main thread.
+   bool mUploadEventListenersAttached;
+   bool mMainThreadSeenLoadStart;
+   bool mInOpen;
+   bool mArrayBufferResponseWasTransferred;
+ 
+ public:
+-  Proxy(XMLHttpRequestWorker* aXHRPrivate, bool aMozAnon, bool aMozSystem)
++  Proxy(XMLHttpRequestWorker* aXHRPrivate, const ClientInfo& aClientInfo,
++        const Maybe<ServiceWorkerDescriptor>& aController, bool aMozAnon,
++        bool aMozSystem)
+   : mWorkerPrivate(nullptr), mXMLHttpRequestPrivate(aXHRPrivate),
++    mClientInfo(aClientInfo), mController(aController),
+     mMozAnon(aMozAnon), mMozSystem(aMozSystem),
+     mInnerEventStreamId(0), mInnerChannelId(0), mOutstandingSendCount(0),
+     mOuterEventStreamId(0), mOuterChannelId(0), mOpenCount(0), mLastLoaded(0),
+     mLastTotal(0), mLastUploadLoaded(0), mLastUploadTotal(0), mIsSyncXHR(false),
+     mLastLengthComputable(false), mLastUploadLengthComputable(false),
+     mSeenLoadStart(false), mSeenUploadLoadStart(false),
+     mUploadEventListenersAttached(false), mMainThreadSeenLoadStart(false),
+     mInOpen(false), mArrayBufferResponseWasTransferred(false)
+@@ -866,16 +871,17 @@ Proxy::Init()
+   nsCOMPtr<nsIGlobalObject> global = do_QueryInterface(ownerWindow);
+ 
+   mXHR = new XMLHttpRequestMainThread();
+   mXHR->Construct(mWorkerPrivate->GetPrincipal(), global,
+                   mWorkerPrivate->GetBaseURI(),
+                   mWorkerPrivate->GetLoadGroup());
+ 
+   mXHR->SetParameters(mMozAnon, mMozSystem);
++  mXHR->SetClientInfoAndController(mClientInfo, mController);
+ 
+   ErrorResult rv;
+   mXHRUpload = mXHR->GetUpload(rv);
+   if (NS_WARN_IF(rv.Failed())) {
+     mXHR = nullptr;
+     return false;
+   }
+ 
+@@ -1877,17 +1883,18 @@ XMLHttpRequestWorker::Open(const nsACStr
+ 
+   if (mProxy) {
+     MaybeDispatchPrematureAbortEvents(aRv);
+     if (aRv.Failed()) {
+       return;
+     }
+   }
+   else {
+-    mProxy = new Proxy(this, mMozAnon, mMozSystem);
++    mProxy = new Proxy(this, mWorkerPrivate->GetClientInfo(),
++                       mWorkerPrivate->GetController(), mMozAnon, mMozSystem);
+   }
+ 
+   mProxy->mOuterEventStreamId++;
+ 
+   RefPtr<OpenRunnable> runnable =
+     new OpenRunnable(mWorkerPrivate, mProxy, aMethod, aUrl, aUser, aPassword,
+                      mBackgroundRequest, mWithCredentials,
+                      mTimeout, mResponseType);

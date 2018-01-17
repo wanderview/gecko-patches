@@ -1,0 +1,189 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  6e61517e779b39481b0d39bc8e95cce19081e031
+Bug 1231211 P14 Make fetch() pass worker ClientInfo and ServiceWorkerDescriptor to NS_NewChannel(). r=asuth
+
+diff --git a/dom/fetch/Fetch.cpp b/dom/fetch/Fetch.cpp
+--- a/dom/fetch/Fetch.cpp
++++ b/dom/fetch/Fetch.cpp
+@@ -379,23 +379,29 @@ private:
+   {
+     mReporter->FlushConsoleReports(mLoadGroup);
+   }
+ };
+ 
+ class MainThreadFetchRunnable : public Runnable
+ {
+   RefPtr<WorkerFetchResolver> mResolver;
++  const ClientInfo mClientInfo;
++  const Maybe<ServiceWorkerDescriptor> mController;
+   RefPtr<InternalRequest> mRequest;
+ 
+ public:
+   MainThreadFetchRunnable(WorkerFetchResolver* aResolver,
++                          const ClientInfo& aClientInfo,
++                          const Maybe<ServiceWorkerDescriptor>& aController,
+                           InternalRequest* aRequest)
+     : Runnable("dom::MainThreadFetchRunnable")
+     , mResolver(aResolver)
++    , mClientInfo(aClientInfo)
++    , mController(aController)
+     , mRequest(aRequest)
+   {
+     MOZ_ASSERT(mResolver);
+   }
+ 
+   NS_IMETHOD
+   Run() override
+   {
+@@ -421,16 +427,19 @@ public:
+       // so pass false as the last argument to FetchDriver().
+       fetch = new FetchDriver(mRequest, principal, loadGroup,
+                               workerPrivate->MainThreadEventTarget(), false);
+       nsAutoCString spec;
+       if (proxy->GetWorkerPrivate()->GetBaseURI()) {
+         proxy->GetWorkerPrivate()->GetBaseURI()->GetAsciiSpec(spec);
+       }
+       fetch->SetWorkerScript(spec);
++
++      fetch->SetClientInfo(mClientInfo);
++      fetch->SetController(mController);
+     }
+ 
+     RefPtr<AbortSignal> signal = mResolver->GetAbortSignalForMainThread();
+ 
+     // ...but release it before calling Fetch, because mResolver's callback can
+     // be called synchronously and they want the mutex, too.
+     return fetch->Fetch(signal, mResolver);
+   }
+@@ -542,17 +551,18 @@ FetchRequest(nsIGlobalObject* aGlobal, c
+       WorkerFetchResolver::Create(worker, p, signal, observer);
+     if (!resolver) {
+       NS_WARNING("Could not add WorkerFetchResolver workerHolder to worker");
+       aRv.Throw(NS_ERROR_DOM_ABORT_ERR);
+       return nullptr;
+     }
+ 
+     RefPtr<MainThreadFetchRunnable> run =
+-      new MainThreadFetchRunnable(resolver, r);
++      new MainThreadFetchRunnable(resolver, worker->GetClientInfo(),
++                                  worker->GetController(), r);
+     worker->DispatchToMainThread(run.forget());
+   }
+ 
+   return p.forget();
+ }
+ 
+ void
+ MainThreadFetchResolver::OnResponseAvailableInternal(InternalResponse* aResponse)
+diff --git a/dom/fetch/FetchDriver.cpp b/dom/fetch/FetchDriver.cpp
+--- a/dom/fetch/FetchDriver.cpp
++++ b/dom/fetch/FetchDriver.cpp
+@@ -515,16 +515,27 @@ FetchDriver::HttpFetch(const nsACString&
+                        uri,
+                        mDocument,
+                        secFlags,
+                        mRequest->ContentPolicyType(),
+                        mLoadGroup,
+                        nullptr, /* aCallbacks */
+                        loadFlags,
+                        ios);
++  } else if (mClientInfo.isSome()) {
++    rv = NS_NewChannel(getter_AddRefs(chan),
++                       uri,
++                       mClientInfo.ref(),
++                       mController,
++                       secFlags,
++                       mRequest->ContentPolicyType(),
++                       mLoadGroup,
++                       nullptr, /* aCallbacks */
++                       loadFlags,
++                       ios);
+   } else {
+     rv = NS_NewChannel(getter_AddRefs(chan),
+                        uri,
+                        mPrincipal,
+                        secFlags,
+                        mRequest->ContentPolicyType(),
+                        mLoadGroup,
+                        nullptr, /* aCallbacks */
+@@ -1326,16 +1337,34 @@ void
+ FetchDriver::SetDocument(nsIDocument* aDocument)
+ {
+   // Cannot set document after Fetch() has been called.
+   MOZ_ASSERT(!mFetchCalled);
+   mDocument = aDocument;
+ }
+ 
+ void
++FetchDriver::SetClientInfo(const ClientInfo& aClientInfo)
++{
++  MOZ_ASSERT(!mFetchCalled);
++#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
++  nsCOMPtr<nsIPrincipal> clientPrincipal(aClientInfo.GetPrincipal());
++  MOZ_DIAGNOSTIC_ASSERT(mPrincipal->Equals(clientPrincipal));
++#endif
++  mClientInfo.emplace(aClientInfo);
++}
++
++void
++FetchDriver::SetController(const Maybe<ServiceWorkerDescriptor>& aController)
++{
++  MOZ_ASSERT(!mFetchCalled);
++  mController = aController;
++}
++
++void
+ FetchDriver::SetRequestHeaders(nsIHttpChannel* aChannel) const
+ {
+   MOZ_ASSERT(aChannel);
+ 
+   AutoTArray<InternalHeaders::Entry, 5> headers;
+   mRequest->Headers()->GetEntries(headers);
+   bool hasAccept = false;
+   for (uint32_t i = 0; i < headers.Length(); ++i) {
+diff --git a/dom/fetch/FetchDriver.h b/dom/fetch/FetchDriver.h
+--- a/dom/fetch/FetchDriver.h
++++ b/dom/fetch/FetchDriver.h
+@@ -113,16 +113,22 @@ public:
+ 
+   nsresult Fetch(AbortSignal* aSignal,
+                  FetchDriverObserver* aObserver);
+ 
+   void
+   SetDocument(nsIDocument* aDocument);
+ 
+   void
++  SetClientInfo(const ClientInfo& aClientInfo);
++
++  void
++  SetController(const Maybe<ServiceWorkerDescriptor>& aController);
++
++  void
+   SetWorkerScript(const nsACString& aWorkerScirpt)
+   {
+     MOZ_ASSERT(!aWorkerScirpt.IsEmpty());
+     mWorkerScript = aWorkerScirpt;
+   }
+ 
+   // AbortFollower
+   void
+@@ -131,16 +137,18 @@ public:
+ private:
+   nsCOMPtr<nsIPrincipal> mPrincipal;
+   nsCOMPtr<nsILoadGroup> mLoadGroup;
+   RefPtr<InternalRequest> mRequest;
+   RefPtr<InternalResponse> mResponse;
+   nsCOMPtr<nsIOutputStream> mPipeOutputStream;
+   RefPtr<FetchDriverObserver> mObserver;
+   nsCOMPtr<nsIDocument> mDocument;
++  Maybe<ClientInfo> mClientInfo;
++  Maybe<ServiceWorkerDescriptor> mController;
+   nsCOMPtr<nsIChannel> mChannel;
+   nsAutoPtr<SRICheckDataVerifier> mSRIDataVerifier;
+   nsCOMPtr<nsIEventTarget> mMainThreadEventTarget;
+   SRIMetadata mSRIMetadata;
+   nsCString mWorkerScript;
+ 
+   // This is written once in OnStartRequest on the main thread and then
+   // written/read in OnDataAvailable() on any thread.  Necko guarantees
