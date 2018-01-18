@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  2ea649d536ea022fb73908d9bba67626763318a1
+# Parent  b63ad1150ed948f70cf6a9a0196e97f5f8cabb2a
 Bug 1231211 P9 Move logic out of nsDocShell::ChannelControlled() and into ServiceWorkerManager::DispatchFetchEvent(). r=asuth
 
 diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
@@ -48,50 +48,43 @@ diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
 diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerManager.cpp
 --- a/dom/workers/ServiceWorkerManager.cpp
 +++ b/dom/workers/ServiceWorkerManager.cpp
-@@ -1512,16 +1512,42 @@ ServiceWorkerManager::GetActiveWorkerInf
- 
-   if (!registration) {
-     return nullptr;
+@@ -1988,16 +1988,35 @@ ServiceWorkerManager::PrincipalToScopeKe
+   nsresult rv = aPrincipal->GetOrigin(aKey);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return rv;
    }
  
-   return registration->GetActive();
+   return NS_OK;
  }
  
-+ServiceWorkerInfo*
-+ServiceWorkerManager::GetActiveWorkerInfoForDescriptor(const ServiceWorkerDescriptor& aDesc)
++/* static */ nsresult
++ServiceWorkerManager::PrincipalInfoToScopeKey(const PrincipalInfo& aPrincipalInfo,
++                                              nsACString& aKey)
 +{
-+  AssertIsOnMainThread();
-+
-+  nsCOMPtr<nsIPrincipal> principal =
-+    PrincipalInfoToPrincipal(aDesc.PrincipalInfo());
-+
-+  nsCOMPtr<nsIURI> scope;
-+  nsresult rv = NS_NewURI(getter_AddRefs(scope), aDesc.Scope());
-+  NS_ENSURE_SUCCESS(rv, nullptr);
-+
-+  RefPtr<ServiceWorkerRegistrationInfo> registration =
-+    GetServiceWorkerRegistrationInfo(principal, scope);
-+  if (!registration) {
-+    return nullptr;
++  if (aPrincipalInfo.type() != PrincipalInfo::TContentPrincipalInfo) {
++    return NS_ERROR_FAILURE;
 +  }
 +
-+  ServiceWorkerInfo* info = registration->GetActive();
-+  if (info->ID() != aDesc.Id()) {
-+    return nullptr;
-+  }
++  auto content = aPrincipalInfo.get_ContentPrincipalInfo();
 +
-+  return info;
++  nsAutoCString suffix;
++  content.attrs().CreateSuffix(suffix);
++
++  aKey = content.originNoSuffix();
++  aKey.Append(suffix);
++
++  return NS_OK;
 +}
 +
- namespace {
- 
- class UnregisterJobCallback final : public ServiceWorkerJob::Callback
+ /* static */ void
+ ServiceWorkerManager::AddScopeAndRegistration(const nsACString& aScope,
+                                               ServiceWorkerRegistrationInfo* aInfo)
  {
-   nsCOMPtr<nsIServiceWorkerUnregisterCallback> mCallback;
+   MOZ_ASSERT(aInfo);
+   MOZ_ASSERT(aInfo->mPrincipal);
  
-   ~UnregisterJobCallback()
-   {
-@@ -2433,141 +2459,136 @@ public:
+   RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+@@ -2433,141 +2452,144 @@ public:
  
      return NS_OK;
    }
@@ -150,14 +143,21 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
 -    nsCOMPtr<nsIChannel> internalChannel;
 -    aRv = aChannel->GetChannel(getter_AddRefs(internalChannel));
 -    if (NS_WARN_IF(aRv.Failed())) {
-+    serviceWorker = GetActiveWorkerInfoForDescriptor(controller.ref());
-+    if (NS_WARN_IF(!serviceWorker)) {
++    RefPtr<ServiceWorkerRegistrationInfo> registration =
++      GetRegistration(controller.ref().PrincipalInfo(), controller.ref().Scope());
++    if (NS_WARN_IF(!registration)) {
 +      aRv.Throw(NS_ERROR_FAILURE);
        return;
      }
--
+ 
 -    internalChannel->GetLoadGroup(getter_AddRefs(loadGroup));
 -
++    serviceWorker = registration->GetActive();
++    if (NS_WARN_IF(!serviceWorker) ||
++        NS_WARN_IF(serviceWorker->Descriptor().Id() != controller.ref().Id())) {
++      aRv.Throw(NS_ERROR_FAILURE);
++      return;
++    }
 +  } else {
      nsCOMPtr<nsIURI> uri;
      aRv = aChannel->GetSecureUpgradedChannelURI(getter_AddRefs(uri));
@@ -297,10 +297,61 @@ diff --git a/dom/workers/ServiceWorkerManager.cpp b/dom/workers/ServiceWorkerMan
    }
    // Otherwise, ensure the upload stream can be cloned directly.  This may
    // require some async copying, so provide a callback.
+@@ -3087,16 +3109,29 @@ ServiceWorkerManager::GetRegistration(ns
+   nsresult rv = PrincipalToScopeKey(aPrincipal, scopeKey);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return nullptr;
+   }
+ 
+   return GetRegistration(scopeKey, aScope);
+ }
+ 
++already_AddRefed<ServiceWorkerRegistrationInfo>
++ServiceWorkerManager::GetRegistration(const PrincipalInfo& aPrincipalInfo,
++                                      const nsACString& aScope) const
++{
++  nsAutoCString scopeKey;
++  nsresult rv = PrincipalInfoToScopeKey(aPrincipalInfo, scopeKey);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return nullptr;
++  }
++
++  return GetRegistration(scopeKey, aScope);
++}
++
+ NS_IMETHODIMP
+ ServiceWorkerManager::GetRegistrationByPrincipal(nsIPrincipal* aPrincipal,
+                                                  const nsAString& aScope,
+                                                  nsIServiceWorkerRegistrationInfo** aInfo)
+ {
+   MOZ_ASSERT(aPrincipal);
+   MOZ_ASSERT(aInfo);
+ 
 diff --git a/dom/workers/ServiceWorkerManager.h b/dom/workers/ServiceWorkerManager.h
 --- a/dom/workers/ServiceWorkerManager.h
 +++ b/dom/workers/ServiceWorkerManager.h
-@@ -137,22 +137,17 @@ public:
+@@ -35,16 +35,20 @@
+ #include "nsTObserverArray.h"
+ 
+ class nsIConsoleReportCollector;
+ 
+ namespace mozilla {
+ 
+ class OriginAttributes;
+ 
++namespace ipc {
++class PrincipalInfo;
++} // namespace ipc
++
+ namespace dom {
+ 
+ class ServiceWorkerRegistrar;
+ class ServiceWorkerRegistrationListener;
+ 
+ namespace workers {
+ 
+ class ServiceWorkerInfo;
+@@ -137,22 +141,17 @@ public:
    // semantics that ensure this method returns true until the worker is known to
    // have shut down in order to allow the caller to induce a crash for security
    // reasons without having to worry about shutdown races with the worker.
@@ -324,23 +375,45 @@ diff --git a/dom/workers/ServiceWorkerManager.h b/dom/workers/ServiceWorkerManag
  
    void
    UpdateInternal(nsIPrincipal* aPrincipal,
-@@ -360,16 +355,19 @@ private:
+@@ -184,16 +183,20 @@ public:
  
-   ServiceWorkerInfo*
-   GetActiveWorkerInfoForScope(const OriginAttributes& aOriginAttributes,
-                               const nsACString& aScope);
+   void
+   RemoveAll();
  
-   ServiceWorkerInfo*
-   GetActiveWorkerInfoForDocument(nsIDocument* aDocument);
+   already_AddRefed<ServiceWorkerRegistrationInfo>
+   GetRegistration(nsIPrincipal* aPrincipal, const nsACString& aScope) const;
  
-+  ServiceWorkerInfo*
-+  GetActiveWorkerInfoForDescriptor(const ServiceWorkerDescriptor& aDesc);
+   already_AddRefed<ServiceWorkerRegistrationInfo>
++  GetRegistration(const mozilla::ipc::PrincipalInfo& aPrincipal,
++                  const nsACString& aScope) const;
 +
-   void
-   TransitionServiceWorkerRegistrationWorker(ServiceWorkerRegistrationInfo* aRegistration,
-                                             WhichServiceWorker aWhichOne);
-   void
-   InvalidateServiceWorkerRegistrationWorker(ServiceWorkerRegistrationInfo* aRegistration,
-                                             WhichServiceWorker aWhichOnes);
++  already_AddRefed<ServiceWorkerRegistrationInfo>
+   CreateNewRegistration(const nsCString& aScope,
+                         nsIPrincipal* aPrincipal,
+                         ServiceWorkerUpdateViaCache aUpdateViaCache);
  
    void
+   RemoveRegistration(ServiceWorkerRegistrationInfo* aRegistration);
+ 
+   void StoreRegistration(nsIPrincipal* aPrincipal,
+@@ -392,16 +395,20 @@ private:
+                                    nsIURI* aURI);
+ 
+   // This method generates a key using appId and isInElementBrowser from the
+   // principal. We don't use the origin because it can change during the
+   // loading.
+   static nsresult
+   PrincipalToScopeKey(nsIPrincipal* aPrincipal, nsACString& aKey);
+ 
++  static nsresult
++  PrincipalInfoToScopeKey(const mozilla::ipc::PrincipalInfo& aPrincipalInfo,
++                          nsACString& aKey);
++
+   static void
+   AddScopeAndRegistration(const nsACString& aScope,
+                           ServiceWorkerRegistrationInfo* aRegistation);
+ 
+   static bool
+   FindScopeForPath(const nsACString& aScopeKey,
+                    const nsACString& aPath,
+                    RegistrationDataPerPrincipal** aData, nsACString& aMatch);
