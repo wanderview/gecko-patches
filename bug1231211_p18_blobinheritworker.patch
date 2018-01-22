@@ -1,0 +1,169 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  a08addb00e4cb7aedc271f2e4ef995f2d1cc4e88
+Bug 1231211 P18 Make blob URL worker scripts inherit the parent's controller. r=asuth
+
+diff --git a/dom/workers/ScriptLoader.cpp b/dom/workers/ScriptLoader.cpp
+--- a/dom/workers/ScriptLoader.cpp
++++ b/dom/workers/ScriptLoader.cpp
+@@ -24,16 +24,17 @@
+ #include "nsIURI.h"
+ 
+ #include "jsapi.h"
+ #include "jsfriendapi.h"
+ #include "nsError.h"
+ #include "nsContentPolicyUtils.h"
+ #include "nsContentUtils.h"
+ #include "nsDocShellCID.h"
++#include "nsHostObjectProtocolHandler.h"
+ #include "nsISupportsPrimitives.h"
+ #include "nsNetUtil.h"
+ #include "nsIPipe.h"
+ #include "nsIOutputStream.h"
+ #include "nsPrintfCString.h"
+ #include "nsString.h"
+ #include "nsStreamUtils.h"
+ #include "nsTArray.h"
+@@ -1255,16 +1256,28 @@ private:
+       if (parent) {
+         // XHR Params Allowed
+         mWorkerPrivate->SetXHRParamsAllowed(parent->XHRParamsAllowed());
+       }
+ 
+       if (chanLoadInfo) {
+         mController = chanLoadInfo->GetController();
+       }
++
++      // If we are loading a blob URL we must inherit the controller
++      // from the parent.  This is a bit odd as the blob URL may have
++      // been created in a different context with a different controller.
++      // For now, though, this is what the spec says.  See:
++      //
++      // https://github.com/w3c/ServiceWorker/issues/1261
++      //
++      if (IsBlobURI(mWorkerPrivate->GetBaseURI())) {
++        MOZ_DIAGNOSTIC_ASSERT(mController.isNothing());
++        mController = mWorkerPrivate->GetParentController();
++      }
+     }
+ 
+     return NS_OK;
+   }
+ 
+   void
+   DataReceivedFromCache(uint32_t aIndex, const uint8_t* aString,
+                         uint32_t aStringLen,
+diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
+--- a/dom/workers/WorkerPrivate.cpp
++++ b/dom/workers/WorkerPrivate.cpp
+@@ -1846,16 +1846,17 @@ WorkerLoadInfo::StealFrom(WorkerLoadInfo
+   mFromWindow = aOther.mFromWindow;
+   mEvalAllowed = aOther.mEvalAllowed;
+   mReportCSPViolations = aOther.mReportCSPViolations;
+   mXHRParamsAllowed = aOther.mXHRParamsAllowed;
+   mPrincipalIsSystem = aOther.mPrincipalIsSystem;
+   mStorageAllowed = aOther.mStorageAllowed;
+   mServiceWorkersTestingInWindow = aOther.mServiceWorkersTestingInWindow;
+   mOriginAttributes = aOther.mOriginAttributes;
++  mParentController = aOther.mParentController;
+ }
+ 
+ nsresult
+ WorkerLoadInfo::SetPrincipalOnMainThread(nsIPrincipal* aPrincipal,
+                                          nsILoadGroup* aLoadGroup)
+ {
+   AssertIsOnMainThread();
+   MOZ_ASSERT(NS_LoadGroupMatchesPrincipal(aLoadGroup, aPrincipal));
+@@ -4785,16 +4786,17 @@ WorkerPrivate::GetLoadInfo(JSContext* aC
+ 
+     loadInfo.mDomain = aParent->Domain();
+     loadInfo.mFromWindow = aParent->IsFromWindow();
+     loadInfo.mWindowID = aParent->WindowID();
+     loadInfo.mStorageAllowed = aParent->IsStorageAllowed();
+     loadInfo.mOriginAttributes = aParent->GetOriginAttributes();
+     loadInfo.mServiceWorkersTestingInWindow =
+       aParent->ServiceWorkersTestingInWindow();
++    loadInfo.mParentController = aParent->GetController();
+   } else {
+     AssertIsOnMainThread();
+ 
+     // Make sure that the IndexedDatabaseManager is set up
+     Unused << NS_WARN_IF(!IndexedDatabaseManager::GetOrCreate());
+ 
+     nsIScriptSecurityManager* ssm = nsContentUtils::GetSecurityManager();
+     MOZ_ASSERT(ssm);
+@@ -4915,16 +4917,17 @@ WorkerPrivate::GetLoadInfo(JSContext* aC
+       loadInfo.mXHRParamsAllowed = perm == nsIPermissionManager::ALLOW_ACTION;
+ 
+       loadInfo.mFromWindow = true;
+       loadInfo.mWindowID = globalWindow->WindowID();
+       nsContentUtils::StorageAccess access =
+         nsContentUtils::StorageAllowedForWindow(globalWindow);
+       loadInfo.mStorageAllowed = access > nsContentUtils::StorageAccess::eDeny;
+       loadInfo.mOriginAttributes = nsContentUtils::GetOriginAttributes(document);
++      loadInfo.mParentController = globalWindow->GetController();
+     } else {
+       // Not a window
+       MOZ_ASSERT(isChrome);
+ 
+       // We're being created outside of a window. Need to figure out the script
+       // that is creating us in order for us to use relative URIs later on.
+       JS::AutoFilename fileName;
+       if (JS::DescribeScriptedCaller(aCx, &fileName)) {
+diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
+--- a/dom/workers/WorkerPrivate.h
++++ b/dom/workers/WorkerPrivate.h
+@@ -568,16 +568,22 @@ public:
+   void
+   UpdateServiceWorkerState(ServiceWorkerState aState)
+   {
+     MOZ_DIAGNOSTIC_ASSERT(IsServiceWorker());
+     MOZ_DIAGNOSTIC_ASSERT(mLoadInfo.mServiceWorkerDescriptor.isSome());
+     return mLoadInfo.mServiceWorkerDescriptor.ref().SetState(aState);
+   }
+ 
++  const Maybe<ServiceWorkerDescriptor>&
++  GetParentController() const
++  {
++    return mLoadInfo.mParentController;
++  }
++
+   const ChannelInfo&
+   GetChannelInfo() const
+   {
+     return mLoadInfo.mChannelInfo;
+   }
+ 
+   void
+   SetChannelInfo(const ChannelInfo& aChannelInfo)
+diff --git a/dom/workers/Workers.h b/dom/workers/Workers.h
+--- a/dom/workers/Workers.h
++++ b/dom/workers/Workers.h
+@@ -239,16 +239,18 @@ struct WorkerLoadInfo
+ 
+   nsAutoPtr<mozilla::ipc::PrincipalInfo> mPrincipalInfo;
+   nsCString mDomain;
+   nsString mOrigin; // Derived from mPrincipal; can be used on worker thread.
+ 
+   nsString mServiceWorkerCacheName;
+   Maybe<ServiceWorkerDescriptor> mServiceWorkerDescriptor;
+ 
++  Maybe<ServiceWorkerDescriptor> mParentController;
++
+   ChannelInfo mChannelInfo;
+   nsLoadFlags mLoadFlags;
+ 
+   uint64_t mWindowID;
+ 
+   net::ReferrerPolicy mReferrerPolicy;
+   bool mFromWindow;
+   bool mEvalAllowed;
+diff --git a/testing/web-platform/meta/service-workers/service-worker/sandboxed-iframe-fetch-event.https.html.ini b/testing/web-platform/meta/service-workers/service-worker/sandboxed-iframe-fetch-event.https.html.ini
+deleted file mode 100644
+--- a/testing/web-platform/meta/service-workers/service-worker/sandboxed-iframe-fetch-event.https.html.ini
++++ /dev/null
+@@ -1,4 +0,0 @@
+-[sandboxed-iframe-fetch-event.https.html]
+-  [ServiceWorker FetchEvent for sandboxed iframe.]
+-    expected: FAIL
+-

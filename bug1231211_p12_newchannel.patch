@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  239eeba419dc120053517c1d6eaf50a88fc0b189
+# Parent  54b1569b26d9da56abe84aea5a5fbc145d83ef62
 Bug 1231211 P12 Allow the ClientInfo and ServiceWorkerDescriptor to be passed to NS_NewChannel() for principal based loads. r=valentin
 
 diff --git a/netwerk/base/LoadInfo.cpp b/netwerk/base/LoadInfo.cpp
@@ -258,7 +258,7 @@ diff --git a/netwerk/base/nsIOService.cpp b/netwerk/base/nsIOService.cpp
   *        * aTriggeringPrincipal
   *        * aSecurityFlags
   *        * aContentPolicyType
-@@ -777,16 +806,65 @@ nsIOService::NewChannelFromURIWithLoadIn
+@@ -777,16 +806,62 @@ nsIOService::NewChannelFromURIWithLoadIn
  {
    return NewChannelFromURIWithProxyFlagsInternal(aURI,
                                                   nullptr, // aProxyURI
@@ -281,18 +281,15 @@ diff --git a/netwerk/base/nsIOService.cpp b/netwerk/base/nsIOService.cpp
 +                                                     uint32_t aContentPolicyType,
 +                                                     nsIChannel** result)
 +{
-+    // Ideally all callers of NewChannelFromURIWithProxyFlags2 provide the
-+    // necessary arguments to create a loadinfo. Keep in mind that addons
-+    // might still call NewChannelFromURIWithProxyFlags() which forwards
-+    // its calls to NewChannelFromURIWithProxyFlags2 using *null* values
-+    // as the arguments for aLoadingNode, aLoadingPrincipal, and also
-+    // aTriggeringPrincipal.
-+    // We do not want to break those addons, hence we only create a Loadinfo
-+    // if 'aLoadingNode' or 'aLoadingPrincipal' are provided. Note, that
-+    // either aLoadingNode or aLoadingPrincipal is required to succesfully
-+    // create a LoadInfo object.
-+    // Except in the case of top level TYPE_DOCUMENT loads, where the
-+    // loadingNode and loadingPrincipal are allowed to have null values.
++    // Ideally all callers of NewChannelFromURIWithProxyFlagsInternal provide
++    // the necessary arguments to create a loadinfo.
++    //
++    // Note, historically this could be called with nullptr aLoadingNode,
++    // aLoadingPrincipal, and aTriggeringPrincipal from addons using
++    // newChannelFromURIWithProxyFlags().  This code tried to accomodate
++    // by not creating a LoadInfo in such cases.  Now that both the legacy
++    // addons and that API are gone we could possibly require always creating a
++    // LoadInfo here.  See bug 1432205.
 +    nsCOMPtr<nsILoadInfo> loadInfo;
 +
 +    // TYPE_DOCUMENT loads don't require a loadingNode or principal, but other
@@ -324,7 +321,7 @@ diff --git a/netwerk/base/nsIOService.cpp b/netwerk/base/nsIOService.cpp
                                                       nsIChannel** result)
  {
      nsresult rv;
-@@ -902,46 +980,26 @@ nsIOService::NewChannelFromURIWithProxyF
+@@ -902,46 +977,26 @@ nsIOService::NewChannelFromURIWithProxyF
                                                uint32_t aProxyFlags,
                                                nsIDOMNode* aLoadingNode,
                                                nsIPrincipal* aLoadingPrincipal,
@@ -425,14 +422,80 @@ diff --git a/netwerk/base/nsNetUtil.cpp b/netwerk/base/nsNetUtil.cpp
 +using mozilla::dom::ClientInfo;
 +using mozilla::dom::ServiceWorkerDescriptor;
  
- #define DEFAULT_USER_CONTROL_RP 3
+ #define DEFAULT_RP 3
+ #define DEFAULT_PRIVATE_RP 2
  
- static uint32_t sUserControlRp = DEFAULT_USER_CONTROL_RP;
+ static uint32_t sDefaultRp = DEFAULT_RP;
+ static uint32_t defaultPrivateRp = DEFAULT_PRIVATE_RP;
  
  already_AddRefed<nsIIOService>
- do_GetIOService(nsresult *error /* = 0 */)
- {
-@@ -220,50 +222,101 @@ NS_NewChannel(nsIChannel           **out
+@@ -206,66 +208,157 @@ NS_NewChannelInternal(nsIChannel        
+     rv = channel->SetLoadFlags(aLoadFlags);
+     NS_ENSURE_SUCCESS(rv, rv);
+   }
+ 
+   channel.forget(outChannel);
+   return NS_OK;
+ }
+ 
++namespace {
++
++void
++AssertLoadingPrincipalAndClientInfoMatch(nsIPrincipal* aLoadingPrincipal,
++                                         const ClientInfo& aLoadingClientInfo,
++                                         nsContentPolicyType aType)
++{
++#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
++  // Verify that the provided loading ClientInfo matches the loading
++  // principal.  Unfortunately we can't just use nsIPrincipal::Equals() here
++  // because of some corner cases:
++  //
++  //  1. Worker debugger scripts want to use a system loading principal for
++  //     worker scripts with a content principal.  We exempt these from this
++  //     check.
++  //  2. Null principals currently require exact object identity for
++  //     nsIPrincipal::Equals() to return true.  This doesn't work here because
++  //     ClientInfo::GetPrincipal() uses PrincipalInfoToPrincipal() to allocate
++  //     a new object.  To work around this we compare the principal origin
++  //     string itself.  If bug 1431771 is fixed then we could switch to
++  //     Equals().
++
++  // Allow worker debugger to load with a system principal.
++  if (aLoadingPrincipal->GetIsSystemPrincipal() &&
++      (aType == nsIContentPolicy::TYPE_INTERNAL_WORKER ||
++       aType == nsIContentPolicy::TYPE_INTERNAL_SHARED_WORKER ||
++       aType == nsIContentPolicy::TYPE_INTERNAL_SERVICE_WORKER ||
++       aType == nsIContentPolicy::TYPE_INTERNAL_WORKER_IMPORT_SCRIPTS)) {
++    return;
++  }
++
++  // Perform a fast comparison for most principal checks.
++  nsCOMPtr<nsIPrincipal> clientPrincipal(aLoadingClientInfo.GetPrincipal());
++  if (aLoadingPrincipal->Equals(clientPrincipal)) {
++    return;
++  }
++
++  // Fall back to a slower origin equality test to support null principals.
++  nsAutoCString loadingOrigin;
++  MOZ_ALWAYS_SUCCEEDS(aLoadingPrincipal->GetOrigin(loadingOrigin));
++
++  nsAutoCString clientOrigin;
++  MOZ_ALWAYS_SUCCEEDS(clientPrincipal->GetOrigin(clientOrigin));
++
++  MOZ_DIAGNOSTIC_ASSERT(loadingOrigin == clientOrigin);
++#endif
++}
++
++}
++
+ nsresult
+ NS_NewChannel(nsIChannel           **outChannel,
+               nsIURI                *aUri,
+               nsIPrincipal          *aLoadingPrincipal,
+               nsSecurityFlags        aSecurityFlags,
+               nsContentPolicyType    aContentPolicyType,
+               nsILoadGroup          *aLoadGroup /* = nullptr */,
+               nsIInterfaceRequestor *aCallbacks /* = nullptr */,
                nsLoadFlags            aLoadFlags /* = nsIRequest::LOAD_NORMAL */,
                nsIIOService          *aIoService /* = nullptr */)
  {
@@ -451,7 +514,7 @@ diff --git a/netwerk/base/nsNetUtil.cpp b/netwerk/base/nsNetUtil.cpp
 +                               aIoService);
 +}
 +
-+nsresult /* NS_NewChannelPrincipal */
++nsresult
 +NS_NewChannel(nsIChannel           **outChannel,
 +              nsIURI                *aUri,
 +              nsIPrincipal          *aLoadingPrincipal,
@@ -464,19 +527,9 @@ diff --git a/netwerk/base/nsNetUtil.cpp b/netwerk/base/nsNetUtil.cpp
 +              nsLoadFlags            aLoadFlags /* = nsIRequest::LOAD_NORMAL */,
 +              nsIIOService          *aIoService /* = nullptr */)
 +{
-+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
-+  // Verify that the provided loading ClientInfo matches the loading
-+  // principal.
-+  //
-+  // NOTE: We must check for the null principal separately here since
-+  //       nsIPrincipal::Equals() wants the exact same object for null
-+  //       principal types.  This isn't the case here since we deserialize
-+  //       the client principal from a PrincipalInfo.
-+  nsCOMPtr<nsIPrincipal> clientPrincipal(aLoadingClientInfo.GetPrincipal());
-+  MOZ_DIAGNOSTIC_ASSERT(aLoadingPrincipal->Equals(clientPrincipal) ||
-+                        (aLoadingPrincipal->GetIsNullPrincipal() &&
-+                         clientPrincipal->GetIsNullPrincipal()));
-+#endif
++  AssertLoadingPrincipalAndClientInfoMatch(aLoadingPrincipal,
++                                           aLoadingClientInfo,
++                                           aContentPolicyType);
 +
 +  Maybe<ClientInfo> loadingClientInfo;
 +  loadingClientInfo.emplace(aLoadingClientInfo);
@@ -535,7 +588,7 @@ diff --git a/netwerk/base/nsNetUtil.cpp b/netwerk/base/nsNetUtil.cpp
    }
  
    if (aLoadGroup) {
-@@ -308,16 +361,18 @@ NS_NewChannelWithTriggeringPrincipal(nsI
+@@ -310,26 +403,28 @@ NS_NewChannelWithTriggeringPrincipal(nsI
  {
    MOZ_ASSERT(aLoadingNode);
    NS_ASSERTION(aTriggeringPrincipal, "Can not create channel without a triggering Principal!");
@@ -554,7 +607,18 @@ diff --git a/netwerk/base/nsNetUtil.cpp b/netwerk/base/nsNetUtil.cpp
                                 aIoService);
  }
  
-@@ -335,16 +390,65 @@ NS_NewChannelWithTriggeringPrincipal(nsI
+ // See NS_NewChannelInternal for usage and argument description
+-nsresult /*NS_NewChannelWithPrincipalAndTriggeringPrincipal */
++nsresult
+ NS_NewChannelWithTriggeringPrincipal(nsIChannel           **outChannel,
+                                      nsIURI                *aUri,
+                                      nsIPrincipal          *aLoadingPrincipal,
+                                      nsIPrincipal          *aTriggeringPrincipal,
+                                      nsSecurityFlags        aSecurityFlags,
+                                      nsContentPolicyType    aContentPolicyType,
+                                      nsILoadGroup          *aLoadGroup /* = nullptr */,
+                                      nsIInterfaceRequestor *aCallbacks /* = nullptr */,
+@@ -337,41 +432,82 @@ NS_NewChannelWithTriggeringPrincipal(nsI
                                       nsIIOService          *aIoService /* = nullptr */)
  {
    NS_ASSERTION(aLoadingPrincipal, "Can not create channel without a loading Principal!");
@@ -565,16 +629,17 @@ diff --git a/netwerk/base/nsNetUtil.cpp b/netwerk/base/nsNetUtil.cpp
                                 aTriggeringPrincipal,
 +                               Maybe<ClientInfo>(),
 +                               Maybe<ServiceWorkerDescriptor>(),
-+                               aSecurityFlags,
-+                               aContentPolicyType,
-+                               aLoadGroup,
-+                               aCallbacks,
-+                               aLoadFlags,
-+                               aIoService);
-+}
-+
+                                aSecurityFlags,
+                                aContentPolicyType,
+                                aLoadGroup,
+                                aCallbacks,
+                                aLoadFlags,
+                                aIoService);
+ }
+ 
+-nsresult /* NS_NewChannelNode */
 +// See NS_NewChannelInternal for usage and argument description
-+nsresult /*NS_NewChannelWithPrincipalAndTriggeringPrincipal */
++nsresult
 +NS_NewChannelWithTriggeringPrincipal(nsIChannel           **outChannel,
 +                                     nsIURI                *aUri,
 +                                     nsIPrincipal          *aLoadingPrincipal,
@@ -588,19 +653,9 @@ diff --git a/netwerk/base/nsNetUtil.cpp b/netwerk/base/nsNetUtil.cpp
 +                                     nsLoadFlags            aLoadFlags /* = nsIRequest::LOAD_NORMAL */,
 +                                     nsIIOService          *aIoService /* = nullptr */)
 +{
-+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
-+  // Verify that the provided loading ClientInfo matches the loading
-+  // principal.
-+  //
-+  // NOTE: We must check for the null principal separately here since
-+  //       nsIPrincipal::Equals() wants the exact same object for null
-+  //       principal types.  This isn't the case here since we deserialize
-+  //       the client principal from a PrincipalInfo.
-+  nsCOMPtr<nsIPrincipal> clientPrincipal(aLoadingClientInfo.GetPrincipal());
-+  MOZ_DIAGNOSTIC_ASSERT(aLoadingPrincipal->Equals(clientPrincipal) ||
-+                        (aLoadingPrincipal->GetIsNullPrincipal() &&
-+                         clientPrincipal->GetIsNullPrincipal()));
-+#endif
++  AssertLoadingPrincipalAndClientInfoMatch(aLoadingPrincipal,
++                                           aLoadingClientInfo,
++                                           aContentPolicyType);
 +
 +  Maybe<ClientInfo> loadingClientInfo;
 +  loadingClientInfo.emplace(aLoadingClientInfo);
@@ -612,15 +667,23 @@ diff --git a/netwerk/base/nsNetUtil.cpp b/netwerk/base/nsNetUtil.cpp
 +                               aTriggeringPrincipal,
 +                               loadingClientInfo,
 +                               aController,
-                                aSecurityFlags,
-                                aContentPolicyType,
-                                aLoadGroup,
-                                aCallbacks,
-                                aLoadFlags,
-                                aIoService);
- }
- 
-@@ -360,16 +464,18 @@ NS_NewChannel(nsIChannel           **out
++                               aSecurityFlags,
++                               aContentPolicyType,
++                               aLoadGroup,
++                               aCallbacks,
++                               aLoadFlags,
++                               aIoService);
++}
++
++nsresult
+ NS_NewChannel(nsIChannel           **outChannel,
+               nsIURI                *aUri,
+               nsINode               *aLoadingNode,
+               nsSecurityFlags        aSecurityFlags,
+               nsContentPolicyType    aContentPolicyType,
+               nsILoadGroup          *aLoadGroup /* = nullptr */,
+               nsIInterfaceRequestor *aCallbacks /* = nullptr */,
+               nsLoadFlags            aLoadFlags /* = nsIRequest::LOAD_NORMAL */,
                nsIIOService          *aIoService /* = nullptr */)
  {
    NS_ASSERTION(aLoadingNode, "Can not create channel without a loading Node!");
@@ -639,7 +702,7 @@ diff --git a/netwerk/base/nsNetUtil.cpp b/netwerk/base/nsNetUtil.cpp
                                 aIoService);
  }
  
-@@ -889,16 +995,18 @@ NS_NewStreamLoaderInternal(nsIStreamLoad
+@@ -891,16 +1027,18 @@ NS_NewStreamLoaderInternal(nsIStreamLoad
                             nsIURI                  *aReferrer /* = nullptr */)
  {
     nsCOMPtr<nsIChannel> channel;
@@ -658,6 +721,44 @@ diff --git a/netwerk/base/nsNetUtil.cpp b/netwerk/base/nsNetUtil.cpp
  
    NS_ENSURE_SUCCESS(rv, rv);
    nsCOMPtr<nsIHttpChannel> httpChannel(do_QueryInterface(channel));
+@@ -909,17 +1047,17 @@ NS_NewStreamLoaderInternal(nsIStreamLoad
+     MOZ_ASSERT(NS_SUCCEEDED(rv));
+   }
+   rv = NS_NewStreamLoader(outStream, aObserver);
+   NS_ENSURE_SUCCESS(rv, rv);
+   return channel->AsyncOpen2(*outStream);
+ }
+ 
+ 
+-nsresult /* NS_NewStreamLoaderNode */
++nsresult
+ NS_NewStreamLoader(nsIStreamLoader        **outStream,
+                    nsIURI                  *aUri,
+                    nsIStreamLoaderObserver *aObserver,
+                    nsINode                 *aLoadingNode,
+                    nsSecurityFlags          aSecurityFlags,
+                    nsContentPolicyType      aContentPolicyType,
+                    nsILoadGroup            *aLoadGroup /* = nullptr */,
+                    nsIInterfaceRequestor   *aCallbacks /* = nullptr */,
+@@ -935,17 +1073,17 @@ NS_NewStreamLoader(nsIStreamLoader      
+                                     aSecurityFlags,
+                                     aContentPolicyType,
+                                     aLoadGroup,
+                                     aCallbacks,
+                                     aLoadFlags,
+                                     aReferrer);
+ }
+ 
+-nsresult /* NS_NewStreamLoaderPrincipal */
++nsresult
+ NS_NewStreamLoader(nsIStreamLoader        **outStream,
+                    nsIURI                  *aUri,
+                    nsIStreamLoaderObserver *aObserver,
+                    nsIPrincipal            *aLoadingPrincipal,
+                    nsSecurityFlags          aSecurityFlags,
+                    nsContentPolicyType      aContentPolicyType,
+                    nsILoadGroup            *aLoadGroup /* = nullptr */,
+                    nsIInterfaceRequestor   *aCallbacks /* = nullptr */,
 diff --git a/netwerk/base/nsNetUtil.h b/netwerk/base/nsNetUtil.h
 --- a/netwerk/base/nsNetUtil.h
 +++ b/netwerk/base/nsNetUtil.h
@@ -758,7 +859,7 @@ diff --git a/netwerk/base/nsNetUtil.h b/netwerk/base/nsNetUtil.h
                                 nsIIOService          *aIoService = nullptr);
  
  // See NS_NewChannelInternal for usage and argument description
-@@ -166,31 +181,46 @@ NS_NewChannelWithTriggeringPrincipal(nsI
+@@ -166,54 +181,83 @@ NS_NewChannelWithTriggeringPrincipal(nsI
                                       nsIPrincipal          *aTriggeringPrincipal,
                                       nsSecurityFlags        aSecurityFlags,
                                       nsContentPolicyType    aContentPolicyType,
@@ -769,7 +870,8 @@ diff --git a/netwerk/base/nsNetUtil.h b/netwerk/base/nsNetUtil.h
  
 -
  // See NS_NewChannelInternal for usage and argument description
- nsresult /*NS_NewChannelWithPrincipalAndTriggeringPrincipal */
+-nsresult /*NS_NewChannelWithPrincipalAndTriggeringPrincipal */
++nsresult
  NS_NewChannelWithTriggeringPrincipal(nsIChannel           **outChannel,
                                       nsIURI                *aUri,
                                       nsIPrincipal          *aLoadingPrincipal,
@@ -782,7 +884,8 @@ diff --git a/netwerk/base/nsNetUtil.h b/netwerk/base/nsNetUtil.h
                                       nsIIOService          *aIoService = nullptr);
  
  // See NS_NewChannelInternal for usage and argument description
-+nsresult /*NS_NewChannelWithPrincipalAndTriggeringPrincipal */
+-nsresult /* NS_NewChannelNode */
++nsresult
 +NS_NewChannelWithTriggeringPrincipal(nsIChannel           **outChannel,
 +                                     nsIURI                *aUri,
 +                                     nsIPrincipal          *aLoadingPrincipal,
@@ -798,7 +901,7 @@ diff --git a/netwerk/base/nsNetUtil.h b/netwerk/base/nsNetUtil.h
 +
 +
 +// See NS_NewChannelInternal for usage and argument description
- nsresult /* NS_NewChannelNode */
++nsresult
  NS_NewChannel(nsIChannel           **outChannel,
                nsIURI                *aUri,
                nsINode               *aLoadingNode,
@@ -806,7 +909,14 @@ diff --git a/netwerk/base/nsNetUtil.h b/netwerk/base/nsNetUtil.h
                nsContentPolicyType    aContentPolicyType,
                nsILoadGroup          *aLoadGroup = nullptr,
                nsIInterfaceRequestor *aCallbacks = nullptr,
-@@ -204,16 +234,30 @@ NS_NewChannel(nsIChannel           **out
+               nsLoadFlags            aLoadFlags = nsIRequest::LOAD_NORMAL,
+               nsIIOService          *aIoService = nullptr);
+ 
+ // See NS_NewChannelInternal for usage and argument description
+-nsresult /* NS_NewChannelPrincipal */
++nsresult
+ NS_NewChannel(nsIChannel           **outChannel,
+               nsIURI                *aUri,
                nsIPrincipal          *aLoadingPrincipal,
                nsSecurityFlags        aSecurityFlags,
                nsContentPolicyType    aContentPolicyType,
@@ -816,7 +926,7 @@ diff --git a/netwerk/base/nsNetUtil.h b/netwerk/base/nsNetUtil.h
                nsIIOService          *aIoService = nullptr);
  
 +// See NS_NewChannelInternal for usage and argument description
-+nsresult /* NS_NewChannelPrincipal */
++nsresult
 +NS_NewChannel(nsIChannel** outChannel,
 +              nsIURI* aUri,
 +              nsIPrincipal* aLoadingPrincipal,
@@ -837,6 +947,38 @@ diff --git a/netwerk/base/nsNetUtil.h b/netwerk/base/nsNetUtil.h
  
  nsresult NS_MakeAbsoluteURI(char        **result,
                              const char   *spec,
+@@ -344,29 +388,29 @@ nsresult NS_NewStreamLoaderInternal(nsIS
+                                     nsIPrincipal            *aLoadingPrincipal,
+                                     nsSecurityFlags          aSecurityFlags,
+                                     nsContentPolicyType      aContentPolicyType,
+                                     nsILoadGroup            *aLoadGroup = nullptr,
+                                     nsIInterfaceRequestor   *aCallbacks = nullptr,
+                                     nsLoadFlags              aLoadFlags = nsIRequest::LOAD_NORMAL,
+                                     nsIURI                  *aReferrer = nullptr);
+ 
+-nsresult /* NS_NewStreamLoaderNode */
++nsresult
+ NS_NewStreamLoader(nsIStreamLoader        **outStream,
+                    nsIURI                  *aUri,
+                    nsIStreamLoaderObserver *aObserver,
+                    nsINode                 *aLoadingNode,
+                    nsSecurityFlags          aSecurityFlags,
+                    nsContentPolicyType      aContentPolicyType,
+                    nsILoadGroup            *aLoadGroup = nullptr,
+                    nsIInterfaceRequestor   *aCallbacks = nullptr,
+                    nsLoadFlags              aLoadFlags = nsIRequest::LOAD_NORMAL,
+                    nsIURI                  *aReferrer = nullptr);
+ 
+-nsresult /* NS_NewStreamLoaderPrincipal */
++nsresult
+ NS_NewStreamLoader(nsIStreamLoader        **outStream,
+                    nsIURI                  *aUri,
+                    nsIStreamLoaderObserver *aObserver,
+                    nsIPrincipal            *aLoadingPrincipal,
+                    nsSecurityFlags          aSecurityFlags,
+                    nsContentPolicyType      aContentPolicyType,
+                    nsILoadGroup            *aLoadGroup = nullptr,
+                    nsIInterfaceRequestor   *aCallbacks = nullptr,
 diff --git a/uriloader/prefetch/nsPrefetchService.cpp b/uriloader/prefetch/nsPrefetchService.cpp
 --- a/uriloader/prefetch/nsPrefetchService.cpp
 +++ b/uriloader/prefetch/nsPrefetchService.cpp
