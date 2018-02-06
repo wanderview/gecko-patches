@@ -1,0 +1,663 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  39cb90977010a03c87ac170cdb68a9b8d3b4e20b
+Bug 1434701 P7 Store the registration descriptor in ServiceWorkerRegistration. r=catalinb
+
+diff --git a/dom/serviceworkers/ServiceWorkerRegistration.cpp b/dom/serviceworkers/ServiceWorkerRegistration.cpp
+--- a/dom/serviceworkers/ServiceWorkerRegistration.cpp
++++ b/dom/serviceworkers/ServiceWorkerRegistration.cpp
+@@ -19,53 +19,51 @@ namespace dom {
+ 
+ NS_IMPL_ADDREF_INHERITED(ServiceWorkerRegistration, DOMEventTargetHelper)
+ NS_IMPL_RELEASE_INHERITED(ServiceWorkerRegistration, DOMEventTargetHelper)
+ 
+ NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ServiceWorkerRegistration)
+ NS_INTERFACE_MAP_END_INHERITING(DOMEventTargetHelper)
+ 
+ ServiceWorkerRegistration::ServiceWorkerRegistration(nsPIDOMWindowInner* aWindow,
+-                                                     const nsAString& aScope)
++                                                     const ServiceWorkerRegistrationDescriptor& aDescriptor)
+   : DOMEventTargetHelper(aWindow)
+-  , mScope(aScope)
+-{}
++  , mDescriptor(aDescriptor)
++{
++}
+ 
+ JSObject*
+ ServiceWorkerRegistration::WrapObject(JSContext* aCx,
+                                       JS::Handle<JSObject*> aGivenProto)
+ {
+   return ServiceWorkerRegistrationBinding::Wrap(aCx, this, aGivenProto);
+ }
+ 
+ /* static */ already_AddRefed<ServiceWorkerRegistration>
+ ServiceWorkerRegistration::CreateForMainThread(nsPIDOMWindowInner* aWindow,
+                                                const ServiceWorkerRegistrationDescriptor& aDescriptor)
+ {
+   MOZ_ASSERT(aWindow);
+   MOZ_ASSERT(NS_IsMainThread());
+ 
+-  NS_ConvertUTF8toUTF16 scope(aDescriptor.Scope());
+-
+-  RefPtr<ServiceWorkerRegistrationMainThread> registration =
+-    new ServiceWorkerRegistrationMainThread(aWindow, scope);
+-  registration->UpdateState(aDescriptor);
++  RefPtr<ServiceWorkerRegistration> registration =
++    new ServiceWorkerRegistrationMainThread(aWindow, aDescriptor);
+ 
+   return registration.forget();
+ }
+ 
+ /* static */ already_AddRefed<ServiceWorkerRegistration>
+ ServiceWorkerRegistration::CreateForWorker(WorkerPrivate* aWorkerPrivate,
+                                            const ServiceWorkerRegistrationDescriptor& aDescriptor)
+ {
+   MOZ_ASSERT(aWorkerPrivate);
+   aWorkerPrivate->AssertIsOnWorkerThread();
+ 
+   NS_ConvertUTF8toUTF16 scope(aDescriptor.Scope());
+ 
+-  RefPtr<ServiceWorkerRegistrationWorkerThread> registration =
+-    new ServiceWorkerRegistrationWorkerThread(aWorkerPrivate, scope);
++  RefPtr<ServiceWorkerRegistration> registration =
++    new ServiceWorkerRegistrationWorkerThread(aWorkerPrivate, aDescriptor);
+ 
+   return registration.forget();
+ }
+ 
+ } // dom namespace
+ } // mozilla namespace
+diff --git a/dom/serviceworkers/ServiceWorkerRegistration.h b/dom/serviceworkers/ServiceWorkerRegistration.h
+--- a/dom/serviceworkers/ServiceWorkerRegistration.h
++++ b/dom/serviceworkers/ServiceWorkerRegistration.h
+@@ -6,28 +6,28 @@
+ 
+ #ifndef mozilla_dom_ServiceWorkerRegistration_h
+ #define mozilla_dom_ServiceWorkerRegistration_h
+ 
+ #include "mozilla/DOMEventTargetHelper.h"
+ #include "mozilla/dom/DOMPrefs.h"
+ #include "mozilla/dom/ServiceWorkerBinding.h"
+ #include "mozilla/dom/ServiceWorkerRegistrationBinding.h"
++#include "mozilla/dom/ServiceWorkerRegistrationDescriptor.h"
+ 
+ // Support for Notification API extension.
+ #include "mozilla/dom/NotificationBinding.h"
+ 
+ class nsPIDOMWindowInner;
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ class Promise;
+ class PushManager;
+-class ServiceWorkerRegistrationDescriptor;
+ class WorkerPrivate;
+ 
+ class ServiceWorkerRegistration : public DOMEventTargetHelper
+ {
+ public:
+   NS_DECL_ISUPPORTS_INHERITED
+ 
+   IMPL_EVENT_HANDLER(updatefound)
+@@ -74,21 +74,21 @@ public:
+                    ErrorResult& aRv) = 0;
+ 
+   virtual already_AddRefed<Promise>
+   GetNotifications(const GetNotificationOptions& aOptions,
+                    ErrorResult& aRv) = 0;
+ 
+ protected:
+   ServiceWorkerRegistration(nsPIDOMWindowInner* aWindow,
+-                            const nsAString& aScope);
++                            const ServiceWorkerRegistrationDescriptor& aDescriptor);
+ 
+   virtual ~ServiceWorkerRegistration()
+   { }
+ 
+-  const nsString mScope;
++  ServiceWorkerRegistrationDescriptor mDescriptor;
+ };
+ 
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif /* mozilla_dom_ServiceWorkerRegistration_h */
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationImpl.cpp b/dom/serviceworkers/ServiceWorkerRegistrationImpl.cpp
+--- a/dom/serviceworkers/ServiceWorkerRegistrationImpl.cpp
++++ b/dom/serviceworkers/ServiceWorkerRegistrationImpl.cpp
+@@ -46,22 +46,23 @@ NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(
+ NS_INTERFACE_MAP_END_INHERITING(ServiceWorkerRegistration)
+ 
+ NS_IMPL_CYCLE_COLLECTION_INHERITED(ServiceWorkerRegistrationMainThread,
+                                    ServiceWorkerRegistration,
+                                    mPushManager,
+                                    mInstallingWorker, mWaitingWorker, mActiveWorker);
+ 
+ ServiceWorkerRegistrationMainThread::ServiceWorkerRegistrationMainThread(nsPIDOMWindowInner* aWindow,
+-                                                                         const nsAString& aScope)
+-  : ServiceWorkerRegistration(aWindow, aScope)
++                                                                         const ServiceWorkerRegistrationDescriptor& aDescriptor)
++  : ServiceWorkerRegistration(aWindow, aDescriptor)
+   , mListeningForEvents(false)
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+   MOZ_ASSERT(aWindow);
++  UpdateState(aDescriptor);
+   StartListeningForEvents();
+ }
+ 
+ ServiceWorkerRegistrationMainThread::~ServiceWorkerRegistrationMainThread()
+ {
+   StopListeningForEvents();
+   MOZ_ASSERT(!mListeningForEvents);
+ }
+@@ -70,32 +71,34 @@ ServiceWorkerRegistrationMainThread::~Se
+ // registered.
+ void
+ ServiceWorkerRegistrationMainThread::StartListeningForEvents()
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+   MOZ_ASSERT(!mListeningForEvents);
+   RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+   if (swm) {
+-    swm->AddRegistrationEventListener(mScope, this);
++    NS_ConvertUTF8toUTF16 scope(mDescriptor.Scope());
++    swm->AddRegistrationEventListener(scope, this);
+     mListeningForEvents = true;
+   }
+ }
+ 
+ void
+ ServiceWorkerRegistrationMainThread::StopListeningForEvents()
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+   if (!mListeningForEvents) {
+     return;
+   }
+ 
+   RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+   if (swm) {
+-    swm->RemoveRegistrationEventListener(mScope, this);
++    NS_ConvertUTF8toUTF16 scope(mDescriptor.Scope());
++    swm->RemoveRegistrationEventListener(scope, this);
+   }
+   mListeningForEvents = false;
+ }
+ 
+ already_AddRefed<ServiceWorker>
+ ServiceWorkerRegistrationMainThread::GetInstalling()
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+@@ -123,16 +126,20 @@ void
+ ServiceWorkerRegistrationMainThread::UpdateFound()
+ {
+   DispatchTrustedEvent(NS_LITERAL_STRING("updatefound"));
+ }
+ 
+ void
+ ServiceWorkerRegistrationMainThread::UpdateState(const ServiceWorkerRegistrationDescriptor& aDescriptor)
+ {
++  MOZ_DIAGNOSTIC_ASSERT(MatchesDescriptor(aDescriptor));
++
++  mDescriptor = aDescriptor;
++
+   nsCOMPtr<nsIGlobalObject> global = GetParentObject();
+   if (!global) {
+     mInstallingWorker = nullptr;
+     mWaitingWorker = nullptr;
+     mActiveWorker = nullptr;
+     return;
+   }
+ 
+@@ -160,45 +167,46 @@ ServiceWorkerRegistrationMainThread::Upd
+ 
+ void
+ ServiceWorkerRegistrationMainThread::RegistrationRemoved()
+ {
+   // If the registration is being removed completely, remove it from the
+   // window registration hash table so that a new registration would get a new
+   // wrapper JS object.
+   if (nsCOMPtr<nsPIDOMWindowInner> window = GetOwner()) {
+-    window->InvalidateServiceWorkerRegistration(mScope);
++    NS_ConvertUTF8toUTF16 scope(mDescriptor.Scope());
++    window->InvalidateServiceWorkerRegistration(scope);
+   }
+ }
+ 
+ bool
+ ServiceWorkerRegistrationMainThread::MatchesDescriptor(const ServiceWorkerRegistrationDescriptor& aDescriptor)
+ {
+-  NS_ConvertUTF16toUTF8 scope(mScope);
+-  return aDescriptor.Scope() == scope;
++  return aDescriptor.PrincipalInfo() == mDescriptor.PrincipalInfo() &&
++         aDescriptor.Scope() == mDescriptor.Scope();
+ }
+ 
+ namespace {
+ 
+ void
+ UpdateInternal(nsIPrincipal* aPrincipal,
+-               const nsAString& aScope,
++               const nsACString& aScope,
+                ServiceWorkerUpdateFinishCallback* aCallback)
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+   MOZ_ASSERT(aPrincipal);
+   MOZ_ASSERT(aCallback);
+ 
+   RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+   if (!swm) {
+     // browser shutdown
+     return;
+   }
+ 
+-  swm->Update(aPrincipal, NS_ConvertUTF16toUTF8(aScope), aCallback);
++  swm->Update(aPrincipal, aScope, aCallback);
+ }
+ 
+ class MainThreadUpdateCallback final : public ServiceWorkerUpdateFinishCallback
+ {
+   PromiseWindowProxy mPromise;
+ 
+   ~MainThreadUpdateCallback()
+   { }
+@@ -324,17 +332,17 @@ public:
+       new UpdateResultRunnable(proxy, aStatus);
+     r->Dispatch();
+   }
+ };
+ 
+ class SWRUpdateRunnable final : public Runnable
+ {
+ public:
+-  SWRUpdateRunnable(PromiseWorkerProxy* aPromiseProxy, const nsAString& aScope)
++  SWRUpdateRunnable(PromiseWorkerProxy* aPromiseProxy, const nsACString& aScope)
+     : Runnable("dom::SWRUpdateRunnable")
+     , mPromiseProxy(aPromiseProxy)
+     , mScope(aScope)
+   {}
+ 
+   NS_IMETHOD
+   Run() override
+   {
+@@ -360,17 +368,17 @@ public:
+     return NS_OK;
+   }
+ 
+ private:
+   ~SWRUpdateRunnable()
+   {}
+ 
+   RefPtr<PromiseWorkerProxy> mPromiseProxy;
+-  const nsString mScope;
++  const nsCString mScope;
+ };
+ 
+ class UnregisterCallback final : public nsIServiceWorkerUnregisterCallback
+ {
+   PromiseWindowProxy mPromise;
+ 
+ public:
+   NS_DECL_ISUPPORTS
+@@ -510,20 +518,20 @@ NS_IMPL_ISUPPORTS(WorkerUnregisterCallba
+  * resolve the worker Promise (which doesn't exist by that point).
+  */
+ class StartUnregisterRunnable final : public Runnable
+ {
+   RefPtr<PromiseWorkerProxy> mPromiseWorkerProxy;
+   const nsString mScope;
+ 
+ public:
+-  StartUnregisterRunnable(PromiseWorkerProxy* aProxy, const nsAString& aScope)
++  StartUnregisterRunnable(PromiseWorkerProxy* aProxy, const nsACString& aScope)
+     : Runnable("dom::StartUnregisterRunnable")
+     , mPromiseWorkerProxy(aProxy)
+-    , mScope(aScope)
++    , mScope(NS_ConvertUTF8toUTF16(aScope))
+   {
+     MOZ_ASSERT(aProxy);
+   }
+ 
+   NS_IMETHOD
+   Run() override
+   {
+     MOZ_ASSERT(NS_IsMainThread());
+@@ -575,17 +583,17 @@ ServiceWorkerRegistrationMainThread::Upd
+     return nullptr;
+   }
+ 
+   nsCOMPtr<nsIDocument> doc = GetOwner()->GetExtantDoc();
+   MOZ_ASSERT(doc);
+ 
+   RefPtr<MainThreadUpdateCallback> cb =
+     new MainThreadUpdateCallback(GetOwner(), promise);
+-  UpdateInternal(doc->NodePrincipal(), mScope, cb);
++  UpdateInternal(doc->NodePrincipal(), mDescriptor.Scope(), cb);
+ 
+   return promise.forget();
+ }
+ 
+ already_AddRefed<Promise>
+ ServiceWorkerRegistrationMainThread::Unregister(ErrorResult& aRv)
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+@@ -604,17 +612,18 @@ ServiceWorkerRegistrationMainThread::Unr
+   if (!document) {
+     aRv.Throw(NS_ERROR_FAILURE);
+     return nullptr;
+   }
+ 
+   nsCOMPtr<nsIURI> scopeURI;
+   nsCOMPtr<nsIURI> baseURI = document->GetBaseURI();
+   // "If the origin of scope is not client's origin..."
+-  nsresult rv = NS_NewURI(getter_AddRefs(scopeURI), mScope, nullptr, baseURI);
++  nsresult rv = NS_NewURI(getter_AddRefs(scopeURI), mDescriptor.Scope(),
++                          nullptr, baseURI);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     aRv.Throw(NS_ERROR_DOM_SECURITY_ERR);
+     return nullptr;
+   }
+ 
+   nsCOMPtr<nsIPrincipal> documentPrincipal = document->NodePrincipal();
+   rv = documentPrincipal->CheckMayLoad(scopeURI, true /* report */,
+                                        false /* allowIfInheritsPrinciple */);
+@@ -663,25 +672,27 @@ ServiceWorkerRegistrationMainThread::Sho
+   }
+ 
+   nsCOMPtr<nsIDocument> doc = window->GetExtantDoc();
+   if (NS_WARN_IF(!doc)) {
+     aRv.Throw(NS_ERROR_FAILURE);
+     return nullptr;
+   }
+ 
++  NS_ConvertUTF8toUTF16 scope(mDescriptor.Scope());
++
+   RefPtr<ServiceWorker> worker = GetActive();
+   if (!worker) {
+-    aRv.ThrowTypeError<MSG_NO_ACTIVE_WORKER>(mScope);
++    aRv.ThrowTypeError<MSG_NO_ACTIVE_WORKER>(scope);
+     return nullptr;
+   }
+ 
+   nsCOMPtr<nsIGlobalObject> global = do_QueryInterface(window);
+   RefPtr<Promise> p =
+-    Notification::ShowPersistentNotification(aCx, global, mScope, aTitle,
++    Notification::ShowPersistentNotification(aCx, global, scope, aTitle,
+                                              aOptions, aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return nullptr;
+   }
+ 
+   return p.forget();
+ }
+ 
+@@ -689,35 +700,38 @@ already_AddRefed<Promise>
+ ServiceWorkerRegistrationMainThread::GetNotifications(const GetNotificationOptions& aOptions, ErrorResult& aRv)
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+   nsCOMPtr<nsPIDOMWindowInner> window = GetOwner();
+   if (NS_WARN_IF(!window)) {
+     aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+     return nullptr;
+   }
+-  return Notification::Get(window, aOptions, mScope, aRv);
++  NS_ConvertUTF8toUTF16 scope(mDescriptor.Scope());
++  return Notification::Get(window, aOptions, scope, aRv);
+ }
+ 
+ already_AddRefed<PushManager>
+ ServiceWorkerRegistrationMainThread::GetPushManager(JSContext* aCx,
+                                                     ErrorResult& aRv)
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+ 
+   if (!mPushManager) {
+     nsCOMPtr<nsIGlobalObject> globalObject = do_QueryInterface(GetOwner());
+ 
+     if (!globalObject) {
+       aRv.Throw(NS_ERROR_FAILURE);
+       return nullptr;
+     }
+ 
++    NS_ConvertUTF8toUTF16 scope(mDescriptor.Scope());
++
+     GlobalObject global(aCx, globalObject->GetGlobalJSObject());
+-    mPushManager = PushManager::Constructor(global, mScope, aRv);
++    mPushManager = PushManager::Constructor(global, scope, aRv);
+     if (aRv.Failed()) {
+       return nullptr;
+     }
+   }
+ 
+   RefPtr<PushManager> ret = mPushManager;
+   return ret.forget();
+ }
+@@ -806,17 +820,17 @@ public:
+   GetScope(nsAString& aScope) const override
+   {
+     aScope = mScope;
+   }
+ 
+   bool
+   MatchesDescriptor(const ServiceWorkerRegistrationDescriptor& aDescriptor) override
+   {
+-    // TODO
++    // TODO: Not implemented
+     return false;
+   }
+ 
+   ServiceWorkerRegistrationWorkerThread*
+   GetRegistration() const
+   {
+     if (mWorkerPrivate) {
+       mWorkerPrivate->AssertIsOnWorkerThread();
+@@ -857,18 +871,18 @@ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+ 
+ NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(ServiceWorkerRegistrationWorkerThread,
+                                                 ServiceWorkerRegistration)
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mPushManager)
+   tmp->ReleaseListener();
+ NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+ 
+ ServiceWorkerRegistrationWorkerThread::ServiceWorkerRegistrationWorkerThread(WorkerPrivate* aWorkerPrivate,
+-                                                                             const nsAString& aScope)
+-  : ServiceWorkerRegistration(nullptr, aScope)
++                                                                             const ServiceWorkerRegistrationDescriptor& aDescriptor)
++  : ServiceWorkerRegistration(nullptr, aDescriptor)
+   , WorkerHolder("ServiceWorkerRegistrationWorkerThread")
+   , mWorkerPrivate(aWorkerPrivate)
+ {
+   InitListener();
+ }
+ 
+ ServiceWorkerRegistrationWorkerThread::~ServiceWorkerRegistrationWorkerThread()
+ {
+@@ -918,17 +932,17 @@ ServiceWorkerRegistrationWorkerThread::U
+   }
+ 
+   RefPtr<PromiseWorkerProxy> proxy = PromiseWorkerProxy::Create(worker, promise);
+   if (!proxy) {
+     aRv.Throw(NS_ERROR_DOM_ABORT_ERR);
+     return nullptr;
+   }
+ 
+-  RefPtr<SWRUpdateRunnable> r = new SWRUpdateRunnable(proxy, mScope);
++  RefPtr<SWRUpdateRunnable> r = new SWRUpdateRunnable(proxy, mDescriptor.Scope());
+   MOZ_ALWAYS_SUCCEEDS(worker->DispatchToMainThread(r.forget()));
+ 
+   return promise.forget();
+ }
+ 
+ already_AddRefed<Promise>
+ ServiceWorkerRegistrationWorkerThread::Unregister(ErrorResult& aRv)
+ {
+@@ -950,17 +964,18 @@ ServiceWorkerRegistrationWorkerThread::U
+   }
+ 
+   RefPtr<PromiseWorkerProxy> proxy = PromiseWorkerProxy::Create(worker, promise);
+   if (!proxy) {
+     aRv.Throw(NS_ERROR_DOM_ABORT_ERR);
+     return nullptr;
+   }
+ 
+-  RefPtr<StartUnregisterRunnable> r = new StartUnregisterRunnable(proxy, mScope);
++  RefPtr<StartUnregisterRunnable> r =
++    new StartUnregisterRunnable(proxy, mDescriptor.Scope());
+   MOZ_ALWAYS_SUCCEEDS(worker->DispatchToMainThread(r.forget()));
+ 
+   return promise.forget();
+ }
+ 
+ void
+ ServiceWorkerRegistrationWorkerThread::InitListener()
+ {
+@@ -1059,42 +1074,46 @@ WorkerListener::UpdateFound()
+ 
+ // Notification API extension.
+ already_AddRefed<Promise>
+ ServiceWorkerRegistrationWorkerThread::ShowNotification(JSContext* aCx,
+                                                         const nsAString& aTitle,
+                                                         const NotificationOptions& aOptions,
+                                                         ErrorResult& aRv)
+ {
++
+   // Until Bug 1131324 exposes ServiceWorkerContainer on workers,
+   // ShowPersistentNotification() checks for valid active worker while it is
+   // also verifying scope so that we block the worker on the main thread only
+   // once.
++  NS_ConvertUTF8toUTF16 scope(mDescriptor.Scope());
+   RefPtr<Promise> p =
+     Notification::ShowPersistentNotification(aCx, mWorkerPrivate->GlobalScope(),
+-                                             mScope, aTitle, aOptions, aRv);
++                                             scope, aTitle, aOptions, aRv);
+   if (NS_WARN_IF(aRv.Failed())) {
+     return nullptr;
+   }
+ 
+   return p.forget();
+ }
+ 
+ already_AddRefed<Promise>
+ ServiceWorkerRegistrationWorkerThread::GetNotifications(const GetNotificationOptions& aOptions,
+                                                         ErrorResult& aRv)
+ {
+-  return Notification::WorkerGet(mWorkerPrivate, aOptions, mScope, aRv);
++  NS_ConvertUTF8toUTF16 scope(mDescriptor.Scope());
++  return Notification::WorkerGet(mWorkerPrivate, aOptions, scope, aRv);
+ }
+ 
+ already_AddRefed<PushManager>
+ ServiceWorkerRegistrationWorkerThread::GetPushManager(JSContext* aCx, ErrorResult& aRv)
+ {
+   if (!mPushManager) {
+-    mPushManager = new PushManager(mScope);
++    NS_ConvertUTF8toUTF16 scope(mDescriptor.Scope());
++    mPushManager = new PushManager(scope);
+   }
+ 
+   RefPtr<PushManager> ret = mPushManager;
+   return ret.forget();
+ }
+ 
+ } // dom namespace
+ } // mozilla namespace
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationImpl.h b/dom/serviceworkers/ServiceWorkerRegistrationImpl.h
+--- a/dom/serviceworkers/ServiceWorkerRegistrationImpl.h
++++ b/dom/serviceworkers/ServiceWorkerRegistrationImpl.h
+@@ -28,17 +28,17 @@ class ServiceWorkerRegistrationMainThrea
+ {
+   friend nsPIDOMWindowInner;
+ public:
+   NS_DECL_ISUPPORTS_INHERITED
+   NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(ServiceWorkerRegistrationMainThread,
+                                            ServiceWorkerRegistration)
+ 
+   ServiceWorkerRegistrationMainThread(nsPIDOMWindowInner* aWindow,
+-                                      const nsAString& aScope);
++                                      const ServiceWorkerRegistrationDescriptor& aDescriptor);
+ 
+   already_AddRefed<Promise>
+   Update(ErrorResult& aRv) override;
+ 
+   already_AddRefed<Promise>
+   Unregister(ErrorResult& aRv) override;
+ 
+   // Partial interface from Notification API.
+@@ -79,33 +79,34 @@ public:
+   UpdateState(const ServiceWorkerRegistrationDescriptor& aDescriptor) override;
+ 
+   void
+   RegistrationRemoved() override;
+ 
+   void
+   GetScope(nsAString& aScope) const override
+   {
+-    aScope = mScope;
++    CopyUTF8toUTF16(mDescriptor.Scope(), aScope);
+   }
+ 
+   ServiceWorkerUpdateViaCache
+   GetUpdateViaCache(ErrorResult& aRv) const override
+   {
+     RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+     MOZ_ASSERT(swm);
+ 
+     nsCOMPtr<nsPIDOMWindowInner> window = GetOwner();
+     MOZ_ASSERT(window);
+ 
+     nsCOMPtr<nsIDocument> doc = window->GetExtantDoc();
+     MOZ_ASSERT(doc);
+ 
+     nsCOMPtr<nsIServiceWorkerRegistrationInfo> registration;
+-    nsresult rv = swm->GetRegistrationByPrincipal(doc->NodePrincipal(), mScope,
++    NS_ConvertUTF8toUTF16 scope(mDescriptor.Scope());
++    nsresult rv = swm->GetRegistrationByPrincipal(doc->NodePrincipal(), scope,
+                                                   getter_AddRefs(registration));
+ 
+     /*
+      *  xxx: We should probably store the `updateViaCache` value on the
+      *  ServiceWorkerRegistration object and update it when necessary.
+      *  We don't have a good way to reach all ServiceWorkerRegistration objects
+      *  from the ServiceWorkerRegistratinInfo right now, though.
+      *  This is a short term fix to avoid crashing.
+@@ -159,17 +160,17 @@ class ServiceWorkerRegistrationWorkerThr
+                                                   , public WorkerHolder
+ {
+ public:
+   NS_DECL_ISUPPORTS_INHERITED
+   NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(ServiceWorkerRegistrationWorkerThread,
+                                            ServiceWorkerRegistration)
+ 
+   ServiceWorkerRegistrationWorkerThread(WorkerPrivate* aWorkerPrivate,
+-                                        const nsAString& aScope);
++                                        const ServiceWorkerRegistrationDescriptor& aDescriptor);
+ 
+   already_AddRefed<Promise>
+   Update(ErrorResult& aRv) override;
+ 
+   already_AddRefed<Promise>
+   Unregister(ErrorResult& aRv) override;
+ 
+   // Partial interface from Notification API.
+@@ -190,17 +191,17 @@ public:
+   GetWaiting() override;
+ 
+   already_AddRefed<ServiceWorker>
+   GetActive() override;
+ 
+   void
+   GetScope(nsAString& aScope) const override
+   {
+-    aScope = mScope;
++    CopyUTF8toUTF16(mDescriptor.Scope(), aScope);
+   }
+ 
+   ServiceWorkerUpdateViaCache
+   GetUpdateViaCache(ErrorResult& aRv) const override
+   {
+     // FIXME(hopang): Will be implemented after Bug 1113522.
+     return ServiceWorkerUpdateViaCache::Imports;
+   }
