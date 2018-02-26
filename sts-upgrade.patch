@@ -1,0 +1,144 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  6699c1f99067a2049b60994818d1790f581d0084
+
+diff --git a/dom/clients/manager/ClientChannelHelper.cpp b/dom/clients/manager/ClientChannelHelper.cpp
+--- a/dom/clients/manager/ClientChannelHelper.cpp
++++ b/dom/clients/manager/ClientChannelHelper.cpp
+@@ -53,16 +53,31 @@ class ClientChannelHelper final : public
+   NS_IMETHOD
+   AsyncOnChannelRedirect(nsIChannel* aOldChannel,
+                          nsIChannel* aNewChannel,
+                          uint32_t aFlags,
+                          nsIAsyncVerifyRedirectCallback *aCallback) override
+   {
+     MOZ_ASSERT(NS_IsMainThread());
+ 
++    nsCOMPtr<nsIURI> oldURI;
++    nsCOMPtr<nsIURI> newURI;
++
++    aOldChannel->GetURI(getter_AddRefs(oldURI));
++    aNewChannel->GetURI(getter_AddRefs(newURI));
++
++    nsAutoCString oldSpec;
++    nsAutoCString newSpec;
++
++    oldURI->GetSpec(oldSpec);
++    newURI->GetSpec(newSpec);
++
++    printf_stderr("### ### [%p] ClientChannelHelper::%s flags:0x%x old:%s new:%s\n",
++                  this, __func__, aFlags, oldSpec.get(), newSpec.get());
++
+     nsCOMPtr<nsILoadInfo> oldLoadInfo;
+     nsresult rv = aOldChannel->GetLoadInfo(getter_AddRefs(oldLoadInfo));
+     NS_ENSURE_SUCCESS(rv, rv);
+ 
+     nsCOMPtr<nsILoadInfo> newLoadInfo;
+     rv = aNewChannel->GetLoadInfo(getter_AddRefs(newLoadInfo));
+     NS_ENSURE_SUCCESS(rv, rv);
+ 
+diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/ServiceWorkerManager.cpp
+--- a/dom/serviceworkers/ServiceWorkerManager.cpp
++++ b/dom/serviceworkers/ServiceWorkerManager.cpp
+@@ -34,16 +34,17 @@
+ #include "mozilla/ClearOnShutdown.h"
+ #include "mozilla/ErrorNames.h"
+ #include "mozilla/LoadContext.h"
+ #include "mozilla/SystemGroup.h"
+ #include "mozilla/Telemetry.h"
+ #include "mozilla/dom/BindingUtils.h"
+ #include "mozilla/dom/ClientHandle.h"
+ #include "mozilla/dom/ClientManager.h"
++#include "mozilla/dom/ClientSource.h"
+ #include "mozilla/dom/ConsoleUtils.h"
+ #include "mozilla/dom/ContentParent.h"
+ #include "mozilla/dom/DOMPrefs.h"
+ #include "mozilla/dom/ErrorEvent.h"
+ #include "mozilla/dom/Headers.h"
+ #include "mozilla/dom/InternalHeaders.h"
+ #include "mozilla/dom/Navigator.h"
+ #include "mozilla/dom/NotificationEvent.h"
+@@ -2484,16 +2485,42 @@ ServiceWorkerManager::DispatchFetchEvent
+       //       is no way for the controller to be cleared from a client in
+       //       the spec or our implementation.  We may want to force a
+       //       new inner window to be created instead of reusing the
+       //       initial about:blank global.  See bug 1419620 and the spec
+       //       issue here: https://github.com/w3c/ServiceWorker/issues/1232
+     }
+ 
+     if (clientInfo.isSome()) {
++      // ClientChannelHelper is not called for STS upgrades that get
++      // intercepted by a service worker when interception occurs in
++      // the content process.  Therefore the reserved client is not
++      // properly cleared in that case leading to a situation where
++      // a ClientSource with an http:// principal is controlled by
++      // a ServiceWorker with an https:// principal.
++      //
++      // This does not occur when interception is handled by the
++      // simpler InterceptedHttpChannel approach in the parent.
++      //
++      // As a temporary work around check for this principal mismatch
++      // here and perform the ClientChannelHelper's replacement of
++      // reserved client automatically.
++      nsCOMPtr<nsIPrincipal> clientPrincipal = clientInfo.ref().GetPrincipal();
++      if (!clientPrincipal || !clientPrincipal->Equals(principal)) {
++        UniquePtr<ClientSource> reservedClient = loadInfo->TakeReservedClientSource();
++        nsCOMPtr<nsISerialEventTarget> target =
++          reservedClient ? reservedClient->EventTarget()
++                         : SystemGroup::EventTargetFor(TaskCategory::Other);
++        reservedClient.reset();
++        reservedClient = ClientManager::CreateSource(ClientType::Window,
++                                                     target,
++                                                     principal);
++        loadInfo->GiveReservedClientSource(Move(reservedClient));
++      }
++
+       // First, attempt to mark the reserved client controlled directly.  This
+       // will update the controlled status in the ClientManagerService in the
+       // parent.  It will also eventually propagate back to the ClientSource.
+       StartControllingClient(clientInfo.ref(), registration);
+     }
+ 
+     // But we also note the reserved state on the LoadInfo.  This allows the
+     // ClientSource to be updated immediately after the nsIChannel starts.
+diff --git a/netwerk/protocol/http/HttpChannelChild.cpp b/netwerk/protocol/http/HttpChannelChild.cpp
+--- a/netwerk/protocol/http/HttpChannelChild.cpp
++++ b/netwerk/protocol/http/HttpChannelChild.cpp
+@@ -1753,16 +1753,18 @@ HttpChannelChild::SetupRedirect(nsIURI* 
+                ((redirectFlags & (nsIChannelEventSink::REDIRECT_TEMPORARY |
+                                   nsIChannelEventSink::REDIRECT_PERMANENT)) != 0) &&
+                channelChild->ShouldInterceptURI(uri, shouldUpgrade)) {
+       // In the case where the redirect mode is manual, we need to check whether
+       // the post-redirect channel needs to be intercepted.  If that is the
+       // case, force the new channel to intercept the request in the parent
+       // similar to the case above, but also remember that ShouldInterceptURI()
+       // returned true to avoid calling it a second time.
++      printf_stderr("### ### [%p] HttpChannelChild::%s calling ForceIntercepted with shouldUpgrade:%s\n",
++                    this, __func__, (shouldUpgrade ? "true" : "false"));
+       rv = httpChannelChild->ForceIntercepted(true, shouldUpgrade);
+     }
+     MOZ_ASSERT(NS_SUCCEEDED(rv));
+   }
+ 
+   mRedirectChannelChild = do_QueryInterface(newChannel);
+   newChannel.forget(outChannel);
+ 
+@@ -2548,16 +2550,18 @@ HttpChannelChild::AsyncOpen(nsIStreamLis
+     nsCOMPtr<nsINetworkInterceptController> controller;
+     GetCallback(controller);
+ 
+     mInterceptListener = new InterceptStreamListener(this, mListenerContext);
+ 
+     RefPtr<InterceptedChannelContent> intercepted =
+         new InterceptedChannelContent(this, controller,
+                                       mInterceptListener, shouldUpgrade);
++    printf_stderr("### ### [%p] HttpChannelChild::%s notifying controller - shouldUpgrade:%s\n",
++                  this, __func__, (shouldUpgrade ? "true" : "false"));
+     intercepted->NotifyController();
+     return NS_OK;
+   }
+ 
+   return ContinueAsyncOpen();
+ }
+ 
+ NS_IMETHODIMP
