@@ -1,11 +1,33 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  f35ec25489cb8e7fe95b9a0aae20ba9a84076fe6
+# Parent  c7a23436255418088bd092cc9cf4371c4b801d70
+Bug 1436812 P3 Add new ServiceWorkerContainer.ready mechanism based on MozPromise. r=asuth
 
 diff --git a/dom/serviceworkers/ServiceWorkerContainer.cpp b/dom/serviceworkers/ServiceWorkerContainer.cpp
 --- a/dom/serviceworkers/ServiceWorkerContainer.cpp
 +++ b/dom/serviceworkers/ServiceWorkerContainer.cpp
-@@ -281,26 +281,56 @@ ServiceWorkerContainer::GetRegistration(
+@@ -96,16 +96,20 @@ ServiceWorkerContainer::ControllerChange
+   }
+   mControllerWorker = go->GetOrCreateServiceWorker(go->GetController().ref());
+   aRv = DispatchTrustedEvent(NS_LITERAL_STRING("controllerchange"));
+ }
+ 
+ void
+ ServiceWorkerContainer::RemoveReadyPromise()
+ {
++  mReadyPromiseHolder.DisconnectIfExists();
++  if (mReadyPromise) {
++    mReadyPromise->MaybeReject(NS_ERROR_DOM_ABORT_ERR);
++  }
+   if (nsCOMPtr<nsPIDOMWindowInner> window = GetOwner()) {
+     nsCOMPtr<nsIServiceWorkerManager> swm =
+       mozilla::services::GetServiceWorkerManager();
+     if (!swm) {
+       // If the browser is shutting down, we don't need to remove the promise.
+       return;
+     }
+ 
+@@ -282,26 +286,55 @@ ServiceWorkerContainer::GetRegistration(
  
  Promise*
  ServiceWorkerContainer::GetReady(ErrorResult& aRv)
@@ -15,7 +37,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerContainer.cpp b/dom/serviceworkers/
    }
  
 -  nsCOMPtr<nsIServiceWorkerManager> swm = mozilla::services::GetServiceWorkerManager();
-+  nsCOMPtr<nsIGlobalObject> global = GetParentObject();
++  nsIGlobalObject* global = GetParentObject();
 +  if (!global) {
 +    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
 +    return nullptr;
@@ -45,19 +67,18 @@ diff --git a/dom/serviceworkers/ServiceWorkerContainer.cpp b/dom/serviceworkers/
 +  RefPtr<Promise> outer = mReadyPromise;
 +  swm->OnReady(clientInfo.ref())->Then(
 +    global->EventTargetFor(TaskCategory::Other), __func__,
-+    [outer, global] (const ServiceWorkerRegistrationDescriptor& aDescriptor) {
-+      // TODO: don't require window here
-+      nsCOMPtr<nsPIDOMWindowInner> window(do_QueryInterface(global));
-+      NS_ENSURE_TRUE_VOID(window);
++    [outer, this] (const ServiceWorkerRegistrationDescriptor& aDescriptor) {
++      mReadyPromiseHolder.Complete();
++      nsIGlobalObject* global = GetParentObject();
++      NS_ENSURE_TRUE_VOID(global);
 +      RefPtr<ServiceWorkerRegistration> reg =
-+        window->GetServiceWorkerRegistration(aDescriptor);
++        global->GetOrCreateServiceWorkerRegistration(aDescriptor);
 +      NS_ENSURE_TRUE_VOID(reg);
 +      outer->MaybeResolve(reg);
-+    }, [outer] (nsresult aRv) {
++    }, [outer, this] (nsresult aRv) {
++      mReadyPromiseHolder.Complete();
 +      outer->MaybeReject(aRv);
-+    });
-+
-+  // TODO: track the MozPromise and disconnect when destroyed
++    })->Track(mReadyPromiseHolder);
 +
    return mReadyPromise;
  }
@@ -67,10 +88,47 @@ diff --git a/dom/serviceworkers/ServiceWorkerContainer.cpp b/dom/serviceworkers/
  ServiceWorkerContainer::GetScopeForUrl(const nsAString& aUrl,
                                         nsString& aScope,
                                         ErrorResult& aRv)
+diff --git a/dom/serviceworkers/ServiceWorkerContainer.h b/dom/serviceworkers/ServiceWorkerContainer.h
+--- a/dom/serviceworkers/ServiceWorkerContainer.h
++++ b/dom/serviceworkers/ServiceWorkerContainer.h
+@@ -3,16 +3,17 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_serviceworkercontainer_h__
+ #define mozilla_dom_serviceworkercontainer_h__
+ 
+ #include "mozilla/DOMEventTargetHelper.h"
++#include "mozilla/dom/ServiceWorkerUtils.h"
+ 
+ class nsIGlobalWindow;
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ class Promise;
+ struct RegistrationOptions;
+@@ -74,14 +75,15 @@ private:
+ 
+   void RemoveReadyPromise();
+ 
+   // This only changes when a worker hijacks everything in its scope by calling
+   // claim.
+   RefPtr<ServiceWorker> mControllerWorker;
+ 
+   RefPtr<Promise> mReadyPromise;
++  MozPromiseRequestHolder<ServiceWorkerRegistrationPromise> mReadyPromiseHolder;
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif /* mozilla_dom_serviceworkercontainer_h__ */
 diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/ServiceWorkerManager.cpp
 --- a/dom/serviceworkers/ServiceWorkerManager.cpp
 +++ b/dom/serviceworkers/ServiceWorkerManager.cpp
-@@ -1433,29 +1433,69 @@ ServiceWorkerManager::StorePendingReadyP
+@@ -1430,29 +1430,78 @@ ServiceWorkerManager::StorePendingReadyP
  
    // We should not have 2 pending promises for the same window.
    MOZ_ASSERT(!mPendingReadyPromises.Get(aWindow, &data));
@@ -85,8 +143,8 @@ diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/Se
 +  AssertIsOnMainThread();
 +
 +  for (auto &prd : mPendingReadyList) {
-+    if (prd->mClientInfo.Id() == aClientInfo.Id() &&
-+        prd->mClientInfo.PrincipalInfo() == aClientInfo.PrincipalInfo()) {
++    if (prd->mClientHandle->Info().Id() == aClientInfo.Id() &&
++        prd->mClientHandle->Info().PrincipalInfo() == aClientInfo.PrincipalInfo()) {
 +      return prd->mPromise;
 +    }
 +  }
@@ -98,9 +156,18 @@ diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/Se
 +                                                              __func__);
 +  }
 +
-+  // TODO: Use ClientHandle::OnDetach() to clean this list up.
++  nsCOMPtr<nsISerialEventTarget> target =
++    SystemGroup::EventTargetFor(TaskCategory::Other);
 +
-+  mPendingReadyList.AppendElement(MakeUnique<PendingReadyData>(aClientInfo));
++  RefPtr<ClientHandle> handle = ClientManager::CreateHandle(aClientInfo, target);
++  mPendingReadyList.AppendElement(MakeUnique<PendingReadyData>(handle));
++
++  RefPtr<ServiceWorkerManager> self(this);
++  handle->OnDetach()->Then( target, __func__,
++    [self = Move(self), aClientInfo] {
++      self->RemovePendingReadyPromise(aClientInfo);
++    });
++
 +  return mPendingReadyList.LastElement()->mPromise;
 +}
 +
@@ -124,7 +191,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/Se
 +    UniquePtr<PendingReadyData> prd(Move(pendingReadyList[i]));
 +
 +    RefPtr<ServiceWorkerRegistrationInfo> reg =
-+      GetServiceWorkerRegistrationInfo(prd->mClientInfo);
++      GetServiceWorkerRegistrationInfo(prd->mClientHandle->Info());
 +
 +    if (reg && reg->GetActive()) {
 +      prd->mPromise->Resolve(reg->Descriptor(), __func__);
@@ -140,7 +207,41 @@ diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/Se
  {
    MOZ_ASSERT(aWindow);
    MOZ_ASSERT(aURI);
-@@ -1891,43 +1931,57 @@ ServiceWorkerManager::StoreRegistration(
+@@ -1471,16 +1520,33 @@ ServiceWorkerManager::CheckReadyPromise(
+       aWindow->AsGlobal()->GetOrCreateServiceWorkerRegistration(registration->Descriptor());
+     aPromise->MaybeResolve(swr);
+     return true;
+   }
+ 
+   return false;
+ }
+ 
++void
++ServiceWorkerManager::RemovePendingReadyPromise(const ClientInfo& aClientInfo)
++{
++  nsTArray<UniquePtr<PendingReadyData>> pendingReadyList;
++  mPendingReadyList.SwapElements(pendingReadyList);
++  for (uint32_t i = 0; i < pendingReadyList.Length(); ++i) {
++    UniquePtr<PendingReadyData> prd(Move(pendingReadyList[i]));
++
++    if (prd->mClientHandle->Info().Id() == aClientInfo.Id() &&
++        prd->mClientHandle->Info().PrincipalInfo() == aClientInfo.PrincipalInfo()) {
++      prd->mPromise->Reject(NS_ERROR_DOM_ABORT_ERR, __func__);
++    } else {
++      mPendingReadyList.AppendElement(Move(prd));
++    }
++  }
++}
++
+ ServiceWorkerInfo*
+ ServiceWorkerManager::GetActiveWorkerInfoForScope(const OriginAttributes& aOriginAttributes,
+                                                   const nsACString& aScope)
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+ 
+   nsCOMPtr<nsIURI> scopeURI;
+   nsresult rv = NS_NewURI(getter_AddRefs(scopeURI), aScope, nullptr, nullptr);
+@@ -1888,43 +1954,57 @@ ServiceWorkerManager::StoreRegistration(
                                                      &principalInfo)))) {
      return;
    }
@@ -201,7 +302,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/Se
    if (NS_WARN_IF(BasePrincipal::Cast(aPrincipal)->AppId() == nsIScriptSecurityManager::UNKNOWN_APP_ID)) {
      return nullptr;
    }
-@@ -1938,17 +1992,17 @@ ServiceWorkerManager::GetServiceWorkerRe
+@@ -1935,17 +2015,17 @@ ServiceWorkerManager::GetServiceWorkerRe
      return nullptr;
    }
  
@@ -252,11 +353,11 @@ diff --git a/dom/serviceworkers/ServiceWorkerManager.h b/dom/serviceworkers/Serv
  
 +  struct PendingReadyData
 +  {
-+    const ClientInfo mClientInfo;
++    RefPtr<ClientHandle> mClientHandle;
 +    RefPtr<ServiceWorkerRegistrationPromise::Private> mPromise;
 +
-+    explicit PendingReadyData(const ClientInfo& aClientInfo)
-+      : mClientInfo(aClientInfo)
++    explicit PendingReadyData(ClientHandle* aClientHandle)
++      : mClientHandle(aClientHandle)
 +      , mPromise(new ServiceWorkerRegistrationPromise::Private(__func__))
 +    { }
 +  };
@@ -271,7 +372,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerManager.h b/dom/serviceworkers/Serv
    // just means that we have any registration for the origin, regardless of
    // scope.  This is a very weak guarantee but is the best we can do when push
    // notifications can currently spin up a service worker in content processes
-@@ -305,16 +319,19 @@ public:
+@@ -305,19 +319,25 @@ public:
                  const Maybe<nsTArray<uint8_t>>& aData);
  
    nsresult
@@ -281,17 +382,23 @@ diff --git a/dom/serviceworkers/ServiceWorkerManager.h b/dom/serviceworkers/Serv
    WorkerIsIdle(ServiceWorkerInfo* aWorker);
  
 +  RefPtr<ServiceWorkerRegistrationPromise>
-+  OnReady(const ClientInfo& aClient);
++  OnReady(const ClientInfo& aClientInfo);
 +
    void
    CheckPendingReadyPromises();
  
++  void
++  RemovePendingReadyPromise(const ClientInfo& aClientInfo);
++
  private:
    ServiceWorkerManager();
    ~ServiceWorkerManager();
  
    void
-@@ -363,27 +380,30 @@ private:
+   Init(ServiceWorkerRegistrar* aRegistrar);
+ 
+   RefPtr<GenericPromise>
+@@ -363,27 +383,30 @@ private:
  
    void
    NotifyServiceWorkerRegistrationRemoved(ServiceWorkerRegistrationInfo* aRegistration);
@@ -329,7 +436,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerManager.h b/dom/serviceworkers/Serv
 diff --git a/dom/serviceworkers/ServiceWorkerUtils.h b/dom/serviceworkers/ServiceWorkerUtils.h
 --- a/dom/serviceworkers/ServiceWorkerUtils.h
 +++ b/dom/serviceworkers/ServiceWorkerUtils.h
-@@ -1,18 +1,25 @@
+@@ -1,18 +1,26 @@
  /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
  /* vim: set ts=8 sts=2 et sw=2 tw=80: */
  /* This Source Code Form is subject to the terms of the Mozilla Public
@@ -339,6 +446,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerUtils.h b/dom/serviceworkers/Servic
  #define _mozilla_dom_ServiceWorkerUtils_h
  
 +#include "mozilla/MozPromise.h"
++#include "mozilla/dom/ServiceWorkerRegistrationDescriptor.h"
 +
  namespace mozilla {
  namespace dom {
