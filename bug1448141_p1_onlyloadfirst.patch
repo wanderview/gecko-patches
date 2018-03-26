@@ -1,0 +1,121 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  7b9da7139d94951431a148dcaf8a388640c91b27
+Bug 1448141 P1 Only load service worker importScripts() from the network in ScriptLoader on first evaluation. r=asuth
+
+diff --git a/dom/workers/ScriptLoader.cpp b/dom/workers/ScriptLoader.cpp
+--- a/dom/workers/ScriptLoader.cpp
++++ b/dom/workers/ScriptLoader.cpp
+@@ -59,16 +59,17 @@
+ #include "mozilla/dom/nsCSPUtils.h"
+ #include "mozilla/dom/PerformanceStorage.h"
+ #include "mozilla/dom/Promise.h"
+ #include "mozilla/dom/PromiseNativeHandler.h"
+ #include "mozilla/dom/Response.h"
+ #include "mozilla/dom/ScriptLoader.h"
+ #include "mozilla/dom/ScriptSettings.h"
+ #include "mozilla/dom/SRILogHelper.h"
++#include "mozilla/dom/ServiceWorkerBinding.h"
+ #include "mozilla/UniquePtr.h"
+ #include "Principal.h"
+ #include "WorkerHolder.h"
+ #include "WorkerPrivate.h"
+ #include "WorkerRunnable.h"
+ #include "WorkerScope.h"
+ 
+ #define MAX_CONCURRENT_SCRIPTS 1000
+@@ -175,16 +176,27 @@ ChannelFromScriptURL(nsIPrincipal* princ
+   if (aIsMainScript && NS_SUCCEEDED(uri->SchemeIs("data", &isData)) && isData) {
+     secFlags = nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_DATA_IS_NULL;
+   }
+ 
+   nsContentPolicyType contentPolicyType =
+     aIsMainScript ? aMainScriptContentPolicyType
+                   : nsIContentPolicy::TYPE_INTERNAL_WORKER_IMPORT_SCRIPTS;
+ 
++  // The main service worker script should never be loaded over the network
++  // in this path.  It should always be offlined by ServiceWorkerScriptCache.
++  // We assert here since this error should also be caught by the runtime
++  // check in CacheScriptLoader.
++  //
++  // Note, if we ever allow service worker scripts to be loaded from network
++  // here we need to configure the channel properly.  For example, it must
++  // not allow redirects.
++  MOZ_DIAGNOSTIC_ASSERT(contentPolicyType !=
++                        nsIContentPolicy::TYPE_INTERNAL_SERVICE_WORKER);
++
+   nsCOMPtr<nsIChannel> channel;
+   // If we have the document, use it. Unfortunately, for dedicated workers
+   // 'parentDoc' ends up being the parent document, which is not the document
+   // that we want to use. So make sure to avoid using 'parentDoc' in that
+   // situation.
+   if (parentDoc && parentDoc->NodePrincipal() == principal) {
+     rv = NS_NewChannel(getter_AddRefs(channel),
+                        uri,
+@@ -459,16 +471,17 @@ public:
+   CacheScriptLoader(WorkerPrivate* aWorkerPrivate, ScriptLoadInfo& aLoadInfo,
+                     uint32_t aIndex, bool aIsWorkerScript,
+                     ScriptLoaderRunnable* aRunnable)
+     : mLoadInfo(aLoadInfo)
+     , mIndex(aIndex)
+     , mRunnable(aRunnable)
+     , mIsWorkerScript(aIsWorkerScript)
+     , mFailed(false)
++    , mState(aWorkerPrivate->GetServiceWorkerDescriptor().State())
+   {
+     MOZ_ASSERT(aWorkerPrivate);
+     MOZ_ASSERT(aWorkerPrivate->IsServiceWorker());
+     mMainThreadEventTarget = aWorkerPrivate->MainThreadEventTarget();
+     MOZ_ASSERT(mMainThreadEventTarget);
+     mBaseURI = GetBaseURI(mIsWorkerScript, aWorkerPrivate);
+     AssertIsOnMainThread();
+   }
+@@ -491,16 +504,17 @@ private:
+     AssertIsOnMainThread();
+   }
+ 
+   ScriptLoadInfo& mLoadInfo;
+   uint32_t mIndex;
+   RefPtr<ScriptLoaderRunnable> mRunnable;
+   bool mIsWorkerScript;
+   bool mFailed;
++  const ServiceWorkerState mState;
+   nsCOMPtr<nsIInputStreamPump> mPump;
+   nsCOMPtr<nsIURI> mBaseURI;
+   mozilla::dom::ChannelInfo mChannelInfo;
+   UniquePtr<PrincipalInfo> mPrincipalInfo;
+   nsCString mCSPHeaderValue;
+   nsCString mCSPReportOnlyHeaderValue;
+   nsCString mReferrerPolicyHeaderValue;
+   nsCOMPtr<nsIEventTarget> mMainThreadEventTarget;
+@@ -1752,17 +1766,30 @@ CacheScriptLoader::ResolvedCallback(JSCo
+   if (mFailed) {
+     return;
+   }
+ 
+   MOZ_ASSERT(mLoadInfo.mCacheStatus == ScriptLoadInfo::Uncached);
+ 
+   nsresult rv;
+ 
++  // The ServiceWorkerScriptCache will store data for any scripts it
++  // it knows about.  This is always at least the top level script.
++  // Depending on if a previous version of the service worker has
++  // been installed or not it may also know about importScripts().  We
++  // must handle loading and offlining new importScripts() here, however.
+   if (aValue.isUndefined()) {
++    // If this is the main script or we're not loading a new service worker
++    // then this is an error.  The storage was probably wiped without
++    // removing the service worker registration.
++    if (NS_WARN_IF(mIsWorkerScript || mState != ServiceWorkerState::Parsed)) {
++      Fail(NS_ERROR_DOM_INVALID_STATE_ERR);
++      return;
++    }
++
+     mLoadInfo.mCacheStatus = ScriptLoadInfo::ToBeCached;
+     rv = mRunnable->LoadScript(mIndex);
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       Fail(rv);
+     }
+     return;
+   }
+ 

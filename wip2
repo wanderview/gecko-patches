@@ -1,0 +1,468 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  89e1e0359d5af7bf66c9dd7fb3dba7cd052dda95
+
+diff --git a/dom/serviceworkers/ServiceWorkerDescriptor.cpp b/dom/serviceworkers/ServiceWorkerDescriptor.cpp
+--- a/dom/serviceworkers/ServiceWorkerDescriptor.cpp
++++ b/dom/serviceworkers/ServiceWorkerDescriptor.cpp
+@@ -90,16 +90,22 @@ ServiceWorkerDescriptor::Id() const
+ }
+ 
+ const mozilla::ipc::PrincipalInfo&
+ ServiceWorkerDescriptor::PrincipalInfo() const
+ {
+   return mData->principalInfo();
+ }
+ 
++already_AddRefed<nsIPrincipal>
++ServiceWorkerDescriptor::GetPrincipal() const
++{
++  return PrincipalInfoToPrincipal(PrincipalInfo());
++}
++
+ const nsCString&
+ ServiceWorkerDescriptor::Scope() const
+ {
+   return mData->scope();
+ }
+ 
+ const nsCString&
+ ServiceWorkerDescriptor::ScriptURL() const
+diff --git a/dom/serviceworkers/ServiceWorkerDescriptor.h b/dom/serviceworkers/ServiceWorkerDescriptor.h
+--- a/dom/serviceworkers/ServiceWorkerDescriptor.h
++++ b/dom/serviceworkers/ServiceWorkerDescriptor.h
+@@ -2,16 +2,17 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ #ifndef _mozilla_dom_ServiceWorkerDescriptor_h
+ #define _mozilla_dom_ServiceWorkerDescriptor_h
+ 
+ #include "mozilla/UniquePtr.h"
++#include "nsCOMPtr.h"
+ #include "nsString.h"
+ 
+ class nsIPrincipal;
+ 
+ namespace mozilla {
+ 
+ namespace ipc {
+ class PrincipalInfo;
+@@ -64,16 +65,19 @@ public:
+   operator==(const ServiceWorkerDescriptor& aRight) const;
+ 
+   uint64_t
+   Id() const;
+ 
+   const mozilla::ipc::PrincipalInfo&
+   PrincipalInfo() const;
+ 
++  already_AddRefed<nsIPrincipal>
++  GetPrincipal() const;
++
+   const nsCString&
+   Scope() const;
+ 
+   const nsCString&
+   ScriptURL() const;
+ 
+   ServiceWorkerState
+   State() const;
+diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/ServiceWorkerManager.cpp
+--- a/dom/serviceworkers/ServiceWorkerManager.cpp
++++ b/dom/serviceworkers/ServiceWorkerManager.cpp
+@@ -2405,76 +2405,16 @@ ServiceWorkerManager::DispatchFetchEvent
+     // before we get to this point.  Therefore we must handle a nullptr
+     // active worker here.
+     serviceWorker = registration->GetActive();
+     if (NS_WARN_IF(!serviceWorker)) {
+       aRv.Throw(NS_ERROR_FAILURE);
+       return;
+     }
+ 
+-    // If there is a reserved client it should be marked as controlled before
+-    // the FetchEvent is dispatched.
+-    Maybe<ClientInfo> clientInfo = loadInfo->GetReservedClientInfo();
+-
+-    // Also override the initial about:blank controller since the real
+-    // network load may be intercepted by a different service worker.  If
+-    // the intial about:blank has a controller here its simply been
+-    // inherited from its parent.
+-    if (clientInfo.isNothing()) {
+-      clientInfo = loadInfo->GetInitialClientInfo();
+-
+-      // TODO: We need to handle the case where the initial about:blank is
+-      //       controlled, but the final document load is not.  Right now
+-      //       the spec does not really say what to do.  There currently
+-      //       is no way for the controller to be cleared from a client in
+-      //       the spec or our implementation.  We may want to force a
+-      //       new inner window to be created instead of reusing the
+-      //       initial about:blank global.  See bug 1419620 and the spec
+-      //       issue here: https://github.com/w3c/ServiceWorker/issues/1232
+-    }
+-
+-    if (clientInfo.isSome()) {
+-      // ClientChannelHelper is not called for STS upgrades that get
+-      // intercepted by a service worker when interception occurs in
+-      // the content process.  Therefore the reserved client is not
+-      // properly cleared in that case leading to a situation where
+-      // a ClientSource with an http:// principal is controlled by
+-      // a ServiceWorker with an https:// principal.
+-      //
+-      // This does not occur when interception is handled by the
+-      // simpler InterceptedHttpChannel approach in the parent.
+-      //
+-      // As a temporary work around check for this principal mismatch
+-      // here and perform the ClientChannelHelper's replacement of
+-      // reserved client automatically.
+-      if (!XRE_IsParentProcess()) {
+-        nsCOMPtr<nsIPrincipal> clientPrincipal = clientInfo.ref().GetPrincipal();
+-        if (!clientPrincipal || !clientPrincipal->Equals(principal)) {
+-          UniquePtr<ClientSource> reservedClient =
+-            loadInfo->TakeReservedClientSource();
+-
+-          nsCOMPtr<nsISerialEventTarget> target =
+-            reservedClient ? reservedClient->EventTarget()
+-                           : SystemGroup::EventTargetFor(TaskCategory::Other);
+-
+-          reservedClient.reset();
+-          reservedClient = ClientManager::CreateSource(ClientType::Window,
+-                                                       target,
+-                                                       principal);
+-
+-          loadInfo->GiveReservedClientSource(Move(reservedClient));
+-        }
+-      }
+-
+-      // First, attempt to mark the reserved client controlled directly.  This
+-      // will update the controlled status in the ClientManagerService in the
+-      // parent.  It will also eventually propagate back to the ClientSource.
+-      StartControllingClient(clientInfo.ref(), registration);
+-    }
+-
+     // But we also note the reserved state on the LoadInfo.  This allows the
+     // ClientSource to be updated immediately after the nsIChannel starts.
+     // This is necessary to have the correct controller in place for immediate
+     // follow-on requests.
+     loadInfo->SetController(serviceWorker->Descriptor());
+   }
+ 
+   MOZ_DIAGNOSTIC_ASSERT(serviceWorker);
+@@ -2501,16 +2441,103 @@ ServiceWorkerManager::DispatchFetchEvent
+     MOZ_ALWAYS_SUCCEEDS(permissionsRunnable->Run());
+     return;
+   }
+   // Otherwise, ensure the upload stream can be cloned directly.  This may
+   // require some async copying, so provide a callback.
+   aRv = uploadChannel->EnsureUploadStreamIsCloneable(permissionsRunnable);
+ }
+ 
++void
++ServiceWorkerManager::FetchEventLikelyToSucceed(nsIInterceptedChannel* aChannel,
++                                                const ServiceWorkerDescriptor& aDescriptor)
++{
++  nsCOMPtr<nsIChannel> internalChannel;
++  nsresult rv = aChannel->GetChannel(getter_AddRefs(internalChannel));
++  NS_ENSURE_SUCCESS_VOID(rv);
++
++  if (nsContentUtils::IsNonSubresourceRequest(internalChannel)) {
++    return;
++  }
++
++  nsCOMPtr<nsILoadInfo> loadInfo = internalChannel->GetLoadInfo();
++  NS_ENSURE_TRUE_VOID(loadInfo);
++
++  nsCOMPtr<nsIURI> uri;
++  rv = aChannel->GetSecureUpgradedChannelURI(getter_AddRefs(uri));
++  NS_ENSURE_SUCCESS_VOID(rv);
++
++  // non-subresource request means the URI contains the principal
++  nsCOMPtr<nsIPrincipal> principal = aDescriptor.GetPrincipal();
++
++  RefPtr<ServiceWorkerRegistrationInfo> registration =
++    GetServiceWorkerRegistrationInfo(principal, uri);
++  NS_ENSURE_TRUE_VOID(registration);
++
++  // If there is a reserved client it should be marked as controlled before
++  // the FetchEvent is dispatched.
++  Maybe<ClientInfo> clientInfo = loadInfo->GetReservedClientInfo();
++
++  // Also override the initial about:blank controller since the real
++  // network load may be intercepted by a different service worker.  If
++  // the intial about:blank has a controller here its simply been
++  // inherited from its parent.
++  if (clientInfo.isNothing()) {
++    clientInfo = loadInfo->GetInitialClientInfo();
++
++    // TODO: We need to handle the case where the initial about:blank is
++    //       controlled, but the final document load is not.  Right now
++    //       the spec does not really say what to do.  There currently
++    //       is no way for the controller to be cleared from a client in
++    //       the spec or our implementation.  We may want to force a
++    //       new inner window to be created instead of reusing the
++    //       initial about:blank global.  See bug 1419620 and the spec
++    //       issue here: https://github.com/w3c/ServiceWorker/issues/1232
++  }
++
++  if (clientInfo.isSome()) {
++    // ClientChannelHelper is not called for STS upgrades that get
++    // intercepted by a service worker when interception occurs in
++    // the content process.  Therefore the reserved client is not
++    // properly cleared in that case leading to a situation where
++    // a ClientSource with an http:// principal is controlled by
++    // a ServiceWorker with an https:// principal.
++    //
++    // This does not occur when interception is handled by the
++    // simpler InterceptedHttpChannel approach in the parent.
++    //
++    // As a temporary work around check for this principal mismatch
++    // here and perform the ClientChannelHelper's replacement of
++    // reserved client automatically.
++    if (!XRE_IsParentProcess()) {
++      nsCOMPtr<nsIPrincipal> clientPrincipal = clientInfo.ref().GetPrincipal();
++      if (!clientPrincipal || !clientPrincipal->Equals(principal)) {
++        UniquePtr<ClientSource> reservedClient =
++          loadInfo->TakeReservedClientSource();
++
++        nsCOMPtr<nsISerialEventTarget> target =
++          reservedClient ? reservedClient->EventTarget()
++                         : SystemGroup::EventTargetFor(TaskCategory::Other);
++
++        reservedClient.reset();
++        reservedClient = ClientManager::CreateSource(ClientType::Window,
++                                                     target,
++                                                     principal);
++
++        loadInfo->GiveReservedClientSource(Move(reservedClient));
++      }
++    }
++
++    // First, attempt to mark the reserved client controlled directly.  This
++    // will update the controlled status in the ClientManagerService in the
++    // parent.  It will also eventually propagate back to the ClientSource.
++    StartControllingClient(clientInfo.ref(), registration);
++  }
++}
++
+ bool
+ ServiceWorkerManager::IsAvailable(nsIPrincipal* aPrincipal,
+                                   nsIURI* aURI)
+ {
+   MOZ_ASSERT(aPrincipal);
+   MOZ_ASSERT(aURI);
+ 
+   RefPtr<ServiceWorkerRegistrationInfo> registration =
+diff --git a/dom/serviceworkers/ServiceWorkerManager.h b/dom/serviceworkers/ServiceWorkerManager.h
+--- a/dom/serviceworkers/ServiceWorkerManager.h
++++ b/dom/serviceworkers/ServiceWorkerManager.h
+@@ -153,16 +153,20 @@ public:
+   bool
+   MayHaveActiveServiceWorkerInstance(ContentParent* aContent,
+                                      nsIPrincipal* aPrincipal);
+ 
+   void
+   DispatchFetchEvent(nsIInterceptedChannel* aChannel, ErrorResult& aRv);
+ 
+   void
++  FetchEventLikelyToSucceed(nsIInterceptedChannel* aChannel,
++                            const ServiceWorkerDescriptor& aDescriptor);
++
++  void
+   Update(nsIPrincipal* aPrincipal,
+          const nsACString& aScope,
+          ServiceWorkerUpdateFinishCallback* aCallback);
+ 
+   void
+   UpdateInternal(nsIPrincipal* aPrincipal,
+                  const nsACString& aScope,
+                  ServiceWorkerUpdateFinishCallback* aCallback);
+diff --git a/dom/serviceworkers/ServiceWorkerPrivate.cpp b/dom/serviceworkers/ServiceWorkerPrivate.cpp
+--- a/dom/serviceworkers/ServiceWorkerPrivate.cpp
++++ b/dom/serviceworkers/ServiceWorkerPrivate.cpp
+@@ -1333,16 +1333,17 @@ ServiceWorkerPrivate::SendNotificationEv
+ 
+ namespace {
+ 
+ // Inheriting ExtendableEventWorkerRunnable so that the worker is not terminated
+ // while handling the fetch event, though that's very unlikely.
+ class FetchEventRunnable : public ExtendableFunctionalEventWorkerRunnable
+                          , public nsIHttpHeaderVisitor {
+   nsMainThreadPtrHandle<nsIInterceptedChannel> mInterceptedChannel;
++  nsCOMPtr<nsIRunnable> mOnStartRunnable;
+   const nsCString mScriptSpec;
+   nsTArray<nsCString> mHeaderNames;
+   nsTArray<nsCString> mHeaderValues;
+   nsCString mSpec;
+   nsCString mFragment;
+   nsCString mMethod;
+   nsString mClientId;
+   bool mIsReload;
+@@ -1356,26 +1357,28 @@ class FetchEventRunnable : public Extend
+   int64_t mUploadStreamContentLength;
+   nsCString mReferrer;
+   ReferrerPolicy mReferrerPolicy;
+   nsString mIntegrity;
+ public:
+   FetchEventRunnable(WorkerPrivate* aWorkerPrivate,
+                      KeepAliveToken* aKeepAliveToken,
+                      nsMainThreadPtrHandle<nsIInterceptedChannel>& aChannel,
++                     nsIRunnable* aOnStartRunnable,
+                      // CSP checks might require the worker script spec
+                      // later on.
+                      const nsACString& aScriptSpec,
+                      nsMainThreadPtrHandle<ServiceWorkerRegistrationInfo>& aRegistration,
+                      const nsAString& aClientId,
+                      bool aIsReload,
+                      bool aMarkLaunchServiceWorkerEnd)
+     : ExtendableFunctionalEventWorkerRunnable(
+         aWorkerPrivate, aKeepAliveToken, aRegistration)
+     , mInterceptedChannel(aChannel)
++    , mOnStartRunnable(aOnStartRunnable)
+     , mScriptSpec(aScriptSpec)
+     , mClientId(aClientId)
+     , mIsReload(aIsReload)
+     , mMarkLaunchServiceWorkerEnd(aMarkLaunchServiceWorkerEnd)
+     , mCacheMode(RequestCache::Default)
+     , mRequestMode(RequestMode::No_cors)
+     , mRequestRedirect(RequestRedirect::Follow)
+     // By default we set it to same-origin since normal HTTP fetches always
+@@ -1538,16 +1541,22 @@ public:
+       mInterceptedChannel->GetLaunchServiceWorkerStart(&launchStartTime);
+ 
+       TimeStamp launchEndTime = TimeStamp();
+       mInterceptedChannel->GetLaunchServiceWorkerEnd(&launchEndTime);
+       Telemetry::AccumulateTimeDelta(Telemetry::SERVICE_WORKER_LAUNCH_TIME,
+                                      launchStartTime, launchEndTime);
+     }
+ 
++    if (mOnStartRunnable) {
++      printf_stderr("### ### dispatch mOnStartRunnable %p\n", mOnStartRunnable.get());
++      MOZ_ALWAYS_SUCCEEDS(
++        aWorkerPrivate->DispatchToMainThread(mOnStartRunnable.forget()));
++    }
++
+     mInterceptedChannel->SetDispatchFetchEventEnd(TimeStamp::Now());
+     return DispatchFetchEvent(aCx, aWorkerPrivate);
+   }
+ 
+   nsresult
+   Cancel() override
+   {
+     nsCOMPtr<nsIRunnable> runnable = new ResumeRequest(mInterceptedChannel);
+@@ -1734,16 +1743,18 @@ ServiceWorkerPrivate::SendFetchEvent(nsI
+     }
+     return NS_OK;
+   }
+ 
+   // Handle Fetch algorithm - step 16. If the service worker didn't register
+   // any fetch event handlers, then abort the interception and maybe trigger
+   // the soft update algorithm.
+   if (!mInfo->HandlesFetch()) {
++    FetchEventLikelyToSucceed(aChannel);
++
+     nsresult rv = aChannel->ResetInterception();
+     if (NS_FAILED(rv)) {
+       NS_WARNING("Failed to resume intercepted network request");
+       aChannel->CancelInterception(rv);
+     }
+ 
+     // Trigger soft updates if necessary.
+     registration->MaybeScheduleTimeCheckAndUpdate();
+@@ -1763,33 +1774,45 @@ ServiceWorkerPrivate::SendFetchEvent(nsI
+ 
+   bool newWorkerCreated = false;
+   nsresult rv = SpawnWorkerIfNeeded(FetchEvent,
+                                     failRunnable,
+                                     &newWorkerCreated,
+                                     aLoadGroup);
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+-  if (!newWorkerCreated) {
+-    aChannel->SetLaunchServiceWorkerEnd(TimeStamp::Now());
+-  }
+-
+   nsMainThreadPtrHandle<nsIInterceptedChannel> handle(
+     new nsMainThreadPtrHolder<nsIInterceptedChannel>(
+       "nsIInterceptedChannel", aChannel, false));
+ 
++  nsCOMPtr<nsIRunnable> onStartRunnable;
++
++  if (!newWorkerCreated) {
++    aChannel->SetLaunchServiceWorkerEnd(TimeStamp::Now());
++    FetchEventLikelyToSucceed(aChannel);
++  } else if (mInfo->State() == ServiceWorkerState::Activating) {
++    FetchEventLikelyToSucceed(aChannel);
++  } else {
++    onStartRunnable =
++      NewRunnableMethod<nsMainThreadPtrHandle<nsIInterceptedChannel>>(
++        "ServiceWorkerPrivate::FetchEventLikelyToSucceed",
++        this,
++        &ServiceWorkerPrivate::FetchEventLikelyToSucceed,
++        handle);
++    printf_stderr("### ### Created onStartRunnable %p\n", onStartRunnable.get());
++  }
++
+   nsMainThreadPtrHandle<ServiceWorkerRegistrationInfo> regInfo(
+     new nsMainThreadPtrHolder<ServiceWorkerRegistrationInfo>(
+       "ServiceWorkerRegistrationInfoProxy", registration, false));
+ 
+   RefPtr<KeepAliveToken> token = CreateEventKeepAliveToken();
+ 
+-
+   RefPtr<FetchEventRunnable> r =
+-    new FetchEventRunnable(mWorkerPrivate, token, handle,
++    new FetchEventRunnable(mWorkerPrivate, token, handle, onStartRunnable,
+                            mInfo->ScriptSpec(), regInfo,
+                            aClientId, aIsReload, newWorkerCreated);
+   rv = r->Init();
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return rv;
+   }
+ 
+   if (mInfo->State() == ServiceWorkerState::Activating) {
+@@ -2295,10 +2318,21 @@ ServiceWorkerPrivate::SetHandlesFetch(bo
+ 
+   if (NS_WARN_IF(!mInfo)) {
+     return;
+   }
+ 
+   mInfo->SetHandlesFetch(aValue);
+ }
+ 
++void
++ServiceWorkerPrivate::FetchEventLikelyToSucceed(nsIInterceptedChannel* aChannel)
++{
++  MOZ_ASSERT(NS_IsMainThread());
++
++  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
++  NS_ENSURE_TRUE_VOID(swm);
++
++  swm->FetchEventLikelyToSucceed(aChannel, mInfo->Descriptor());
++}
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/serviceworkers/ServiceWorkerPrivate.h b/dom/serviceworkers/ServiceWorkerPrivate.h
+--- a/dom/serviceworkers/ServiceWorkerPrivate.h
++++ b/dom/serviceworkers/ServiceWorkerPrivate.h
+@@ -154,16 +154,19 @@ public:
+   DetachDebugger();
+ 
+   bool
+   IsIdle() const;
+ 
+   void
+   SetHandlesFetch(bool aValue);
+ 
++  void
++  FetchEventLikelyToSucceed(nsIInterceptedChannel* aChannel);
++
+ private:
+   enum WakeUpReason {
+     FetchEvent = 0,
+     PushEvent,
+     PushSubscriptionChangeEvent,
+     MessageEvent,
+     NotificationClickEvent,
+     NotificationCloseEvent,
