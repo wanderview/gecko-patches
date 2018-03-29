@@ -1,0 +1,449 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  a456475502b80a1264642d9eaee9394a8fad8315
+Bug 1447871 P1 Remove nsGlobalWindowInner::CleanUp() method in favor of FreeInnerObjects(). r=smaug
+
+diff --git a/dom/base/PostMessageEvent.cpp b/dom/base/PostMessageEvent.cpp
+--- a/dom/base/PostMessageEvent.cpp
++++ b/dom/base/PostMessageEvent.cpp
+@@ -69,17 +69,17 @@ PostMessageEvent::Run()
+   sourceDocument.swap(mSourceDocument);
+ 
+   // If we bailed before this point we're going to leak mMessage, but
+   // that's probably better than crashing.
+ 
+   RefPtr<nsGlobalWindowInner> targetWindow;
+   if (mTargetWindow->IsClosedOrClosing() ||
+       !(targetWindow = mTargetWindow->GetCurrentInnerWindowInternal()) ||
+-      targetWindow->IsClosedOrClosing())
++      targetWindow->InnerObjectsFreed())
+     return NS_OK;
+ 
+   JSAutoCompartment ac(cx, targetWindow->GetWrapper());
+ 
+   // Ensure that any origin which might have been provided is the origin of this
+   // window's document.  Note that we do this *now* instead of when postMessage
+   // is called because the target window might have been navigated to a
+   // different location between then and now.  If this check happened when
+diff --git a/dom/base/nsGlobalWindowInner.cpp b/dom/base/nsGlobalWindowInner.cpp
+--- a/dom/base/nsGlobalWindowInner.cpp
++++ b/dom/base/nsGlobalWindowInner.cpp
+@@ -403,17 +403,17 @@ public:
+   {
+     return mWindow ? mWindow->EventTargetFor(TaskCategory::Other) : nullptr;
+   }
+ 
+ private:
+   ~nsGlobalWindowObserver() = default;
+ 
+   // This reference is non-owning and safe because it's cleared by
+-  // nsGlobalWindowInner::CleanUp().
++  // nsGlobalWindowInner::FreeInnerObjects().
+   nsGlobalWindowInner* MOZ_NON_OWNING_REF mWindow;
+ };
+ 
+ NS_IMPL_ISUPPORTS(nsGlobalWindowObserver, nsIObserver, nsIInterfaceRequestor)
+ 
+ class IdleRequestExecutor;
+ 
+ class IdleRequestExecutorTimeoutHandler final : public TimeoutHandler
+@@ -914,17 +914,16 @@ nsGlobalWindowInner::nsGlobalWindowInner
+     mHasVRDisplayActivateEvents(false),
+     mHasSeenGamepadInput(false),
+     mSuspendDepth(0),
+     mFreezeDepth(0),
+     mFocusMethod(0),
+     mSerial(0),
+     mIdleRequestCallbackCounter(1),
+     mIdleRequestExecutor(nullptr),
+-    mCleanedUp(false),
+     mDialogAbuseCount(0),
+     mAreDialogsEnabled(true),
+     mObservingDidRefresh(false),
+     mIteratingDocumentFlushedResolvers(false),
+     mCanSkipCCGeneration(0),
+     mBeforeUnloadListenerCount(0)
+ {
+   AssertIsOnMainThread();
+@@ -1119,22 +1118,16 @@ nsGlobalWindowInner::~nsGlobalWindowInne
+   // outer window's reference to this window that's being deleted.
+   nsGlobalWindowOuter *outer = GetOuterWindowInternal();
+   if (outer) {
+     outer->MaybeClearInnerWindow(this);
+   }
+ 
+   // We don't have to leave the tab group if we are an inner window.
+ 
+-  // While CleanUp generally seems to be intended to clean up outers, we've
+-  // historically called it for both. Changing this would probably involve
+-  // auditing all of the references that inners and outers can have, and
+-  // separating the handling into CleanUp() and FreeInnerObjects.
+-  CleanUp();
+-
+   nsCOMPtr<nsIDeviceSensors> ac = do_GetService(NS_DEVICE_SENSORS_CONTRACTID);
+   if (ac)
+     ac->RemoveWindowAsListener(this);
+ 
+   nsLayoutStatics::Release();
+ }
+ 
+ // static
+@@ -1158,118 +1151,16 @@ nsGlobalWindowInner::CleanupCachedXBLHan
+ {
+   if (mCachedXBLPrototypeHandlers &&
+       mCachedXBLPrototypeHandlers->Count() > 0) {
+     mCachedXBLPrototypeHandlers->Clear();
+   }
+ }
+ 
+ void
+-nsGlobalWindowInner::CleanUp()
+-{
+-  // Guarantee idempotence.
+-  if (mCleanedUp)
+-    return;
+-  mCleanedUp = true;
+-
+-  StartDying();
+-
+-  DisconnectEventTargetObjects();
+-
+-  if (mObserver) {
+-    nsCOMPtr<nsIObserverService> os = mozilla::services::GetObserverService();
+-    if (os) {
+-      os->RemoveObserver(mObserver, NS_IOSERVICE_OFFLINE_STATUS_TOPIC);
+-      os->RemoveObserver(mObserver, MEMORY_PRESSURE_OBSERVER_TOPIC);
+-    }
+-
+-    RefPtr<StorageNotifierService> sns = StorageNotifierService::GetOrCreate();
+-    if (sns) {
+-     sns->Unregister(mObserver);
+-    }
+-
+-    if (mIdleService) {
+-      mIdleService->RemoveIdleObserver(mObserver, MIN_IDLE_NOTIFICATION_TIME_S);
+-    }
+-
+-    Preferences::RemoveObserver(mObserver, "intl.accept_languages");
+-
+-    // Drop its reference to this dying window, in case for some bogus reason
+-    // the object stays around.
+-    mObserver->Forget();
+-  }
+-
+-  if (mNavigator) {
+-    mNavigator->Invalidate();
+-    mNavigator = nullptr;
+-  }
+-
+-  mScreen = nullptr;
+-  mMenubar = nullptr;
+-  mToolbar = nullptr;
+-  mLocationbar = nullptr;
+-  mPersonalbar = nullptr;
+-  mStatusbar = nullptr;
+-  mScrollbars = nullptr;
+-  mHistory = nullptr;
+-  mCustomElements = nullptr;
+-  mApplicationCache = nullptr;
+-  mIndexedDB = nullptr;
+-
+-  mConsole = nullptr;
+-
+-  mAudioWorklet = nullptr;
+-  mPaintWorklet = nullptr;
+-
+-  mExternal = nullptr;
+-  mInstallTrigger = nullptr;
+-
+-  mPerformance = nullptr;
+-
+-#ifdef MOZ_WEBSPEECH
+-  mSpeechSynthesis = nullptr;
+-#endif
+-
+-#if defined(MOZ_WIDGET_ANDROID)
+-  mOrientationChangeObserver = nullptr;
+-#endif
+-
+-  mChromeEventHandler = nullptr; // Forces Release
+-  mParentTarget = nullptr;
+-
+-  DisableGamepadUpdates();
+-  mHasGamepad = false;
+-  DisableVRUpdates();
+-  mHasVREvents = false;
+-  mHasVRDisplayActivateEvents = false;
+-  DisableIdleCallbackRequests();
+-
+-  if (mCleanMessageManager) {
+-    MOZ_ASSERT(mIsChrome, "only chrome should have msg manager cleaned");
+-    if (mChromeFields.mMessageManager) {
+-      mChromeFields.mMessageManager->Disconnect();
+-    }
+-  }
+-
+-  CleanupCachedXBLHandlers();
+-
+-  for (uint32_t i = 0; i < mAudioContexts.Length(); ++i) {
+-    mAudioContexts[i]->Shutdown();
+-  }
+-  mAudioContexts.Clear();
+-
+-  if (mIdleTimer) {
+-    mIdleTimer->Cancel();
+-    mIdleTimer = nullptr;
+-  }
+-
+-  mIntlUtils = nullptr;
+-}
+-
+-void
+ nsGlobalWindowInner::FreeInnerObjects()
+ {
+   // Make sure that this is called before we null out the document and
+   // other members that the window destroyed observers could
+   // re-create.
+   NotifyDOMWindowDestroyed(this);
+   if (auto* reporter = nsWindowMemoryReporter::Get()) {
+     reporter->ObserveDOMWindowDetached(this);
+@@ -1374,16 +1265,109 @@ nsGlobalWindowInner::FreeInnerObjects()
+     }
+     mBeforeUnloadListenerCount = 0;
+   }
+ 
+   // If we have any promiseDocumentFlushed callbacks, fire them now so
+   // that the Promises can resolve.
+   CallDocumentFlushedResolvers();
+   mObservingDidRefresh = false;
++
++  StartDying();
++
++  DisconnectEventTargetObjects();
++
++  if (mObserver) {
++    nsCOMPtr<nsIObserverService> os = mozilla::services::GetObserverService();
++    if (os) {
++      os->RemoveObserver(mObserver, NS_IOSERVICE_OFFLINE_STATUS_TOPIC);
++      os->RemoveObserver(mObserver, MEMORY_PRESSURE_OBSERVER_TOPIC);
++    }
++
++    RefPtr<StorageNotifierService> sns = StorageNotifierService::GetOrCreate();
++    if (sns) {
++     sns->Unregister(mObserver);
++    }
++
++    if (mIdleService) {
++      mIdleService->RemoveIdleObserver(mObserver, MIN_IDLE_NOTIFICATION_TIME_S);
++    }
++
++    Preferences::RemoveObserver(mObserver, "intl.accept_languages");
++
++    // Drop its reference to this dying window, in case for some bogus reason
++    // the object stays around.
++    mObserver->Forget();
++  }
++
++  if (mNavigator) {
++    mNavigator->Invalidate();
++    mNavigator = nullptr;
++  }
++
++  mScreen = nullptr;
++  mMenubar = nullptr;
++  mToolbar = nullptr;
++  mLocationbar = nullptr;
++  mPersonalbar = nullptr;
++  mStatusbar = nullptr;
++  mScrollbars = nullptr;
++  mHistory = nullptr;
++  mCustomElements = nullptr;
++  mApplicationCache = nullptr;
++  mIndexedDB = nullptr;
++
++  mConsole = nullptr;
++
++  mAudioWorklet = nullptr;
++  mPaintWorklet = nullptr;
++
++  mExternal = nullptr;
++  mInstallTrigger = nullptr;
++
++  mPerformance = nullptr;
++
++#ifdef MOZ_WEBSPEECH
++  mSpeechSynthesis = nullptr;
++#endif
++
++#if defined(MOZ_WIDGET_ANDROID)
++  mOrientationChangeObserver = nullptr;
++#endif
++
++  mChromeEventHandler = nullptr; // Forces Release
++  mParentTarget = nullptr;
++
++  DisableGamepadUpdates();
++  mHasGamepad = false;
++  DisableVRUpdates();
++  mHasVREvents = false;
++  mHasVRDisplayActivateEvents = false;
++  DisableIdleCallbackRequests();
++
++  if (mCleanMessageManager) {
++    MOZ_ASSERT(mIsChrome, "only chrome should have msg manager cleaned");
++    if (mChromeFields.mMessageManager) {
++      mChromeFields.mMessageManager->Disconnect();
++    }
++  }
++
++  CleanupCachedXBLHandlers();
++
++  for (uint32_t i = 0; i < mAudioContexts.Length(); ++i) {
++    mAudioContexts[i]->Shutdown();
++  }
++  mAudioContexts.Clear();
++
++  if (mIdleTimer) {
++    mIdleTimer->Cancel();
++    mIdleTimer = nullptr;
++  }
++
++  mIntlUtils = nullptr;
+ }
+ 
+ //*****************************************************************************
+ // nsGlobalWindowInner::nsISupports
+ //*****************************************************************************
+ 
+ // QueryInterface implementation for nsGlobalWindowInner
+ NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(nsGlobalWindowInner)
+@@ -4785,17 +4769,17 @@ nsGlobalWindowInner::SetFocusedNode(nsIC
+                                     uint32_t aFocusMethod,
+                                     bool aNeedsFocus)
+ {
+   if (aNode && aNode->GetComposedDoc() != mDoc) {
+     NS_WARNING("Trying to set focus to a node from a wrong document");
+     return;
+   }
+ 
+-  if (mCleanedUp) {
++  if (mInnerObjectsFreed) {
+     NS_ASSERTION(!aNode, "Trying to focus cleaned up window!");
+     aNode = nullptr;
+     aNeedsFocus = false;
+   }
+   if (mFocusedNode != aNode) {
+     UpdateCanvasFocus(false, aNode);
+     mFocusedNode = aNode;
+     mFocusMethod = aFocusMethod & FOCUSMETHOD_MASK;
+@@ -4840,17 +4824,17 @@ nsGlobalWindowInner::ShouldShowFocusRing
+ 
+   nsCOMPtr<nsPIWindowRoot> root = GetTopWindowRoot();
+   return root ? root->ShowFocusRings() : false;
+ }
+ 
+ bool
+ nsGlobalWindowInner::TakeFocus(bool aFocus, uint32_t aFocusMethod)
+ {
+-  if (mCleanedUp) {
++  if (mInnerObjectsFreed) {
+     return false;
+   }
+ 
+   if (aFocus)
+     mFocusMethod = aFocusMethod & FOCUSMETHOD_MASK;
+ 
+   if (mHasFocus != aFocus) {
+     mHasFocus = aFocus;
+diff --git a/dom/base/nsGlobalWindowInner.h b/dom/base/nsGlobalWindowInner.h
+--- a/dom/base/nsGlobalWindowInner.h
++++ b/dom/base/nsGlobalWindowInner.h
+@@ -499,26 +499,16 @@ public:
+   virtual void EnableDeviceSensor(uint32_t aType) override;
+   virtual void DisableDeviceSensor(uint32_t aType) override;
+ 
+ #if defined(MOZ_WIDGET_ANDROID)
+   virtual void EnableOrientationChangeListener() override;
+   virtual void DisableOrientationChangeListener() override;
+ #endif
+ 
+-  bool IsClosedOrClosing() {
+-    return mCleanedUp;
+-  }
+-
+-  bool
+-  IsCleanedUp() const
+-  {
+-    return mCleanedUp;
+-  }
+-
+   virtual uint32_t GetSerial() override {
+     return mSerial;
+   }
+ 
+   void AddSizeOfIncludingThis(nsWindowSizes& aWindowSizes) const;
+ 
+   void NotifyIdleObserver(IdleObserverHolder* aIdleObserverHolder,
+                           bool aCallOnidle);
+@@ -1088,17 +1078,16 @@ protected:
+ 
+   RefPtr<mozilla::dom::WakeLock> mWakeLock;
+ 
+   friend class HashchangeCallback;
+   friend class mozilla::dom::BarProp;
+ 
+   // Object Management
+   virtual ~nsGlobalWindowInner();
+-  void CleanUp();
+ 
+   void FreeInnerObjects();
+   nsGlobalWindowInner *CallerInnerWindow();
+ 
+   // Only to be called on an inner window.
+   // aDocument must not be null.
+   void InnerSetNewDocument(JSContext* aCx, nsIDocument* aDocument);
+ 
+@@ -1420,18 +1409,16 @@ protected:
+   uint32_t mIdleRequestCallbackCounter;
+   IdleRequests mIdleRequestCallbacks;
+   RefPtr<IdleRequestExecutor> mIdleRequestExecutor;
+ 
+ #ifdef DEBUG
+   nsCOMPtr<nsIURI> mLastOpenedURI;
+ #endif
+ 
+-  bool mCleanedUp;
+-
+   nsCOMPtr<nsIDOMOfflineResourceList> mApplicationCache;
+ 
+   using XBLPrototypeHandlerTable = nsJSThingHashtable<nsPtrHashKey<nsXBLPrototypeHandler>, JSObject*>;
+   mozilla::UniquePtr<XBLPrototypeHandlerTable> mCachedXBLPrototypeHandlers;
+ 
+   RefPtr<mozilla::dom::IDBFactory> mIndexedDB;
+ 
+   // This counts the number of windows that have been opened in rapid succession
+diff --git a/dom/base/nsGlobalWindowOuter.cpp b/dom/base/nsGlobalWindowOuter.cpp
+--- a/dom/base/nsGlobalWindowOuter.cpp
++++ b/dom/base/nsGlobalWindowOuter.cpp
+@@ -1049,21 +1049,16 @@ nsGlobalWindowOuter::CleanUp()
+ 
+   mOpener = nullptr;             // Forces Release
+   if (mContext) {
+     mContext = nullptr;            // Forces Release
+   }
+   mChromeEventHandler = nullptr; // Forces Release
+   mParentTarget = nullptr;
+ 
+-  nsGlobalWindowInner* inner = GetCurrentInnerWindowInternal();
+-  if (inner) {
+-    inner->CleanUp();
+-  }
+-
+   mArguments = nullptr;
+ 
+   if (mIdleTimer) {
+     mIdleTimer->Cancel();
+     mIdleTimer = nullptr;
+   }
+ }
+ 

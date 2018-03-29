@@ -3,6 +3,122 @@
 # Parent  ccda836b2a163f1a4e582aa34eb0b87dc3ed707e
 Bug 1448141 P2 Uninstall the service worker registration if update fails while its scripts are missing from offline storage. r=asuth
 
+diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/ServiceWorkerManager.cpp
+--- a/dom/serviceworkers/ServiceWorkerManager.cpp
++++ b/dom/serviceworkers/ServiceWorkerManager.cpp
+@@ -2075,18 +2075,18 @@ ServiceWorkerManager::RemoveScopeAndRegi
+     entry.Remove();
+   }
+ 
+   // Verify there are no controlled clients for the purged registration.
+   for (auto iter = swm->mControlledClients.Iter(); !iter.Done(); iter.Next()) {
+     auto& reg = iter.UserData()->mRegistrationInfo;
+     if (reg->Scope().Equals(aRegistration->Scope()) &&
+         reg->Principal()->Equals(aRegistration->Principal())) {
+-      MOZ_DIAGNOSTIC_ASSERT(false,
+-                            "controlled client when removing registration");
++      MOZ_DIAGNOSTIC_ASSERT(aRegistration->IsCorrupt(),
++                            "controlled client when removing non-corrupt registration");
+       iter.Remove();
+       break;
+     }
+   }
+ 
+   RefPtr<ServiceWorkerRegistrationInfo> info;
+   data->mInfos.Remove(aRegistration->Scope(), getter_AddRefs(info));
+   data->mOrderedScopes.RemoveElement(aRegistration->Scope());
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationInfo.cpp b/dom/serviceworkers/ServiceWorkerRegistrationInfo.cpp
+--- a/dom/serviceworkers/ServiceWorkerRegistrationInfo.cpp
++++ b/dom/serviceworkers/ServiceWorkerRegistrationInfo.cpp
+@@ -75,29 +75,43 @@ ServiceWorkerRegistrationInfo::Clear()
+     active->UpdateState(ServiceWorkerState::Redundant);
+     active->UpdateRedundantTime();
+     active->WorkerPrivate()->NoteDeadServiceWorkerInfo();
+   }
+ 
+   NotifyChromeRegistrationListeners();
+ }
+ 
++void
++ServiceWorkerRegistrationInfo::ClearAsCorrupt()
++{
++  mCorrupt = true;
++  Clear();
++}
++
++bool
++ServiceWorkerRegistrationInfo::IsCorrupt() const
++{
++  return mCorrupt;
++}
++
+ ServiceWorkerRegistrationInfo::ServiceWorkerRegistrationInfo(
+     const nsACString& aScope,
+     nsIPrincipal* aPrincipal,
+     ServiceWorkerUpdateViaCache aUpdateViaCache)
+   : mPrincipal(aPrincipal)
+   , mDescriptor(GetNextId(), aPrincipal, aScope, aUpdateViaCache)
+   , mControlledClientsCounter(0)
+   , mDelayMultiplier(0)
+   , mUpdateState(NoUpdate)
+   , mCreationTime(PR_Now())
+   , mCreationTimeStamp(TimeStamp::Now())
+   , mLastUpdateTime(0)
+   , mPendingUninstall(false)
++  , mCorrupt(false)
+ {}
+ 
+ ServiceWorkerRegistrationInfo::~ServiceWorkerRegistrationInfo()
+ {
+   MOZ_DIAGNOSTIC_ASSERT(!IsControllingClients());
+ }
+ 
+ const nsCString&
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationInfo.h b/dom/serviceworkers/ServiceWorkerRegistrationInfo.h
+--- a/dom/serviceworkers/ServiceWorkerRegistrationInfo.h
++++ b/dom/serviceworkers/ServiceWorkerRegistrationInfo.h
+@@ -45,16 +45,18 @@ class ServiceWorkerRegistrationInfo fina
+ 
+   virtual ~ServiceWorkerRegistrationInfo();
+ 
+   // When unregister() is called on a registration, it is not immediately
+   // removed since documents may be controlled. It is marked as
+   // pendingUninstall and when all controlling documents go away, removed.
+   bool mPendingUninstall;
+ 
++  bool mCorrupt;
++
+ public:
+   NS_DECL_ISUPPORTS
+   NS_DECL_NSISERVICEWORKERREGISTRATIONINFO
+ 
+   ServiceWorkerRegistrationInfo(const nsACString& aScope,
+                                 nsIPrincipal* aPrincipal,
+                                 ServiceWorkerUpdateViaCache aUpdateViaCache);
+ 
+@@ -110,16 +112,22 @@ public:
+   {
+     return mActiveWorker && mControlledClientsCounter;
+   }
+ 
+   void
+   Clear();
+ 
+   void
++  ClearAsCorrupt();
++
++  bool
++  IsCorrupt() const;
++
++  void
+   TryToActivateAsync();
+ 
+   void
+   TryToActivate();
+ 
+   void
+   Activate();
+ 
 diff --git a/dom/serviceworkers/ServiceWorkerScriptCache.cpp b/dom/serviceworkers/ServiceWorkerScriptCache.cpp
 --- a/dom/serviceworkers/ServiceWorkerScriptCache.cpp
 +++ b/dom/serviceworkers/ServiceWorkerScriptCache.cpp
@@ -307,7 +423,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerUpdateJob.cpp b/dom/serviceworkers/
 +    // Some kinds of failures indicate there is something broken in the currently
 +    // installed registration.  In these cases we want to fully unregister.
 +    if (mOnFailure == OnFailure::Uninstall) {
-+      mRegistration->Clear();
++      mRegistration->ClearAsCorrupt();
 +    }
 +
 +    // Otherwise just clear the workers we may have created as part of the
@@ -361,6 +477,31 @@ diff --git a/dom/serviceworkers/ServiceWorkerUpdateJob.cpp b/dom/serviceworkers/
  
    // Handle failure of the download or comparison.  This is part of Update
    // step 5 as "If the algorithm asynchronously completes with null, then:".
+@@ -435,16 +460,24 @@ ServiceWorkerUpdateJob::ComparisonResult
+ 
+   RefPtr<ServiceWorkerInfo> sw =
+     new ServiceWorkerInfo(mRegistration->Principal(),
+                           mRegistration->Scope(),
+                           mScriptSpec,
+                           aNewCacheName,
+                           flags);
+ 
++  // If the registration is corrupt enough to force an uninstall if the
++  // upgrade fails, then we want to make sure the upgrade takes effect
++  // if it succeeds.  Therefore force the skip-waiting flag on to replace
++  // the broken worker after install.
++  if (aOnFailure == OnFailure::Uninstall) {
++    sw->SetSkipWaitingFlag();
++  }
++
+   mRegistration->SetEvaluating(sw);
+ 
+   nsMainThreadPtrHandle<ServiceWorkerUpdateJob> handle(
+       new nsMainThreadPtrHolder<ServiceWorkerUpdateJob>(
+         "ServiceWorkerUpdateJob", this));
+   RefPtr<LifeCycleEventCallback> callback = new ContinueUpdateRunnable(handle);
+ 
+   ServiceWorkerPrivate* workerPrivate = sw->WorkerPrivate();
 diff --git a/dom/serviceworkers/ServiceWorkerUpdateJob.h b/dom/serviceworkers/ServiceWorkerUpdateJob.h
 --- a/dom/serviceworkers/ServiceWorkerUpdateJob.h
 +++ b/dom/serviceworkers/ServiceWorkerUpdateJob.h
