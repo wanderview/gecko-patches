@@ -1,7 +1,7 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  a456475502b80a1264642d9eaee9394a8fad8315
-Bug 1447871 P1 Remove nsGlobalWindowInner::CleanUp() method in favor of FreeInnerObjects(). r=smaug
+# Parent  3030b0e6f6257556fd12c1b32834c5940d02fc22
+Bug 1450266 P1 Remove nsGlobalWindowInner::CleanUp() method in favor of FreeInnerObjects(). r=smaug
 
 diff --git a/dom/base/PostMessageEvent.cpp b/dom/base/PostMessageEvent.cpp
 --- a/dom/base/PostMessageEvent.cpp
@@ -16,7 +16,7 @@ diff --git a/dom/base/PostMessageEvent.cpp b/dom/base/PostMessageEvent.cpp
    if (mTargetWindow->IsClosedOrClosing() ||
        !(targetWindow = mTargetWindow->GetCurrentInnerWindowInternal()) ||
 -      targetWindow->IsClosedOrClosing())
-+      targetWindow->InnerObjectsFreed())
++      targetWindow->IsDying())
      return NS_OK;
  
    JSAutoCompartment ac(cx, targetWindow->GetWrapper());
@@ -65,7 +65,47 @@ diff --git a/dom/base/nsGlobalWindowInner.cpp b/dom/base/nsGlobalWindowInner.cpp
      mBeforeUnloadListenerCount(0)
  {
    AssertIsOnMainThread();
-@@ -1119,22 +1118,16 @@ nsGlobalWindowInner::~nsGlobalWindowInne
+@@ -1061,17 +1060,19 @@ nsGlobalWindowInner::~nsGlobalWindowInne
+     if (mChromeFields.mMessageManager) {
+       static_cast<nsFrameMessageManager *>(
+         mChromeFields.mMessageManager.get())->Disconnect();
+     }
+ 
+     mCleanMessageManager = false;
+   }
+ 
+-  DisconnectEventTargetObjects();
++  // In most cases this should already have been called, but call it again
++  // here to catch any corner cases.
++  FreeInnerObjects();
+ 
+   if (sInnerWindowsById) {
+     MOZ_ASSERT(sInnerWindowsById->Get(mWindowID),
+                 "This window should be in the hash table");
+     sInnerWindowsById->Remove(mWindowID);
+   }
+ 
+   nsContentUtils::InnerOrOuterWindowDestroyed();
+@@ -1100,41 +1101,30 @@ nsGlobalWindowInner::~nsGlobalWindowInne
+   }
+ #endif
+ 
+   MOZ_LOG(gDOMLeakPRLogInner, LogLevel::Debug, ("DOMWINDOW %p destroyed", this));
+ 
+   Telemetry::Accumulate(Telemetry::INNERWINDOWS_WITH_MUTATION_LISTENERS,
+                         mMutationBits ? 1 : 0);
+ 
+-  if (mListenerManager) {
+-    mListenerManager->Disconnect();
+-    mListenerManager = nullptr;
+-  }
+-
+   // An inner window is destroyed, pull it out of the outer window's
+   // list if inner windows.
+ 
+   PR_REMOVE_LINK(this);
+ 
+   // If our outer window's inner window is this window, null out the
    // outer window's reference to this window that's being deleted.
    nsGlobalWindowOuter *outer = GetOuterWindowInternal();
    if (outer) {
@@ -88,7 +128,7 @@ diff --git a/dom/base/nsGlobalWindowInner.cpp b/dom/base/nsGlobalWindowInner.cpp
  }
  
  // static
-@@ -1158,118 +1151,16 @@ nsGlobalWindowInner::CleanupCachedXBLHan
+@@ -1158,120 +1148,23 @@ nsGlobalWindowInner::CleanupCachedXBLHan
  {
    if (mCachedXBLPrototypeHandlers &&
        mCachedXBLPrototypeHandlers->Count() > 0) {
@@ -101,11 +141,15 @@ diff --git a/dom/base/nsGlobalWindowInner.cpp b/dom/base/nsGlobalWindowInner.cpp
 -{
 -  // Guarantee idempotence.
 -  if (mCleanedUp)
--    return;
++nsGlobalWindowInner::FreeInnerObjects()
++{
++  if (IsDying()) {
+     return;
 -  mCleanedUp = true;
 -
--  StartDying();
--
++  }
+   StartDying();
+ 
 -  DisconnectEventTargetObjects();
 -
 -  if (mObserver) {
@@ -199,16 +243,17 @@ diff --git a/dom/base/nsGlobalWindowInner.cpp b/dom/base/nsGlobalWindowInner.cpp
 -}
 -
 -void
- nsGlobalWindowInner::FreeInnerObjects()
- {
+-nsGlobalWindowInner::FreeInnerObjects()
+-{
    // Make sure that this is called before we null out the document and
    // other members that the window destroyed observers could
    // re-create.
    NotifyDOMWindowDestroyed(this);
    if (auto* reporter = nsWindowMemoryReporter::Get()) {
      reporter->ObserveDOMWindowDetached(this);
-@@ -1374,16 +1265,109 @@ nsGlobalWindowInner::FreeInnerObjects()
-     }
+   }
+ 
+@@ -1375,32 +1268,106 @@ nsGlobalWindowInner::FreeInnerObjects()
      mBeforeUnloadListenerCount = 0;
    }
  
@@ -216,9 +261,23 @@ diff --git a/dom/base/nsGlobalWindowInner.cpp b/dom/base/nsGlobalWindowInner.cpp
    // that the Promises can resolve.
    CallDocumentFlushedResolvers();
    mObservingDidRefresh = false;
-+
-+  StartDying();
-+
+ 
+-  // Disconnect service worker objects in FreeInnerObjects().  This is normally
+-  // done from CleanUp().  In the future we plan to unify CleanUp() and
+-  // FreeInnerObjects().  See bug 1450266.
+-  ForEachEventTargetObject([&] (DOMEventTargetHelper* aTarget, bool* aDoneOut) {
+-    RefPtr<ServiceWorkerRegistration> swr = do_QueryObject(aTarget);
+-    if (swr) {
+-      aTarget->DisconnectFromOwner();
+-      return;
+-    }
+-
+-    RefPtr<ServiceWorker> sw = do_QueryObject(aTarget);
+-    if (sw) {
+-      aTarget->DisconnectFromOwner();
+-      return;
+-    }
+-  });
 +  DisconnectEventTargetObjects();
 +
 +  if (mObserver) {
@@ -317,7 +376,7 @@ diff --git a/dom/base/nsGlobalWindowInner.cpp b/dom/base/nsGlobalWindowInner.cpp
  
  // QueryInterface implementation for nsGlobalWindowInner
  NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(nsGlobalWindowInner)
-@@ -4785,17 +4769,17 @@ nsGlobalWindowInner::SetFocusedNode(nsIC
+@@ -4802,17 +4769,17 @@ nsGlobalWindowInner::SetFocusedNode(nsIC
                                      uint32_t aFocusMethod,
                                      bool aNeedsFocus)
  {
@@ -336,7 +395,7 @@ diff --git a/dom/base/nsGlobalWindowInner.cpp b/dom/base/nsGlobalWindowInner.cpp
      UpdateCanvasFocus(false, aNode);
      mFocusedNode = aNode;
      mFocusMethod = aFocusMethod & FOCUSMETHOD_MASK;
-@@ -4840,17 +4824,17 @@ nsGlobalWindowInner::ShouldShowFocusRing
+@@ -4857,17 +4824,17 @@ nsGlobalWindowInner::ShouldShowFocusRing
  
    nsCOMPtr<nsPIWindowRoot> root = GetTopWindowRoot();
    return root ? root->ShowFocusRings() : false;
