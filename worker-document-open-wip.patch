@@ -1,0 +1,202 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  e84993a8102acf01f4038709343d73369edde2d0
+
+diff --git a/dom/base/nsGlobalWindowInner.cpp b/dom/base/nsGlobalWindowInner.cpp
+--- a/dom/base/nsGlobalWindowInner.cpp
++++ b/dom/base/nsGlobalWindowInner.cpp
+@@ -2492,16 +2492,18 @@ nsGlobalWindowInner::MigrateStateForDocu
+   // Move the old Performance object from the old window to the new window.
+   // The Performance object was also rebound in the DETH loop above.
+   mPerformance = aOldInner->mPerformance.forget();
+ 
+   if (aOldInner->mIndexedDB) {
+     aOldInner->mIndexedDB->RebindToNewWindow(this);
+     mIndexedDB = aOldInner->mIndexedDB.forget();
+   }
++
++  RebindWorkersToNewWindow(aOldInner, this);
+ }
+ 
+ void
+ nsGlobalWindowInner::UpdateTopInnerWindow()
+ {
+   if (IsTopInnerWindow() || !mTopInnerWindow) {
+     return;
+   }
+diff --git a/dom/workers/RuntimeService.cpp b/dom/workers/RuntimeService.cpp
+--- a/dom/workers/RuntimeService.cpp
++++ b/dom/workers/RuntimeService.cpp
+@@ -2254,16 +2254,44 @@ RuntimeService::ResumeWorkersForWindow(n
+   nsTArray<WorkerPrivate*> workers;
+   GetWorkersForWindow(aWindow, workers);
+ 
+   for (uint32_t index = 0; index < workers.Length(); index++) {
+     workers[index]->ParentWindowResumed();
+   }
+ }
+ 
++void
++RuntimeService::RebindWorkersToNewWindow(nsPIDOMWindowInner* aOld,
++                                         nsPIDOMWindowInner* aNew)
++{
++  AssertIsOnMainThread();
++
++  auto oldResult = mWindowMap.Lookup(aOld);
++  if (!oldResult) {
++    // no workers, nothing to do here
++    return;
++  }
++
++  MOZ_ASSERT(!oldResult.Data()->IsEmpty());
++
++  auto& newResult = mWindowMap.GetOrInsert(aNew);
++  if (newResult) {
++    newResult->AppendElements(*oldResult.Data());
++  } else {
++    newResult = new nsTArray<WorkerPrivate*>(*oldResult.Data());
++  }
++
++  oldResult.Remove();
++
++  for (auto worker : *newResult) {
++    worker->RebindToNewWindow(aNew);
++  }
++}
++
+ nsresult
+ RuntimeService::CreateSharedWorker(const GlobalObject& aGlobal,
+                                    const nsAString& aScriptURL,
+                                    const nsAString& aName,
+                                    SharedWorker** aSharedWorker)
+ {
+   AssertIsOnMainThread();
+ 
+@@ -2848,16 +2876,26 @@ ResumeWorkersForWindow(nsPIDOMWindowInne
+ {
+   AssertIsOnMainThread();
+   RuntimeService* runtime = RuntimeService::GetService();
+   if (runtime) {
+     runtime->ResumeWorkersForWindow(aWindow);
+   }
+ }
+ 
++void
++RebindWorkersToNewWindow(nsPIDOMWindowInner* aOld, nsPIDOMWindowInner* aNew)
++{
++  AssertIsOnMainThread();
++  RuntimeService* runtime = RuntimeService::GetService();
++  if (runtime) {
++    runtime->RebindWorkersToNewWindow(aOld, aNew);
++  }
++}
++
+ WorkerPrivate*
+ GetWorkerPrivateFromContext(JSContext* aCx)
+ {
+   MOZ_ASSERT(!NS_IsMainThread());
+   MOZ_ASSERT(aCx);
+ 
+   void* cxPrivate = JS_GetContextPrivate(aCx);
+   if (!cxPrivate) {
+diff --git a/dom/workers/RuntimeService.h b/dom/workers/RuntimeService.h
+--- a/dom/workers/RuntimeService.h
++++ b/dom/workers/RuntimeService.h
+@@ -147,16 +147,19 @@ public:
+   ThawWorkersForWindow(nsPIDOMWindowInner* aWindow);
+ 
+   void
+   SuspendWorkersForWindow(nsPIDOMWindowInner* aWindow);
+ 
+   void
+   ResumeWorkersForWindow(nsPIDOMWindowInner* aWindow);
+ 
++  void
++  RebindWorkersToNewWindow(nsPIDOMWindowInner* aOld, nsPIDOMWindowInner* aNew);
++
+   nsresult
+   CreateSharedWorker(const GlobalObject& aGlobal,
+                      const nsAString& aScriptURL,
+                      const nsAString& aName,
+                      SharedWorker** aSharedWorker);
+ 
+   void
+   ForgetSharedWorker(WorkerPrivate* aWorkerPrivate);
+diff --git a/dom/workers/WorkerCommon.h b/dom/workers/WorkerCommon.h
+--- a/dom/workers/WorkerCommon.h
++++ b/dom/workers/WorkerCommon.h
+@@ -48,16 +48,19 @@ void
+ ThawWorkersForWindow(nsPIDOMWindowInner* aWindow);
+ 
+ void
+ SuspendWorkersForWindow(nsPIDOMWindowInner* aWindow);
+ 
+ void
+ ResumeWorkersForWindow(nsPIDOMWindowInner* aWindow);
+ 
++void
++RebindWorkersToNewWindow(nsPIDOMWindowInner* aOld, nsPIDOMWindowInner* aNew);
++
+ // All of these are implemented in WorkerScope.cpp
+ 
+ bool
+ IsWorkerGlobal(JSObject* global);
+ 
+ bool
+ IsWorkerDebuggerGlobal(JSObject* global);
+ 
+diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
+--- a/dom/workers/WorkerPrivate.cpp
++++ b/dom/workers/WorkerPrivate.cpp
+@@ -1863,16 +1863,28 @@ WorkerPrivate::Thaw(nsPIDOMWindowInner* 
+   if (!runnable->Dispatch()) {
+     return false;
+   }
+ 
+   return true;
+ }
+ 
+ void
++WorkerPrivate::RebindToNewWindow(nsPIDOMWindowInner* aWindow)
++{
++  AssertIsOnMainThread();
++  mLoadInfo.mWindowID = aWindow->WindowID();
++  if (mLoadInfo.mWindow) {
++    mLoadInfo.mWindow = aWindow;
++  }
++
++  // TODO: propagate new window ID to child workers
++}
++
++void
+ WorkerPrivate::ParentWindowPaused()
+ {
+   AssertIsOnMainThread();
+   MOZ_ASSERT_IF(IsDedicatedWorker(), mParentWindowPausedDepth == 0);
+   mParentWindowPausedDepth += 1;
+ }
+ 
+ void
+diff --git a/dom/workers/WorkerPrivate.h b/dom/workers/WorkerPrivate.h
+--- a/dom/workers/WorkerPrivate.h
++++ b/dom/workers/WorkerPrivate.h
+@@ -1116,16 +1116,19 @@ public:
+   // respectively.  See bug 1251722.
+   bool
+   Freeze(nsPIDOMWindowInner* aWindow);
+ 
+   bool
+   Thaw(nsPIDOMWindowInner* aWindow);
+ 
+   void
++  RebindToNewWindow(nsPIDOMWindowInner* aWindow);
++
++  void
+   EnableDebugger();
+ 
+   void
+   DisableDebugger();
+ 
+   already_AddRefed<WorkerRunnable>
+   MaybeWrapAsWorkerRunnable(already_AddRefed<nsIRunnable> aRunnable);
+ 

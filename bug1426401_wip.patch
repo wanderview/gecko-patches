@@ -1,0 +1,192 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  187677ccd0a51bd927fe726eb683b57ffff89603
+Bug 1426401 Serialize waiting service workers properly and activate them on first read.
+
+diff --git a/dom/serviceworkers/ServiceWorkerInfo.h b/dom/serviceworkers/ServiceWorkerInfo.h
+--- a/dom/serviceworkers/ServiceWorkerInfo.h
++++ b/dom/serviceworkers/ServiceWorkerInfo.h
+@@ -177,17 +177,17 @@ public:
+     return mDescriptor;
+   }
+ 
+   void
+   UpdateState(ServiceWorkerState aState);
+ 
+   // Only used to set initial state when loading from disk!
+   void
+-  SetActivateStateUncheckedWithoutEvent(ServiceWorkerState aState)
++  SetStateUncheckedWithoutEvent(ServiceWorkerState aState)
+   {
+     MOZ_ASSERT(NS_IsMainThread());
+     mDescriptor.SetState(aState);
+   }
+ 
+   void
+   SetHandlesFetch(bool aHandlesFetch)
+   {
+diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/ServiceWorkerManager.cpp
+--- a/dom/serviceworkers/ServiceWorkerManager.cpp
++++ b/dom/serviceworkers/ServiceWorkerManager.cpp
+@@ -191,31 +191,30 @@ PopulateRegistrationData(nsIPrincipal* a
+ 
+   nsresult rv = PrincipalToPrincipalInfo(aPrincipal, &aData.principal());
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return rv;
+   }
+ 
+   aData.scope() = aRegistration->Scope();
+ 
+-  RefPtr<ServiceWorkerInfo> newest = aRegistration->Newest();
+-  if (NS_WARN_IF(!newest)) {
+-    return NS_ERROR_FAILURE;
+-  }
+-
+-  if (aRegistration->GetActive()) {
+-    aData.currentWorkerURL() = aRegistration->GetActive()->ScriptSpec();
+-    aData.cacheName() = aRegistration->GetActive()->CacheName();
+-    aData.currentWorkerHandlesFetch() = aRegistration->GetActive()->HandlesFetch();
+-
+-    aData.currentWorkerInstalledTime() =
+-      aRegistration->GetActive()->GetInstalledTime();
+-    aData.currentWorkerActivatedTime() =
+-      aRegistration->GetActive()->GetActivatedTime();
+-  }
++  // If there is a waiting worker we should save it as the active
++  // worker in the registrar.  That way if the browser is closed
++  // it will become active on the next browser launch.
++  RefPtr<ServiceWorkerInfo> nextActive = aRegistration->GetWaiting()
++                                       ? aRegistration->GetWaiting()
++                                       : aRegistration->GetActive();
++  NS_ENSURE_TRUE(nextActive, NS_ERROR_FAILURE);
++
++  aData.currentWorkerURL() = nextActive->ScriptSpec();
++  aData.cacheName() = nextActive->CacheName();
++  aData.currentWorkerHandlesFetch() = nextActive->HandlesFetch();
++
++  aData.currentWorkerInstalledTime() = nextActive->GetInstalledTime();
++  aData.currentWorkerActivatedTime() = nextActive->GetActivatedTime();
+ 
+   aData.updateViaCache() =
+     static_cast<uint32_t>(aRegistration->GetUpdateViaCache());
+ 
+   aData.lastUpdateTime() = aRegistration->GetLastUpdateTime();
+ 
+   return NS_OK;
+ }
+@@ -1764,27 +1763,35 @@ ServiceWorkerManager::LoadRegistration(
+ 
+   nsLoadFlags importsLoadFlags = nsIChannel::LOAD_BYPASS_SERVICE_WORKER;
+   importsLoadFlags |=
+     aRegistration.updateViaCache() == static_cast<uint16_t>(ServiceWorkerUpdateViaCache::None)
+       ? nsIRequest::LOAD_NORMAL
+       : nsIRequest::VALIDATE_ALWAYS;
+ 
+   const nsCString& currentWorkerURL = aRegistration.currentWorkerURL();
+-  if (!currentWorkerURL.IsEmpty()) {
+-    registration->SetActive(
+-      new ServiceWorkerInfo(registration->Principal(),
+-                            registration->Scope(),
+-                            currentWorkerURL,
+-                            aRegistration.cacheName(),
+-                            importsLoadFlags));
+-    registration->GetActive()->SetHandlesFetch(aRegistration.currentWorkerHandlesFetch());
+-    registration->GetActive()->SetInstalledTime(aRegistration.currentWorkerInstalledTime());
+-    registration->GetActive()->SetActivatedTime(aRegistration.currentWorkerActivatedTime());
++  if (currentWorkerURL.IsEmpty()) {
++    return;
+   }
++
++  // Hydrate the next worker to be active for the registration.
++  RefPtr<ServiceWorkerInfo> info =
++    new ServiceWorkerInfo(registration->Principal(),
++                          registration->Scope(),
++                          currentWorkerURL,
++                          aRegistration.cacheName(),
++                          importsLoadFlags);
++  info->SetHandlesFetch(aRegistration.currentWorkerHandlesFetch());
++  info->SetInstalledTime(aRegistration.currentWorkerInstalledTime());
++  info->SetActivatedTime(aRegistration.currentWorkerActivatedTime());
++
++  // Set it active.  If the worker has a null activated time then
++  // it will be set to waiting and transitioned with an activate event.
++  // Otherwise it will be simply set as active.
++  registration->SetActive(info);
+ }
+ 
+ void
+ ServiceWorkerManager::LoadRegistrations(
+                   const nsTArray<ServiceWorkerRegistrationData>& aRegistrations)
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+ 
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrar.cpp b/dom/serviceworkers/ServiceWorkerRegistrar.cpp
+--- a/dom/serviceworkers/ServiceWorkerRegistrar.cpp
++++ b/dom/serviceworkers/ServiceWorkerRegistrar.cpp
+@@ -774,16 +774,17 @@ ServiceWorkerRegistrar::RegisterServiceW
+     if (Equivalent(aData, mData[i])) {
+       mData[i] = aData;
+       found = true;
+       break;
+     }
+   }
+ 
+   if (!found) {
++    MOZ_DIAGNOSTIC_ASSERT(!aData.currentWorkerURL().IsEmpty());
+     mData.AppendElement(aData);
+   }
+ }
+ 
+ class ServiceWorkerRegistrarSaveDataRunnable final : public Runnable
+ {
+ public:
+   ServiceWorkerRegistrarSaveDataRunnable()
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationInfo.cpp b/dom/serviceworkers/ServiceWorkerRegistrationInfo.cpp
+--- a/dom/serviceworkers/ServiceWorkerRegistrationInfo.cpp
++++ b/dom/serviceworkers/ServiceWorkerRegistrationInfo.cpp
+@@ -624,27 +624,44 @@ ServiceWorkerRegistrationInfo::SetActive
+   // TODO: Assert installing, waiting, and active are nullptr once the SWM
+   //       moves to the parent process.  After that happens this code will
+   //       only run for browser initialization and not for cross-process
+   //       overrides.
+   MOZ_ASSERT(mInstallingWorker != aServiceWorker);
+   MOZ_ASSERT(mWaitingWorker != aServiceWorker);
+   MOZ_ASSERT(mActiveWorker != aServiceWorker);
+ 
++  // If the given worker does not have an activated time then it
++  // never processed an activate event.  The browser must have
++  // restarted before it went from waiting to active.  To handle
++  // this we set the new worker to waiting and then transition it
++  // to active.
++  if (aServiceWorker->GetActivatedTime().IsNull()) {
++    if (mWaitingWorker) {
++      MOZ_ASSERT(aServiceWorker->CacheName() != mWaitingWorker->CacheName());
++      mWaitingWorker->UpdateState(ServiceWorkerState::Redundant);
++      mWaitingWorker->UpdateRedundantTime();
++    }
++    mWaitingWorker = aServiceWorker;
++    mWaitingWorker->SetStateUnchecked(ServiceWorkerState::Waiting);
++    TransitionWaitingToActive();
++    return;
++  }
++
+   if (mActiveWorker) {
+     MOZ_ASSERT(aServiceWorker->CacheName() != mActiveWorker->CacheName());
+     mActiveWorker->UpdateState(ServiceWorkerState::Redundant);
+     mActiveWorker->UpdateRedundantTime();
+   }
+ 
+   // The active worker is being overriden due to initial load or
+   // another process activating a worker.  Move straight to the
+   // Activated state.
+   mActiveWorker = aServiceWorker;
+-  mActiveWorker->SetActivateStateUncheckedWithoutEvent(ServiceWorkerState::Activated);
++  mActiveWorker->SetStateUnchecked(ServiceWorkerState::Activated);
+ 
+   // We don't need to update activated time when we load registration from
+   // registrar.
+   UpdateRegistrationState();
+ 
+   NotifyChromeRegistrationListeners();
+ }
+ 
