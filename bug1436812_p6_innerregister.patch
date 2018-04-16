@@ -193,7 +193,85 @@ diff --git a/dom/serviceworkers/ServiceWorkerContainerImpl.h b/dom/serviceworker
 diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/ServiceWorkerManager.cpp
 --- a/dom/serviceworkers/ServiceWorkerManager.cpp
 +++ b/dom/serviceworkers/ServiceWorkerManager.cpp
-@@ -756,16 +756,17 @@ private:
+@@ -431,66 +431,51 @@ ServiceWorkerManager::MaybeStartShutdown
+   RefPtr<TeardownRunnable> runnable = new TeardownRunnable(mActor);
+   nsresult rv = NS_DispatchToMainThread(runnable);
+   Unused << NS_WARN_IF(NS_FAILED(rv));
+   mActor = nullptr;
+ }
+ 
+ class ServiceWorkerResolveWindowPromiseOnRegisterCallback final : public ServiceWorkerJob::Callback
+ {
+-  // The promise "returned" by the call to Update up to
+-  // navigator.serviceWorker.register().
+-  PromiseWindowProxy mPromise;
++  RefPtr<ServiceWorkerRegistrationPromise::Private> mPromise;
+ 
+   ~ServiceWorkerResolveWindowPromiseOnRegisterCallback()
+   {}
+ 
+   virtual void
+   JobFinished(ServiceWorkerJob* aJob, ErrorResult& aStatus) override
+   {
+     MOZ_ASSERT(NS_IsMainThread());
+     MOZ_ASSERT(aJob);
+-    RefPtr<Promise> promise = mPromise.Get();
+-    if (!promise) {
+-      return;
+-    }
+ 
+     if (aStatus.Failed()) {
+-      promise->MaybeReject(aStatus);
+-      return;
+-    }
+-
+-    nsCOMPtr<nsPIDOMWindowInner> window = mPromise.GetWindow();
+-    if (!window) {
++      mPromise->Reject(aStatus.StealNSResult(), __func__);
+       return;
+     }
+ 
+     MOZ_ASSERT(aJob->GetType() == ServiceWorkerJob::Type::Register);
+     RefPtr<ServiceWorkerRegisterJob> registerJob =
+       static_cast<ServiceWorkerRegisterJob*>(aJob);
+     RefPtr<ServiceWorkerRegistrationInfo> reg = registerJob->GetRegistration();
+ 
+-    RefPtr<ServiceWorkerRegistration> swr =
+-      window->AsGlobal()->GetOrCreateServiceWorkerRegistration(reg->Descriptor());
+-
+-    nsCOMPtr<nsIRunnable> r = NS_NewRunnableFunction(
+-      "ServiceWorkerResolveWindowPromiseOnRegisterCallback::JobFinished",
+-      [promise = Move(promise), swr = Move(swr)] () {
+-        promise->MaybeResolve(swr);
+-      });
+-    MOZ_ALWAYS_SUCCEEDS(
+-      window->EventTargetFor(TaskCategory::Other)->Dispatch(r.forget()));
++    mPromise->Resolve(reg->Descriptor(), __func__);
+   }
+ 
+ public:
+-  ServiceWorkerResolveWindowPromiseOnRegisterCallback(nsPIDOMWindowInner* aWindow,
+-                                                      Promise* aPromise)
+-    : mPromise(aWindow, aPromise)
++  ServiceWorkerResolveWindowPromiseOnRegisterCallback()
++    : mPromise(new ServiceWorkerRegistrationPromise::Private(__func__))
+   {}
+ 
++  RefPtr<ServiceWorkerRegistrationPromise>
++  Promise() const
++  {
++    return mPromise;
++  }
++
+   NS_INLINE_DECL_REFCOUNTING(ServiceWorkerResolveWindowPromiseOnRegisterCallback, override)
+ };
+ 
+ namespace {
+ 
+ class PropagateSoftUpdateRunnable final : public Runnable
+ {
+ public:
+@@ -756,16 +741,17 @@ private:
  
    RefPtr<GenericPromise::Private> mPromise;
  };
@@ -211,7 +289,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/Se
    nsCOMPtr<nsIContentSecurityManager> csm = do_GetService(NS_CONTENTSECURITYMANAGER_CONTRACTID);
    if (NS_WARN_IF(!csm)) {
      return false;
-@@ -786,26 +787,28 @@ IsFromAuthenticatedOrigin(nsIDocument* a
+@@ -786,26 +772,28 @@ IsFromAuthenticatedOrigin(nsIDocument* a
      if (!trustworthyOrigin) {
        return false;
      }
@@ -233,7 +311,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/Se
 +RefPtr<ServiceWorkerRegistrationPromise>
 +ServiceWorkerManager::Register(const ClientInfo& aClientInfo,
 +                               const nsACString& aScopeURL,
-+                               const nsACString& aScriptURl,
++                               const nsACString& aScriptURL,
 +                               ServiceWorkerUpdateViaCache aUpdateViaCache)
  {
 +  // TODO
@@ -246,17 +324,153 @@ diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/Se
  
    auto* window = nsPIDOMWindowInner::From(aWindow);
  
-@@ -947,16 +950,18 @@ ServiceWorkerManager::Register(mozIDOMWi
+@@ -870,93 +858,110 @@ ServiceWorkerManager::Register(mozIDOMWi
+                                  secCheckLoadInfo,
+                                  EmptyCString(),
+                                  &decision);
+   NS_ENSURE_SUCCESS(rv, rv);
+   if (NS_WARN_IF(decision != nsIContentPolicy::ACCEPT)) {
+     return NS_ERROR_CONTENT_BLOCKED;
+   }
+ 
+-
+-  rv = documentPrincipal->CheckMayLoad(aScopeURI, true /* report */,
+-                                       false /* allowIfInheritsPrinciple */);
++  nsCString cleanedScope;
++  rv = aScopeURI->GetSpecIgnoringRef(cleanedScope);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return ServiceWorkerRegistrationPromise::CreateAndReject(rv, __func__);
++  }
++
++  nsAutoCString spec;
++  rv = aScriptURI->GetSpecIgnoringRef(spec);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    return NS_ERROR_DOM_SECURITY_ERR;
++    return ServiceWorkerRegistrationPromise::CreateAndReject(rv, __func__);
++  }
++
++  window->NoteCalledRegisterForServiceWorkerScope(cleanedScope);
++  #endif
++
++  nsCOMPtr<nsIPrincipal> principal = aClientInfo.GetPrincipal();
++  if (!principal) {
++    return ServiceWorkerRegistrationPromise::CreateAndReject(
++      NS_ERROR_DOM_INVALID_STATE_ERR, __func__);
++  }
++
++  nsCOMPtr<nsIURI> scopeURI;
++  nsresult rv = NS_NewURI(getter_AddRefs(scopeURI), aScopeURL, nullptr, nullptr);
++  if (NS_FAILED(rv)) {
++    return ServiceWorkerRegistrationPromise::CreateAndReject(rv, __func__);
++  }
++
++  nsCOMPtr<nsIURI> scriptURI;
++  rv = NS_NewURI(getter_AddRefs(scriptURI), aScriptURL, nullptr, nullptr);
++  if (NS_FAILED(rv)) {
++    return ServiceWorkerRegistrationPromise::CreateAndReject(rv, __func__);
++  }
++
++  nsAutoCString ref;
++  scopeURI->GetRef(ref);
++  if (!ref.IsEmpty()) {
++    return ServiceWorkerRegistrationPromise::CreateAndReject(
++      NS_ERROR_DOM_SECURITY_ERR, __func__);
++  }
++
++  scriptURI->GetRef(ref);
++  if (!ref.IsEmpty()) {
++    return ServiceWorkerRegistrationPromise::CreateAndReject(
++      NS_ERROR_DOM_SECURITY_ERR, __func__);
++  }
++
++  rv = principal->CheckMayLoad(scopeURI, true /* report */,
++                               false /* allowIfInheritsPrinciple */);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return ServiceWorkerRegistrationPromise::CreateAndReject(
++      NS_ERROR_DOM_SECURITY_ERR, __func__);
+   }
+ 
+   // The IsOriginPotentiallyTrustworthy() check allows file:// and possibly other
+   // URI schemes.  We need to explicitly only allows http and https schemes.
+   // Note, we just use the aScriptURI here for the check since its already
+   // been verified as same origin with the document principal.  This also
+   // is a good block against accidentally allowing blob: script URIs which
+   // might inherit the origin.
+   bool isHttp = false;
+   bool isHttps = false;
+-  aScriptURI->SchemeIs("http", &isHttp);
+-  aScriptURI->SchemeIs("https", &isHttps);
++  scriptURI->SchemeIs("http", &isHttp);
++  scriptURI->SchemeIs("https", &isHttps);
+   if (NS_WARN_IF(!isHttp && !isHttps)) {
+-    return NS_ERROR_DOM_SECURITY_ERR;
+-  }
+-
+-  nsCString cleanedScope;
+-  rv = aScopeURI->GetSpecIgnoringRef(cleanedScope);
+-  if (NS_WARN_IF(NS_FAILED(rv))) {
+-    return NS_ERROR_FAILURE;
+-  }
+-
+-  nsAutoCString spec;
+-  rv = aScriptURI->GetSpecIgnoringRef(spec);
+-  if (NS_WARN_IF(NS_FAILED(rv))) {
+-    return rv;
+-  }
+-
+-  ErrorResult result;
+-  RefPtr<Promise> promise = Promise::Create(window->AsGlobal(), result);
+-  if (result.Failed()) {
+-    return result.StealNSResult();
++    return ServiceWorkerRegistrationPromise::CreateAndReject(
++      NS_ERROR_DOM_SECURITY_ERR, __func__);
+   }
+ 
+   nsAutoCString scopeKey;
+-  rv = PrincipalToScopeKey(documentPrincipal, scopeKey);
++  rv = PrincipalToScopeKey(principal, scopeKey);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+-    return rv;
++    return ServiceWorkerRegistrationPromise::CreateAndReject(rv, __func__);
+   }
+ 
+-  window->NoteCalledRegisterForServiceWorkerScope(cleanedScope);
+-
+   RefPtr<ServiceWorkerJobQueue> queue = GetOrCreateJobQueue(scopeKey,
+-                                                            cleanedScope);
++                                                            aScopeURL);
+ 
+   RefPtr<ServiceWorkerResolveWindowPromiseOnRegisterCallback> cb =
+-    new ServiceWorkerResolveWindowPromiseOnRegisterCallback(window, promise);
+-
+-  nsCOMPtr<nsILoadGroup> docLoadGroup = doc->GetDocumentLoadGroup();
+-  RefPtr<WorkerLoadInfo::InterfaceRequestor> ir =
+-    new WorkerLoadInfo::InterfaceRequestor(documentPrincipal, docLoadGroup);
+-  ir->MaybeAddTabChild(docLoadGroup);
+-
+-  // Create a load group that is separate from, yet related to, the document's load group.
+-  // This allows checks for interfaces like nsILoadContext to yield the values used by the
+-  // the document, yet will not cancel the update job if the document's load group is cancelled.
++    new ServiceWorkerResolveWindowPromiseOnRegisterCallback();
++
+   nsCOMPtr<nsILoadGroup> loadGroup = do_CreateInstance(NS_LOADGROUP_CONTRACTID);
+-  MOZ_ALWAYS_SUCCEEDS(loadGroup->SetNotificationCallbacks(ir));
+ 
+   RefPtr<ServiceWorkerRegisterJob> job = new ServiceWorkerRegisterJob(
+-    documentPrincipal, cleanedScope, spec, loadGroup,
++    principal, aScopeURL, aScriptURL, loadGroup,
+     static_cast<ServiceWorkerUpdateViaCache>(aUpdateViaCache)
+   );
+ 
    job->AppendResultCallback(cb);
    queue->ScheduleJob(job);
  
    MOZ_ASSERT(NS_IsMainThread());
    Telemetry::Accumulate(Telemetry::SERVICE_WORKER_REGISTRATIONS, 1);
  
-   promise.forget(aPromise);
-   return NS_OK;
-+  #endif
-+  return nullptr;
+-  promise.forget(aPromise);
+-  return NS_OK;
++  return cb->Promise();
  }
  
  /*
@@ -278,7 +492,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerManager.h b/dom/serviceworkers/Serv
  
    RefPtr<ServiceWorkerRegistrationPromise>
 +  Register(const ClientInfo& aClientInfo, const nsACString& aScopeURL,
-+           const nsACString& aScriptURl,
++           const nsACString& aScriptURL,
 +           ServiceWorkerUpdateViaCache aUpdateViaCache);
 +
 +  RefPtr<ServiceWorkerRegistrationPromise>
