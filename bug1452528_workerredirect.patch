@@ -1,0 +1,117 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  50d12253b88e1d1530caf9fcfddffef1e9f3f5d6
+Bug 1452528 Don't clear the controller on non-subresource channel loads when redirect mode is "follow". r=baku
+
+diff --git a/dom/clients/manager/ClientChannelHelper.cpp b/dom/clients/manager/ClientChannelHelper.cpp
+--- a/dom/clients/manager/ClientChannelHelper.cpp
++++ b/dom/clients/manager/ClientChannelHelper.cpp
+@@ -11,16 +11,17 @@
+ #include "MainThreadUtils.h"
+ #include "mozilla/dom/ServiceWorkerDescriptor.h"
+ #include "mozilla/ipc/BackgroundUtils.h"
+ #include "nsContentUtils.h"
+ #include "nsIAsyncVerifyRedirectCallback.h"
+ #include "nsIChannel.h"
+ #include "nsIChannelEventSink.h"
+ #include "nsIDocShell.h"
++#include "nsIHttpChannelInternal.h"
+ #include "nsIInterfaceRequestor.h"
+ #include "nsIInterfaceRequestorUtils.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ using mozilla::ipc::PrincipalInfoToPrincipal;
+ 
+@@ -120,27 +121,36 @@ class ClientChannelHelper final : public
+       reservedClient.reset();
+       reservedClient = ClientManager::CreateSource(ClientType::Window,
+                                                    mEventTarget, principal);
+       MOZ_DIAGNOSTIC_ASSERT(reservedClient);
+ 
+       newLoadInfo->GiveReservedClientSource(Move(reservedClient));
+     }
+ 
++    uint32_t redirectMode = nsIHttpChannelInternal::REDIRECT_MODE_MANUAL;
++    nsCOMPtr<nsIHttpChannelInternal> http = do_QueryInterface(aOldChannel);
++    if (http) {
++      MOZ_ALWAYS_SUCCEEDS(http->GetRedirectMode(&redirectMode));
++    }
++
+     // Normally we keep the controller across channel redirects, but we must
+-    // clear it when a non-subresource load redirects.  Only do this for real
++    // clear it when a document load redirects.  Only do this for real
+     // redirects, however.
+     //
+-    // There is an open spec question about what to do in this case for
+-    // worker script redirects.  For now we clear the controller as that
+-    // seems most sane. See:
++    // This is effectively described in step 4.2 of:
++    //
++    //  https://fetch.spec.whatwg.org/#http-fetch
+     //
+-    //  https://github.com/w3c/ServiceWorker/issues/1239
+-    //
+-    if (!(aFlags & nsIChannelEventSink::REDIRECT_INTERNAL)) {
++    // The spec sets the service-workers mode to none when the request is
++    // configured to *not* follow redirects.  This prevents any further
++    // service workers from intercepting.  The first service worker that
++    // had a shot at the FetchEvent remains the controller in this case.
++    if (!(aFlags & nsIChannelEventSink::REDIRECT_INTERNAL) &&
++        redirectMode != nsIHttpChannelInternal::REDIRECT_MODE_FOLLOW) {
+       newLoadInfo->ClearController();
+     }
+ 
+     nsCOMPtr<nsIChannelEventSink> outerSink = do_GetInterface(mOuter);
+     if (outerSink) {
+       return outerSink->AsyncOnChannelRedirect(aOldChannel, aNewChannel, aFlags,
+                                                aCallback);
+     }
+diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/ServiceWorkerManager.cpp
+--- a/dom/serviceworkers/ServiceWorkerManager.cpp
++++ b/dom/serviceworkers/ServiceWorkerManager.cpp
+@@ -2390,16 +2390,28 @@ ServiceWorkerManager::DispatchFetchEvent
+       }
+ 
+       // First, attempt to mark the reserved client controlled directly.  This
+       // will update the controlled status in the ClientManagerService in the
+       // parent.  It will also eventually propagate back to the ClientSource.
+       StartControllingClient(clientInfo.ref(), registration);
+     }
+ 
++    uint32_t redirectMode = nsIHttpChannelInternal::REDIRECT_MODE_MANUAL;
++    nsCOMPtr<nsIHttpChannelInternal> http = do_QueryInterface(internalChannel);
++    MOZ_ALWAYS_SUCCEEDS(http->GetRedirectMode(&redirectMode));
++
++    // Synthetic redirects for non-subresource requests with a "follow"
++    // redirect mode may switch controllers.  This is basically worker
++    // scripts right now.  In this case we need to explicitly clear the
++    // controller to avoid assertions on the SetController() below.
++    if (redirectMode == nsIHttpChannelInternal::REDIRECT_MODE_FOLLOW) {
++      loadInfo->ClearController();
++    }
++
+     // But we also note the reserved state on the LoadInfo.  This allows the
+     // ClientSource to be updated immediately after the nsIChannel starts.
+     // This is necessary to have the correct controller in place for immediate
+     // follow-on requests.
+     loadInfo->SetController(serviceWorker->Descriptor());
+   }
+ 
+   MOZ_DIAGNOSTIC_ASSERT(serviceWorker);
+diff --git a/testing/web-platform/meta/service-workers/service-worker/worker-interception-redirect.https.html.ini b/testing/web-platform/meta/service-workers/service-worker/worker-interception-redirect.https.html.ini
+deleted file mode 100644
+--- a/testing/web-platform/meta/service-workers/service-worker/worker-interception-redirect.https.html.ini
++++ /dev/null
+@@ -1,10 +0,0 @@
+-[worker-interception-redirect.https.html]
+-  [request to sw1 scope gets network redirect to sw2 scope]
+-    expected: FAIL
+-
+-  [request to sw1 scope gets network redirect to out-of-scope]
+-    expected: FAIL
+-
+-  [request to sw1 scope gets service-worker redirect to out-of-scope]
+-    expected: FAIL
+-

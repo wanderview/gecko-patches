@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  19323169adcbd9cb3eab39d260cb80644e80eacb
+# Parent  c164b4cb63573e3fc825e4eb17bbb54cee9d17d2
 Bug 1436812 P6 Implement ServiceWorkerContainer::GetReady() via the inner class. r=baku
 
 diff --git a/dom/interfaces/base/nsIServiceWorkerManager.idl b/dom/interfaces/base/nsIServiceWorkerManager.idl
@@ -39,7 +39,39 @@ diff --git a/dom/interfaces/base/nsIServiceWorkerManager.idl b/dom/interfaces/ba
 diff --git a/dom/serviceworkers/ServiceWorkerContainer.cpp b/dom/serviceworkers/ServiceWorkerContainer.cpp
 --- a/dom/serviceworkers/ServiceWorkerContainer.cpp
 +++ b/dom/serviceworkers/ServiceWorkerContainer.cpp
-@@ -105,16 +105,17 @@ ServiceWorkerContainer::ControllerChange
+@@ -1,28 +1,31 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "ServiceWorkerContainer.h"
+ 
++#include "nsContentPolicyUtils.h"
++#include "nsContentSecurityManager.h"
+ #include "nsContentUtils.h"
+ #include "nsIDocument.h"
+ #include "nsIServiceWorkerManager.h"
+ #include "nsIScriptError.h"
+ #include "nsIURL.h"
+ #include "nsNetUtil.h"
+ #include "nsPIDOMWindow.h"
+ #include "mozilla/Services.h"
+ 
+ #include "nsCycleCollectionParticipant.h"
+ #include "nsServiceManagerUtils.h"
+ 
++#include "mozilla/LoadInfo.h"
+ #include "mozilla/dom/DOMPrefs.h"
+ #include "mozilla/dom/Navigator.h"
+ #include "mozilla/dom/Promise.h"
+ #include "mozilla/dom/ServiceWorker.h"
+ #include "mozilla/dom/ServiceWorkerContainerBinding.h"
+ 
+ #include "ServiceWorker.h"
+ #include "ServiceWorkerContainerImpl.h"
+@@ -105,48 +108,253 @@ ServiceWorkerContainer::ControllerChange
  }
  
  JSObject*
@@ -48,33 +80,261 @@ diff --git a/dom/serviceworkers/ServiceWorkerContainer.cpp b/dom/serviceworkers/
    return ServiceWorkerContainerBinding::Wrap(aCx, this, aGivenProto);
  }
  
-+/* TODO
- static nsresult
- CheckForSlashEscapedCharsInPath(nsIURI* aURI)
- {
-   MOZ_ASSERT(aURI);
+-static nsresult
+-CheckForSlashEscapedCharsInPath(nsIURI* aURI)
+-{
+-  MOZ_ASSERT(aURI);
++namespace {
  
-   // A URL that can't be downcast to a standard URL is an invalid URL and should
-   // be treated as such and fail with SecurityError.
-   nsCOMPtr<nsIURL> url(do_QueryInterface(aURI));
-@@ -131,22 +132,26 @@ CheckForSlashEscapedCharsInPath(nsIURI* 
-   ToLowerCase(path);
-   if (path.Find("%2f") != kNotFound ||
-       path.Find("%5c") != kNotFound) {
-     return NS_ERROR_DOM_TYPE_ERR;
+-  // A URL that can't be downcast to a standard URL is an invalid URL and should
+-  // be treated as such and fail with SecurityError.
+-  nsCOMPtr<nsIURL> url(do_QueryInterface(aURI));
+-  if (NS_WARN_IF(!url)) {
+-    return NS_ERROR_DOM_SECURITY_ERR;
++already_AddRefed<nsIURI>
++GetBaseURIFromGlobal(nsIGlobalObject* aGlobal, ErrorResult& aRv)
++{
++  // It would be nice not to require a window here, but right
++  // now we don't have a great way to get the base URL just
++  // from the nsIGlobalObject.
++  nsCOMPtr<nsPIDOMWindowInner> window = do_QueryInterface(aGlobal);
++  if (!window) {
++    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
++    return nullptr;
++  }
++
++  nsIDocument* doc = window->GetExtantDoc();
++  if (!doc) {
++    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
++    return nullptr;
++  }
++
++  nsCOMPtr<nsIURI> baseURI = doc->GetDocBaseURI();
++  if (!baseURI) {
++    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
++    return nullptr;
    }
  
-   return NS_OK;
- }
-+*/
+-  nsAutoCString path;
+-  nsresult rv = url->GetFilePath(path);
+-  if (NS_WARN_IF(NS_FAILED(rv))) {
+-    return rv;
++  return baseURI.forget();
++}
++
++// This function implements parts of the step 3 of the following algorithm:
++// https://w3c.github.io/webappsec/specs/powerfulfeatures/#settings-secure
++static bool
++IsFromAuthenticatedOrigin(nsIDocument* aDoc)
++{
++  MOZ_ASSERT(aDoc);
++  nsCOMPtr<nsIDocument> doc(aDoc);
++  nsCOMPtr<nsIContentSecurityManager> csm = do_GetService(NS_CONTENTSECURITYMANAGER_CONTRACTID);
++  if (NS_WARN_IF(!csm)) {
++    return false;
+   }
+ 
+-  ToLowerCase(path);
+-  if (path.Find("%2f") != kNotFound ||
+-      path.Find("%5c") != kNotFound) {
+-    return NS_ERROR_DOM_TYPE_ERR;
++  while (doc && !nsContentUtils::IsChromeDoc(doc)) {
++    bool trustworthyOrigin = false;
++
++    // The origin of the document may be different from the document URI
++    // itself.  Check the principal, not the document URI itself.
++    nsCOMPtr<nsIPrincipal> documentPrincipal = doc->NodePrincipal();
++
++    // The check for IsChromeDoc() above should mean we never see a system
++    // principal inside the loop.
++    MOZ_ASSERT(!nsContentUtils::IsSystemPrincipal(documentPrincipal));
++
++    csm->IsOriginPotentiallyTrustworthy(documentPrincipal, &trustworthyOrigin);
++    if (!trustworthyOrigin) {
++      return false;
++    }
++
++    doc = doc->GetParentDocument();
+   }
++  return true;
++}
+ 
+-  return NS_OK;
+-}
++} // anonymous namespace
  
  already_AddRefed<Promise>
  ServiceWorkerContainer::Register(const nsAString& aScriptURL,
                                   const RegistrationOptions& aOptions,
                                   ErrorResult& aRv)
  {
-+  // TODO
-+  return nullptr;
++  nsIGlobalObject* global = GetParentObject();
++  if (!global) {
++    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
++    return nullptr;
++  }
++
++  Maybe<ClientInfo> clientInfo = global->GetClientInfo();
++  if (clientInfo.isNothing()) {
++    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
++    return nullptr;
++  }
++
++  nsCOMPtr<nsIURI> baseURI = GetBaseURIFromGlobal(global, aRv);
++  if (aRv.Failed()) {
++    return nullptr;
++  }
++
++  nsresult rv = NS_OK;
++  nsCOMPtr<nsIURI> scriptURI;
++  rv = NS_NewURI(getter_AddRefs(scriptURI), aScriptURL, nullptr, baseURI);
++  if (NS_FAILED(rv)) {
++    aRv.ThrowTypeError<MSG_INVALID_URL>(aScriptURL);
++    return nullptr;
++  }
++
++  // In ServiceWorkerContainer.register() the scope argument is parsed against
++  // different base URLs depending on whether it was passed or not.
++  nsCOMPtr<nsIURI> scopeURI;
++
++  // Step 4. If none passed, parse against script's URL
++  if (!aOptions.mScope.WasPassed()) {
++    NS_NAMED_LITERAL_STRING(defaultScope, "./");
++    rv = NS_NewURI(getter_AddRefs(scopeURI), defaultScope,
++                   nullptr, scriptURI);
++    if (NS_WARN_IF(NS_FAILED(rv))) {
++      nsAutoCString spec;
++      scriptURI->GetSpec(spec);
++      NS_ConvertUTF8toUTF16 wSpec(spec);
++      aRv.ThrowTypeError<MSG_INVALID_SCOPE>(defaultScope, wSpec);
++      return nullptr;
++    }
++  } else {
++    // Step 5. Parse against entry settings object's base URL.
++    rv = NS_NewURI(getter_AddRefs(scopeURI), aOptions.mScope.Value(),
++                   nullptr, baseURI);
++    if (NS_WARN_IF(NS_FAILED(rv))) {
++      nsIURI* uri = baseURI ? baseURI : scriptURI;
++      nsAutoCString spec;
++      uri->GetSpec(spec);
++      NS_ConvertUTF8toUTF16 wSpec(spec);
++      aRv.ThrowTypeError<MSG_INVALID_SCOPE>(aOptions.mScope.Value(), wSpec);
++      return nullptr;
++    }
++  }
++
++  // The next section of code executes an NS_CheckContentLoadPolicy()
++  // check.  Its unclear to me how this differs from the
++  // nsIPrincipal::CheckMayLoad() we perform in the SWM.
++  // TODO: Determine if we can remove this or, if thats not possible,
++  //       how we can achieve the same thing on workers.
++  nsCOMPtr<nsPIDOMWindowInner> window = do_QueryInterface(global);
++  if (!window) {
++    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
++    return nullptr;
++  }
++
++  nsIDocument* doc = window->GetExtantDoc();
++  if (!doc) {
++    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
++    return nullptr;
++  }
++
++  nsCOMPtr<nsIPrincipal> documentPrincipal = doc->NodePrincipal();
++
++  nsCOMPtr<nsILoadInfo> secCheckLoadInfo =
++    new LoadInfo(documentPrincipal, // loading principal
++                 documentPrincipal, // triggering principal
++                 doc,
++                 nsILoadInfo::SEC_ONLY_FOR_EXPLICIT_CONTENTSEC_CHECK,
++                 nsIContentPolicy::TYPE_INTERNAL_SERVICE_WORKER);
++
++  int16_t decision = nsIContentPolicy::ACCEPT;
++  aRv = NS_CheckContentLoadPolicy(scriptURI,
++                                  secCheckLoadInfo,
++                                  EmptyCString(),
++                                  &decision);
++  if (aRv.Failed()) {
++    return nullptr;
++  }
++
++  if (NS_WARN_IF(decision != nsIContentPolicy::ACCEPT)) {
++    aRv.Throw(NS_ERROR_CONTENT_BLOCKED);
++    return nullptr;
++  }
++
++  // Next, implement a lame version of [SecureContext] with an
++  // exception based on pref or devtools option.
++  // TODO: This logic should be moved to a webidl [Func].
++  nsCOMPtr<nsPIDOMWindowOuter> outerWindow = window->GetOuterWindow();
++  bool serviceWorkersTestingEnabled =
++    outerWindow->GetServiceWorkersTestingEnabled();
++
++  bool authenticatedOrigin;
++  if (serviceWorkersTestingEnabled ||
++      DOMPrefs::ServiceWorkersTestingEnabled()) {
++    authenticatedOrigin = true;
++  } else {
++    authenticatedOrigin = IsFromAuthenticatedOrigin(doc);
++  }
++
++  if (!authenticatedOrigin) {
++    NS_WARNING("ServiceWorker registration from insecure websites is not allowed.");
++    aRv.Throw(NS_ERROR_DOM_SECURITY_ERR);
++    return nullptr;
++  }
++
++  // Remove any refs from the script and scope URLs.
++  nsCString cleanedScopeURL;
++  aRv = scopeURI->GetSpecIgnoringRef(cleanedScopeURL);
++  if (aRv.Failed()) {
++    return nullptr;
++  }
++
++  nsCString cleanedScriptURL;
++  aRv = scriptURI->GetSpecIgnoringRef(cleanedScriptURL);
++  if (aRv.Failed()) {
++    return nullptr;
++  }
++
++  Unused << GetGlobalIfValid(aRv, [&cleanedScopeURL](nsIDocument* aDoc) {
++    NS_ConvertUTF8toUTF16 reportScope(cleanedScopeURL);
++    const char16_t* param[] = { reportScope.get() };
++    nsContentUtils::ReportToConsole(nsIScriptError::errorFlag,
++                                    NS_LITERAL_CSTRING("Service Workers"),
++                                    aDoc, nsContentUtils::eDOM_PROPERTIES,
++                                    "ServiceWorkerRegisterStorageError",
++                                    param, 1);
++  });
++
++  // Note that this window called register().
++  window->NoteCalledRegisterForServiceWorkerScope(cleanedScopeURL);
++
++  RefPtr<Promise> outer = Promise::Create(global, aRv);
++  if (aRv.Failed()) {
++    return nullptr;
++  }
++
++  RefPtr<ServiceWorkerContainer> self = this;
++
++  mInner->Register(clientInfo.ref(), cleanedScopeURL, cleanedScriptURL,
++                   aOptions.mUpdateViaCache)->Then(
++    global->EventTargetFor(TaskCategory::Other), __func__,
++    [self, outer] (const ServiceWorkerRegistrationDescriptor& aDesc) {
++      ErrorResult rv;
++      nsIGlobalObject* global = self->GetGlobalIfValid(rv);
++      if (rv.Failed()) {
++        outer->MaybeReject(rv);
++        return;
++      }
++      RefPtr<ServiceWorkerRegistration> reg =
++        global->GetOrCreateServiceWorkerRegistration(aDesc);
++      outer->MaybeResolve(reg);
++    }, [self, outer] (nsresult aRv) {
++      outer->MaybeReject(aRv);
++    });
++
++  return outer.forget();
 +  /*
    nsCOMPtr<nsISupports> promise;
  
@@ -84,7 +344,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerContainer.cpp b/dom/serviceworkers/
      return nullptr;
    }
  
-@@ -214,16 +219,17 @@ ServiceWorkerContainer::Register(const n
+@@ -214,29 +422,35 @@ ServiceWorkerContainer::Register(const n
                        getter_AddRefs(promise));
    if (NS_WARN_IF(aRv.Failed())) {
      return nullptr;
@@ -102,6 +362,165 @@ diff --git a/dom/serviceworkers/ServiceWorkerContainer.cpp b/dom/serviceworkers/
    RefPtr<ServiceWorker> ref = mControllerWorker;
    return ref.forget();
  }
+ 
+ already_AddRefed<Promise>
+ ServiceWorkerContainer::GetRegistrations(ErrorResult& aRv)
+ {
+-  nsIGlobalObject* global = GetGlobalIfValid(aRv);
++  nsIGlobalObject* global = GetGlobalIfValid(aRv, [](nsIDocument* aDoc) {
++    nsContentUtils::ReportToConsole(nsIScriptError::errorFlag,
++                                    NS_LITERAL_CSTRING("Service Workers"),
++                                    aDoc, nsContentUtils::eDOM_PROPERTIES,
++                                    "ServiceWorkerGetRegistrationStorageError");
++  });
+   if (aRv.Failed()) {
+     return nullptr;
+   }
+ 
+   Maybe<ClientInfo> clientInfo = global->GetClientInfo();
+   if (clientInfo.isNothing()) {
+     aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+     return nullptr;
+@@ -273,69 +487,58 @@ ServiceWorkerContainer::GetRegistrations
+ 
+   return outer.forget();
+ }
+ 
+ already_AddRefed<Promise>
+ ServiceWorkerContainer::GetRegistration(const nsAString& aURL,
+                                         ErrorResult& aRv)
+ {
+-  nsIGlobalObject* global = GetGlobalIfValid(aRv);
++  nsIGlobalObject* global = GetGlobalIfValid(aRv, [](nsIDocument* aDoc) {
++    nsContentUtils::ReportToConsole(nsIScriptError::errorFlag,
++                                    NS_LITERAL_CSTRING("Service Workers"),
++                                    aDoc, nsContentUtils::eDOM_PROPERTIES,
++                                    "ServiceWorkerGetRegistrationStorageError");
++  });
+   if (aRv.Failed()) {
+     return nullptr;
+   }
+ 
+-  nsCOMPtr<nsPIDOMWindowInner> window = do_QueryInterface(global);
+-  if (!window) {
+-    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+-    return nullptr;
+-  }
+-
+-  // It would be nice not to require a window here, but right
+-  // now we don't have a great way to get the base URL just
+-  // from the nsIGlobalObject.
+-  Maybe<ClientInfo> clientInfo = window->GetClientInfo();
++  Maybe<ClientInfo> clientInfo = global->GetClientInfo();
+   if (clientInfo.isNothing()) {
+     aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+     return nullptr;
+   }
+ 
+-  nsIDocument* doc = window->GetExtantDoc();
+-  if (!doc) {
+-    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+-    return nullptr;
+-  }
+-
+-  nsCOMPtr<nsIURI> baseURI = doc->GetDocBaseURI();
+-  if (!baseURI) {
+-    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
++  nsCOMPtr<nsIURI> baseURI = GetBaseURIFromGlobal(global, aRv);
++  if (aRv.Failed()) {
+     return nullptr;
+   }
+ 
+   nsCOMPtr<nsIURI> uri;
+   aRv = NS_NewURI(getter_AddRefs(uri), aURL, nullptr, baseURI);
+   if (aRv.Failed()) {
+     return nullptr;
+   }
+ 
+   nsCString spec;
+   aRv = uri->GetSpec(spec);
+   if (aRv.Failed()) {
+     return nullptr;
+   }
+ 
+-  RefPtr<Promise> outer = Promise::Create(window->AsGlobal(), aRv);
++  RefPtr<Promise> outer = Promise::Create(global, aRv);
+   if (aRv.Failed()) {
+     return nullptr;
+   }
+ 
+   RefPtr<ServiceWorkerContainer> self = this;
+ 
+   mInner->GetRegistration(clientInfo.ref(), spec)->Then(
+-    window->EventTargetFor(TaskCategory::Other), __func__,
++    global->EventTargetFor(TaskCategory::Other), __func__,
+     [self, outer] (const ServiceWorkerRegistrationDescriptor& aDescriptor) {
+       ErrorResult rv;
+       nsIGlobalObject* global = self->GetGlobalIfValid(rv);
+       if (rv.Failed()) {
+         outer->MaybeReject(rv);
+         return;
+       }
+       RefPtr<ServiceWorkerRegistration> reg =
+@@ -431,41 +634,51 @@ ServiceWorkerContainer::GetScopeForUrl(c
+     return;
+   }
+ 
+   aRv = swm->GetScopeForUrl(doc->NodePrincipal(),
+                             aUrl, aScope);
+ }
+ 
+ nsIGlobalObject*
+-ServiceWorkerContainer::GetGlobalIfValid(ErrorResult& aRv) const
++ServiceWorkerContainer::GetGlobalIfValid(ErrorResult& aRv,
++                                         const std::function<void(nsIDocument*)>&& aStorageFailureCB) const
+ {
+   // For now we require a window since ServiceWorkerContainer is
+   // not exposed on worker globals yet.  The main thing we need
+   // to fix here to support that is the storage access check via
+   // the nsIGlobalObject.
+   nsPIDOMWindowInner* window = GetOwner();
+   if (NS_WARN_IF(!window)) {
+     aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+     return nullptr;
+   }
+ 
++  nsCOMPtr<nsIDocument> doc = window->GetExtantDoc();
++  if (NS_WARN_IF(!doc)) {
++    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
++    return nullptr;
++  }
++
+   // Don't allow a service worker to access service worker registrations
+   // from a window with storage disabled.  If these windows can access
+   // the registration it increases the chance they can bypass the storage
+   // block via postMessage(), etc.
+   auto storageAllowed = nsContentUtils::StorageAllowedForWindow(window);
+   if (NS_WARN_IF(storageAllowed != nsContentUtils::StorageAccess::eAllow)) {
+-    nsCOMPtr<nsIDocument> doc = window->GetExtantDoc();
+-    nsContentUtils::ReportToConsole(nsIScriptError::errorFlag,
+-                                    NS_LITERAL_CSTRING("Service Workers"), doc,
+-                                    nsContentUtils::eDOM_PROPERTIES,
+-                                    "ServiceWorkerGetRegistrationStorageError");
++    if (aStorageFailureCB) {
++      aStorageFailureCB(doc);
++    }
+     aRv.Throw(NS_ERROR_DOM_SECURITY_ERR);
+     return nullptr;
+   }
+-  MOZ_ASSERT(!nsContentUtils::IsSystemPrincipal(window->GetExtantDoc()->NodePrincipal()));
++
++  // Don't allow service workers to register when the *document* is chrome.
++  if (NS_WARN_IF(nsContentUtils::IsSystemPrincipal(doc->NodePrincipal()))) {
++    aRv.Throw(NS_ERROR_DOM_SECURITY_ERR);
++    return nullptr;
++  }
+ 
+   return window->AsGlobal();
+ }
+ 
+ } // namespace dom
+ } // namespace mozilla
 diff --git a/dom/serviceworkers/ServiceWorkerContainer.h b/dom/serviceworkers/ServiceWorkerContainer.h
 --- a/dom/serviceworkers/ServiceWorkerContainer.h
 +++ b/dom/serviceworkers/ServiceWorkerContainer.h
@@ -128,6 +547,26 @@ diff --git a/dom/serviceworkers/ServiceWorkerContainer.h b/dom/serviceworkers/Se
      virtual RefPtr<ServiceWorkerRegistrationListPromise>
      GetRegistrations(const ClientInfo& aClientInfo) const = 0;
  
+@@ -90,17 +92,18 @@ public:
+ 
+ private:
+   ServiceWorkerContainer(nsIGlobalObject* aGlobal,
+                          already_AddRefed<ServiceWorkerContainer::Inner> aInner);
+ 
+   ~ServiceWorkerContainer();
+ 
+   nsIGlobalObject*
+-  GetGlobalIfValid(ErrorResult& aRv) const;
++  GetGlobalIfValid(ErrorResult& aRv,
++                   const std::function<void(nsIDocument*)>&& aStorageFailureCB = nullptr) const;
+ 
+   RefPtr<Inner> mInner;
+ 
+   // This only changes when a worker hijacks everything in its scope by calling
+   // claim.
+   RefPtr<ServiceWorker> mControllerWorker;
+ 
+   RefPtr<Promise> mReadyPromise;
 diff --git a/dom/serviceworkers/ServiceWorkerContainerImpl.cpp b/dom/serviceworkers/ServiceWorkerContainerImpl.cpp
 --- a/dom/serviceworkers/ServiceWorkerContainerImpl.cpp
 +++ b/dom/serviceworkers/ServiceWorkerContainerImpl.cpp
@@ -193,7 +632,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerContainerImpl.h b/dom/serviceworker
 diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/ServiceWorkerManager.cpp
 --- a/dom/serviceworkers/ServiceWorkerManager.cpp
 +++ b/dom/serviceworkers/ServiceWorkerManager.cpp
-@@ -431,66 +431,51 @@ ServiceWorkerManager::MaybeStartShutdown
+@@ -431,66 +431,57 @@ ServiceWorkerManager::MaybeStartShutdown
    RefPtr<TeardownRunnable> runnable = new TeardownRunnable(mActor);
    nsresult rv = NS_DispatchToMainThread(runnable);
    Unused << NS_WARN_IF(NS_FAILED(rv));
@@ -227,7 +666,13 @@ diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/Se
 -
 -    nsCOMPtr<nsPIDOMWindowInner> window = mPromise.GetWindow();
 -    if (!window) {
-+      mPromise->Reject(aStatus.StealNSResult(), __func__);
++      // TODO: Do something better to propagate the error here!
++      bool typeError = aStatus.IsErrorWithMessage();
++      nsresult rv = aStatus.StealNSResult();
++      if (typeError) {
++        rv = NS_ERROR_DOM_TYPE_ERR;
++      }
++      mPromise->Reject(rv, __func__);
        return;
      }
  
@@ -271,35 +716,73 @@ diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/Se
  class PropagateSoftUpdateRunnable final : public Runnable
  {
  public:
-@@ -756,16 +741,17 @@ private:
+@@ -752,60 +743,55 @@ private:
+       mPromise->Resolve(true, __func__);
+       mPromise = nullptr;
+     }
+   }
  
    RefPtr<GenericPromise::Private> mPromise;
  };
  
- } // namespace
- 
- // This function implements parts of the step 3 of the following algorithm:
- // https://w3c.github.io/webappsec/specs/powerfulfeatures/#settings-secure
-+/* TODO
- static bool
- IsFromAuthenticatedOrigin(nsIDocument* aDoc)
+-} // namespace
+-
+-// This function implements parts of the step 3 of the following algorithm:
+-// https://w3c.github.io/webappsec/specs/powerfulfeatures/#settings-secure
+-static bool
+-IsFromAuthenticatedOrigin(nsIDocument* aDoc)
++nsresult
++CheckForSlashEscapedCharsInPath(nsIURI* aURI)
  {
-   MOZ_ASSERT(aDoc);
-   nsCOMPtr<nsIDocument> doc(aDoc);
-   nsCOMPtr<nsIContentSecurityManager> csm = do_GetService(NS_CONTENTSECURITYMANAGER_CONTRACTID);
-   if (NS_WARN_IF(!csm)) {
-     return false;
-@@ -786,26 +772,28 @@ IsFromAuthenticatedOrigin(nsIDocument* a
-     if (!trustworthyOrigin) {
-       return false;
-     }
- 
-     doc = doc->GetParentDocument();
+-  MOZ_ASSERT(aDoc);
+-  nsCOMPtr<nsIDocument> doc(aDoc);
+-  nsCOMPtr<nsIContentSecurityManager> csm = do_GetService(NS_CONTENTSECURITYMANAGER_CONTRACTID);
+-  if (NS_WARN_IF(!csm)) {
+-    return false;
++  MOZ_ASSERT(aURI);
++
++  // A URL that can't be downcast to a standard URL is an invalid URL and should
++  // be treated as such and fail with SecurityError.
++  nsCOMPtr<nsIURL> url(do_QueryInterface(aURI));
++  if (NS_WARN_IF(!url)) {
++    return NS_ERROR_DOM_SECURITY_ERR;
    }
-   return true;
- }
-+*/
  
+-  while (doc && !nsContentUtils::IsChromeDoc(doc)) {
+-    bool trustworthyOrigin = false;
+-
+-    // The origin of the document may be different from the document URI
+-    // itself.  Check the principal, not the document URI itself.
+-    nsCOMPtr<nsIPrincipal> documentPrincipal = doc->NodePrincipal();
+-
+-    // The check for IsChromeDoc() above should mean we never see a system
+-    // principal inside the loop.
+-    MOZ_ASSERT(!nsContentUtils::IsSystemPrincipal(documentPrincipal));
+-
+-    csm->IsOriginPotentiallyTrustworthy(documentPrincipal, &trustworthyOrigin);
+-    if (!trustworthyOrigin) {
+-      return false;
+-    }
+-
+-    doc = doc->GetParentDocument();
++  nsAutoCString path;
++  nsresult rv = url->GetFilePath(path);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return rv;
+   }
+-  return true;
++
++  ToLowerCase(path);
++  if (path.Find("%2f") != kNotFound ||
++      path.Find("%5c") != kNotFound) {
++    return NS_ERROR_DOM_TYPE_ERR;
++  }
++
++  return NS_OK;
+ }
+ 
++} // namespace
++
  // If we return an error code here, the ServiceWorkerContainer will
  // automatically reject the Promise.
 -NS_IMETHODIMP
@@ -324,7 +807,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/Se
  
    auto* window = nsPIDOMWindowInner::From(aWindow);
  
-@@ -870,93 +858,110 @@ ServiceWorkerManager::Register(mozIDOMWi
+@@ -870,93 +856,124 @@ ServiceWorkerManager::Register(mozIDOMWi
                                   secCheckLoadInfo,
                                   EmptyCString(),
                                   &decision);
@@ -370,6 +853,8 @@ diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/Se
 +    return ServiceWorkerRegistrationPromise::CreateAndReject(rv, __func__);
 +  }
 +
++  // The binding code should have stripped the ref.  Verify that
++  // here to make sure the content process isn't lying to us.
 +  nsAutoCString ref;
 +  scopeURI->GetRef(ref);
 +  if (!ref.IsEmpty()) {
@@ -379,13 +864,6 @@ diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/Se
 +
 +  scriptURI->GetRef(ref);
 +  if (!ref.IsEmpty()) {
-+    return ServiceWorkerRegistrationPromise::CreateAndReject(
-+      NS_ERROR_DOM_SECURITY_ERR, __func__);
-+  }
-+
-+  rv = principal->CheckMayLoad(scopeURI, true /* report */,
-+                               false /* allowIfInheritsPrinciple */);
-+  if (NS_WARN_IF(NS_FAILED(rv))) {
 +    return ServiceWorkerRegistrationPromise::CreateAndReject(
 +      NS_ERROR_DOM_SECURITY_ERR, __func__);
    }
@@ -404,24 +882,37 @@ diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/Se
 +  scriptURI->SchemeIs("https", &isHttps);
    if (NS_WARN_IF(!isHttp && !isHttps)) {
 -    return NS_ERROR_DOM_SECURITY_ERR;
--  }
--
++    return ServiceWorkerRegistrationPromise::CreateAndReject(
++      NS_ERROR_DOM_SECURITY_ERR, __func__);
+   }
+ 
 -  nsCString cleanedScope;
 -  rv = aScopeURI->GetSpecIgnoringRef(cleanedScope);
 -  if (NS_WARN_IF(NS_FAILED(rv))) {
 -    return NS_ERROR_FAILURE;
--  }
--
++  rv = CheckForSlashEscapedCharsInPath(scriptURI);
++  if (NS_FAILED(rv)) {
++    return ServiceWorkerRegistrationPromise::CreateAndReject(rv, __func__);
+   }
+ 
 -  nsAutoCString spec;
 -  rv = aScriptURI->GetSpecIgnoringRef(spec);
 -  if (NS_WARN_IF(NS_FAILED(rv))) {
 -    return rv;
--  }
--
++  rv = CheckForSlashEscapedCharsInPath(scopeURI);
++  if (NS_FAILED(rv)) {
++    return ServiceWorkerRegistrationPromise::CreateAndReject(rv, __func__);
+   }
+ 
 -  ErrorResult result;
 -  RefPtr<Promise> promise = Promise::Create(window->AsGlobal(), result);
 -  if (result.Failed()) {
 -    return result.StealNSResult();
++  // Verify that the scope matches the principal here to ensure
++  // the content process isn't lying to us.
++  rv = principal->CheckMayLoad(scopeURI, true /* report */,
++                               false /* allowIfInheritsPrinciple */);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
 +    return ServiceWorkerRegistrationPromise::CreateAndReject(
 +      NS_ERROR_DOM_SECURITY_ERR, __func__);
    }
