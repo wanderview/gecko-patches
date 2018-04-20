@@ -1,0 +1,322 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  9057a65ea667170527fef28918fa122d6ae2717a
+Bug 1436812 P7 Move many checks into ServiceWorkerScopeAndScriptAreValid() utility method. r=baku
+
+diff --git a/dom/serviceworkers/ServiceWorkerContainer.cpp b/dom/serviceworkers/ServiceWorkerContainer.cpp
+--- a/dom/serviceworkers/ServiceWorkerContainer.cpp
++++ b/dom/serviceworkers/ServiceWorkerContainer.cpp
+@@ -171,78 +171,54 @@ IsFromAuthenticatedOrigin(nsIDocument* a
+ 
+     doc = doc->GetParentDocument();
+   }
+   return true;
+ }
+ 
+ } // anonymous namespace
+ 
+-static nsresult
+-CheckForSlashEscapedCharsInPath(nsIURI* aURI)
+-{
+-  MOZ_ASSERT(aURI);
+-
+-  // A URL that can't be downcast to a standard URL is an invalid URL and should
+-  // be treated as such and fail with SecurityError.
+-  nsCOMPtr<nsIURL> url(do_QueryInterface(aURI));
+-  if (NS_WARN_IF(!url)) {
+-    return NS_ERROR_DOM_SECURITY_ERR;
+-  }
+-
+-  nsAutoCString path;
+-  nsresult rv = url->GetFilePath(path);
+-  if (NS_WARN_IF(NS_FAILED(rv))) {
+-    return rv;
+-  }
+-
+-  ToLowerCase(path);
+-  if (path.Find("%2f") != kNotFound ||
+-      path.Find("%5c") != kNotFound) {
+-    return NS_ERROR_DOM_TYPE_ERR;
+-  }
+-
+-  return NS_OK;
+-}
+-
+ already_AddRefed<Promise>
+ ServiceWorkerContainer::Register(const nsAString& aScriptURL,
+                                  const RegistrationOptions& aOptions,
+                                  ErrorResult& aRv)
+ {
+   nsCOMPtr<nsISupports> promise;
+ 
+   nsCOMPtr<nsIServiceWorkerManager> swm = mozilla::services::GetServiceWorkerManager();
+   if (!swm) {
+     aRv.Throw(NS_ERROR_FAILURE);
+     return nullptr;
+   }
+ 
+-  nsCOMPtr<nsIURI> baseURI;
+-  nsCOMPtr<nsPIDOMWindowInner> window = GetOwner();
+-  if (window) {
+-    baseURI = window->GetDocBaseURI();
+-  } else {
++  nsIGlobalObject* global = GetParentObject();
++  if (!global) {
+     aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+     return nullptr;
+   }
+ 
++  Maybe<ClientInfo> clientInfo = global->GetClientInfo();
++  if (clientInfo.isNothing()) {
++    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
++    return nullptr;
++  }
++
++  nsCOMPtr<nsIURI> baseURI = GetBaseURIFromGlobal(global, aRv);
++  if (aRv.Failed()) {
++    return nullptr;
++  }
++
+   nsresult rv;
+   nsCOMPtr<nsIURI> scriptURI;
+   rv = NS_NewURI(getter_AddRefs(scriptURI), aScriptURL, nullptr, baseURI);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     aRv.ThrowTypeError<MSG_INVALID_URL>(aScriptURL);
+     return nullptr;
+   }
+ 
+-  aRv = CheckForSlashEscapedCharsInPath(scriptURI);
+-  if (NS_WARN_IF(aRv.Failed())) {
+-    return nullptr;
+-  }
+-
+   // In ServiceWorkerContainer.register() the scope argument is parsed against
+   // different base URLs depending on whether it was passed or not.
+   nsCOMPtr<nsIURI> scopeURI;
+ 
+   // Step 4. If none passed, parse against script's URL
+   if (!aOptions.mScope.WasPassed()) {
+     NS_NAMED_LITERAL_STRING(defaultScope, "./");
+     rv = NS_NewURI(getter_AddRefs(scopeURI), defaultScope,
+@@ -261,21 +237,43 @@ ServiceWorkerContainer::Register(const n
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+       nsIURI* uri = baseURI ? baseURI : scriptURI;
+       nsAutoCString spec;
+       uri->GetSpec(spec);
+       NS_ConvertUTF8toUTF16 wSpec(spec);
+       aRv.ThrowTypeError<MSG_INVALID_SCOPE>(aOptions.mScope.Value(), wSpec);
+       return nullptr;
+     }
++  }
+ 
+-    aRv = CheckForSlashEscapedCharsInPath(scopeURI);
+-    if (NS_WARN_IF(aRv.Failed())) {
+-      return nullptr;
+-    }
++  // Strip the any ref from both the script and scope URLs.
++  nsCOMPtr<nsIURI> cloneWithoutRef;
++  aRv = scriptURI->CloneIgnoringRef(getter_AddRefs(cloneWithoutRef));
++  if (aRv.Failed()) {
++    return nullptr;
++  }
++  scriptURI = cloneWithoutRef.forget();
++
++  aRv = scopeURI->CloneIgnoringRef(getter_AddRefs(cloneWithoutRef));
++  if (aRv.Failed()) {
++    return nullptr;
++  }
++  scopeURI = cloneWithoutRef.forget();
++
++  aRv = ServiceWorkerScopeAndScriptAreValid(clientInfo.ref(),
++                                            scopeURI,
++                                            scriptURI);
++  if (aRv.Failed()) {
++    return nullptr;
++  }
++
++  nsCOMPtr<nsPIDOMWindowInner> window = do_QueryInterface(global);
++  if (!window) {
++    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
++    return nullptr;
+   }
+ 
+   nsIDocument* doc = window->GetExtantDoc();
+   if (!doc) {
+     aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+     return nullptr;
+   }
+ 
+@@ -324,17 +322,16 @@ ServiceWorkerContainer::Register(const n
+     return nullptr;
+ 
+   }
+   if (NS_WARN_IF(decision != nsIContentPolicy::ACCEPT)) {
+     aRv.Throw(NS_ERROR_CONTENT_BLOCKED);
+     return nullptr;
+   }
+ 
+-
+   // The spec says that the "client" passed to Register() must be the global
+   // where the ServiceWorkerContainer was retrieved from.
+   aRv = swm->Register(GetOwner(), scopeURI, scriptURI,
+                       static_cast<uint16_t>(aOptions.mUpdateViaCache),
+                       getter_AddRefs(promise));
+   if (NS_WARN_IF(aRv.Failed())) {
+     return nullptr;
+   }
+diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/ServiceWorkerManager.cpp
+--- a/dom/serviceworkers/ServiceWorkerManager.cpp
++++ b/dom/serviceworkers/ServiceWorkerManager.cpp
+@@ -786,44 +786,18 @@ ServiceWorkerManager::Register(mozIDOMWi
+   // Don't allow service workers to register when the *document* is chrome.
+   if (NS_WARN_IF(nsContentUtils::IsSystemPrincipal(doc->NodePrincipal()))) {
+     return NS_ERROR_DOM_SECURITY_ERR;
+   }
+ 
+   // Data URLs are not allowed.
+   nsCOMPtr<nsIPrincipal> documentPrincipal = doc->NodePrincipal();
+ 
+-  nsresult rv = documentPrincipal->CheckMayLoad(aScriptURI, true /* report */,
+-                                                false /* allowIfInheritsPrincipal */);
+-  if (NS_WARN_IF(NS_FAILED(rv))) {
+-    return NS_ERROR_DOM_SECURITY_ERR;
+-  }
+-
+-  rv = documentPrincipal->CheckMayLoad(aScopeURI, true /* report */,
+-                                       false /* allowIfInheritsPrinciple */);
+-  if (NS_WARN_IF(NS_FAILED(rv))) {
+-    return NS_ERROR_DOM_SECURITY_ERR;
+-  }
+-
+-  // The IsOriginPotentiallyTrustworthy() check allows file:// and possibly other
+-  // URI schemes.  We need to explicitly only allows http and https schemes.
+-  // Note, we just use the aScriptURI here for the check since its already
+-  // been verified as same origin with the document principal.  This also
+-  // is a good block against accidentally allowing blob: script URIs which
+-  // might inherit the origin.
+-  bool isHttp = false;
+-  bool isHttps = false;
+-  aScriptURI->SchemeIs("http", &isHttp);
+-  aScriptURI->SchemeIs("https", &isHttps);
+-  if (NS_WARN_IF(!isHttp && !isHttps)) {
+-    return NS_ERROR_DOM_SECURITY_ERR;
+-  }
+-
+   nsCString cleanedScope;
+-  rv = aScopeURI->GetSpecIgnoringRef(cleanedScope);
++  nsresult rv = aScopeURI->GetSpecIgnoringRef(cleanedScope);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return NS_ERROR_FAILURE;
+   }
+ 
+   nsAutoCString spec;
+   rv = aScriptURI->GetSpecIgnoringRef(spec);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return rv;
+diff --git a/dom/serviceworkers/ServiceWorkerUtils.cpp b/dom/serviceworkers/ServiceWorkerUtils.cpp
+--- a/dom/serviceworkers/ServiceWorkerUtils.cpp
++++ b/dom/serviceworkers/ServiceWorkerUtils.cpp
+@@ -35,10 +35,82 @@ ServiceWorkerParentInterceptEnabled()
+ bool
+ ServiceWorkerRegistrationDataIsValid(const ServiceWorkerRegistrationData& aData)
+ {
+   return !aData.scope().IsEmpty() &&
+          !aData.currentWorkerURL().IsEmpty() &&
+          !aData.cacheName().IsEmpty();
+ }
+ 
++namespace {
++
++nsresult
++CheckForSlashEscapedCharsInPath(nsIURI* aURI)
++{
++  MOZ_ASSERT(aURI);
++
++  // A URL that can't be downcast to a standard URL is an invalid URL and should
++  // be treated as such and fail with SecurityError.
++  nsCOMPtr<nsIURL> url(do_QueryInterface(aURI));
++  if (NS_WARN_IF(!url)) {
++    return NS_ERROR_DOM_SECURITY_ERR;
++  }
++
++  nsAutoCString path;
++  nsresult rv = url->GetFilePath(path);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    return rv;
++  }
++
++  ToLowerCase(path);
++  if (path.Find("%2f") != kNotFound ||
++      path.Find("%5c") != kNotFound) {
++    return NS_ERROR_DOM_TYPE_ERR;
++  }
++
++  return NS_OK;
++}
++
++} // anonymous namespace
++
++nsresult
++ServiceWorkerScopeAndScriptAreValid(const ClientInfo& aClientInfo,
++                                    nsIURI* aScopeURI,
++                                    nsIURI* aScriptURI)
++{
++  MOZ_DIAGNOSTIC_ASSERT(aScopeURI);
++  MOZ_DIAGNOSTIC_ASSERT(aScriptURI);
++
++  nsCOMPtr<nsIPrincipal> principal = aClientInfo.GetPrincipal();
++  NS_ENSURE_TRUE(principal, NS_ERROR_DOM_INVALID_STATE_ERR);
++
++  bool isHttp = false;
++  bool isHttps = false;
++  Unused << aScriptURI->SchemeIs("http", &isHttp);
++  Unused << aScriptURI->SchemeIs("https", &isHttps);
++  NS_ENSURE_TRUE(isHttp || isHttps, NS_ERROR_DOM_SECURITY_ERR);
++
++  nsresult rv = CheckForSlashEscapedCharsInPath(aScopeURI);
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  rv = CheckForSlashEscapedCharsInPath(aScriptURI);
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  nsAutoCString ref;
++  Unused << aScopeURI->GetRef(ref);
++  NS_ENSURE_TRUE(ref.IsEmpty(), NS_ERROR_DOM_SECURITY_ERR);
++
++  Unused << aScriptURI->GetRef(ref);
++  NS_ENSURE_TRUE(ref.IsEmpty(), NS_ERROR_DOM_SECURITY_ERR);
++
++  rv = principal->CheckMayLoad(aScopeURI, true /* report */,
++                               false /* allowIfInheritsPrincipal */);
++  NS_ENSURE_SUCCESS(rv, NS_ERROR_DOM_SECURITY_ERR);
++
++  rv = principal->CheckMayLoad(aScriptURI, true /* report */,
++                               false /* allowIfInheritsPrincipal */);
++  NS_ENSURE_SUCCESS(rv, NS_ERROR_DOM_SECURITY_ERR);
++
++  return NS_OK;
++}
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/serviceworkers/ServiceWorkerUtils.h b/dom/serviceworkers/ServiceWorkerUtils.h
+--- a/dom/serviceworkers/ServiceWorkerUtils.h
++++ b/dom/serviceworkers/ServiceWorkerUtils.h
+@@ -30,12 +30,17 @@ typedef MozPromise<nsTArray<ServiceWorke
+         ServiceWorkerRegistrationListPromise;
+ 
+ bool
+ ServiceWorkerParentInterceptEnabled();
+ 
+ bool
+ ServiceWorkerRegistrationDataIsValid(const ServiceWorkerRegistrationData& aData);
+ 
++nsresult
++ServiceWorkerScopeAndScriptAreValid(const ClientInfo& aClientInfo,
++                                    nsIURI* aScopeURI,
++                                    nsIURI* aScriptURI);
++
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // _mozilla_dom_ServiceWorkerUtils_h

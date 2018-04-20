@@ -1,0 +1,138 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  9568bfba9ed1eae1c6507dbdc480057d611e9253
+Bug 1436812 P3 Refactor ServiceWorkerContainer::GetGlobalIfValid() to accomodate Register() usage. r=baku
+
+diff --git a/dom/serviceworkers/ServiceWorkerContainer.cpp b/dom/serviceworkers/ServiceWorkerContainer.cpp
+--- a/dom/serviceworkers/ServiceWorkerContainer.cpp
++++ b/dom/serviceworkers/ServiceWorkerContainer.cpp
+@@ -225,17 +225,22 @@ ServiceWorkerContainer::GetController()
+ {
+   RefPtr<ServiceWorker> ref = mControllerWorker;
+   return ref.forget();
+ }
+ 
+ already_AddRefed<Promise>
+ ServiceWorkerContainer::GetRegistrations(ErrorResult& aRv)
+ {
+-  nsIGlobalObject* global = GetGlobalIfValid(aRv);
++  nsIGlobalObject* global = GetGlobalIfValid(aRv, [](nsIDocument* aDoc) {
++    nsContentUtils::ReportToConsole(nsIScriptError::errorFlag,
++                                    NS_LITERAL_CSTRING("Service Workers"), aDoc,
++                                    nsContentUtils::eDOM_PROPERTIES,
++                                    "ServiceWorkerGetRegistrationStorageError");
++  });
+   if (aRv.Failed()) {
+     return nullptr;
+   }
+ 
+   Maybe<ClientInfo> clientInfo = global->GetClientInfo();
+   if (clientInfo.isNothing()) {
+     aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+     return nullptr;
+@@ -272,17 +277,22 @@ ServiceWorkerContainer::GetRegistrations
+ 
+   return outer.forget();
+ }
+ 
+ already_AddRefed<Promise>
+ ServiceWorkerContainer::GetRegistration(const nsAString& aURL,
+                                         ErrorResult& aRv)
+ {
+-  nsIGlobalObject* global = GetGlobalIfValid(aRv);
++  nsIGlobalObject* global = GetGlobalIfValid(aRv, [](nsIDocument* aDoc) {
++    nsContentUtils::ReportToConsole(nsIScriptError::errorFlag,
++                                    NS_LITERAL_CSTRING("Service Workers"), aDoc,
++                                    nsContentUtils::eDOM_PROPERTIES,
++                                    "ServiceWorkerGetRegistrationStorageError");
++  });
+   if (aRv.Failed()) {
+     return nullptr;
+   }
+ 
+   nsCOMPtr<nsPIDOMWindowInner> window = do_QueryInterface(global);
+   if (!window) {
+     aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+     return nullptr;
+@@ -423,41 +433,51 @@ ServiceWorkerContainer::GetScopeForUrl(c
+     return;
+   }
+ 
+   aRv = swm->GetScopeForUrl(doc->NodePrincipal(),
+                             aUrl, aScope);
+ }
+ 
+ nsIGlobalObject*
+-ServiceWorkerContainer::GetGlobalIfValid(ErrorResult& aRv) const
++ServiceWorkerContainer::GetGlobalIfValid(ErrorResult& aRv,
++                                         const std::function<void(nsIDocument*)>&& aStorageFailureCB) const
+ {
+   // For now we require a window since ServiceWorkerContainer is
+   // not exposed on worker globals yet.  The main thing we need
+   // to fix here to support that is the storage access check via
+   // the nsIGlobalObject.
+   nsPIDOMWindowInner* window = GetOwner();
+   if (NS_WARN_IF(!window)) {
+     aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+     return nullptr;
+   }
+ 
++  nsCOMPtr<nsIDocument> doc = window->GetExtantDoc();
++  if (NS_WARN_IF(!doc)) {
++    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
++    return nullptr;
++  }
++
+   // Don't allow a service worker to access service worker registrations
+   // from a window with storage disabled.  If these windows can access
+   // the registration it increases the chance they can bypass the storage
+   // block via postMessage(), etc.
+   auto storageAllowed = nsContentUtils::StorageAllowedForWindow(window);
+   if (NS_WARN_IF(storageAllowed != nsContentUtils::StorageAccess::eAllow)) {
+-    nsCOMPtr<nsIDocument> doc = window->GetExtantDoc();
+-    nsContentUtils::ReportToConsole(nsIScriptError::errorFlag,
+-                                    NS_LITERAL_CSTRING("Service Workers"), doc,
+-                                    nsContentUtils::eDOM_PROPERTIES,
+-                                    "ServiceWorkerGetRegistrationStorageError");
++    if (aStorageFailureCB) {
++      aStorageFailureCB(doc);
++    }
+     aRv.Throw(NS_ERROR_DOM_SECURITY_ERR);
+     return nullptr;
+   }
+-  MOZ_ASSERT(!nsContentUtils::IsSystemPrincipal(window->GetExtantDoc()->NodePrincipal()));
++
++  // Don't allow service workers when the document is chrome.
++  if (NS_WARN_IF(nsContentUtils::IsSystemPrincipal(doc->NodePrincipal()))) {
++    aRv.Throw(NS_ERROR_DOM_SECURITY_ERR);
++    return nullptr;
++  }
+ 
+   return window->AsGlobal();
+ }
+ 
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/serviceworkers/ServiceWorkerContainer.h b/dom/serviceworkers/ServiceWorkerContainer.h
+--- a/dom/serviceworkers/ServiceWorkerContainer.h
++++ b/dom/serviceworkers/ServiceWorkerContainer.h
+@@ -90,17 +90,18 @@ public:
+ 
+ private:
+   ServiceWorkerContainer(nsIGlobalObject* aGlobal,
+                          already_AddRefed<ServiceWorkerContainer::Inner> aInner);
+ 
+   ~ServiceWorkerContainer();
+ 
+   nsIGlobalObject*
+-  GetGlobalIfValid(ErrorResult& aRv) const;
++  GetGlobalIfValid(ErrorResult& aRv,
++                   const std::function<void(nsIDocument*)>&& aStorageFailureCB = nullptr) const;
+ 
+   RefPtr<Inner> mInner;
+ 
+   // This only changes when a worker hijacks everything in its scope by calling
+   // claim.
+   RefPtr<ServiceWorker> mControllerWorker;
+ 
+   RefPtr<Promise> mReadyPromise;

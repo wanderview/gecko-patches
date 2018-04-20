@@ -1,0 +1,225 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  2d58b2204ac67e7814f1cd4acdbd26f2ed0690b3
+Bug 1436812 P5 Move the IsFromAuthenticatedOrigin() check from the ServiceWorkerManager to the ServiceWorkerContainer. r=baku
+
+diff --git a/dom/serviceworkers/ServiceWorkerContainer.cpp b/dom/serviceworkers/ServiceWorkerContainer.cpp
+--- a/dom/serviceworkers/ServiceWorkerContainer.cpp
++++ b/dom/serviceworkers/ServiceWorkerContainer.cpp
+@@ -1,16 +1,17 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "ServiceWorkerContainer.h"
+ 
++#include "nsContentSecurityManager.h"
+ #include "nsContentUtils.h"
+ #include "nsIDocument.h"
+ #include "nsIServiceWorkerManager.h"
+ #include "nsIScriptError.h"
+ #include "nsIURL.h"
+ #include "nsNetUtil.h"
+ #include "nsPIDOMWindow.h"
+ #include "mozilla/Services.h"
+@@ -133,16 +134,49 @@ GetBaseURIFromGlobal(nsIGlobalObject* aG
+   if (!baseURI) {
+     aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+     return nullptr;
+   }
+ 
+   return baseURI.forget();
+ }
+ 
++// This function implements parts of the step 3 of the following algorithm:
++// https://w3c.github.io/webappsec/specs/powerfulfeatures/#settings-secure
++static bool
++IsFromAuthenticatedOrigin(nsIDocument* aDoc)
++{
++  MOZ_ASSERT(aDoc);
++  nsCOMPtr<nsIDocument> doc(aDoc);
++  nsCOMPtr<nsIContentSecurityManager> csm = do_GetService(NS_CONTENTSECURITYMANAGER_CONTRACTID);
++  if (NS_WARN_IF(!csm)) {
++    return false;
++  }
++
++  while (doc && !nsContentUtils::IsChromeDoc(doc)) {
++    bool trustworthyOrigin = false;
++
++    // The origin of the document may be different from the document URI
++    // itself.  Check the principal, not the document URI itself.
++    nsCOMPtr<nsIPrincipal> documentPrincipal = doc->NodePrincipal();
++
++    // The check for IsChromeDoc() above should mean we never see a system
++    // principal inside the loop.
++    MOZ_ASSERT(!nsContentUtils::IsSystemPrincipal(documentPrincipal));
++
++    csm->IsOriginPotentiallyTrustworthy(documentPrincipal, &trustworthyOrigin);
++    if (!trustworthyOrigin) {
++      return false;
++    }
++
++    doc = doc->GetParentDocument();
++  }
++  return true;
++}
++
+ } // anonymous namespace
+ 
+ static nsresult
+ CheckForSlashEscapedCharsInPath(nsIURI* aURI)
+ {
+   MOZ_ASSERT(aURI);
+ 
+   // A URL that can't be downcast to a standard URL is an invalid URL and should
+@@ -232,16 +266,43 @@ ServiceWorkerContainer::Register(const n
+     }
+ 
+     aRv = CheckForSlashEscapedCharsInPath(scopeURI);
+     if (NS_WARN_IF(aRv.Failed())) {
+       return nullptr;
+     }
+   }
+ 
++  nsIDocument* doc = window->GetExtantDoc();
++  if (!doc) {
++    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
++    return nullptr;
++  }
++
++  // Next, implement a lame version of [SecureContext[ with an
++  // exception based on a pref or devtools option.
++  // TODO: This logic should be moved to a webidl [Func]. See bug 1455078.
++  nsCOMPtr<nsPIDOMWindowOuter> outerWindow = window->GetOuterWindow();
++  bool serviceWorkersTestingEnabled =
++    outerWindow->GetServiceWorkersTestingEnabled();
++
++  bool authenticatedOrigin;
++  if (DOMPrefs::ServiceWorkersTestingEnabled() ||
++      serviceWorkersTestingEnabled) {
++    authenticatedOrigin = true;
++  } else {
++    authenticatedOrigin = IsFromAuthenticatedOrigin(doc);
++  }
++
++  if (!authenticatedOrigin) {
++    NS_WARNING("ServiceWorker registration from insecure websites is not allowed.");
++    aRv.Throw(NS_ERROR_DOM_SECURITY_ERR);
++    return nullptr;
++  }
++
+   // The spec says that the "client" passed to Register() must be the global
+   // where the ServiceWorkerContainer was retrieved from.
+   aRv = swm->Register(GetOwner(), scopeURI, scriptURI,
+                       static_cast<uint16_t>(aOptions.mUpdateViaCache),
+                       getter_AddRefs(promise));
+   if (NS_WARN_IF(aRv.Failed())) {
+     return nullptr;
+   }
+diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/ServiceWorkerManager.cpp
+--- a/dom/serviceworkers/ServiceWorkerManager.cpp
++++ b/dom/serviceworkers/ServiceWorkerManager.cpp
+@@ -60,17 +60,16 @@
+ #include "mozilla/ipc/BackgroundChild.h"
+ #include "mozilla/ipc/PBackgroundChild.h"
+ #include "mozilla/ipc/PBackgroundSharedTypes.h"
+ #include "mozilla/dom/ScriptLoader.h"
+ #include "mozilla/Unused.h"
+ #include "mozilla/EnumSet.h"
+ 
+ #include "nsContentPolicyUtils.h"
+-#include "nsContentSecurityManager.h"
+ #include "nsContentUtils.h"
+ #include "nsNetUtil.h"
+ #include "nsProxyRelease.h"
+ #include "nsQueryObject.h"
+ #include "nsTArray.h"
+ 
+ #include "ServiceWorker.h"
+ #include "ServiceWorkerContainer.h"
+@@ -746,49 +745,16 @@ private:
+     }
+   }
+ 
+   RefPtr<GenericPromise::Private> mPromise;
+ };
+ 
+ } // namespace
+ 
+-// This function implements parts of the step 3 of the following algorithm:
+-// https://w3c.github.io/webappsec/specs/powerfulfeatures/#settings-secure
+-static bool
+-IsFromAuthenticatedOrigin(nsIDocument* aDoc)
+-{
+-  MOZ_ASSERT(aDoc);
+-  nsCOMPtr<nsIDocument> doc(aDoc);
+-  nsCOMPtr<nsIContentSecurityManager> csm = do_GetService(NS_CONTENTSECURITYMANAGER_CONTRACTID);
+-  if (NS_WARN_IF(!csm)) {
+-    return false;
+-  }
+-
+-  while (doc && !nsContentUtils::IsChromeDoc(doc)) {
+-    bool trustworthyOrigin = false;
+-
+-    // The origin of the document may be different from the document URI
+-    // itself.  Check the principal, not the document URI itself.
+-    nsCOMPtr<nsIPrincipal> documentPrincipal = doc->NodePrincipal();
+-
+-    // The check for IsChromeDoc() above should mean we never see a system
+-    // principal inside the loop.
+-    MOZ_ASSERT(!nsContentUtils::IsSystemPrincipal(documentPrincipal));
+-
+-    csm->IsOriginPotentiallyTrustworthy(documentPrincipal, &trustworthyOrigin);
+-    if (!trustworthyOrigin) {
+-      return false;
+-    }
+-
+-    doc = doc->GetParentDocument();
+-  }
+-  return true;
+-}
+-
+ // If we return an error code here, the ServiceWorkerContainer will
+ // automatically reject the Promise.
+ NS_IMETHODIMP
+ ServiceWorkerManager::Register(mozIDOMWindow* aWindow,
+                                nsIURI* aScopeURI,
+                                nsIURI* aScriptURI,
+                                uint16_t aUpdateViaCache,
+                                nsISupports** aPromise)
+@@ -818,33 +784,16 @@ ServiceWorkerManager::Register(mozIDOMWi
+     return NS_ERROR_DOM_SECURITY_ERR;
+   }
+ 
+   // Don't allow service workers to register when the *document* is chrome.
+   if (NS_WARN_IF(nsContentUtils::IsSystemPrincipal(doc->NodePrincipal()))) {
+     return NS_ERROR_DOM_SECURITY_ERR;
+   }
+ 
+-  nsCOMPtr<nsPIDOMWindowOuter> outerWindow = window->GetOuterWindow();
+-  bool serviceWorkersTestingEnabled =
+-    outerWindow->GetServiceWorkersTestingEnabled();
+-
+-  bool authenticatedOrigin;
+-  if (DOMPrefs::ServiceWorkersTestingEnabled() ||
+-      serviceWorkersTestingEnabled) {
+-    authenticatedOrigin = true;
+-  } else {
+-    authenticatedOrigin = IsFromAuthenticatedOrigin(doc);
+-  }
+-
+-  if (!authenticatedOrigin) {
+-    NS_WARNING("ServiceWorker registration from insecure websites is not allowed.");
+-    return NS_ERROR_DOM_SECURITY_ERR;
+-  }
+-
+   // Data URLs are not allowed.
+   nsCOMPtr<nsIPrincipal> documentPrincipal = doc->NodePrincipal();
+ 
+   nsresult rv = documentPrincipal->CheckMayLoad(aScriptURI, true /* report */,
+                                                 false /* allowIfInheritsPrincipal */);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+     return NS_ERROR_DOM_SECURITY_ERR;
+   }
