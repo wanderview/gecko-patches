@@ -1,0 +1,189 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  fc03c61aa31e9696372361c0f7997da7eba56148
+Bug 1455695 P6 Remove ServiceWorkerRegistration::Inner::GetNotifications(). r=baku
+
+diff --git a/dom/serviceworkers/ServiceWorkerRegistration.cpp b/dom/serviceworkers/ServiceWorkerRegistration.cpp
+--- a/dom/serviceworkers/ServiceWorkerRegistration.cpp
++++ b/dom/serviceworkers/ServiceWorkerRegistration.cpp
+@@ -318,17 +318,32 @@ ServiceWorkerRegistration::ShowNotificat
+ 
+   return p.forget();
+ }
+ 
+ already_AddRefed<Promise>
+ ServiceWorkerRegistration::GetNotifications(const GetNotificationOptions& aOptions,
+                                             ErrorResult& aRv)
+ {
+-  if (!mInner) {
++  nsIGlobalObject* global = GetParentObject();
++  if (!global) {
+     aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+     return nullptr;
+   }
+-  return mInner->GetNotifications(aOptions, aRv);
++
++  NS_ConvertUTF8toUTF16 scope(mDescriptor.Scope());
++
++  if (NS_IsMainThread()) {
++    nsCOMPtr<nsPIDOMWindowInner> window = do_QueryInterface(global);
++    if (NS_WARN_IF(!window)) {
++      aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
++      return nullptr;
++    }
++    return Notification::Get(window, aOptions, scope, aRv);
++  }
++
++  WorkerPrivate* worker = GetCurrentThreadWorkerPrivate();
++  worker->AssertIsOnWorkerThread();
++  return Notification::WorkerGet(worker, aOptions, scope, aRv);
+ }
+ 
+ } // dom namespace
+ } // mozilla namespace
+diff --git a/dom/serviceworkers/ServiceWorkerRegistration.h b/dom/serviceworkers/ServiceWorkerRegistration.h
+--- a/dom/serviceworkers/ServiceWorkerRegistration.h
++++ b/dom/serviceworkers/ServiceWorkerRegistration.h
+@@ -44,20 +44,16 @@ public:
+     virtual void
+     ClearServiceWorkerRegistration(ServiceWorkerRegistration* aReg) = 0;
+ 
+     virtual RefPtr<ServiceWorkerRegistrationPromise>
+     Update(ErrorResult& aRv) = 0;
+ 
+     virtual RefPtr<GenericPromise>
+     Unregister() = 0;
+-
+-    virtual already_AddRefed<Promise>
+-    GetNotifications(const GetNotificationOptions& aOptions,
+-                     ErrorResult& aRv) = 0;
+   };
+ 
+   NS_DECLARE_STATIC_IID_ACCESSOR(NS_DOM_SERVICEWORKERREGISTRATION_IID)
+   NS_DECL_ISUPPORTS_INHERITED
+   NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(ServiceWorkerRegistration, DOMEventTargetHelper)
+ 
+   IMPL_EVENT_HANDLER(updatefound)
+ 
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationImpl.cpp b/dom/serviceworkers/ServiceWorkerRegistrationImpl.cpp
+--- a/dom/serviceworkers/ServiceWorkerRegistrationImpl.cpp
++++ b/dom/serviceworkers/ServiceWorkerRegistrationImpl.cpp
+@@ -3,17 +3,16 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "ServiceWorkerRegistrationImpl.h"
+ 
+ #include "ipc/ErrorIPCUtils.h"
+ #include "mozilla/dom/DOMPrefs.h"
+-#include "mozilla/dom/Notification.h"
+ #include "mozilla/dom/Promise.h"
+ #include "mozilla/dom/PromiseWorkerProxy.h"
+ #include "mozilla/dom/PushManagerBinding.h"
+ #include "mozilla/dom/PushManager.h"
+ #include "mozilla/dom/ServiceWorkerRegistrationBinding.h"
+ #include "mozilla/dom/WorkerCommon.h"
+ #include "mozilla/dom/WorkerPrivate.h"
+ #include "mozilla/dom/WorkerRef.h"
+@@ -513,30 +512,16 @@ ServiceWorkerRegistrationMainThread::Unr
+                                 NS_ConvertUTF8toUTF16(mDescriptor.Scope()));
+   if (NS_FAILED(rv)) {
+     return GenericPromise::CreateAndReject(rv, __func__);
+   }
+ 
+   return cb->Promise();
+ }
+ 
+-already_AddRefed<Promise>
+-ServiceWorkerRegistrationMainThread::GetNotifications(const GetNotificationOptions& aOptions, ErrorResult& aRv)
+-{
+-  MOZ_ASSERT(NS_IsMainThread());
+-  MOZ_DIAGNOSTIC_ASSERT(mOuter);
+-
+-  nsCOMPtr<nsPIDOMWindowInner> window = mOuter->GetOwner();
+-  if (NS_WARN_IF(!window)) {
+-    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+-    return nullptr;
+-  }
+-  return Notification::Get(window, aOptions, mScope, aRv);
+-}
+-
+ ////////////////////////////////////////////////////
+ // Worker Thread implementation
+ 
+ class WorkerListener final : public ServiceWorkerRegistrationListener
+ {
+   const nsString mScope;
+   bool mListeningForEvents;
+ 
+@@ -906,24 +891,16 @@ WorkerListener::RegistrationRemoved()
+ 
+     StopListeningForEvents();
+     return;
+   }
+ 
+   mRegistration->RegistrationRemoved();
+ }
+ 
+-already_AddRefed<Promise>
+-ServiceWorkerRegistrationWorkerThread::GetNotifications(const GetNotificationOptions& aOptions,
+-                                                        ErrorResult& aRv)
+-{
+-  MOZ_ASSERT(mWorkerRef && mWorkerRef->GetPrivate());
+-  return Notification::WorkerGet(mWorkerRef->GetPrivate(), aOptions, mScope, aRv);
+-}
+-
+ void
+ ServiceWorkerRegistrationWorkerThread::UpdateFound()
+ {
+   mOuter->DispatchTrustedEvent(NS_LITERAL_STRING("updatefound"));
+ }
+ 
+ WorkerPrivate*
+ ServiceWorkerRegistrationWorkerThread::GetWorkerPrivate(const MutexAutoLock& aProofOfLock)
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationImpl.h b/dom/serviceworkers/ServiceWorkerRegistrationImpl.h
+--- a/dom/serviceworkers/ServiceWorkerRegistrationImpl.h
++++ b/dom/serviceworkers/ServiceWorkerRegistrationImpl.h
+@@ -43,20 +43,16 @@ public:
+   ClearServiceWorkerRegistration(ServiceWorkerRegistration* aReg) override;
+ 
+   RefPtr<ServiceWorkerRegistrationPromise>
+   Update(ErrorResult& aRv) override;
+ 
+   RefPtr<GenericPromise>
+   Unregister() override;
+ 
+-  already_AddRefed<Promise>
+-  GetNotifications(const GetNotificationOptions& aOptions,
+-                   ErrorResult& aRv) override;
+-
+   // ServiceWorkerRegistrationListener
+   void
+   UpdateFound() override;
+ 
+   void
+   UpdateState(const ServiceWorkerRegistrationDescriptor& aDescriptor) override;
+ 
+   void
+@@ -114,20 +110,16 @@ public:
+   ClearServiceWorkerRegistration(ServiceWorkerRegistration* aReg) override;
+ 
+   RefPtr<ServiceWorkerRegistrationPromise>
+   Update(ErrorResult& aRv) override;
+ 
+   RefPtr<GenericPromise>
+   Unregister() override;
+ 
+-  already_AddRefed<Promise>
+-  GetNotifications(const GetNotificationOptions& aOptions,
+-                   ErrorResult& aRv) override;
+-
+   void
+   UpdateFound();
+ 
+ private:
+   ~ServiceWorkerRegistrationWorkerThread();
+ 
+   void
+   InitListener();
