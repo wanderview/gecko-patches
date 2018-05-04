@@ -1,0 +1,420 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  050cacf2c841fe5e3f891da7b58da712b697be12
+Bug 1459209 P2 Implement RemoteServiceWorkerImpl to connect the binding ServiceWorker to the PServiceWorkerChild actor. r=baku
+
+diff --git a/dom/serviceworkers/RemoteServiceWorkerImpl.cpp b/dom/serviceworkers/RemoteServiceWorkerImpl.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/serviceworkers/RemoteServiceWorkerImpl.cpp
+@@ -0,0 +1,117 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "RemoteServiceWorkerImpl.h"
++
++#include "mozilla/ipc/BackgroundChild.h"
++#include "mozilla/ipc/PBackgroundChild.h"
++#include "ServiceWorkerChild.h"
++
++namespace mozilla {
++namespace dom {
++
++using mozilla::ipc::BackgroundChild;
++using mozilla::ipc::PBackgroundChild;
++
++RemoteServiceWorkerImpl::~RemoteServiceWorkerImpl()
++{
++  MOZ_DIAGNOSTIC_ASSERT(!mWorker);
++  Shutdown();
++}
++
++void
++RemoteServiceWorkerImpl::Shutdown()
++{
++  if (mShutdown) {
++    return;
++  }
++  mShutdown = true;
++
++  if (mActor) {
++    mActor->RevokeOwner(this);
++    mActor->MaybeStartTeardown();
++    mActor = nullptr;
++  }
++}
++
++void
++RemoteServiceWorkerImpl::AddServiceWorker(ServiceWorker* aWorker)
++{
++  NS_ASSERT_OWNINGTHREAD(RemoteServiceWorkerImpl);
++  MOZ_DIAGNOSTIC_ASSERT(!mWorker);
++  MOZ_DIAGNOSTIC_ASSERT(aWorker);
++  mWorker = aWorker;
++}
++
++void
++RemoteServiceWorkerImpl::RemoveServiceWorker(ServiceWorker* aWorker)
++{
++  NS_ASSERT_OWNINGTHREAD(RemoteServiceWorkerImpl);
++  MOZ_DIAGNOSTIC_ASSERT(mWorker);
++  MOZ_DIAGNOSTIC_ASSERT(aWorker == mWorker);
++  mWorker = nullptr;
++}
++
++void
++RemoteServiceWorkerImpl::PostMessage(ipc::StructuredCloneData&& aData,
++                                     const ClientInfo& aClientInfo,
++                                     const ClientState& aClientState)
++{
++  // TODO
++}
++
++RemoteServiceWorkerImpl::RemoteServiceWorkerImpl(const ServiceWorkerDescriptor& aDescriptor)
++  : mActor(nullptr)
++  , mWorker(nullptr)
++  , mShutdown(false)
++{
++  PBackgroundChild* parentActor = BackgroundChild::GetOrCreateForCurrentThread();
++  if (NS_WARN_IF(!parentActor)) {
++    Shutdown();
++    return;
++  }
++
++  RefPtr<WorkerHolderToken> workerHolderToken;
++  if (!NS_IsMainThread()) {
++    WorkerPrivate* workerPrivate = GetCurrentThreadWorkerPrivate();
++    MOZ_DIAGNOSTIC_ASSERT(workerPrivate);
++
++    workerHolderToken =
++      WorkerHolderToken::Create(workerPrivate, Terminating,
++                                WorkerHolderToken::AllowIdleShutdownStart);
++
++    if (NS_WARN_IF(!workerHolderToken)) {
++      Shutdown();
++      return;
++    }
++  }
++
++  ServiceWorkerChild* actor = new ServiceWorkerChild(workerHolderToken);
++  PServiceWorkerChild* sentActor =
++    parentActor->SendPServiceWorkerConstructor(actor, aDescriptor.ToIPC());
++  if (NS_WARN_IF(!sentActor)) {
++    Shutdown();
++    return;
++  }
++  MOZ_DIAGNOSTIC_ASSERT(sentActor == actor);
++
++  mActor = actor;
++  mActor->SetOwner(this);
++}
++
++void
++RemoteServiceWorkerImpl::RevokeActor(ServiceWorkerChild* aActor)
++{
++  MOZ_DIAGNOSTIC_ASSERT(mActor);
++  MOZ_DIAGNOSTIC_ASSERT(mActor == aActor);
++  mActor->RevokeOwner(this);
++  mActor = nullptr;
++
++  mShutdown = true;
++}
++
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/serviceworkers/RemoteServiceWorkerImpl.h b/dom/serviceworkers/RemoteServiceWorkerImpl.h
+new file mode 100644
+--- /dev/null
++++ b/dom/serviceworkers/RemoteServiceWorkerImpl.h
+@@ -0,0 +1,51 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_remoteserviceworkerimpl_h__
++#define mozilla_dom_remoteserviceworkerimpl_h__
++
++#include "ServiceWorker.h"
++
++namespace mozilla {
++namespace dom {
++
++class ServiceWorkerChild;
++
++class RemoteServiceWorkerImpl final : public ServiceWorker::Inner
++{
++  ServiceWorkerChild* mActor;
++  ServiceWorker* mWorker;
++  bool mShutdown;
++
++  ~RemoteServiceWorkerImpl();
++
++  void
++  Shutdown();
++
++  // ServiceWorker::Inner implementation
++  void
++  AddServiceWorker(ServiceWorker* aWorker) override;
++
++  void
++  RemoveServiceWorker(ServiceWorker* aWorker) override;
++
++  void
++  PostMessage(ipc::StructuredCloneData&& aData,
++              const ClientInfo& aClientInfo,
++              const ClientState& aClientState) override;
++public:
++  explicit RemoteServiceWorkerImpl(const ServiceWorkerDescriptor& aDescriptor);
++
++  void
++  RevokeActor(ServiceWorkerChild* aActor);
++
++  NS_INLINE_DECL_REFCOUNTING(RemoteServiceWorkerImpl, override)
++};
++
++} // namespace dom
++} // namespace mozilla
++
++#endif // mozilla_dom_remoteserviceworkerimpl_h__
+diff --git a/dom/serviceworkers/ServiceWorker.cpp b/dom/serviceworkers/ServiceWorker.cpp
+--- a/dom/serviceworkers/ServiceWorker.cpp
++++ b/dom/serviceworkers/ServiceWorker.cpp
+@@ -3,18 +3,20 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+  * You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "ServiceWorker.h"
+ 
+ #include "nsIDocument.h"
+ #include "nsPIDOMWindow.h"
++#include "RemoteServiceWorkerImpl.h"
+ #include "ServiceWorkerManager.h"
+ #include "ServiceWorkerPrivate.h"
++#include "ServiceWorkerUtils.h"
+ 
+ #include "mozilla/dom/DOMPrefs.h"
+ #include "mozilla/dom/ClientIPCTypes.h"
+ #include "mozilla/dom/ClientState.h"
+ #include "mozilla/dom/Promise.h"
+ #include "mozilla/dom/ServiceWorkerGlobalScopeBinding.h"
+ #include "mozilla/dom/WorkerPrivate.h"
+ #include "mozilla/dom/ipc/StructuredCloneData.h"
+@@ -41,33 +43,34 @@ ServiceWorkerVisible(JSContext* aCx, JSO
+ 
+ // static
+ already_AddRefed<ServiceWorker>
+ ServiceWorker::Create(nsIGlobalObject* aOwner,
+                       const ServiceWorkerDescriptor& aDescriptor)
+ {
+   RefPtr<ServiceWorker> ref;
+ 
+-  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+-  if (!swm) {
+-    return ref.forget();
++  RefPtr<ServiceWorker::Inner> inner;
++
++  if (ServiceWorkerParentInterceptEnabled()) {
++    inner = new RemoteServiceWorkerImpl(aDescriptor);
++  } else {
++    RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
++    NS_ENSURE_TRUE(swm, nullptr);
++
++    RefPtr<ServiceWorkerRegistrationInfo> reg =
++      swm->GetRegistration(aDescriptor.PrincipalInfo(), aDescriptor.Scope());
++    NS_ENSURE_TRUE(reg, nullptr);
++
++    inner = reg->GetByDescriptor(aDescriptor);
+   }
+ 
+-  RefPtr<ServiceWorkerRegistrationInfo> reg =
+-    swm->GetRegistration(aDescriptor.PrincipalInfo(), aDescriptor.Scope());
+-  if (!reg) {
+-    return ref.forget();
+-  }
++  NS_ENSURE_TRUE(inner, nullptr);
+ 
+-  RefPtr<ServiceWorkerInfo> info = reg->GetByDescriptor(aDescriptor);
+-  if (!info) {
+-    return ref.forget();
+-  }
+-
+-  ref = new ServiceWorker(aOwner, aDescriptor, info);
++  ref = new ServiceWorker(aOwner, aDescriptor, inner);
+   return ref.forget();
+ }
+ 
+ ServiceWorker::ServiceWorker(nsIGlobalObject* aGlobal,
+                              const ServiceWorkerDescriptor& aDescriptor,
+                              ServiceWorker::Inner* aInner)
+   : DOMEventTargetHelper(aGlobal)
+   , mDescriptor(aDescriptor)
+diff --git a/dom/serviceworkers/ServiceWorkerActors.cpp b/dom/serviceworkers/ServiceWorkerActors.cpp
+--- a/dom/serviceworkers/ServiceWorkerActors.cpp
++++ b/dom/serviceworkers/ServiceWorkerActors.cpp
+@@ -14,17 +14,17 @@
+ #include "ServiceWorkerRegistrationParent.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ PServiceWorkerChild*
+ AllocServiceWorkerChild()
+ {
+-  return new ServiceWorkerChild();
++  MOZ_CRASH("should not be called");
+ }
+ 
+ bool
+ DeallocServiceWorkerChild(PServiceWorkerChild* aActor)
+ {
+   auto actor = static_cast<ServiceWorkerChild*>(aActor);
+   delete actor;
+   return true;
+diff --git a/dom/serviceworkers/ServiceWorkerChild.cpp b/dom/serviceworkers/ServiceWorkerChild.cpp
+--- a/dom/serviceworkers/ServiceWorkerChild.cpp
++++ b/dom/serviceworkers/ServiceWorkerChild.cpp
+@@ -7,13 +7,63 @@
+ #include "ServiceWorkerChild.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ void
+ ServiceWorkerChild::ActorDestroy(ActorDestroyReason aReason)
+ {
+-  // TODO
++  if (mWorkerHolderToken) {
++    mWorkerHolderToken->RemoveListener(this);
++    mWorkerHolderToken = nullptr;
++  }
++
++  if (mOwner) {
++    mOwner->RevokeActor(this);
++    MOZ_DIAGNOSTIC_ASSERT(!mOwner);
++  }
++}
++
++void
++ServiceWorkerChild::WorkerShuttingDown()
++{
++  MaybeStartTeardown();
++}
++
++ServiceWorkerChild::ServiceWorkerChild(WorkerHolderToken* aWorkerHolderToken)
++  : mWorkerHolderToken(aWorkerHolderToken)
++  , mOwner(nullptr)
++  , mTeardownStarted(false)
++{
++  if (mWorkerHolderToken) {
++    mWorkerHolderToken->AddListener(this);
++  }
++}
++
++void
++ServiceWorkerChild::SetOwner(RemoteServiceWorkerImpl* aOwner)
++{
++  MOZ_DIAGNOSTIC_ASSERT(!mOwner);
++  MOZ_DIAGNOSTIC_ASSERT(aOwner);
++  mOwner = aOwner;
++}
++
++void
++ServiceWorkerChild::RevokeOwner(RemoteServiceWorkerImpl* aOwner)
++{
++  MOZ_DIAGNOSTIC_ASSERT(mOwner);
++  MOZ_DIAGNOSTIC_ASSERT(aOwner == mOwner);
++  mOwner = nullptr;
++}
++
++void
++ServiceWorkerChild::MaybeStartTeardown()
++{
++  if (mTeardownStarted) {
++    return;
++  }
++  mTeardownStarted = true;
++  Unused << SendTeardown();
+ }
+ 
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/serviceworkers/ServiceWorkerChild.h b/dom/serviceworkers/ServiceWorkerChild.h
+--- a/dom/serviceworkers/ServiceWorkerChild.h
++++ b/dom/serviceworkers/ServiceWorkerChild.h
+@@ -3,27 +3,48 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_serviceworkerchild_h__
+ #define mozilla_dom_serviceworkerchild_h__
+ 
+ #include "mozilla/dom/PServiceWorkerChild.h"
++#include "mozilla/dom/WorkerHolderToken.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
++class RemoteServiceWorkerImpl;
++
+ class ServiceWorkerChild final : public PServiceWorkerChild
++                               , public WorkerHolderToken::Listener
+ {
++  RefPtr<WorkerHolderToken> mWorkerHolderToken;
++  RemoteServiceWorkerImpl* mOwner;
++  bool mTeardownStarted;
++
+   // PServiceWorkerChild
+   void
+   ActorDestroy(ActorDestroyReason aReason) override;
+ 
++  // WorkerHolderToken::Listener
++  void
++  WorkerShuttingDown() override;
++
+ public:
+-  ServiceWorkerChild() = default;
++  explicit ServiceWorkerChild(WorkerHolderToken* aWorkerHolderToken);
+   ~ServiceWorkerChild() = default;
++
++  void
++  SetOwner(RemoteServiceWorkerImpl* aOwner);
++
++  void
++  RevokeOwner(RemoteServiceWorkerImpl* aOwner);
++
++  void
++  MaybeStartTeardown();
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_serviceworkerchild_h__
+diff --git a/dom/serviceworkers/moz.build b/dom/serviceworkers/moz.build
+--- a/dom/serviceworkers/moz.build
++++ b/dom/serviceworkers/moz.build
+@@ -23,16 +23,17 @@ EXPORTS.mozilla.dom += [
+     'ServiceWorkerRegistrar.h',
+     'ServiceWorkerRegistration.h',
+     'ServiceWorkerRegistrationDescriptor.h',
+     'ServiceWorkerRegistrationInfo.h',
+     'ServiceWorkerUtils.h',
+ ]
+ 
+ UNIFIED_SOURCES += [
++    'RemoteServiceWorkerImpl.cpp',
+     'ServiceWorker.cpp',
+     'ServiceWorkerActors.cpp',
+     'ServiceWorkerChild.cpp',
+     'ServiceWorkerContainer.cpp',
+     'ServiceWorkerContainerChild.cpp',
+     'ServiceWorkerContainerImpl.cpp',
+     'ServiceWorkerContainerParent.cpp',
+     'ServiceWorkerDescriptor.cpp',
