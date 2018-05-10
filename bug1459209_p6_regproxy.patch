@@ -1,0 +1,401 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  14daf1792d0f4c807ca27ce238b316a9407d01dc
+Bug 1459209 P6 Scaffold a ServiceWorkerRegistrationProxy class to connect the parent actor to the main thread SWM. r=baku
+
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationParent.cpp b/dom/serviceworkers/ServiceWorkerRegistrationParent.cpp
+--- a/dom/serviceworkers/ServiceWorkerRegistrationParent.cpp
++++ b/dom/serviceworkers/ServiceWorkerRegistrationParent.cpp
+@@ -1,34 +1,61 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "ServiceWorkerRegistrationParent.h"
+ 
++#include "ServiceWorkerRegistrationProxy.h"
++
+ namespace mozilla {
+ namespace dom {
+ 
+ using mozilla::ipc::IPCResult;
+ 
+ void
+ ServiceWorkerRegistrationParent::ActorDestroy(ActorDestroyReason aReason)
+ {
+-  // TODO
++  if (mProxy) {
++    mProxy->RevokeActor(this);
++    mProxy = nullptr;
++  }
+ }
+ 
+ IPCResult
+ ServiceWorkerRegistrationParent::RecvTeardown()
+ {
+-  // TODO
++  MaybeSendDelete();
+   return IPC_OK();
+ }
+ 
++ServiceWorkerRegistrationParent::ServiceWorkerRegistrationParent()
++  : mDeleteSent(false)
++{
++}
++
++ServiceWorkerRegistrationParent::~ServiceWorkerRegistrationParent()
++{
++  MOZ_DIAGNOSTIC_ASSERT(!mProxy);
++}
++
+ void
+ ServiceWorkerRegistrationParent::Init(const IPCServiceWorkerRegistrationDescriptor& aDescriptor)
+ {
+-  // TODO
++  MOZ_DIAGNOSTIC_ASSERT(!mProxy);
++  mProxy = new ServiceWorkerRegistrationProxy(
++    this, ServiceWorkerRegistrationDescriptor(aDescriptor));
++}
++
++void
++ServiceWorkerRegistrationParent::MaybeSendDelete()
++{
++  if (mDeleteSent) {
++    return;
++  }
++  mDeleteSent = true;
++  Unused << Send__delete__(this);
+ }
+ 
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationParent.h b/dom/serviceworkers/ServiceWorkerRegistrationParent.h
+--- a/dom/serviceworkers/ServiceWorkerRegistrationParent.h
++++ b/dom/serviceworkers/ServiceWorkerRegistrationParent.h
+@@ -8,30 +8,37 @@
+ #define mozilla_dom_serviceworkerregistrationparent_h__
+ 
+ #include "mozilla/dom/PServiceWorkerRegistrationParent.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ class IPCServiceWorkerRegistrationDescriptor;
++class ServiceWorkerRegistrationProxy;
+ 
+ class ServiceWorkerRegistrationParent final : public PServiceWorkerRegistrationParent
+ {
++  RefPtr<ServiceWorkerRegistrationProxy> mProxy;
++  bool mDeleteSent;
++
+   // PServiceWorkerRegistrationParent
+   void
+   ActorDestroy(ActorDestroyReason aReason) override;
+ 
+   mozilla::ipc::IPCResult
+   RecvTeardown() override;
+ 
+ public:
+-  ServiceWorkerRegistrationParent() = default;
+-  ~ServiceWorkerRegistrationParent() = default;
++  ServiceWorkerRegistrationParent();
++  ~ServiceWorkerRegistrationParent();
+ 
+   void
+   Init(const IPCServiceWorkerRegistrationDescriptor& aDescriptor);
++
++  void
++  MaybeSendDelete();
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_serviceworkerregistrationparent_h__
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationProxy.cpp b/dom/serviceworkers/ServiceWorkerRegistrationProxy.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/serviceworkers/ServiceWorkerRegistrationProxy.cpp
+@@ -0,0 +1,174 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "ServiceWorkerRegistrationProxy.h"
++
++#include "mozilla/ipc/BackgroundParent.h"
++#include "ServiceWorkerManager.h"
++#include "ServiceWorkerRegistrationParent.h"
++
++namespace mozilla {
++namespace dom {
++
++using mozilla::ipc::AssertIsOnBackgroundThread;
++
++ServiceWorkerRegistrationProxy::~ServiceWorkerRegistrationProxy()
++{
++  // Any thread
++  MOZ_DIAGNOSTIC_ASSERT(!mActor);
++  MOZ_DIAGNOSTIC_ASSERT(!mReg);
++}
++
++void
++ServiceWorkerRegistrationProxy::MaybeShutdownOnBGThread()
++{
++  AssertIsOnBackgroundThread();
++  if (!mActor) {
++    return;
++  }
++  mActor->MaybeSendDelete();
++}
++
++void
++ServiceWorkerRegistrationProxy::UpdateStateOnBGThread(const ServiceWorkerRegistrationDescriptor& aDescriptor)
++{
++  AssertIsOnBackgroundThread();
++  if (!mActor) {
++    return;
++  }
++  // send update
++}
++
++void
++ServiceWorkerRegistrationProxy::InitOnMainThread()
++{
++  AssertIsOnMainThread();
++
++  auto scopeExit = MakeScopeExit([&] {
++    MaybeShutdownOnMainThread();
++  });
++
++  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
++  NS_ENSURE_TRUE_VOID(swm);
++
++  RefPtr<ServiceWorkerRegistrationInfo> reg =
++    swm->GetRegistration(mDescriptor.PrincipalInfo(), mDescriptor.Scope());
++  NS_ENSURE_TRUE_VOID(reg);
++
++  scopeExit.release();
++
++  mReg = new nsMainThreadPtrHolder<ServiceWorkerRegistrationInfo>(
++    "ServiceWorkerRegistrationProxy::mInfo", reg);
++
++  swm->AddRegistrationEventListener(NS_ConvertUTF8toUTF16(mDescriptor.Scope()),
++                                    this);
++}
++
++void
++ServiceWorkerRegistrationProxy::MaybeShutdownOnMainThread()
++{
++  AssertIsOnMainThread();
++
++  nsCOMPtr<nsIRunnable> r =
++    NewRunnableMethod(__func__, this,
++                      &ServiceWorkerRegistrationProxy::MaybeShutdownOnBGThread);
++
++  MOZ_ALWAYS_SUCCEEDS(mEventTarget->Dispatch(r.forget(), NS_DISPATCH_NORMAL));
++}
++
++void
++ServiceWorkerRegistrationProxy::StopListeningOnMainThread()
++{
++  AssertIsOnMainThread();
++
++  if (!mReg) {
++    return;
++  }
++  mReg = nullptr;
++
++  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
++  NS_ENSURE_TRUE_VOID(swm);
++
++  swm->RemoveRegistrationEventListener(NS_ConvertUTF8toUTF16(mDescriptor.Scope()),
++                                       this);
++}
++
++void
++ServiceWorkerRegistrationProxy::UpdateFound()
++{
++  // TODO
++}
++
++void
++ServiceWorkerRegistrationProxy::UpdateState(const ServiceWorkerRegistrationDescriptor& aDescriptor)
++{
++  // TODO
++  AssertIsOnMainThread();
++
++  if (mDescriptor == aDescriptor) {
++    return;
++  }
++  mDescriptor = aDescriptor;
++
++  nsCOMPtr<nsIRunnable> r = NewRunnableMethod<ServiceWorkerRegistrationDescriptor>(
++    __func__, this, &ServiceWorkerRegistrationProxy::UpdateStateOnBGThread,
++    aDescriptor);
++
++  MOZ_ALWAYS_SUCCEEDS(mEventTarget->Dispatch(r.forget(), NS_DISPATCH_NORMAL));
++}
++
++void
++ServiceWorkerRegistrationProxy::RegistrationRemoved()
++{
++  MaybeShutdownOnMainThread();
++}
++
++void
++ServiceWorkerRegistrationProxy::GetScope(nsAString& aScope) const
++{
++  CopyUTF8toUTF16(mDescriptor.Scope(), aScope);
++}
++
++bool
++ServiceWorkerRegistrationProxy::MatchesDescriptor(const ServiceWorkerRegistrationDescriptor& aDescriptor)
++{
++  AssertIsOnMainThread();
++  return aDescriptor.Id() == mDescriptor.Id() &&
++         aDescriptor.PrincipalInfo() == mDescriptor.PrincipalInfo() &&
++         aDescriptor.Scope() == mDescriptor.Scope();
++}
++
++ServiceWorkerRegistrationProxy::ServiceWorkerRegistrationProxy(ServiceWorkerRegistrationParent* aActor,
++                                                               const ServiceWorkerRegistrationDescriptor& aDescriptor)
++  : mActor(aActor)
++  , mEventTarget(GetCurrentThreadSerialEventTarget())
++  , mDescriptor(aDescriptor)
++{
++  AssertIsOnBackgroundThread();
++  MOZ_DIAGNOSTIC_ASSERT(mActor);
++  MOZ_DIAGNOSTIC_ASSERT(mEventTarget);
++
++  nsCOMPtr<nsIRunnable> r = NewRunnableMethod(
++    __func__, this, &ServiceWorkerRegistrationProxy::InitOnMainThread);
++  MOZ_ALWAYS_SUCCEEDS(SystemGroup::Dispatch(TaskCategory::Other, r.forget()));
++}
++
++void
++ServiceWorkerRegistrationProxy::RevokeActor(ServiceWorkerRegistrationParent* aActor)
++{
++  AssertIsOnBackgroundThread();
++  MOZ_DIAGNOSTIC_ASSERT(mActor);
++  MOZ_DIAGNOSTIC_ASSERT(mActor == aActor);
++  mActor = nullptr;
++
++  nsCOMPtr<nsIRunnable> r =
++    NewRunnableMethod(__func__, this,
++                      &ServiceWorkerRegistrationProxy::StopListeningOnMainThread);
++  MOZ_ALWAYS_SUCCEEDS(SystemGroup::Dispatch(TaskCategory::Other, r.forget()));
++}
++
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationProxy.h b/dom/serviceworkers/ServiceWorkerRegistrationProxy.h
+new file mode 100644
+--- /dev/null
++++ b/dom/serviceworkers/ServiceWorkerRegistrationProxy.h
+@@ -0,0 +1,80 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef moz_dom_ServiceWorkerRegistrationProxy_h
++#define moz_dom_ServiceWorkerRegistrationProxy_h
++
++#include "nsProxyRelease.h"
++#include "ServiceWorkerRegistrationDescriptor.h"
++#include "ServiceWorkerRegistrationListener.h"
++
++namespace mozilla {
++namespace dom {
++
++class ServiceWorkerRegistrationInfo;
++class ServiceWorkerRegistrationParent;
++
++class ServiceWorkerRegistrationProxy final : public ServiceWorkerRegistrationListener
++{
++  // Background thread only
++  ServiceWorkerRegistrationParent* mActor;
++
++  // Written on background thread and read on main thread
++  nsCOMPtr<nsISerialEventTarget> mEventTarget;
++
++  // Main thread only
++  ServiceWorkerRegistrationDescriptor mDescriptor;
++  nsMainThreadPtrHandle<ServiceWorkerRegistrationInfo> mReg;
++
++  ~ServiceWorkerRegistrationProxy();
++
++  // Background thread methods
++  void
++  MaybeShutdownOnBGThread();
++
++  void
++  UpdateStateOnBGThread(const ServiceWorkerRegistrationDescriptor& aDescriptor);
++
++  // Main thread methods
++  void
++  InitOnMainThread();
++
++  void
++  MaybeShutdownOnMainThread();
++
++  void
++  StopListeningOnMainThread();
++
++  // ServiceWorkerRegistrationListener interface
++  void
++  UpdateFound() override;
++
++  void
++  UpdateState(const ServiceWorkerRegistrationDescriptor& aDescriptor) override;
++
++  void
++  RegistrationRemoved() override;
++
++  void
++  GetScope(nsAString& aScope) const override;
++
++  bool
++  MatchesDescriptor(const ServiceWorkerRegistrationDescriptor& aDescriptor) override;
++
++public:
++  ServiceWorkerRegistrationProxy(ServiceWorkerRegistrationParent* aActor,
++                                 const ServiceWorkerRegistrationDescriptor& aDescriptor);
++
++  void
++  RevokeActor(ServiceWorkerRegistrationParent* aActor);
++
++  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ServiceWorkerRegistrationProxy, override);
++};
++
++} // namespace dom
++} // namespace mozilla
++
++#endif // moz_dom_ServiceWorkerRegistrationProxy_h
+diff --git a/dom/serviceworkers/moz.build b/dom/serviceworkers/moz.build
+--- a/dom/serviceworkers/moz.build
++++ b/dom/serviceworkers/moz.build
+@@ -55,16 +55,17 @@ UNIFIED_SOURCES += [
+     'ServiceWorkerRegisterJob.cpp',
+     'ServiceWorkerRegistrar.cpp',
+     'ServiceWorkerRegistration.cpp',
+     'ServiceWorkerRegistrationChild.cpp',
+     'ServiceWorkerRegistrationDescriptor.cpp',
+     'ServiceWorkerRegistrationImpl.cpp',
+     'ServiceWorkerRegistrationInfo.cpp',
+     'ServiceWorkerRegistrationParent.cpp',
++    'ServiceWorkerRegistrationProxy.cpp',
+     'ServiceWorkerScriptCache.cpp',
+     'ServiceWorkerUnregisterJob.cpp',
+     'ServiceWorkerUpdateJob.cpp',
+     'ServiceWorkerUpdaterChild.cpp',
+     'ServiceWorkerUpdaterParent.cpp',
+     'ServiceWorkerUtils.cpp',
+ ]
+ 

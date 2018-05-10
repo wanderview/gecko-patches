@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  44d59fa07179916c7aac718b2e59631a9c2a804c
+# Parent  cf5301acf36449126db147bc582a596d93faea02
 Bug 1459209 P5 Scaffold a ServiceWorkerProxy class to connect the parent actor to the main thread SWM. r=baku
 
 diff --git a/dom/serviceworkers/ServiceWorkerParent.cpp b/dom/serviceworkers/ServiceWorkerParent.cpp
@@ -117,7 +117,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerProxy.cpp b/dom/serviceworkers/Serv
 new file mode 100644
 --- /dev/null
 +++ b/dom/serviceworkers/ServiceWorkerProxy.cpp
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,145 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -137,6 +137,7 @@ new file mode 100644
 +{
 +  // Any thread
 +  MOZ_DIAGNOSTIC_ASSERT(!mActor);
++  MOZ_DIAGNOSTIC_ASSERT(!mInfo);
 +}
 +
 +void
@@ -147,6 +148,16 @@ new file mode 100644
 +    return;
 +  }
 +  mActor->MaybeSendDelete();
++}
++
++void
++ServiceWorkerProxy::SetStateOnBGThread(ServiceWorkerState aState)
++{
++  AssertIsOnBackgroundThread();
++  if (!mActor) {
++    return;
++  }
++  // TODO send the state
 +}
 +
 +void
@@ -173,7 +184,9 @@ new file mode 100644
 +  mInfo = new nsMainThreadPtrHolder<ServiceWorkerInfo>("ServiceWorkerProxy::mInfo",
 +                                                       info);
 +
-+  // TODO: update state if necessary
++  // The ServiceWorkerInfo will automatically update our state when we
++  // add ourself as a listener.
++  mInfo->AddListener(this);
 +}
 +
 +void
@@ -184,6 +197,37 @@ new file mode 100644
 +  nsCOMPtr<nsIRunnable> r =
 +    NewRunnableMethod(__func__, this,
 +                      &ServiceWorkerProxy::MaybeShutdownOnBGThread);
++
++  MOZ_ALWAYS_SUCCEEDS(mEventTarget->Dispatch(r.forget(), NS_DISPATCH_NORMAL));
++}
++
++void
++ServiceWorkerProxy::StopListeningOnMainThread()
++{
++  AssertIsOnMainThread();
++
++  if (!mInfo) {
++    return;
++  }
++
++  mInfo->RemoveListener(this);
++  mInfo = nullptr;
++}
++
++void
++ServiceWorkerProxy::SetState(ServiceWorkerState aState)
++{
++  AssertIsOnMainThread();
++
++  if (mDescriptor.State() == aState) {
++    return;
++  }
++  mDescriptor.SetState(aState);
++
++  nsCOMPtr<nsIRunnable> r =
++    NewRunnableMethod<ServiceWorkerState>(__func__, this,
++                                          &ServiceWorkerProxy::SetStateOnBGThread,
++                                          aState);
 +
 +  MOZ_ALWAYS_SUCCEEDS(mEventTarget->Dispatch(r.forget(), NS_DISPATCH_NORMAL));
 +}
@@ -210,6 +254,11 @@ new file mode 100644
 +  MOZ_DIAGNOSTIC_ASSERT(mActor);
 +  MOZ_DIAGNOSTIC_ASSERT(mActor == aActor);
 +  mActor = nullptr;
++
++  nsCOMPtr<nsIRunnable> r =
++    NewRunnableMethod(__func__, this,
++                      &ServiceWorkerProxy::StopListeningOnMainThread);
++  MOZ_ALWAYS_SUCCEEDS(SystemGroup::Dispatch(TaskCategory::Other, r.forget()));
 +}
 +
 +} // namespace dom
@@ -218,7 +267,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerProxy.h b/dom/serviceworkers/Servic
 new file mode 100644
 --- /dev/null
 +++ b/dom/serviceworkers/ServiceWorkerProxy.h
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,68 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -230,6 +279,7 @@ new file mode 100644
 +
 +#include "nsProxyRelease.h"
 +#include "ServiceWorkerDescriptor.h"
++#include "ServiceWorkerInfo.h"
 +
 +namespace mozilla {
 +namespace dom {
@@ -237,7 +287,7 @@ new file mode 100644
 +class ServiceWorkerInfo;
 +class ServiceWorkerParent;
 +
-+class ServiceWorkerProxy final
++class ServiceWorkerProxy final : public ServiceWorkerInfo::Listener
 +{
 +  // Background thread only
 +  ServiceWorkerParent* mActor;
@@ -255,12 +305,22 @@ new file mode 100644
 +  void
 +  MaybeShutdownOnBGThread();
 +
++  void
++  SetStateOnBGThread(ServiceWorkerState aState);
++
 +  // Main thread methods
 +  void
 +  InitOnMainThread();
 +
 +  void
 +  MaybeShutdownOnMainThread();
++
++  void
++  StopListeningOnMainThread();
++
++  // ServiceWorkerInfo::Listener interface
++  void
++  SetState(ServiceWorkerState aState) override;
 +
 +public:
 +  ServiceWorkerProxy(ServiceWorkerParent* aActor,
@@ -269,42 +329,38 @@ new file mode 100644
 +  void
 +  RevokeActor(ServiceWorkerParent* aActor);
 +
-+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ServiceWorkerProxy);
++  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ServiceWorkerProxy, override);
 +};
 +
 +} // namespace dom
 +} // namespace mozilla
 +
 +#endif // moz_dom_ServiceWorkerProxy_h
-diff --git a/dom/serviceworkers/ServiceWorkerUnregisterJob.cpp b/dom/serviceworkers/ServiceWorkerUnregisterJob.cpp
---- a/dom/serviceworkers/ServiceWorkerUnregisterJob.cpp
-+++ b/dom/serviceworkers/ServiceWorkerUnregisterJob.cpp
-@@ -1,17 +1,21 @@
- /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+diff --git a/dom/serviceworkers/ServiceWorkerScriptCache.h b/dom/serviceworkers/ServiceWorkerScriptCache.h
+--- a/dom/serviceworkers/ServiceWorkerScriptCache.h
++++ b/dom/serviceworkers/ServiceWorkerScriptCache.h
+@@ -2,16 +2,17 @@
  /* vim: set ts=8 sts=2 et sw=2 tw=80: */
  /* This Source Code Form is subject to the terms of the Mozilla Public
   * License, v. 2.0. If a copy of the MPL was not distributed with this
   * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
  
- #include "ServiceWorkerUnregisterJob.h"
+ #ifndef mozilla_dom_ServiceWorkerScriptCache_h
+ #define mozilla_dom_ServiceWorkerScriptCache_h
  
-+#include "mozilla/Unused.h"
- #include "nsIPushService.h"
-+#include "nsServiceManagerUtils.h"
-+#include "nsThreadUtils.h"
-+#include "ServiceWorkerManager.h"
++#include "nsIRequest.h"
+ #include "nsString.h"
+ 
+ class nsILoadGroup;
+ class nsIPrincipal;
  
  namespace mozilla {
  namespace dom {
  
- class ServiceWorkerUnregisterJob::PushUnsubscribeCallback final :
-         public nsIUnsubscribeResultCallback
- {
- public:
 diff --git a/dom/serviceworkers/moz.build b/dom/serviceworkers/moz.build
 --- a/dom/serviceworkers/moz.build
 +++ b/dom/serviceworkers/moz.build
-@@ -45,16 +45,17 @@ UNIFIED_SOURCES += [
+@@ -46,16 +46,17 @@ UNIFIED_SOURCES += [
      'ServiceWorkerJob.cpp',
      'ServiceWorkerJobQueue.cpp',
      'ServiceWorkerManager.cpp',
