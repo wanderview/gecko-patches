@@ -1,12 +1,12 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  9c6040c361951f9bbe783dbd0ed0f8741e0c5ce3
+# Parent  44d59fa07179916c7aac718b2e59631a9c2a804c
 Bug 1459209 P5 Scaffold a ServiceWorkerProxy class to connect the parent actor to the main thread SWM. r=baku
 
 diff --git a/dom/serviceworkers/ServiceWorkerParent.cpp b/dom/serviceworkers/ServiceWorkerParent.cpp
 --- a/dom/serviceworkers/ServiceWorkerParent.cpp
 +++ b/dom/serviceworkers/ServiceWorkerParent.cpp
-@@ -1,34 +1,49 @@
+@@ -1,34 +1,60 @@
  /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
  /* vim: set ts=8 sts=2 et sw=2 tw=80: */
  /* This Source Code Form is subject to the terms of the Mozilla Public
@@ -36,11 +36,12 @@ diff --git a/dom/serviceworkers/ServiceWorkerParent.cpp b/dom/serviceworkers/Ser
  ServiceWorkerParent::RecvTeardown()
  {
 -  // TODO
-+  Unused << Send__delete__(this);
++  MaybeSendDelete();
    return IPC_OK();
  }
  
 +ServiceWorkerParent::ServiceWorkerParent()
++  : mDeleteSent(false)
 +{
 +}
 +
@@ -55,6 +56,16 @@ diff --git a/dom/serviceworkers/ServiceWorkerParent.cpp b/dom/serviceworkers/Ser
 -  // TODO
 +  MOZ_DIAGNOSTIC_ASSERT(!mProxy);
 +  mProxy = new ServiceWorkerProxy(this, ServiceWorkerDescriptor(aDescriptor));
++}
++
++void
++ServiceWorkerParent::MaybeSendDelete()
++{
++  if (mDeleteSent) {
++    return;
++  }
++  mDeleteSent = true;
++  Unused << Send__delete__(this);
  }
  
  } // namespace dom
@@ -62,7 +73,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerParent.cpp b/dom/serviceworkers/Ser
 diff --git a/dom/serviceworkers/ServiceWorkerParent.h b/dom/serviceworkers/ServiceWorkerParent.h
 --- a/dom/serviceworkers/ServiceWorkerParent.h
 +++ b/dom/serviceworkers/ServiceWorkerParent.h
-@@ -8,29 +8,32 @@
+@@ -8,30 +8,37 @@
  #define mozilla_dom_serviceworkerparent_h__
  
  #include "mozilla/dom/PServiceWorkerParent.h"
@@ -76,6 +87,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerParent.h b/dom/serviceworkers/Servi
  class ServiceWorkerParent final : public PServiceWorkerParent
  {
 +  RefPtr<ServiceWorkerProxy> mProxy;
++  bool mDeleteSent;
 +
    // PServiceWorkerParent
    void
@@ -92,16 +104,20 @@ diff --git a/dom/serviceworkers/ServiceWorkerParent.h b/dom/serviceworkers/Servi
  
    void
    Init(const IPCServiceWorkerDescriptor& aDescriptor);
++
++  void
++  MaybeSendDelete();
  };
  
  } // namespace dom
  } // namespace mozilla
  
+ #endif // mozilla_dom_serviceworkerparent_h__
 diff --git a/dom/serviceworkers/ServiceWorkerProxy.cpp b/dom/serviceworkers/ServiceWorkerProxy.cpp
 new file mode 100644
 --- /dev/null
 +++ b/dom/serviceworkers/ServiceWorkerProxy.cpp
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,96 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -124,13 +140,22 @@ new file mode 100644
 +}
 +
 +void
++ServiceWorkerProxy::MaybeShutdownOnBGThread()
++{
++  AssertIsOnBackgroundThread();
++  if (!mActor) {
++    return;
++  }
++  mActor->MaybeSendDelete();
++}
++
++void
 +ServiceWorkerProxy::InitOnMainThread()
 +{
 +  AssertIsOnMainThread();
 +
-+  nsresult rv = NS_ERROR_DOM_INVALID_STATE_ERR;
 +  auto scopeExit = MakeScopeExit([&] {
-+    MaybeShutdownOnMainThread(rv);
++    MaybeShutdownOnMainThread();
 +  });
 +
 +  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
@@ -152,18 +177,26 @@ new file mode 100644
 +}
 +
 +void
-+ServiceWorkerProxy::MaybeShutdownOnMainThread(nsresult aRv)
++ServiceWorkerProxy::MaybeShutdownOnMainThread()
 +{
-+  // TODO
++  AssertIsOnMainThread();
++
++  nsCOMPtr<nsIRunnable> r =
++    NewRunnableMethod(__func__, this,
++                      &ServiceWorkerProxy::MaybeShutdownOnBGThread);
++
++  MOZ_ALWAYS_SUCCEEDS(mEventTarget->Dispatch(r.forget(), NS_DISPATCH_NORMAL));
 +}
 +
 +ServiceWorkerProxy::ServiceWorkerProxy(ServiceWorkerParent* aActor,
 +                                       const ServiceWorkerDescriptor& aDescriptor)
 +  : mActor(aActor)
++  , mEventTarget(GetCurrentThreadSerialEventTarget())
 +  , mDescriptor(aDescriptor)
 +{
 +  AssertIsOnBackgroundThread();
 +  MOZ_DIAGNOSTIC_ASSERT(mActor);
++  MOZ_DIAGNOSTIC_ASSERT(mEventTarget);
 +
 +  nsCOMPtr<nsIRunnable> r = NewRunnableMethod("ServiceWorkerProxy", this,
 +                                              &ServiceWorkerProxy::InitOnMainThread);
@@ -185,7 +218,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerProxy.h b/dom/serviceworkers/Servic
 new file mode 100644
 --- /dev/null
 +++ b/dom/serviceworkers/ServiceWorkerProxy.h
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,57 @@
 +/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -209,18 +242,25 @@ new file mode 100644
 +  // Background thread only
 +  ServiceWorkerParent* mActor;
 +
++  // Written on background thread and read on main thread
++  nsCOMPtr<nsISerialEventTarget> mEventTarget;
++
 +  // Main thread only
 +  ServiceWorkerDescriptor mDescriptor;
 +  nsMainThreadPtrHandle<ServiceWorkerInfo> mInfo;
 +
 +  ~ServiceWorkerProxy();
 +
++  // Background thread methods
++  void
++  MaybeShutdownOnBGThread();
++
 +  // Main thread methods
 +  void
 +  InitOnMainThread();
 +
 +  void
-+  MaybeShutdownOnMainThread(nsresult aRv);
++  MaybeShutdownOnMainThread();
 +
 +public:
 +  ServiceWorkerProxy(ServiceWorkerParent* aActor,
