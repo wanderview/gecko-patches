@@ -1,0 +1,256 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  692485a9fceecc2a2dc1d25e9d13a547d9ca2906
+Bug 1459209 P11 Implement RemoteServiceWorkerRegistrationImpl::Update() across IPC to the parent-side SWM. r=baku
+
+diff --git a/dom/serviceworkers/IPCServiceWorkerRegistrationDescriptor.ipdlh b/dom/serviceworkers/IPCServiceWorkerRegistrationDescriptor.ipdlh
+--- a/dom/serviceworkers/IPCServiceWorkerRegistrationDescriptor.ipdlh
++++ b/dom/serviceworkers/IPCServiceWorkerRegistrationDescriptor.ipdlh
+@@ -1,16 +1,17 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ include PBackgroundSharedTypes;
+ include IPCServiceWorkerDescriptor;
+ 
+ using ServiceWorkerUpdateViaCache from "mozilla/dom/ServiceWorkerIPCUtils.h";
++using mozilla::CopyableErrorResult from "ipc/ErrorIPCUtils.h";
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ // IPC type with enough information to create a ServiceWorker DOM object
+ // in a child process.  Note that the state may be slightly out-of-sync
+ // with the parent and should be updated dynamically if necessary.
+ struct IPCServiceWorkerRegistrationDescriptor
+@@ -27,10 +28,16 @@ struct IPCServiceWorkerRegistrationDescr
+ 
+   ServiceWorkerUpdateViaCache updateViaCache;
+ 
+   OptionalIPCServiceWorkerDescriptor installing;
+   OptionalIPCServiceWorkerDescriptor waiting;
+   OptionalIPCServiceWorkerDescriptor active;
+ };
+ 
++union IPCServiceWorkerRegistrationDescriptorOrCopyableErrorResult
++{
++  IPCServiceWorkerRegistrationDescriptor;
++  CopyableErrorResult;
++};
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/serviceworkers/PServiceWorkerRegistration.ipdl b/dom/serviceworkers/PServiceWorkerRegistration.ipdl
+--- a/dom/serviceworkers/PServiceWorkerRegistration.ipdl
++++ b/dom/serviceworkers/PServiceWorkerRegistration.ipdl
+@@ -1,22 +1,26 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ include protocol PBackground;
+ 
++include IPCServiceWorkerRegistrationDescriptor;
++
+ namespace mozilla {
+ namespace dom {
+ 
+ protocol PServiceWorkerRegistration
+ {
+   manager PBackground;
+ 
+ parent:
+   async Teardown();
+ 
++  async Update() returns (IPCServiceWorkerRegistrationDescriptorOrCopyableErrorResult aResult);
++
+ child:
+   async __delete__();
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/serviceworkers/RemoteServiceWorkerRegistrationImpl.cpp b/dom/serviceworkers/RemoteServiceWorkerRegistrationImpl.cpp
+--- a/dom/serviceworkers/RemoteServiceWorkerRegistrationImpl.cpp
++++ b/dom/serviceworkers/RemoteServiceWorkerRegistrationImpl.cpp
+@@ -6,16 +6,19 @@
+ 
+ #include "RemoteServiceWorkerRegistrationImpl.h"
+ 
+ #include "ServiceWorkerRegistrationChild.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
++using mozilla::ipc::IPCResult;
++using mozilla::ipc::ResponseRejectReason;
++
+ RemoteServiceWorkerRegistrationImpl::~RemoteServiceWorkerRegistrationImpl()
+ {
+   MOZ_DIAGNOSTIC_ASSERT(!mOuter);
+   Shutdown();
+ }
+ 
+ void
+ RemoteServiceWorkerRegistrationImpl::Shutdown()
+@@ -48,18 +51,41 @@ RemoteServiceWorkerRegistrationImpl::Cle
+   MOZ_DIAGNOSTIC_ASSERT(mOuter);
+   MOZ_DIAGNOSTIC_ASSERT(aReg == mOuter);
+   mOuter = nullptr;
+ }
+ 
+ RefPtr<ServiceWorkerRegistrationPromise>
+ RemoteServiceWorkerRegistrationImpl::Update()
+ {
+-  // TODO
+-  return nullptr;
++  if (!mActor) {
++    return ServiceWorkerRegistrationPromise::CreateAndReject(
++      NS_ERROR_DOM_INVALID_STATE_ERR, __func__);
++  }
++
++  RefPtr<ServiceWorkerRegistrationPromise::Private> promise =
++    new ServiceWorkerRegistrationPromise::Private(__func__);
++
++  mActor->SendUpdate([promise] (const IPCServiceWorkerRegistrationDescriptorOrCopyableErrorResult& aResult) {
++    if (aResult.type() == IPCServiceWorkerRegistrationDescriptorOrCopyableErrorResult::TCopyableErrorResult) {
++      // application layer error
++      auto& rv = aResult.get_CopyableErrorResult();
++      MOZ_DIAGNOSTIC_ASSERT(rv.Failed());
++      promise->Reject(rv, __func__);
++      return;
++    }
++    // success
++    auto& ipcDesc = aResult.get_IPCServiceWorkerRegistrationDescriptor();
++    promise->Resolve(ServiceWorkerRegistrationDescriptor(ipcDesc), __func__);
++  }, [promise] (ResponseRejectReason aReason) {
++    // IPC layer error
++    promise->Reject(NS_ERROR_DOM_INVALID_STATE_ERR, __func__);
++  });
++
++  return promise.forget();
+ }
+ 
+ RefPtr<GenericPromise>
+ RemoteServiceWorkerRegistrationImpl::Unregister()
+ {
+   // TODO
+   return nullptr;
+ }
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationParent.cpp b/dom/serviceworkers/ServiceWorkerRegistrationParent.cpp
+--- a/dom/serviceworkers/ServiceWorkerRegistrationParent.cpp
++++ b/dom/serviceworkers/ServiceWorkerRegistrationParent.cpp
+@@ -24,16 +24,27 @@ ServiceWorkerRegistrationParent::ActorDe
+ 
+ IPCResult
+ ServiceWorkerRegistrationParent::RecvTeardown()
+ {
+   MaybeSendDelete();
+   return IPC_OK();
+ }
+ 
++IPCResult
++ServiceWorkerRegistrationParent::RecvUpdate(UpdateResolver&& aResolver)
++{
++  if (!mProxy) {
++    aResolver(CopyableErrorResult(NS_ERROR_DOM_INVALID_STATE_ERR));
++    return IPC_OK();
++  }
++  mProxy->Update(Move(aResolver));
++  return IPC_OK();
++}
++
+ ServiceWorkerRegistrationParent::ServiceWorkerRegistrationParent()
+   : mDeleteSent(false)
+ {
+ }
+ 
+ ServiceWorkerRegistrationParent::~ServiceWorkerRegistrationParent()
+ {
+   MOZ_DIAGNOSTIC_ASSERT(!mProxy);
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationParent.h b/dom/serviceworkers/ServiceWorkerRegistrationParent.h
+--- a/dom/serviceworkers/ServiceWorkerRegistrationParent.h
++++ b/dom/serviceworkers/ServiceWorkerRegistrationParent.h
+@@ -22,16 +22,19 @@ class ServiceWorkerRegistrationParent fi
+ 
+   // PServiceWorkerRegistrationParent
+   void
+   ActorDestroy(ActorDestroyReason aReason) override;
+ 
+   mozilla::ipc::IPCResult
+   RecvTeardown() override;
+ 
++  mozilla::ipc::IPCResult
++  RecvUpdate(UpdateResolver&& aResolver) override;
++
+ public:
+   ServiceWorkerRegistrationParent();
+   ~ServiceWorkerRegistrationParent();
+ 
+   void
+   Init(const IPCServiceWorkerRegistrationDescriptor& aDescriptor);
+ 
+   void
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationProxy.cpp b/dom/serviceworkers/ServiceWorkerRegistrationProxy.cpp
+--- a/dom/serviceworkers/ServiceWorkerRegistrationProxy.cpp
++++ b/dom/serviceworkers/ServiceWorkerRegistrationProxy.cpp
+@@ -179,10 +179,18 @@ ServiceWorkerRegistrationProxy::RevokeAc
+   mActor = nullptr;
+ 
+   nsCOMPtr<nsIRunnable> r =
+     NewRunnableMethod(__func__, this,
+                       &ServiceWorkerRegistrationProxy::StopListeningOnMainThread);
+   MOZ_ALWAYS_SUCCEEDS(SystemGroup::Dispatch(TaskCategory::Other, r.forget()));
+ }
+ 
++void
++ServiceWorkerRegistrationProxy::Update(PServiceWorkerRegistrationParent::UpdateResolver&& aUpdateResolver)
++{
++  AssertIsOnBackgroundThread();
++  // TODO: Maybe use a MozPromise here and a list of UniquePtr<MozPromiseRequestHolder>s
++  //       in the actor?
++}
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationProxy.h b/dom/serviceworkers/ServiceWorkerRegistrationProxy.h
+--- a/dom/serviceworkers/ServiceWorkerRegistrationProxy.h
++++ b/dom/serviceworkers/ServiceWorkerRegistrationProxy.h
+@@ -2,16 +2,17 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef moz_dom_ServiceWorkerRegistrationProxy_h
+ #define moz_dom_ServiceWorkerRegistrationProxy_h
+ 
++#include "mozilla/dom/PServiceWorkerRegistrationParent.h"
+ #include "nsProxyRelease.h"
+ #include "ServiceWorkerRegistrationDescriptor.h"
+ #include "ServiceWorkerRegistrationListener.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ class ServiceWorkerRegistrationInfo;
+@@ -69,15 +70,18 @@ class ServiceWorkerRegistrationProxy fin
+ 
+ public:
+   ServiceWorkerRegistrationProxy(ServiceWorkerRegistrationParent* aActor,
+                                  const ServiceWorkerRegistrationDescriptor& aDescriptor);
+ 
+   void
+   RevokeActor(ServiceWorkerRegistrationParent* aActor);
+ 
++  void
++  Update(PServiceWorkerRegistrationParent::UpdateResolver&& aUpdateResolver);
++
+   NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ServiceWorkerRegistrationProxy, override);
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // moz_dom_ServiceWorkerRegistrationProxy_h
