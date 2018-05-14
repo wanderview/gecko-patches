@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  692485a9fceecc2a2dc1d25e9d13a547d9ca2906
+# Parent  8b8cae3e6441b0d2246bdc01e348a3d4ea21c8ae
 Bug 1459209 P11 Implement RemoteServiceWorkerRegistrationImpl::Update() across IPC to the parent-side SWM. r=baku
 
 diff --git a/dom/serviceworkers/IPCServiceWorkerRegistrationDescriptor.ipdlh b/dom/serviceworkers/IPCServiceWorkerRegistrationDescriptor.ipdlh
@@ -141,7 +141,7 @@ diff --git a/dom/serviceworkers/RemoteServiceWorkerRegistrationImpl.cpp b/dom/se
 diff --git a/dom/serviceworkers/ServiceWorkerRegistrationParent.cpp b/dom/serviceworkers/ServiceWorkerRegistrationParent.cpp
 --- a/dom/serviceworkers/ServiceWorkerRegistrationParent.cpp
 +++ b/dom/serviceworkers/ServiceWorkerRegistrationParent.cpp
-@@ -24,16 +24,27 @@ ServiceWorkerRegistrationParent::ActorDe
+@@ -24,16 +24,34 @@ ServiceWorkerRegistrationParent::ActorDe
  
  IPCResult
  ServiceWorkerRegistrationParent::RecvTeardown()
@@ -157,7 +157,14 @@ diff --git a/dom/serviceworkers/ServiceWorkerRegistrationParent.cpp b/dom/servic
 +    aResolver(CopyableErrorResult(NS_ERROR_DOM_INVALID_STATE_ERR));
 +    return IPC_OK();
 +  }
-+  mProxy->Update(Move(aResolver));
++
++  mProxy->Update()->Then(GetCurrentThreadSerialEventTarget(), __func__,
++    [aResolver] (const ServiceWorkerRegistrationDescriptor& aDescriptor) {
++      aResolver(aDescriptor.ToIPC());
++    }, [aResolver] (const CopyableErrorResult& aResult) {
++      aResolver(aResult);
++    });
++
 +  return IPC_OK();
 +}
 +
@@ -195,7 +202,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerRegistrationParent.h b/dom/servicew
 diff --git a/dom/serviceworkers/ServiceWorkerRegistrationProxy.cpp b/dom/serviceworkers/ServiceWorkerRegistrationProxy.cpp
 --- a/dom/serviceworkers/ServiceWorkerRegistrationProxy.cpp
 +++ b/dom/serviceworkers/ServiceWorkerRegistrationProxy.cpp
-@@ -179,10 +179,18 @@ ServiceWorkerRegistrationProxy::RevokeAc
+@@ -179,10 +179,71 @@ ServiceWorkerRegistrationProxy::RevokeAc
    mActor = nullptr;
  
    nsCOMPtr<nsIRunnable> r =
@@ -204,12 +211,65 @@ diff --git a/dom/serviceworkers/ServiceWorkerRegistrationProxy.cpp b/dom/service
    MOZ_ALWAYS_SUCCEEDS(SystemGroup::Dispatch(TaskCategory::Other, r.forget()));
  }
  
-+void
-+ServiceWorkerRegistrationProxy::Update(PServiceWorkerRegistrationParent::UpdateResolver&& aUpdateResolver)
++namespace {
++
++class UpdateCallback final : public ServiceWorkerUpdateFinishCallback
++{
++  RefPtr<ServiceWorkerRegistrationPromise::Private> mPromise;
++
++  ~UpdateCallback() = default;
++
++public:
++  explicit UpdateCallback(RefPtr<ServiceWorkerRegistrationPromise::Private>&& aPromise)
++    : mPromise(Move(aPromise))
++  {
++    MOZ_DIAGNOSTIC_ASSERT(mPromise);
++  }
++
++  void
++  UpdateSucceeded(ServiceWorkerRegistrationInfo* aInfo) override
++  {
++    mPromise->Resolve(aInfo->Descriptor(), __func__);
++  }
++
++  void
++  UpdateFailed(ErrorResult& aResult) override
++  {
++    mPromise->Reject(CopyableErrorResult(aResult), __func__);
++  }
++};
++
++} // anonymous namespace
++
++RefPtr<ServiceWorkerRegistrationPromise>
++ServiceWorkerRegistrationProxy::Update()
 +{
 +  AssertIsOnBackgroundThread();
-+  // TODO: Maybe use a MozPromise here and a list of UniquePtr<MozPromiseRequestHolder>s
-+  //       in the actor?
++
++  RefPtr<ServiceWorkerRegistrationProxy> self = this;
++  RefPtr<ServiceWorkerRegistrationPromise::Private> promise =
++    new ServiceWorkerRegistrationPromise::Private(__func__);
++
++  nsCOMPtr<nsIRunnable> r = NS_NewRunnableFunction(__func__,
++    [self, promise] () mutable {
++      auto scopeExit = MakeScopeExit([&] {
++        promise->Reject(NS_ERROR_DOM_INVALID_STATE_ERR, __func__);
++      });
++
++      NS_ENSURE_TRUE_VOID(self->mReg);
++
++      RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
++      NS_ENSURE_TRUE_VOID(swm);
++
++      RefPtr<UpdateCallback> cb = new UpdateCallback(Move(promise));
++      swm->Update(self->mReg->Principal(), self->mReg->Scope(), cb);
++
++      scopeExit.release();
++    });
++
++  MOZ_ALWAYS_SUCCEEDS(SystemGroup::Dispatch(TaskCategory::Other, r.forget()));
++
++  return promise;
 +}
 +
  } // namespace dom
@@ -217,7 +277,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerRegistrationProxy.cpp b/dom/service
 diff --git a/dom/serviceworkers/ServiceWorkerRegistrationProxy.h b/dom/serviceworkers/ServiceWorkerRegistrationProxy.h
 --- a/dom/serviceworkers/ServiceWorkerRegistrationProxy.h
 +++ b/dom/serviceworkers/ServiceWorkerRegistrationProxy.h
-@@ -2,16 +2,17 @@
+@@ -2,19 +2,21 @@
  /* vim: set ts=8 sts=2 et sw=2 tw=80: */
  /* This Source Code Form is subject to the terms of the Mozilla Public
   * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -230,12 +290,16 @@ diff --git a/dom/serviceworkers/ServiceWorkerRegistrationProxy.h b/dom/servicewo
  #include "nsProxyRelease.h"
  #include "ServiceWorkerRegistrationDescriptor.h"
  #include "ServiceWorkerRegistrationListener.h"
++#include "ServiceWorkerUtils.h"
  
  namespace mozilla {
  namespace dom {
  
  class ServiceWorkerRegistrationInfo;
-@@ -69,15 +70,18 @@ class ServiceWorkerRegistrationProxy fin
+ class ServiceWorkerRegistrationParent;
+ 
+ class ServiceWorkerRegistrationProxy final : public ServiceWorkerRegistrationListener
+@@ -69,15 +71,18 @@ class ServiceWorkerRegistrationProxy fin
  
  public:
    ServiceWorkerRegistrationProxy(ServiceWorkerRegistrationParent* aActor,
@@ -244,8 +308,8 @@ diff --git a/dom/serviceworkers/ServiceWorkerRegistrationProxy.h b/dom/servicewo
    void
    RevokeActor(ServiceWorkerRegistrationParent* aActor);
  
-+  void
-+  Update(PServiceWorkerRegistrationParent::UpdateResolver&& aUpdateResolver);
++  RefPtr<ServiceWorkerRegistrationPromise>
++  Update();
 +
    NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ServiceWorkerRegistrationProxy, override);
  };

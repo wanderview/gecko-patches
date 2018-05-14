@@ -1,0 +1,258 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  02d83f901d5105a6a3583697f17acaeef48a86f0
+Bug 1459209 P12 Implement RemoteServiceWorkerRegistrationImpl::Unregister() across IPC to the parent-side SWM. r=baku
+
+diff --git a/dom/serviceworkers/PServiceWorkerRegistration.ipdl b/dom/serviceworkers/PServiceWorkerRegistration.ipdl
+--- a/dom/serviceworkers/PServiceWorkerRegistration.ipdl
++++ b/dom/serviceworkers/PServiceWorkerRegistration.ipdl
+@@ -11,16 +11,17 @@ namespace dom {
+ 
+ protocol PServiceWorkerRegistration
+ {
+   manager PBackground;
+ 
+ parent:
+   async Teardown();
+ 
++  async Unregister() returns (bool aSuccess, CopyableErrorResult aRv);
+   async Update() returns (IPCServiceWorkerRegistrationDescriptorOrCopyableErrorResult aResult);
+ 
+ child:
+   async __delete__();
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/serviceworkers/RemoteServiceWorkerRegistrationImpl.cpp b/dom/serviceworkers/RemoteServiceWorkerRegistrationImpl.cpp
+--- a/dom/serviceworkers/RemoteServiceWorkerRegistrationImpl.cpp
++++ b/dom/serviceworkers/RemoteServiceWorkerRegistrationImpl.cpp
+@@ -81,18 +81,38 @@ RemoteServiceWorkerRegistrationImpl::Upd
+   });
+ 
+   return promise.forget();
+ }
+ 
+ RefPtr<GenericPromise>
+ RemoteServiceWorkerRegistrationImpl::Unregister()
+ {
+-  // TODO
+-  return nullptr;
++  if (!mActor) {
++    return GenericPromise::CreateAndReject(NS_ERROR_DOM_INVALID_STATE_ERR,
++                                           __func__);
++  }
++
++  RefPtr<GenericPromise::Private> promise =
++    new GenericPromise::Private(__func__);
++
++  mActor->SendUnregister([promise] (Tuple<bool, CopyableErrorResult>&& aResult) {
++    if (Get<1>(aResult).Failed()) {
++      // application layer error
++      promise->Reject(Get<1>(aResult).StealNSResult(), __func__);
++      return;
++    }
++    // success
++    promise->Resolve(Get<0>(aResult), __func__);
++  }, [promise] (ResponseRejectReason aReason) {
++    // IPC layer error
++    promise->Reject(NS_ERROR_DOM_INVALID_STATE_ERR, __func__);
++  });
++
++  return promise.forget();
+ }
+ 
+ RemoteServiceWorkerRegistrationImpl::RemoteServiceWorkerRegistrationImpl(const ServiceWorkerRegistrationDescriptor& aDescriptor)
+   : mActor(nullptr)
+   , mOuter(nullptr)
+   , mShutdown(false)
+ {
+   PBackgroundChild* parentActor = BackgroundChild::GetOrCreateForCurrentThread();
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationParent.cpp b/dom/serviceworkers/ServiceWorkerRegistrationParent.cpp
+--- a/dom/serviceworkers/ServiceWorkerRegistrationParent.cpp
++++ b/dom/serviceworkers/ServiceWorkerRegistrationParent.cpp
+@@ -24,16 +24,46 @@ ServiceWorkerRegistrationParent::ActorDe
+ 
+ IPCResult
+ ServiceWorkerRegistrationParent::RecvTeardown()
+ {
+   MaybeSendDelete();
+   return IPC_OK();
+ }
+ 
++namespace {
++
++void
++ResolveUnregister(PServiceWorkerRegistrationParent::UnregisterResolver&& aResolver,
++                  bool aSuccess, nsresult aRv)
++{
++  aResolver(Tuple<const bool&, const CopyableErrorResult&>(
++    aSuccess, CopyableErrorResult(aRv)));
++}
++
++} // anonymous namespace
++
++IPCResult
++ServiceWorkerRegistrationParent::RecvUnregister(UnregisterResolver&& aResolver)
++{
++  if (!mProxy) {
++    ResolveUnregister(Move(aResolver), false, NS_ERROR_DOM_INVALID_STATE_ERR);
++    return IPC_OK();
++  }
++
++  mProxy->Unregister()->Then(GetCurrentThreadSerialEventTarget(), __func__,
++    [aResolver] (bool aSuccess) mutable {
++      ResolveUnregister(Move(aResolver), aSuccess, NS_OK);
++    }, [aResolver] (nsresult aRv) mutable {
++      ResolveUnregister(Move(aResolver), false, aRv);
++    });
++
++  return IPC_OK();
++}
++
+ IPCResult
+ ServiceWorkerRegistrationParent::RecvUpdate(UpdateResolver&& aResolver)
+ {
+   if (!mProxy) {
+     aResolver(CopyableErrorResult(NS_ERROR_DOM_INVALID_STATE_ERR));
+     return IPC_OK();
+   }
+ 
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationParent.h b/dom/serviceworkers/ServiceWorkerRegistrationParent.h
+--- a/dom/serviceworkers/ServiceWorkerRegistrationParent.h
++++ b/dom/serviceworkers/ServiceWorkerRegistrationParent.h
+@@ -23,16 +23,19 @@ class ServiceWorkerRegistrationParent fi
+   // PServiceWorkerRegistrationParent
+   void
+   ActorDestroy(ActorDestroyReason aReason) override;
+ 
+   mozilla::ipc::IPCResult
+   RecvTeardown() override;
+ 
+   mozilla::ipc::IPCResult
++  RecvUnregister(UnregisterResolver&& aResolver) override;
++
++  mozilla::ipc::IPCResult
+   RecvUpdate(UpdateResolver&& aResolver) override;
+ 
+ public:
+   ServiceWorkerRegistrationParent();
+   ~ServiceWorkerRegistrationParent();
+ 
+   void
+   Init(const IPCServiceWorkerRegistrationDescriptor& aDescriptor);
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationProxy.cpp b/dom/serviceworkers/ServiceWorkerRegistrationProxy.cpp
+--- a/dom/serviceworkers/ServiceWorkerRegistrationProxy.cpp
++++ b/dom/serviceworkers/ServiceWorkerRegistrationProxy.cpp
+@@ -181,16 +181,88 @@ ServiceWorkerRegistrationProxy::RevokeAc
+   nsCOMPtr<nsIRunnable> r =
+     NewRunnableMethod(__func__, this,
+                       &ServiceWorkerRegistrationProxy::StopListeningOnMainThread);
+   MOZ_ALWAYS_SUCCEEDS(SystemGroup::Dispatch(TaskCategory::Other, r.forget()));
+ }
+ 
+ namespace {
+ 
++class UnregisterCallback final : public nsIServiceWorkerUnregisterCallback
++{
++  RefPtr<GenericPromise::Private> mPromise;
++
++  ~UnregisterCallback() = default;
++
++public:
++  explicit UnregisterCallback(GenericPromise::Private* aPromise)
++    : mPromise(aPromise)
++  {
++    MOZ_DIAGNOSTIC_ASSERT(mPromise);
++  }
++
++  NS_IMETHOD
++  UnregisterSucceeded(bool aState) override
++  {
++    mPromise->Resolve(aState, __func__);
++    return NS_OK;
++  }
++
++  NS_IMETHOD
++  UnregisterFailed() override
++  {
++    mPromise->Reject(NS_ERROR_DOM_SECURITY_ERR, __func__);
++    return NS_OK;
++  }
++
++  NS_DECL_ISUPPORTS
++};
++
++NS_IMPL_ISUPPORTS(UnregisterCallback, nsIServiceWorkerUnregisterCallback)
++
++} // anonymous namespace
++
++RefPtr<GenericPromise>
++ServiceWorkerRegistrationProxy::Unregister()
++{
++  AssertIsOnBackgroundThread();
++
++  RefPtr<ServiceWorkerRegistrationProxy> self = this;
++  RefPtr<GenericPromise::Private> promise =
++    new GenericPromise::Private(__func__);
++
++  nsCOMPtr<nsIRunnable> r = NS_NewRunnableFunction(__func__,
++    [self, promise] () mutable {
++      nsresult rv = NS_ERROR_DOM_INVALID_STATE_ERR;
++      auto scopeExit = MakeScopeExit([&] {
++        promise->Reject(rv, __func__);
++      });
++
++      NS_ENSURE_TRUE_VOID(self->mReg);
++
++      RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
++      NS_ENSURE_TRUE_VOID(swm);
++
++      RefPtr<UnregisterCallback> cb = new UnregisterCallback(promise);
++
++      rv = swm->Unregister(self->mReg->Principal(), cb,
++                           NS_ConvertUTF8toUTF16(self->mReg->Scope()));
++      NS_ENSURE_SUCCESS_VOID(rv);
++
++
++      scopeExit.release();
++    });
++
++  MOZ_ALWAYS_SUCCEEDS(SystemGroup::Dispatch(TaskCategory::Other, r.forget()));
++
++  return promise;
++}
++
++namespace {
++
+ class UpdateCallback final : public ServiceWorkerUpdateFinishCallback
+ {
+   RefPtr<ServiceWorkerRegistrationPromise::Private> mPromise;
+ 
+   ~UpdateCallback() = default;
+ 
+ public:
+   explicit UpdateCallback(RefPtr<ServiceWorkerRegistrationPromise::Private>&& aPromise)
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationProxy.h b/dom/serviceworkers/ServiceWorkerRegistrationProxy.h
+--- a/dom/serviceworkers/ServiceWorkerRegistrationProxy.h
++++ b/dom/serviceworkers/ServiceWorkerRegistrationProxy.h
+@@ -71,16 +71,19 @@ class ServiceWorkerRegistrationProxy fin
+ 
+ public:
+   ServiceWorkerRegistrationProxy(ServiceWorkerRegistrationParent* aActor,
+                                  const ServiceWorkerRegistrationDescriptor& aDescriptor);
+ 
+   void
+   RevokeActor(ServiceWorkerRegistrationParent* aActor);
+ 
++  RefPtr<GenericPromise>
++  Unregister();
++
+   RefPtr<ServiceWorkerRegistrationPromise>
+   Update();
+ 
+   NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ServiceWorkerRegistrationProxy, override);
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
