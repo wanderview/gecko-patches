@@ -1,0 +1,208 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  f0bed827dc84b519c33d5aaa43a84e512cf587ef
+Bug 1459209 P17 Implement RemoteServiceWorkerContainerImpl::GetRegistration() across IPC to the parent-side SWM. r=baku
+
+diff --git a/dom/serviceworkers/PServiceWorkerContainer.ipdl b/dom/serviceworkers/PServiceWorkerContainer.ipdl
+--- a/dom/serviceworkers/PServiceWorkerContainer.ipdl
++++ b/dom/serviceworkers/PServiceWorkerContainer.ipdl
+@@ -16,14 +16,17 @@ protocol PServiceWorkerContainer
+ 
+ parent:
+   async Teardown();
+ 
+   async Register(IPCClientInfo aClientInfo, nsCString aScopeURL, nsCString aScriptURL,
+                  ServiceWorkerUpdateViaCache aUpdateViaCache)
+         returns (IPCServiceWorkerRegistrationDescriptorOrCopyableErrorResult aResult);
+ 
++  async GetRegistration(IPCClientInfo aClientInfo, nsCString aURL)
++        returns (IPCServiceWorkerRegistrationDescriptorOrCopyableErrorResult aResult);
++
+ child:
+   async __delete__();
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/serviceworkers/RemoteServiceWorkerContainerImpl.cpp b/dom/serviceworkers/RemoteServiceWorkerContainerImpl.cpp
+--- a/dom/serviceworkers/RemoteServiceWorkerContainerImpl.cpp
++++ b/dom/serviceworkers/RemoteServiceWorkerContainerImpl.cpp
+@@ -69,20 +69,44 @@ RemoteServiceWorkerContainerImpl::Regist
+       promise->Reject(NS_ERROR_DOM_INVALID_STATE_ERR, __func__);
+     });
+ 
+   return promise.forget();
+ }
+ 
+ RefPtr<ServiceWorkerRegistrationPromise>
+ RemoteServiceWorkerContainerImpl::GetRegistration(const ClientInfo& aClientInfo,
+-                const nsACString& aURL) const
++                                                  const nsACString& aURL) const
+ {
+-  // TODO
+-  return nullptr;
++  if (!mActor) {
++    return ServiceWorkerRegistrationPromise::CreateAndReject(
++      NS_ERROR_DOM_INVALID_STATE_ERR, __func__);
++  }
++
++  RefPtr<ServiceWorkerRegistrationPromise::Private> promise =
++    new ServiceWorkerRegistrationPromise::Private(__func__);
++
++  mActor->SendGetRegistration(aClientInfo.ToIPC(), nsCString(aURL),
++    [promise] (const IPCServiceWorkerRegistrationDescriptorOrCopyableErrorResult& aResult) {
++      if (aResult.type() == IPCServiceWorkerRegistrationDescriptorOrCopyableErrorResult::TCopyableErrorResult) {
++        // application layer error
++        auto& rv = aResult.get_CopyableErrorResult();
++        MOZ_DIAGNOSTIC_ASSERT(rv.Failed());
++        promise->Reject(rv, __func__);
++        return;
++      }
++      // success
++      auto& ipcDesc = aResult.get_IPCServiceWorkerRegistrationDescriptor();
++      promise->Resolve(ServiceWorkerRegistrationDescriptor(ipcDesc), __func__);
++    }, [promise] (ResponseRejectReason aReason) {
++      // IPC layer error
++      promise->Reject(NS_ERROR_DOM_INVALID_STATE_ERR, __func__);
++    });
++
++  return promise.forget();
+ }
+ 
+ RefPtr<ServiceWorkerRegistrationListPromise>
+ RemoteServiceWorkerContainerImpl::GetRegistrations(const ClientInfo& aClientInfo) const
+ {
+   // TODO
+   return nullptr;
+ }
+diff --git a/dom/serviceworkers/ServiceWorkerContainerParent.cpp b/dom/serviceworkers/ServiceWorkerContainerParent.cpp
+--- a/dom/serviceworkers/ServiceWorkerContainerParent.cpp
++++ b/dom/serviceworkers/ServiceWorkerContainerParent.cpp
+@@ -47,16 +47,37 @@ ServiceWorkerContainerParent::RecvRegist
+       aResolver(aDescriptor.ToIPC());
+     }, [aResolver] (const CopyableErrorResult& aResult) {
+       aResolver(aResult);
+     });
+ 
+   return IPC_OK();
+ }
+ 
++IPCResult
++ServiceWorkerContainerParent::RecvGetRegistration(const IPCClientInfo& aClientInfo,
++                                                  const nsCString& aURL,
++                                                  GetRegistrationResolver&& aResolver)
++{
++  if (!mProxy) {
++    aResolver(CopyableErrorResult(NS_ERROR_DOM_INVALID_STATE_ERR));
++    return IPC_OK();
++  }
++
++  mProxy->GetRegistration(ClientInfo(aClientInfo), aURL)->Then(
++    GetCurrentThreadSerialEventTarget(), __func__,
++    [aResolver] (const ServiceWorkerRegistrationDescriptor& aDescriptor) {
++      aResolver(aDescriptor.ToIPC());
++    }, [aResolver] (const CopyableErrorResult& aResult) {
++      aResolver(aResult);
++    });
++
++  return IPC_OK();
++}
++
+ ServiceWorkerContainerParent::ServiceWorkerContainerParent()
+ {
+ }
+ 
+ ServiceWorkerContainerParent::~ServiceWorkerContainerParent()
+ {
+   MOZ_DIAGNOSTIC_ASSERT(!mProxy);
+ }
+diff --git a/dom/serviceworkers/ServiceWorkerContainerParent.h b/dom/serviceworkers/ServiceWorkerContainerParent.h
+--- a/dom/serviceworkers/ServiceWorkerContainerParent.h
++++ b/dom/serviceworkers/ServiceWorkerContainerParent.h
+@@ -27,16 +27,21 @@ class ServiceWorkerContainerParent final
+   RecvTeardown() override;
+ 
+   mozilla::ipc::IPCResult
+   RecvRegister(const IPCClientInfo& aClientInfo, const nsCString& aScopeURL,
+                const nsCString& aScriptURL,
+                const ServiceWorkerUpdateViaCache& aUpdateViaCache,
+                RegisterResolver&& aResolver) override;
+ 
++  mozilla::ipc::IPCResult
++  RecvGetRegistration(const IPCClientInfo& aClientInfo,
++                      const nsCString& aURL,
++                      GetRegistrationResolver&& aResolver) override;
++
+ public:
+   ServiceWorkerContainerParent();
+   ~ServiceWorkerContainerParent();
+ 
+   void
+   Init();
+ };
+ 
+diff --git a/dom/serviceworkers/ServiceWorkerContainerProxy.cpp b/dom/serviceworkers/ServiceWorkerContainerProxy.cpp
+--- a/dom/serviceworkers/ServiceWorkerContainerProxy.cpp
++++ b/dom/serviceworkers/ServiceWorkerContainerProxy.cpp
+@@ -65,10 +65,39 @@ ServiceWorkerContainerProxy::Register(co
+       scopeExit.release();
+     });
+ 
+   MOZ_ALWAYS_SUCCEEDS(SystemGroup::Dispatch(TaskCategory::Other, r.forget()));
+ 
+   return promise;
+ }
+ 
++RefPtr<ServiceWorkerRegistrationPromise>
++ServiceWorkerContainerProxy::GetRegistration(const ClientInfo& aClientInfo,
++                                             const nsCString& aURL)
++{
++  AssertIsOnBackgroundThread();
++
++  RefPtr<ServiceWorkerRegistrationPromise::Private> promise =
++    new ServiceWorkerRegistrationPromise::Private(__func__);
++
++  nsCOMPtr<nsIRunnable> r = NS_NewRunnableFunction(__func__,
++    [aClientInfo, aURL, promise] () mutable {
++      auto scopeExit = MakeScopeExit([&] {
++        promise->Reject(NS_ERROR_DOM_INVALID_STATE_ERR, __func__);
++      });
++
++      RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
++      NS_ENSURE_TRUE_VOID(swm);
++
++      swm->GetRegistration(aClientInfo, aURL)->ChainTo(promise.forget(),
++                                                       __func__);
++
++      scopeExit.release();
++    });
++
++  MOZ_ALWAYS_SUCCEEDS(SystemGroup::Dispatch(TaskCategory::Other, r.forget()));
++
++  return promise;
++}
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/serviceworkers/ServiceWorkerContainerProxy.h b/dom/serviceworkers/ServiceWorkerContainerProxy.h
+--- a/dom/serviceworkers/ServiceWorkerContainerProxy.h
++++ b/dom/serviceworkers/ServiceWorkerContainerProxy.h
+@@ -25,15 +25,18 @@ public:
+   void
+   RevokeActor(ServiceWorkerContainerParent* aActor);
+ 
+   RefPtr<ServiceWorkerRegistrationPromise>
+   Register(const ClientInfo& aClientInfo, const nsCString& aScopeURL,
+            const nsCString& aScriptURL,
+            ServiceWorkerUpdateViaCache aUpdateViaCache);
+ 
++  RefPtr<ServiceWorkerRegistrationPromise>
++  GetRegistration(const ClientInfo& aClientInfo, const nsCString& aURL);
++
+   NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ServiceWorkerContainerProxy);
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // moz_dom_ServiceWorkerContainerProxy_h
