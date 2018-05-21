@@ -1,0 +1,516 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  d9f21bbbf2b5907777a7e2a5841b3daf29e335dc
+Bug 1462772 P3 Make ServiceWorker binding objects get or create a handle to their associated registration. r=baku
+
+diff --git a/dom/serviceworkers/PServiceWorker.ipdl b/dom/serviceworkers/PServiceWorker.ipdl
+--- a/dom/serviceworkers/PServiceWorker.ipdl
++++ b/dom/serviceworkers/PServiceWorker.ipdl
+@@ -1,31 +1,35 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ include protocol PBackground;
+ 
+ include ClientIPCTypes;
+ include DOMTypes;
++include IPCServiceWorkerRegistrationDescriptor;
+ 
+ using ServiceWorkerState from "mozilla/dom/ServiceWorkerIPCUtils.h";
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ protocol PServiceWorker
+ {
+   manager PBackground;
+ 
+ parent:
+   async Teardown();
+ 
+   async PostMessage(ClonedMessageData aClonedData, ClientInfoAndState aSource);
+ 
++  async GetRegistration()
++        returns (IPCServiceWorkerRegistrationDescriptorOrCopyableErrorResult aResult);
++
+ child:
+   async __delete__();
+ 
+   async SetState(ServiceWorkerState aState);
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/serviceworkers/RemoteServiceWorkerImpl.cpp b/dom/serviceworkers/RemoteServiceWorkerImpl.cpp
+--- a/dom/serviceworkers/RemoteServiceWorkerImpl.cpp
++++ b/dom/serviceworkers/RemoteServiceWorkerImpl.cpp
+@@ -53,16 +53,47 @@ void
+ RemoteServiceWorkerImpl::RemoveServiceWorker(ServiceWorker* aWorker)
+ {
+   NS_ASSERT_OWNINGTHREAD(RemoteServiceWorkerImpl);
+   MOZ_DIAGNOSTIC_ASSERT(mWorker);
+   MOZ_DIAGNOSTIC_ASSERT(aWorker == mWorker);
+   mWorker = nullptr;
+ }
+ 
++RefPtr<ServiceWorkerRegistrationPromise>
++RemoteServiceWorkerImpl::GetRegistration()
++{
++  if (!mActor) {
++    return ServiceWorkerRegistrationPromise::CreateAndReject(
++      NS_ERROR_DOM_INVALID_STATE_ERR, __func__);
++  }
++
++  RefPtr<ServiceWorkerRegistrationPromise::Private> promise =
++    new ServiceWorkerRegistrationPromise::Private(__func__);
++
++  mActor->SendGetRegistration(
++    [promise] (const IPCServiceWorkerRegistrationDescriptorOrCopyableErrorResult& aResult) {
++      if (aResult.type() == IPCServiceWorkerRegistrationDescriptorOrCopyableErrorResult::TCopyableErrorResult) {
++        // application layer error
++        auto& rv = aResult.get_CopyableErrorResult();
++        MOZ_DIAGNOSTIC_ASSERT(rv.Failed());
++        promise->Reject(rv, __func__);
++        return;
++      }
++      // success
++      auto& ipcDesc = aResult.get_IPCServiceWorkerRegistrationDescriptor();
++      promise->Resolve(ServiceWorkerRegistrationDescriptor(ipcDesc), __func__);
++    }, [promise] (ResponseRejectReason aReason) {
++      // IPC layer error
++      promise->Reject(NS_ERROR_DOM_INVALID_STATE_ERR, __func__);
++    });
++
++  return promise.forget();
++}
++
+ void
+ RemoteServiceWorkerImpl::PostMessage(RefPtr<ServiceWorkerCloneData>&& aData,
+                                      const ClientInfo& aClientInfo,
+                                      const ClientState& aClientState)
+ {
+   NS_ASSERT_OWNINGTHREAD(RemoteServiceWorkerImpl);
+   if (!mActor) {
+     return;
+diff --git a/dom/serviceworkers/RemoteServiceWorkerImpl.h b/dom/serviceworkers/RemoteServiceWorkerImpl.h
+--- a/dom/serviceworkers/RemoteServiceWorkerImpl.h
++++ b/dom/serviceworkers/RemoteServiceWorkerImpl.h
+@@ -27,16 +27,19 @@ class RemoteServiceWorkerImpl final : pu
+ 
+   // ServiceWorker::Inner implementation
+   void
+   AddServiceWorker(ServiceWorker* aWorker) override;
+ 
+   void
+   RemoveServiceWorker(ServiceWorker* aWorker) override;
+ 
++  RefPtr<ServiceWorkerRegistrationPromise>
++  GetRegistration() override;
++
+   void
+   PostMessage(RefPtr<ServiceWorkerCloneData>&& aData,
+               const ClientInfo& aClientInfo,
+               const ClientState& aClientState) override;
+ public:
+   explicit RemoteServiceWorkerImpl(const ServiceWorkerDescriptor& aDescriptor);
+ 
+   void
+diff --git a/dom/serviceworkers/ServiceWorker.cpp b/dom/serviceworkers/ServiceWorker.cpp
+--- a/dom/serviceworkers/ServiceWorker.cpp
++++ b/dom/serviceworkers/ServiceWorker.cpp
+@@ -59,17 +59,17 @@ ServiceWorker::Create(nsIGlobalObject* a
+ 
+     RefPtr<ServiceWorkerRegistrationInfo> reg =
+       swm->GetRegistration(aDescriptor.PrincipalInfo(), aDescriptor.Scope());
+     NS_ENSURE_TRUE(reg, nullptr);
+ 
+     RefPtr<ServiceWorkerInfo> info = reg->GetByDescriptor(aDescriptor);
+     NS_ENSURE_TRUE(reg, nullptr);
+ 
+-    inner = new ServiceWorkerImpl(info);
++    inner = new ServiceWorkerImpl(info, reg);
+   }
+ 
+   NS_ENSURE_TRUE(inner, nullptr);
+ 
+   ref = new ServiceWorker(aOwner, aDescriptor, inner);
+   return ref.forget();
+ }
+ 
+@@ -86,24 +86,51 @@ ServiceWorker::ServiceWorker(nsIGlobalOb
+ 
+   KeepAliveIfHasListenersFor(NS_LITERAL_STRING("statechange"));
+ 
+   // The error event handler is required by the spec currently, but is not used
+   // anywhere.  Don't keep the object alive in that case.
+ 
+   // This will update our state too.
+   mInner->AddServiceWorker(this);
++
++  // Attempt to get an existing binding object for the registration
++  // associated with this ServiceWorker.
++  mRegistration = aGlobal->GetServiceWorkerRegistration(
++    ServiceWorkerRegistrationDescriptor(mDescriptor.RegistrationId(),
++                                        mDescriptor.PrincipalInfo(),
++                                        mDescriptor.Scope(),
++                                        ServiceWorkerUpdateViaCache::Imports));
++  if (!mRegistration) {
++    RefPtr<ServiceWorker> self = this;
++
++    mInner->GetRegistration()->Then(
++      aGlobal->EventTargetFor(TaskCategory::Other), __func__,
++      [self] (const ServiceWorkerRegistrationDescriptor& aDescriptor) {
++        self->mRegistrationPromiseHolder.Complete();
++        nsIGlobalObject* global = self->GetParentObject();
++        self->mRegistration =
++          global->GetOrCreateServiceWorkerRegistration(aDescriptor);
++      }, [self] (const CopyableErrorResult& aRv) {
++        self->mRegistrationPromiseHolder.Complete();
++        // do nothing
++      })->Track(mRegistrationPromiseHolder);
++  }
+ }
+ 
+ ServiceWorker::~ServiceWorker()
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+   mInner->RemoveServiceWorker(this);
+ }
+ 
++NS_IMPL_CYCLE_COLLECTION_INHERITED(ServiceWorker,
++                                   DOMEventTargetHelper,
++                                   mRegistration);
++
+ NS_IMPL_ADDREF_INHERITED(ServiceWorker, DOMEventTargetHelper)
+ NS_IMPL_RELEASE_INHERITED(ServiceWorker, DOMEventTargetHelper)
+ 
+ NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ServiceWorker)
+   NS_INTERFACE_MAP_ENTRY(ServiceWorker)
+ NS_INTERFACE_MAP_END_INHERITING(DOMEventTargetHelper)
+ 
+ JSObject*
+@@ -198,13 +225,14 @@ const ServiceWorkerDescriptor&
+ ServiceWorker::Descriptor() const
+ {
+   return mDescriptor;
+ }
+ 
+ void
+ ServiceWorker::DisconnectFromOwner()
+ {
++  mRegistrationPromiseHolder.DisconnectIfExists();
+   DOMEventTargetHelper::DisconnectFromOwner();
+ }
+ 
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/serviceworkers/ServiceWorker.h b/dom/serviceworkers/ServiceWorker.h
+--- a/dom/serviceworkers/ServiceWorker.h
++++ b/dom/serviceworkers/ServiceWorker.h
+@@ -5,16 +5,17 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_serviceworker_h__
+ #define mozilla_dom_serviceworker_h__
+ 
+ #include "mozilla/DOMEventTargetHelper.h"
+ #include "mozilla/dom/BindingDeclarations.h"
+ #include "mozilla/dom/ServiceWorkerDescriptor.h"
++#include "mozilla/dom/ServiceWorkerUtils.h"
+ 
+ #ifdef XP_WIN
+ #undef PostMessage
+ #endif
+ 
+ class nsIGlobalObject;
+ 
+ namespace mozilla {
+@@ -50,26 +51,31 @@ public:
+     virtual void
+     AddServiceWorker(ServiceWorker* aWorker) = 0;
+ 
+     // This is called when the DOM ServiceWorker object is
+     // destroyed and drops its ref to the Inner object.
+     virtual void
+     RemoveServiceWorker(ServiceWorker* aWorker) = 0;
+ 
++    // Get the associated registration for this ServiceWorker.
++    virtual RefPtr<ServiceWorkerRegistrationPromise>
++    GetRegistration() = 0;
++
+     virtual void
+     PostMessage(RefPtr<ServiceWorkerCloneData>&& aData,
+                 const ClientInfo& aClientInfo,
+                 const ClientState& aClientState) = 0;
+ 
+     NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+   };
+ 
+   NS_DECLARE_STATIC_IID_ACCESSOR(NS_DOM_SERVICEWORKER_IID)
+   NS_DECL_ISUPPORTS_INHERITED
++  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(ServiceWorker, DOMEventTargetHelper)
+ 
+   IMPL_EVENT_HANDLER(statechange)
+   IMPL_EVENT_HANDLER(error)
+ 
+   static already_AddRefed<ServiceWorker>
+   Create(nsIGlobalObject* aOwner, const ServiceWorkerDescriptor& aDescriptor);
+ 
+   virtual JSObject*
+@@ -100,16 +106,18 @@ private:
+                 Inner* aInner);
+ 
+   // This class is reference-counted and will be destroyed from Release().
+   ~ServiceWorker();
+ 
+   ServiceWorkerDescriptor mDescriptor;
+ 
+   RefPtr<Inner> mInner;
++  RefPtr<ServiceWorkerRegistration> mRegistration;
++  MozPromiseRequestHolder<ServiceWorkerRegistrationPromise> mRegistrationPromiseHolder;
+ };
+ 
+ NS_DEFINE_STATIC_IID_ACCESSOR(ServiceWorker, NS_DOM_SERVICEWORKER_IID)
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_serviceworker_h__
+diff --git a/dom/serviceworkers/ServiceWorkerImpl.cpp b/dom/serviceworkers/ServiceWorkerImpl.cpp
+--- a/dom/serviceworkers/ServiceWorkerImpl.cpp
++++ b/dom/serviceworkers/ServiceWorkerImpl.cpp
+@@ -31,16 +31,23 @@ ServiceWorkerImpl::AddServiceWorker(Serv
+ void
+ ServiceWorkerImpl::RemoveServiceWorker(ServiceWorker* aWorker)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(mOuter);
+   MOZ_DIAGNOSTIC_ASSERT(mOuter == aWorker);
+   mOuter = nullptr;
+ }
+ 
++RefPtr<ServiceWorkerRegistrationPromise>
++ServiceWorkerImpl::GetRegistration()
++{
++  return ServiceWorkerRegistrationPromise::CreateAndResolve(mReg->Descriptor(),
++                                                            __func__);
++}
++
+ void
+ ServiceWorkerImpl::PostMessage(RefPtr<ServiceWorkerCloneData>&& aData,
+                                const ClientInfo& aClientInfo,
+                                const ClientState& aClientState)
+ {
+   mInfo->PostMessage(Move(aData), aClientInfo, aClientState);
+ }
+ 
+@@ -49,17 +56,20 @@ ServiceWorkerImpl::SetState(ServiceWorke
+ {
+   if (!mOuter) {
+     return;
+   }
+   mOuter->SetState(aState);
+ }
+ 
+ 
+-ServiceWorkerImpl::ServiceWorkerImpl(ServiceWorkerInfo* aInfo)
++ServiceWorkerImpl::ServiceWorkerImpl(ServiceWorkerInfo* aInfo,
++                                     ServiceWorkerRegistrationInfo* aReg)
+   : mInfo(aInfo)
++  , mReg(aReg)
+   , mOuter(nullptr)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(mInfo);
++  MOZ_DIAGNOSTIC_ASSERT(mReg);
+ }
+ 
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/serviceworkers/ServiceWorkerImpl.h b/dom/serviceworkers/ServiceWorkerImpl.h
+--- a/dom/serviceworkers/ServiceWorkerImpl.h
++++ b/dom/serviceworkers/ServiceWorkerImpl.h
+@@ -9,43 +9,49 @@
+ 
+ #include "ServiceWorker.h"
+ #include "ServiceWorkerInfo.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ class ServiceWorkerInfo;
++class ServiceWorkerRegistrationInfo;
+ 
+ class ServiceWorkerImpl final : public ServiceWorker::Inner
+                               , public ServiceWorkerInfo::Listener
+ {
+   RefPtr<ServiceWorkerInfo> mInfo;
++  RefPtr<ServiceWorkerRegistrationInfo> mReg;
+   ServiceWorker* mOuter;
+ 
+   ~ServiceWorkerImpl();
+ 
+   // ServiceWorker::Inner interface
+   void
+   AddServiceWorker(ServiceWorker* aWorker) override;
+ 
+   void
+   RemoveServiceWorker(ServiceWorker* aWorker) override;
+ 
++  RefPtr<ServiceWorkerRegistrationPromise>
++  GetRegistration() override;
++
+   void
+   PostMessage(RefPtr<ServiceWorkerCloneData>&& aData,
+               const ClientInfo& aClientInfo,
+               const ClientState& aClientState) override;
+ 
+   // ServiceWorkerInfo::Listener interface
+   void
+   SetState(ServiceWorkerState aState) override;
+ 
+ public:
+-  explicit ServiceWorkerImpl(ServiceWorkerInfo* aInfo);
++  ServiceWorkerImpl(ServiceWorkerInfo* aInfo,
++                    ServiceWorkerRegistrationInfo* aReg);
+ 
+   NS_INLINE_DECL_REFCOUNTING(ServiceWorkerImpl, override);
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_ServiceWorkerImpl_h
+diff --git a/dom/serviceworkers/ServiceWorkerParent.cpp b/dom/serviceworkers/ServiceWorkerParent.cpp
+--- a/dom/serviceworkers/ServiceWorkerParent.cpp
++++ b/dom/serviceworkers/ServiceWorkerParent.cpp
+@@ -42,16 +42,35 @@ ServiceWorkerParent::RecvPostMessage(con
+   data->CopyFromClonedMessageDataForBackgroundParent(aClonedData);
+ 
+   mProxy->PostMessage(Move(data), ClientInfo(aSource.info()),
+                       ClientState::FromIPC(aSource.state()));
+ 
+   return IPC_OK();
+ }
+ 
++mozilla::ipc::IPCResult
++ServiceWorkerParent::RecvGetRegistration(GetRegistrationResolver&& aResolver)
++{
++  if (!mProxy) {
++    aResolver(CopyableErrorResult(NS_ERROR_DOM_INVALID_STATE_ERR));
++    return IPC_OK();
++  }
++
++  mProxy->GetRegistration()->Then(
++    GetCurrentThreadSerialEventTarget(), __func__,
++    [aResolver] (const ServiceWorkerRegistrationDescriptor& aDescriptor) {
++      aResolver(aDescriptor.ToIPC());
++    }, [aResolver] (const CopyableErrorResult& aResult) {
++      aResolver(aResult);
++    });
++
++  return IPC_OK();
++}
++
+ ServiceWorkerParent::ServiceWorkerParent()
+   : mDeleteSent(false)
+ {
+ }
+ 
+ ServiceWorkerParent::~ServiceWorkerParent()
+ {
+   MOZ_DIAGNOSTIC_ASSERT(!mProxy);
+diff --git a/dom/serviceworkers/ServiceWorkerParent.h b/dom/serviceworkers/ServiceWorkerParent.h
+--- a/dom/serviceworkers/ServiceWorkerParent.h
++++ b/dom/serviceworkers/ServiceWorkerParent.h
+@@ -26,16 +26,19 @@ class ServiceWorkerParent final : public
+ 
+   mozilla::ipc::IPCResult
+   RecvTeardown() override;
+ 
+   mozilla::ipc::IPCResult
+   RecvPostMessage(const ClonedMessageData& aClonedData,
+                   const ClientInfoAndState& aSource) override;
+ 
++  mozilla::ipc::IPCResult
++  RecvGetRegistration(GetRegistrationResolver&& aResolver) override;
++
+ public:
+   ServiceWorkerParent();
+   ~ServiceWorkerParent();
+ 
+   void
+   Init(const IPCServiceWorkerDescriptor& aDescriptor);
+ 
+   void
+diff --git a/dom/serviceworkers/ServiceWorkerProxy.cpp b/dom/serviceworkers/ServiceWorkerProxy.cpp
+--- a/dom/serviceworkers/ServiceWorkerProxy.cpp
++++ b/dom/serviceworkers/ServiceWorkerProxy.cpp
+@@ -156,10 +156,46 @@ ServiceWorkerProxy::PostMessage(RefPtr<S
+       if (!self->mInfo) {
+         return;
+       }
+       self->mInfo->PostMessage(Move(data), aClientInfo, aClientState);
+     });
+   MOZ_ALWAYS_SUCCEEDS(SystemGroup::Dispatch(TaskCategory::Other, r.forget()));
+ }
+ 
++RefPtr<ServiceWorkerRegistrationPromise>
++ServiceWorkerProxy::GetRegistration()
++{
++  AssertIsOnBackgroundThread();
++
++  RefPtr<ServiceWorkerProxy> self = this;
++  RefPtr<ServiceWorkerRegistrationPromise::Private> promise =
++    new ServiceWorkerRegistrationPromise::Private(__func__);
++
++  nsCOMPtr<nsIRunnable> r = NS_NewRunnableFunction(__func__,
++    [self = Move(self), promise] () mutable {
++      auto scopeExit = MakeScopeExit([&] {
++        promise->Reject(NS_ERROR_DOM_INVALID_STATE_ERR, __func__);
++      });
++
++      NS_ENSURE_TRUE_VOID(self->mInfo);
++
++      RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
++      NS_ENSURE_TRUE_VOID(swm);
++
++      RefPtr<ServiceWorkerRegistrationInfo> reg =
++        swm->GetRegistration(self->mInfo->Principal(),
++                             self->mInfo->Scope());
++      NS_ENSURE_TRUE_VOID(reg);
++      NS_ENSURE_TRUE_VOID(reg->Id() == self->mInfo->Descriptor().RegistrationId());
++
++      promise->Resolve(reg->Descriptor(), __func__);
++
++      scopeExit.release();
++    });
++
++  MOZ_ALWAYS_SUCCEEDS(SystemGroup::Dispatch(TaskCategory::Other, r.forget()));
++
++  return promise;
++}
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/serviceworkers/ServiceWorkerProxy.h b/dom/serviceworkers/ServiceWorkerProxy.h
+--- a/dom/serviceworkers/ServiceWorkerProxy.h
++++ b/dom/serviceworkers/ServiceWorkerProxy.h
+@@ -60,15 +60,18 @@ public:
+   void
+   RevokeActor(ServiceWorkerParent* aActor);
+ 
+   void
+   PostMessage(RefPtr<ServiceWorkerCloneData>&& aData,
+               const ClientInfo& aClientInfo,
+               const ClientState& aState);
+ 
++  RefPtr<ServiceWorkerRegistrationPromise>
++  GetRegistration();
++
+   NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ServiceWorkerProxy, override);
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // moz_dom_ServiceWorkerProxy_h

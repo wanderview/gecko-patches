@@ -1,0 +1,113 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  9218a2fb7bedf1008476628eb49000945b911e11
+Bug 1462467 Auto-update the ServiceWorkerRegistration's state when it attaches to the parent-side registration info. r=baku
+
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationDescriptor.cpp b/dom/serviceworkers/ServiceWorkerRegistrationDescriptor.cpp
+--- a/dom/serviceworkers/ServiceWorkerRegistrationDescriptor.cpp
++++ b/dom/serviceworkers/ServiceWorkerRegistrationDescriptor.cpp
+@@ -110,16 +110,22 @@ ServiceWorkerRegistrationDescriptor::~Se
+ }
+ 
+ bool
+ ServiceWorkerRegistrationDescriptor::operator==(const ServiceWorkerRegistrationDescriptor& aRight) const
+ {
+   return *mData == *aRight.mData;
+ }
+ 
++bool
++ServiceWorkerRegistrationDescriptor::operator!=(const ServiceWorkerRegistrationDescriptor& aRight) const
++{
++  return *mData != *aRight.mData;
++}
++
+ uint64_t
+ ServiceWorkerRegistrationDescriptor::Id() const
+ {
+   return mData->id();
+ }
+ 
+ ServiceWorkerUpdateViaCache
+ ServiceWorkerRegistrationDescriptor::UpdateViaCache() const
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationDescriptor.h b/dom/serviceworkers/ServiceWorkerRegistrationDescriptor.h
+--- a/dom/serviceworkers/ServiceWorkerRegistrationDescriptor.h
++++ b/dom/serviceworkers/ServiceWorkerRegistrationDescriptor.h
+@@ -59,16 +59,19 @@ public:
+   ServiceWorkerRegistrationDescriptor&
+   operator=(ServiceWorkerRegistrationDescriptor&& aRight);
+ 
+   ~ServiceWorkerRegistrationDescriptor();
+ 
+   bool
+   operator==(const ServiceWorkerRegistrationDescriptor& aRight) const;
+ 
++  bool
++  operator!=(const ServiceWorkerRegistrationDescriptor& aRight) const;
++
+   uint64_t
+   Id() const;
+ 
+   ServiceWorkerUpdateViaCache
+   UpdateViaCache() const;
+ 
+   const mozilla::ipc::PrincipalInfo&
+   PrincipalInfo() const;
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationProxy.cpp b/dom/serviceworkers/ServiceWorkerRegistrationProxy.cpp
+--- a/dom/serviceworkers/ServiceWorkerRegistrationProxy.cpp
++++ b/dom/serviceworkers/ServiceWorkerRegistrationProxy.cpp
+@@ -70,16 +70,55 @@ ServiceWorkerRegistrationProxy::InitOnMa
+ 
+   scopeExit.release();
+ 
+   mReg = new nsMainThreadPtrHolder<ServiceWorkerRegistrationInfo>(
+     "ServiceWorkerRegistrationProxy::mInfo", reg);
+ 
+   swm->AddRegistrationEventListener(NS_ConvertUTF8toUTF16(mDescriptor.Scope()),
+                                     this);
++
++  // Currently the spec only sets an installing worker in step 3 of the Install
++  // algorithm:
++  //
++  //  https://w3c.github.io/ServiceWorker/#installation-algorithm
++  //
++  // In step 7 it then queues a task to dispatch an "updatefound" event.
++  //
++  // The SWM implements these steps, but the remote IPC configuration currently
++  // misses the "updatefound" case when the ServiceWorkerRegistration object is
++  // newly created.  In that case the actor and its proxy are not setup yet, so
++  // the UpdateFound() method is not called.
++  //
++  // To work around this problem we look to see if we are creating an actor and
++  // proxy for a registration with an installing worker.  In this case we assume
++  // the registration was just created and simulate the "updatefound" trigger.
++  //
++  // There is some risk that another client will call getRegistration() at exactly
++  // the time a worker in installing and will also trigger this logic, but per
++  // the spec this case could happen and legitimately get an updatefound event
++  // as well.
++  //
++  // In the future it would be nice to move the "updatefound" dispatch trigger to
++  // be entirely in the binding layer.  When an installing worker is set we would
++  // just always fire the "updatefound" event.  We cannot do this, however, until
++  // bug 1113522 is implemented since we need the "updatefound" to fire in the
++  // service worker thread context, but we don't yet expose the actual worker
++  // values there.
++  if (mDescriptor.GetInstalling().isSome()) {
++    UpdateFound();
++  }
++
++  // We also need to handle the case where the service worker installed and
++  // possibly activated in the time it took us to setup the registration's
++  // actor.  If there has been any change in the registration's state, then
++  // automitically push it to the binding layer.
++  if (mReg->Descriptor() != mDescriptor) {
++    UpdateState(mReg->Descriptor());
++  }
+ }
+ 
+ void
+ ServiceWorkerRegistrationProxy::MaybeShutdownOnMainThread()
+ {
+   AssertIsOnMainThread();
+ 
+   nsCOMPtr<nsIRunnable> r =
