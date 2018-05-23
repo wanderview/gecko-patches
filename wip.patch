@@ -1,0 +1,636 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  cc531cf6325277a6d502235166e38e1bbf26bc66
+
+diff --git a/dom/serviceworkers/ServiceWorker.cpp b/dom/serviceworkers/ServiceWorker.cpp
+--- a/dom/serviceworkers/ServiceWorker.cpp
++++ b/dom/serviceworkers/ServiceWorker.cpp
+@@ -74,46 +74,50 @@ ServiceWorker::Create(nsIGlobalObject* a
+ }
+ 
+ ServiceWorker::ServiceWorker(nsIGlobalObject* aGlobal,
+                              const ServiceWorkerDescriptor& aDescriptor,
+                              ServiceWorker::Inner* aInner)
+   : DOMEventTargetHelper(aGlobal)
+   , mDescriptor(aDescriptor)
+   , mInner(aInner)
++  , mLastNotifiedState(ServiceWorkerState::Installing)
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+   MOZ_DIAGNOSTIC_ASSERT(aGlobal);
+   MOZ_DIAGNOSTIC_ASSERT(mInner);
+ 
+   KeepAliveIfHasListenersFor(NS_LITERAL_STRING("statechange"));
+ 
+   // The error event handler is required by the spec currently, but is not used
+   // anywhere.  Don't keep the object alive in that case.
+ 
+   // This will update our state too.
+   mInner->AddServiceWorker(this);
+ 
+   // Attempt to get an existing binding object for the registration
+   // associated with this ServiceWorker.
+-  mRegistration = aGlobal->GetServiceWorkerRegistration(
++  RefPtr<ServiceWorkerRegistration> reg = aGlobal->GetServiceWorkerRegistration(
+     ServiceWorkerRegistrationDescriptor(mDescriptor.RegistrationId(),
+                                         mDescriptor.PrincipalInfo(),
+                                         mDescriptor.Scope(),
+                                         ServiceWorkerUpdateViaCache::Imports));
+-  if (!mRegistration) {
++  if (reg) {
++    MaybeAttachToRegistration(reg);
++  } else {
+     RefPtr<ServiceWorker> self = this;
+ 
+     mInner->GetRegistration()->Then(
+       aGlobal->EventTargetFor(TaskCategory::Other), __func__,
+       [self] (const ServiceWorkerRegistrationDescriptor& aDescriptor) {
+         self->mRegistrationPromiseHolder.Complete();
+         nsIGlobalObject* global = self->GetParentObject();
+-        self->mRegistration =
++        RefPtr<ServiceWorkerRegistration> reg =
+           global->GetOrCreateServiceWorkerRegistration(aDescriptor);
++        self->MaybeAttachToRegistration(reg);
+       }, [self] (const CopyableErrorResult& aRv) {
+         self->mRegistrationPromiseHolder.Complete();
+         // do nothing
+       })->Track(mRegistrationPromiseHolder);
+   }
+ }
+ 
+ ServiceWorker::~ServiceWorker()
+@@ -145,28 +149,34 @@ ServiceWorkerState
+ ServiceWorker::State() const
+ {
+   return mDescriptor.State();
+ }
+ 
+ void
+ ServiceWorker::SetState(ServiceWorkerState aState)
+ {
+-  ServiceWorkerState oldState = mDescriptor.State();
++  NS_ENSURE_TRUE_VOID(aState >= mDescriptor.State());
+   mDescriptor.SetState(aState);
+-  if (oldState == aState) {
++}
++
++void
++ServiceWorker::MaybeDispatchStateChangeEvent()
++{
++  if (mDescriptor.State() <= mLastNotifiedState || !GetParentObject()) {
+     return;
+   }
++  mLastNotifiedState = mDescriptor.State();
+ 
+   DOMEventTargetHelper::DispatchTrustedEvent(NS_LITERAL_STRING("statechange"));
+ 
+   // Once we have transitioned to the redundant state then no
+   // more statechange events will occur.  We can allow the DOM
+   // object to GC if script is not holding it alive.
+-  if (mDescriptor.State() == ServiceWorkerState::Redundant) {
++  if (mLastNotifiedState == ServiceWorkerState::Redundant) {
+     IgnoreKeepAliveIfHasListenersFor(NS_LITERAL_STRING("statechange"));
+   }
+ }
+ 
+ void
+ ServiceWorker::GetScriptURL(nsString& aURL) const
+ {
+   CopyUTF8toUTF16(mDescriptor.ScriptURL(), aURL);
+@@ -229,10 +239,32 @@ ServiceWorker::Descriptor() const
+ 
+ void
+ ServiceWorker::DisconnectFromOwner()
+ {
+   mRegistrationPromiseHolder.DisconnectIfExists();
+   DOMEventTargetHelper::DisconnectFromOwner();
+ }
+ 
++void
++ServiceWorker::MaybeAttachToRegistration(ServiceWorkerRegistration* aRegistration)
++{
++  MOZ_DIAGNOSTIC_ASSERT(aRegistration);
++  MOZ_DIAGNOSTIC_ASSERT(!mRegistration);
++
++  auto& desc = aRegistration->Descriptor();
++  Maybe<ServiceWorkerDescriptor> installing = desc.GetInstalling();
++  Maybe<ServiceWorkerDescriptor> waiting = desc.GetWaiting();
++  Maybe<ServiceWorkerDescriptor> active = desc.GetActive();
++
++  if ((installing.isNothing() || !installing.ref().Matches(mDescriptor)) &&
++      (waiting.isNothing() || !waiting.ref().Matches(mDescriptor)) &&
++      (active.isNothing() || !active.ref().Matches(mDescriptor))) {
++    SetState(ServiceWorkerState::Redundant);
++    MaybeDispatchStateChangeEvent();
++    return;
++  }
++
++  mRegistration = aRegistration;
++}
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/serviceworkers/ServiceWorker.h b/dom/serviceworkers/ServiceWorker.h
+--- a/dom/serviceworkers/ServiceWorker.h
++++ b/dom/serviceworkers/ServiceWorker.h
+@@ -83,16 +83,19 @@ public:
+ 
+   ServiceWorkerState
+   State() const;
+ 
+   void
+   SetState(ServiceWorkerState aState);
+ 
+   void
++  MaybeDispatchStateChangeEvent();
++
++  void
+   GetScriptURL(nsString& aURL) const;
+ 
+   void
+   PostMessage(JSContext* aCx, JS::Handle<JS::Value> aMessage,
+               const Sequence<JSObject*>& aTransferable, ErrorResult& aRv);
+ 
+   const ServiceWorkerDescriptor&
+   Descriptor() const;
+@@ -103,21 +106,25 @@ public:
+ private:
+   ServiceWorker(nsIGlobalObject* aWindow,
+                 const ServiceWorkerDescriptor& aDescriptor,
+                 Inner* aInner);
+ 
+   // This class is reference-counted and will be destroyed from Release().
+   ~ServiceWorker();
+ 
++  void
++  MaybeAttachToRegistration(ServiceWorkerRegistration* aRegistration);
++
+   ServiceWorkerDescriptor mDescriptor;
+ 
+   RefPtr<Inner> mInner;
+   RefPtr<ServiceWorkerRegistration> mRegistration;
+   MozPromiseRequestHolder<ServiceWorkerRegistrationPromise> mRegistrationPromiseHolder;
++  ServiceWorkerState mLastNotifiedState;
+ };
+ 
+ NS_DEFINE_STATIC_IID_ACCESSOR(ServiceWorker, NS_DOM_SERVICEWORKER_IID)
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif // mozilla_dom_serviceworker_h__
+diff --git a/dom/serviceworkers/ServiceWorkerImpl.cpp b/dom/serviceworkers/ServiceWorkerImpl.cpp
+--- a/dom/serviceworkers/ServiceWorkerImpl.cpp
++++ b/dom/serviceworkers/ServiceWorkerImpl.cpp
+@@ -7,30 +7,31 @@
+ #include "ServiceWorkerImpl.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ ServiceWorkerImpl::~ServiceWorkerImpl()
+ {
+   MOZ_DIAGNOSTIC_ASSERT(!mOuter);
+-  mInfo->RemoveListener(this);
++  // TODO
++  //mInfo->RemoveListener(this);
+ }
+ 
+ void
+ ServiceWorkerImpl::AddServiceWorker(ServiceWorker* aWorker)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(!mOuter);
+   MOZ_DIAGNOSTIC_ASSERT(aWorker);
+   mOuter = aWorker;
+ 
+   // Wait to attach to the info as a listener until we have the outer
+   // set.  This is important because the info will try to set the
+   // state immediately.
+-  mInfo->AddListener(this);
++  //mInfo->AddListener(this);
+ }
+ 
+ void
+ ServiceWorkerImpl::RemoveServiceWorker(ServiceWorker* aWorker)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(mOuter);
+   MOZ_DIAGNOSTIC_ASSERT(mOuter == aWorker);
+   mOuter = nullptr;
+diff --git a/dom/serviceworkers/ServiceWorkerInfo.cpp b/dom/serviceworkers/ServiceWorkerInfo.cpp
+--- a/dom/serviceworkers/ServiceWorkerInfo.cpp
++++ b/dom/serviceworkers/ServiceWorkerInfo.cpp
+@@ -167,18 +167,18 @@ ServiceWorkerInfo::UpdateState(ServiceWo
+   // Flush any pending functional events to the worker when it transitions to the
+   // activated state.
+   // TODO: Do we care that these events will race with the propagation of the
+   //       state change?
+   if (State() != aState) {
+     mServiceWorkerPrivate->UpdateState(aState);
+   }
+   mDescriptor.SetState(aState);
+-  nsCOMPtr<nsIRunnable> r = new ChangeStateUpdater(mInstances, State());
+-  MOZ_ALWAYS_SUCCEEDS(NS_DispatchToMainThread(r.forget()));
++  //nsCOMPtr<nsIRunnable> r = new ChangeStateUpdater(mInstances, State());
++  //MOZ_ALWAYS_SUCCEEDS(NS_DispatchToMainThread(r.forget()));
+   if (State() == ServiceWorkerState::Redundant) {
+     serviceWorkerScriptCache::PurgeCache(mPrincipal, mCacheName);
+   }
+ }
+ 
+ ServiceWorkerInfo::ServiceWorkerInfo(nsIPrincipal* aPrincipal,
+                                      const nsACString& aScope,
+                                      uint64_t aRegistrationId,
+diff --git a/dom/serviceworkers/ServiceWorkerRegistration.cpp b/dom/serviceworkers/ServiceWorkerRegistration.cpp
+--- a/dom/serviceworkers/ServiceWorkerRegistration.cpp
++++ b/dom/serviceworkers/ServiceWorkerRegistration.cpp
+@@ -147,44 +147,81 @@ void
+ ServiceWorkerRegistration::UpdateState(const ServiceWorkerRegistrationDescriptor& aDescriptor)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(MatchesDescriptor(aDescriptor));
+ 
+   mDescriptor = aDescriptor;
+ 
+   nsCOMPtr<nsIGlobalObject> global = GetParentObject();
+ 
++  RefPtr<ServiceWorker> oldInstalling = mInstallingWorker.forget();
++  RefPtr<ServiceWorker> oldWaiting = mWaitingWorker.forget();
++  RefPtr<ServiceWorker> oldActive = mActiveWorker.forget();
++
++  auto scopeExit = MakeScopeExit([&] {
++    if (oldActive && oldActive != mActiveWorker) {
++      oldActive->SetState(ServiceWorkerState::Redundant);
++    }
++    if (oldWaiting && oldWaiting != mWaitingWorker &&
++                      oldWaiting != mActiveWorker) {
++      oldWaiting->SetState(ServiceWorkerState::Redundant);
++    }
++    if (oldInstalling && oldInstalling != mInstallingWorker &&
++                         oldInstalling != mWaitingWorker &&
++                         oldInstalling != mActiveWorker) {
++      oldInstalling->SetState(ServiceWorkerState::Redundant);
++    }
++    if (mInstallingWorker) {
++      mInstallingWorker->MaybeDispatchStateChangeEvent();
++    }
++    if (mWaitingWorker) {
++      mWaitingWorker->MaybeDispatchStateChangeEvent();
++    }
++    if (mActiveWorker) {
++      mActiveWorker->MaybeDispatchStateChangeEvent();
++    }
++    if (oldInstalling) {
++      oldInstalling->MaybeDispatchStateChangeEvent();
++    }
++    if (oldWaiting) {
++      oldWaiting->MaybeDispatchStateChangeEvent();
++    }
++    if (oldActive) {
++      oldActive->MaybeDispatchStateChangeEvent();
++    }
++  });
++
+   // Clear all workers if the registration has been detached from the global.
+   // Also, we cannot expose ServiceWorker objects on worker threads yet, so
+   // do the same on when off-main-thread.  This main thread check should be
+   // removed as part of bug 1113522.
+   if (!global || !NS_IsMainThread()) {
+-    mInstallingWorker = nullptr;
+-    mWaitingWorker = nullptr;
+-    mActiveWorker = nullptr;
+     return;
+   }
+ 
+   Maybe<ServiceWorkerDescriptor> active = aDescriptor.GetActive();
+   if (active.isSome()) {
+     mActiveWorker = global->GetOrCreateServiceWorker(active.ref());
++    mActiveWorker->SetState(active.ref().State());
+   } else {
+     mActiveWorker = nullptr;
+   }
+ 
+   Maybe<ServiceWorkerDescriptor> waiting = aDescriptor.GetWaiting();
+   if (waiting.isSome()) {
+     mWaitingWorker = global->GetOrCreateServiceWorker(waiting.ref());
++    mWaitingWorker->SetState(waiting.ref().State());
+   } else {
+     mWaitingWorker = nullptr;
+   }
+ 
+   Maybe<ServiceWorkerDescriptor> installing = aDescriptor.GetInstalling();
+   if (installing.isSome()) {
+     mInstallingWorker = global->GetOrCreateServiceWorker(installing.ref());
++    mInstallingWorker->SetState(installing.ref().State());
+   } else {
+     mInstallingWorker = nullptr;
+   }
+ }
+ 
+ bool
+ ServiceWorkerRegistration::MatchesDescriptor(const ServiceWorkerRegistrationDescriptor& aDescriptor) const
+ {
+@@ -363,10 +400,16 @@ ServiceWorkerRegistration::GetNotificati
+     return Notification::Get(window, aOptions, scope, aRv);
+   }
+ 
+   WorkerPrivate* worker = GetCurrentThreadWorkerPrivate();
+   worker->AssertIsOnWorkerThread();
+   return Notification::WorkerGet(worker, aOptions, scope, aRv);
+ }
+ 
++const ServiceWorkerRegistrationDescriptor&
++ServiceWorkerRegistration::Descriptor() const
++{
++  return mDescriptor;
++}
++
+ } // dom namespace
+ } // mozilla namespace
+diff --git a/dom/serviceworkers/ServiceWorkerRegistration.h b/dom/serviceworkers/ServiceWorkerRegistration.h
+--- a/dom/serviceworkers/ServiceWorkerRegistration.h
++++ b/dom/serviceworkers/ServiceWorkerRegistration.h
+@@ -109,16 +109,19 @@ public:
+                    const nsAString& aTitle,
+                    const NotificationOptions& aOptions,
+                    ErrorResult& aRv);
+ 
+   already_AddRefed<Promise>
+   GetNotifications(const GetNotificationOptions& aOptions,
+                    ErrorResult& aRv);
+ 
++  const ServiceWorkerRegistrationDescriptor&
++  Descriptor() const;
++
+ private:
+   ServiceWorkerRegistration(nsIGlobalObject* aGlobal,
+                             const ServiceWorkerRegistrationDescriptor& aDescriptor,
+                             Inner* aInner);
+ 
+   ~ServiceWorkerRegistration();
+ 
+   ServiceWorkerRegistrationDescriptor mDescriptor;
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationDescriptor.h b/dom/serviceworkers/ServiceWorkerRegistrationDescriptor.h
+--- a/dom/serviceworkers/ServiceWorkerRegistrationDescriptor.h
++++ b/dom/serviceworkers/ServiceWorkerRegistrationDescriptor.h
+@@ -86,16 +86,19 @@ public:
+   GetInstalling() const;
+ 
+   Maybe<ServiceWorkerDescriptor>
+   GetWaiting() const;
+ 
+   Maybe<ServiceWorkerDescriptor>
+   GetActive() const;
+ 
++  bool
++  HasWorker(const ServiceWorkerDescriptor& aWorker) const;
++
+   Maybe<ServiceWorkerDescriptor>
+   Newest() const;
+ 
+   bool
+   IsValid() const;
+ 
+   void
+   SetUpdateViaCache(ServiceWorkerUpdateViaCache aUpdateViaCache);
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationImpl.cpp b/dom/serviceworkers/ServiceWorkerRegistrationImpl.cpp
+--- a/dom/serviceworkers/ServiceWorkerRegistrationImpl.cpp
++++ b/dom/serviceworkers/ServiceWorkerRegistrationImpl.cpp
+@@ -100,18 +100,33 @@ void
+ ServiceWorkerRegistrationMainThread::UpdateFound()
+ {
+   mOuter->DispatchTrustedEvent(NS_LITERAL_STRING("updatefound"));
+ }
+ 
+ void
+ ServiceWorkerRegistrationMainThread::UpdateState(const ServiceWorkerRegistrationDescriptor& aDescriptor)
+ {
+-  mDescriptor = aDescriptor;
+-  mOuter->UpdateState(aDescriptor);
++  NS_ENSURE_TRUE_VOID(mOuter);
++
++  nsIGlobalObject* global = mOuter->GetParentObject();
++  NS_ENSURE_TRUE_VOID(global);
++
++  RefPtr<ServiceWorkerRegistrationMainThread> self = this;
++  nsCOMPtr<nsIRunnable> r = NS_NewRunnableFunction(
++    "ServiceWorkerRegistrationMainThread::UpdateState",
++    [self, desc = Move(aDescriptor)] () mutable {
++      self->mDescriptor = Move(desc);
++      NS_ENSURE_TRUE_VOID(self->mOuter);
++      self->mOuter->UpdateState(self->mDescriptor);
++    });
++
++  Unused <<
++    global->EventTargetFor(TaskCategory::Other)->Dispatch(r.forget(),
++                                                          NS_DISPATCH_NORMAL);
+ }
+ 
+ void
+ ServiceWorkerRegistrationMainThread::RegistrationRemoved()
+ {
+   // Queue a runnable to clean up the registration.  This is necessary
+   // because there may be runnables in the event queue already to
+   // update the registration state.  We want to let those run
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationInfo.cpp b/dom/serviceworkers/ServiceWorkerRegistrationInfo.cpp
+--- a/dom/serviceworkers/ServiceWorkerRegistrationInfo.cpp
++++ b/dom/serviceworkers/ServiceWorkerRegistrationInfo.cpp
+@@ -51,18 +51,16 @@ ServiceWorkerRegistrationInfo::Clear()
+   if (mEvaluatingWorker) {
+     mEvaluatingWorker = nullptr;
+   }
+ 
+   RefPtr<ServiceWorkerInfo> installing = mInstallingWorker.forget();
+   RefPtr<ServiceWorkerInfo> waiting = mWaitingWorker.forget();
+   RefPtr<ServiceWorkerInfo> active = mActiveWorker.forget();
+ 
+-  UpdateRegistrationState();
+-
+   if (installing) {
+     installing->UpdateState(ServiceWorkerState::Redundant);
+     installing->UpdateRedundantTime();
+     installing->WorkerPrivate()->NoteDeadServiceWorkerInfo();
+     // FIXME(nsm): Abort any inflight requests from installing worker.
+   }
+ 
+   if (waiting) {
+@@ -72,16 +70,17 @@ ServiceWorkerRegistrationInfo::Clear()
+   }
+ 
+   if (active) {
+     active->UpdateState(ServiceWorkerState::Redundant);
+     active->UpdateRedundantTime();
+     active->WorkerPrivate()->NoteDeadServiceWorkerInfo();
+   }
+ 
++  UpdateRegistrationState();
+   NotifyChromeRegistrationListeners();
+ }
+ 
+ void
+ ServiceWorkerRegistrationInfo::ClearAsCorrupt()
+ {
+   mCorrupt = true;
+   Clear();
+@@ -361,16 +360,17 @@ ServiceWorkerRegistrationInfo::FinishAct
+   }
+ 
+   // Activation never fails, so aSuccess is ignored.
+   mActiveWorker->UpdateState(ServiceWorkerState::Activated);
+   mActiveWorker->UpdateActivatedTime();
+ 
+   mDescriptor.SetWorkers(mInstallingWorker, mWaitingWorker, mActiveWorker);
+ 
++  UpdateRegistrationState();
+   NotifyChromeRegistrationListeners();
+ 
+   RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+   if (!swm) {
+     // browser shutdown started during async activation completion step
+     return;
+   }
+   swm->StoreRegistration(mPrincipal, this);
+@@ -413,26 +413,20 @@ ServiceWorkerRegistrationInfo::IsLastUpd
+ 
+ void
+ ServiceWorkerRegistrationInfo::UpdateRegistrationState()
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+ 
+   mDescriptor.SetWorkers(mInstallingWorker, mWaitingWorker, mActiveWorker);
+ 
+-  RefPtr<ServiceWorkerRegistrationInfo> self(this);
+-  nsCOMPtr<nsIRunnable> r = NS_NewRunnableFunction(
+-    "ServiceWorkerRegistrationInfo::UpdateRegistrationState",
+-    [self = Move(self)] {
+-      RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+-      if (swm) {
+-        swm->UpdateRegistrationListeners(self);
+-      }
+-    });
+-  MOZ_ALWAYS_SUCCEEDS(SystemGroup::Dispatch(TaskCategory::Other, r.forget()));
++  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
++  NS_ENSURE_TRUE_VOID(swm);
++
++  swm->UpdateRegistrationListeners(this);
+ }
+ 
+ void
+ ServiceWorkerRegistrationInfo::NotifyChromeRegistrationListeners()
+ {
+   nsTArray<nsCOMPtr<nsIServiceWorkerRegistrationInfoListener>> listeners(mListeners);
+   for (size_t index = 0; index < listeners.Length(); ++index) {
+     listeners[index]->OnChange();
+@@ -566,60 +560,54 @@ ServiceWorkerRegistrationInfo::ClearInst
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+ 
+   if (!mInstallingWorker) {
+     return;
+   }
+ 
+   RefPtr<ServiceWorkerInfo> installing = mInstallingWorker.forget();
+-
+-  UpdateRegistrationState();
+-
+   installing->UpdateState(ServiceWorkerState::Redundant);
+   installing->UpdateRedundantTime();
+ 
++  UpdateRegistrationState();
+   NotifyChromeRegistrationListeners();
+ }
+ 
+ void
+ ServiceWorkerRegistrationInfo::TransitionEvaluatingToInstalling()
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+   MOZ_ASSERT(mEvaluatingWorker);
+   MOZ_ASSERT(!mInstallingWorker);
+ 
+   mInstallingWorker = mEvaluatingWorker.forget();
++  mInstallingWorker->UpdateState(ServiceWorkerState::Installing);
+ 
+   UpdateRegistrationState();
+-
+-  mInstallingWorker->UpdateState(ServiceWorkerState::Installing);
+-
+   NotifyChromeRegistrationListeners();
+ }
+ 
+ void
+ ServiceWorkerRegistrationInfo::TransitionInstallingToWaiting()
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+   MOZ_ASSERT(mInstallingWorker);
+ 
+   if (mWaitingWorker) {
+     MOZ_ASSERT(mInstallingWorker->CacheName() != mWaitingWorker->CacheName());
+     mWaitingWorker->UpdateState(ServiceWorkerState::Redundant);
+     mWaitingWorker->UpdateRedundantTime();
+   }
+ 
+   mWaitingWorker = mInstallingWorker.forget();
+-
+-  UpdateRegistrationState();
+-
+   mWaitingWorker->UpdateState(ServiceWorkerState::Installed);
+   mWaitingWorker->UpdateInstalledTime();
+ 
++  UpdateRegistrationState();
+   NotifyChromeRegistrationListeners();
+ 
+   // TODO: When bug 1426401 is implemented we will need to call
+   //       StoreRegistration() here to persist the waiting worker.
+ }
+ 
+ void
+ ServiceWorkerRegistrationInfo::SetActive(ServiceWorkerInfo* aServiceWorker)
+@@ -645,17 +633,16 @@ ServiceWorkerRegistrationInfo::SetActive
+   // another process activating a worker.  Move straight to the
+   // Activated state.
+   mActiveWorker = aServiceWorker;
+   mActiveWorker->SetActivateStateUncheckedWithoutEvent(ServiceWorkerState::Activated);
+ 
+   // We don't need to update activated time when we load registration from
+   // registrar.
+   UpdateRegistrationState();
+-
+   NotifyChromeRegistrationListeners();
+ }
+ 
+ void
+ ServiceWorkerRegistrationInfo::TransitionWaitingToActive()
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+   MOZ_ASSERT(mWaitingWorker);
+@@ -664,31 +651,29 @@ ServiceWorkerRegistrationInfo::Transitio
+     MOZ_ASSERT(mWaitingWorker->CacheName() != mActiveWorker->CacheName());
+     mActiveWorker->UpdateState(ServiceWorkerState::Redundant);
+     mActiveWorker->UpdateRedundantTime();
+   }
+ 
+   // We are transitioning from waiting to active normally, so go to
+   // the activating state.
+   mActiveWorker = mWaitingWorker.forget();
+-
+-  UpdateRegistrationState();
+-
+   mActiveWorker->UpdateState(ServiceWorkerState::Activating);
+ 
+   nsCOMPtr<nsIRunnable> r =
+     NS_NewRunnableFunction("ServiceWorkerRegistrationInfo::TransitionWaitingToActive",
+     [] {
+       RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+       if (swm) {
+         swm->CheckPendingReadyPromises();
+       }
+     });
+   MOZ_ALWAYS_SUCCEEDS(SystemGroup::Dispatch(TaskCategory::Other, r.forget()));
+ 
++  UpdateRegistrationState();
+   NotifyChromeRegistrationListeners();
+ }
+ 
+ bool
+ ServiceWorkerRegistrationInfo::IsIdle() const
+ {
+   return !mActiveWorker || mActiveWorker->WorkerPrivate()->IsIdle();
+ }
