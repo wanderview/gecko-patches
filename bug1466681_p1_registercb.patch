@@ -1,12 +1,39 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  19639ac128fb7f406b41696f0402e86c93150a3c
+# Parent  395c27a4f82acccf90a00722436c056844370da9
 Bug 1466681 P1 Make ServiceWorkerContainer::Inner::Register() use callbacks instead of MozPromise. r=asuth
 
 diff --git a/dom/serviceworkers/ServiceWorkerContainer.cpp b/dom/serviceworkers/ServiceWorkerContainer.cpp
 --- a/dom/serviceworkers/ServiceWorkerContainer.cpp
 +++ b/dom/serviceworkers/ServiceWorkerContainer.cpp
-@@ -353,37 +353,32 @@ ServiceWorkerContainer::Register(const n
+@@ -72,24 +72,26 @@ ServiceWorkerContainer::Create(nsIGlobal
+   return ref.forget();
+ }
+ 
+ ServiceWorkerContainer::ServiceWorkerContainer(nsIGlobalObject* aGlobal,
+                                                already_AddRefed<ServiceWorkerContainer::Inner> aInner)
+   : DOMEventTargetHelper(aGlobal)
+   , mInner(aInner)
+ {
++  mInner->AddContainer(this);
+   Maybe<ServiceWorkerDescriptor> controller = aGlobal->GetController();
+   if (controller.isSome()) {
+     mControllerWorker = aGlobal->GetOrCreateServiceWorker(controller.ref());
+   }
+ }
+ 
+ ServiceWorkerContainer::~ServiceWorkerContainer()
+ {
++  mInner->RemoveContainer(this);
+ }
+ 
+ void
+ ServiceWorkerContainer::DisconnectFromOwner()
+ {
+   mControllerWorker = nullptr;
+   mReadyPromise = nullptr;
+   DOMEventTargetHelper::DisconnectFromOwner();
+@@ -353,37 +355,32 @@ ServiceWorkerContainer::Register(const n
    window->NoteCalledRegisterForServiceWorkerScope(cleanedScopeURL);
  
    RefPtr<Promise> outer = Promise::Create(global, aRv);
@@ -53,7 +80,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerContainer.cpp b/dom/serviceworkers/
 diff --git a/dom/serviceworkers/ServiceWorkerContainer.h b/dom/serviceworkers/ServiceWorkerContainer.h
 --- a/dom/serviceworkers/ServiceWorkerContainer.h
 +++ b/dom/serviceworkers/ServiceWorkerContainer.h
-@@ -21,21 +21,23 @@ class ServiceWorker;
+@@ -21,21 +21,29 @@ class ServiceWorker;
  
  // Lightweight serviceWorker APIs collection.
  class ServiceWorkerContainer final : public DOMEventTargetHelper
@@ -64,13 +91,19 @@ diff --git a/dom/serviceworkers/ServiceWorkerContainer.h b/dom/serviceworkers/Se
    public:
 -    virtual RefPtr<ServiceWorkerRegistrationPromise>
 +    virtual void
++    AddContainer(ServiceWorkerContainer* aOuter) = 0;
++
++    virtual void
++    RemoveContainer(ServiceWorkerContainer* aOuter) = 0;
++
++    virtual void
      Register(const ClientInfo& aClientInfo,
               const nsACString& aScopeURL,
               const nsACString& aScriptURL,
 -             ServiceWorkerUpdateViaCache aUpdateViaCache) const = 0;
 +             ServiceWorkerUpdateViaCache aUpdateViaCache,
-+             ServiceWorkerRegistrationCallback&& aSuccess,
-+             ServiceWorkerErrorCallback&& aError) const = 0;
++             ServiceWorkerRegistrationCallback&& aSuccessCB,
++             ServiceWorkerFailureCallback&& aFailureCB) const = 0;
  
      virtual RefPtr<ServiceWorkerRegistrationPromise>
      GetRegistration(const ClientInfo& aClientInfo,
@@ -82,7 +115,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerContainer.h b/dom/serviceworkers/Se
 diff --git a/dom/serviceworkers/ServiceWorkerContainerImpl.cpp b/dom/serviceworkers/ServiceWorkerContainerImpl.cpp
 --- a/dom/serviceworkers/ServiceWorkerContainerImpl.cpp
 +++ b/dom/serviceworkers/ServiceWorkerContainerImpl.cpp
-@@ -4,29 +4,32 @@
+@@ -4,29 +4,76 @@
   * License, v. 2.0. If a copy of the MPL was not distributed with this
   * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
  
@@ -92,26 +125,70 @@ diff --git a/dom/serviceworkers/ServiceWorkerContainerImpl.cpp b/dom/servicework
  namespace dom {
  
 -RefPtr<ServiceWorkerRegistrationPromise>
++ServiceWorkerContainerImpl::~ServiceWorkerContainerImpl()
++{
++  MOZ_DIAGNOSTIC_ASSERT(!mOuter);
++}
++
++ServiceWorkerContainerImpl::ServiceWorkerContainerImpl()
++  : mOuter(nullptr)
++{
++}
++
++void
++ServiceWorkerContainerImpl::AddContainer(ServiceWorkerContainer* aOuter)
++{
++  MOZ_DIAGNOSTIC_ASSERT(aOuter);
++  MOZ_DIAGNOSTIC_ASSERT(!mOuter);
++  mOuter = aOuter;
++}
++
++void
++ServiceWorkerContainerImpl::RemoveContainer(ServiceWorkerContainer* aOuter)
++{
++  MOZ_DIAGNOSTIC_ASSERT(aOuter);
++  MOZ_DIAGNOSTIC_ASSERT(mOuter == aOuter);
++  mOuter = nullptr;
++}
++
 +void
  ServiceWorkerContainerImpl::Register(const ClientInfo& aClientInfo,
                                       const nsACString& aScopeURL,
                                       const nsACString& aScriptURL,
 -                                     ServiceWorkerUpdateViaCache aUpdateViaCache) const
 +                                     ServiceWorkerUpdateViaCache aUpdateViaCache,
-+                                     ServiceWorkerRegistrationCallback&& aSuccess,
-+                                     ServiceWorkerErrorCallback&& aError) const
++                                     ServiceWorkerRegistrationCallback&& aSuccessCB,
++                                     ServiceWorkerFailureCallback&& aFailureCB) const
  {
++  MOZ_DIAGNOSTIC_ASSERT(mOuter);
++
++  nsIGlobalObject* global = mOuter->GetParentObject();
++  if (NS_WARN_IF(!global)) {
++    aFailureCB(CopyableErrorResult(NS_ERROR_DOM_INVALID_STATE_ERR));
++    return;
++  }
++
    RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
    if (NS_WARN_IF(!swm)) {
 -    return ServiceWorkerRegistrationPromise::CreateAndReject(NS_ERROR_DOM_INVALID_STATE_ERR,
 -                                                             __func__);
-+    aError(CopyableErrorResult(NS_ERROR_DOM_INVALID_STATE_ERR));
++    aFailureCB(CopyableErrorResult(NS_ERROR_DOM_INVALID_STATE_ERR));
 +    return;
    }
  
 -  return swm->Register(aClientInfo, aScopeURL, aScriptURL, aUpdateViaCache);
-+  swm->Register(aClientInfo, aScopeURL, aScriptURL, aUpdateViaCache,
-+                std::move(aSuccess), std::move(aError));
++  auto holder =
++    MakeRefPtr<DOMMozPromiseRequestHolder<ServiceWorkerRegistrationPromise>>(global);
++
++  swm->Register(aClientInfo, aScopeURL, aScriptURL, aUpdateViaCache)->Then(
++    global->EventTargetFor(TaskCategory::Other), __func__,
++    [successCB = std::move(aSuccessCB), holder] (const ServiceWorkerRegistrationDescriptor& aDescriptor) {
++      holder->Complete();
++      successCB(aDescriptor);
++    }, [failureCB = std::move(aFailureCB), holder] (const CopyableErrorResult& aResult) {
++      holder->Complete();
++      failureCB(CopyableErrorResult(aResult));
++    })->Track(*holder);
  }
  
  RefPtr<ServiceWorkerRegistrationPromise>
@@ -123,24 +200,39 @@ diff --git a/dom/serviceworkers/ServiceWorkerContainerImpl.cpp b/dom/servicework
 diff --git a/dom/serviceworkers/ServiceWorkerContainerImpl.h b/dom/serviceworkers/ServiceWorkerContainerImpl.h
 --- a/dom/serviceworkers/ServiceWorkerContainerImpl.h
 +++ b/dom/serviceworkers/ServiceWorkerContainerImpl.h
-@@ -15,21 +15,23 @@ namespace dom {
+@@ -10,26 +10,36 @@
+ #include "ServiceWorkerContainer.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
  // Lightweight serviceWorker APIs collection.
  class ServiceWorkerContainerImpl final : public ServiceWorkerContainer::Inner
  {
-   ~ServiceWorkerContainerImpl() = default;
+-  ~ServiceWorkerContainerImpl() = default;
++  ServiceWorkerContainer* mOuter;
++
++  ~ServiceWorkerContainerImpl();
  
  public:
-   ServiceWorkerContainerImpl() = default;
+-  ServiceWorkerContainerImpl() = default;
++  ServiceWorkerContainerImpl();
++
++  void
++  AddContainer(ServiceWorkerContainer* aOuter) override;
  
 -  RefPtr<ServiceWorkerRegistrationPromise>
++  void
++  RemoveContainer(ServiceWorkerContainer* aOuter) override;
++
 +  void
    Register(const ClientInfo& aClientInfo,
             const nsACString& aScopeURL,
             const nsACString& aScriptURL,
 -           ServiceWorkerUpdateViaCache aUpdateViaCache) const override;
 +           ServiceWorkerUpdateViaCache aUpdateViaCache,
-+           ServiceWorkerRegistrationCallback&& aSuccess,
-+           ServiceWorkerErrorCallback&& aError) const override;
++           ServiceWorkerRegistrationCallback&& aSuccessCB,
++           ServiceWorkerFailureCallback&& aFailureCB) const override;
  
    RefPtr<ServiceWorkerRegistrationPromise>
    GetRegistration(const ClientInfo& aClientInfo,
@@ -149,179 +241,6 @@ diff --git a/dom/serviceworkers/ServiceWorkerContainerImpl.h b/dom/serviceworker
    RefPtr<ServiceWorkerRegistrationListPromise>
    GetRegistrations(const ClientInfo& aClientInfo) const override;
  
-diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/ServiceWorkerManager.cpp
---- a/dom/serviceworkers/ServiceWorkerManager.cpp
-+++ b/dom/serviceworkers/ServiceWorkerManager.cpp
-@@ -420,49 +420,49 @@ ServiceWorkerManager::MaybeStartShutdown
-   RefPtr<TeardownRunnable> runnable = new TeardownRunnable(mActor);
-   nsresult rv = NS_DispatchToMainThread(runnable);
-   Unused << NS_WARN_IF(NS_FAILED(rv));
-   mActor = nullptr;
- }
- 
- class ServiceWorkerResolveWindowPromiseOnRegisterCallback final : public ServiceWorkerJob::Callback
- {
--  RefPtr<ServiceWorkerRegistrationPromise::Private> mPromise;
-+  ServiceWorkerRegistrationCallback mSuccess;
-+  ServiceWorkerErrorCallback mError;
- 
-   ~ServiceWorkerResolveWindowPromiseOnRegisterCallback()
-   {}
- 
-   virtual void
-   JobFinished(ServiceWorkerJob* aJob, ErrorResult& aStatus) override
-   {
-     MOZ_ASSERT(NS_IsMainThread());
-     MOZ_ASSERT(aJob);
- 
-     if (aStatus.Failed()) {
--      mPromise->Reject(std::move(aStatus), __func__);
-+      mError(aStatus);
-       return;
-     }
- 
-     MOZ_ASSERT(aJob->GetType() == ServiceWorkerJob::Type::Register);
-     RefPtr<ServiceWorkerRegisterJob> registerJob =
-       static_cast<ServiceWorkerRegisterJob*>(aJob);
-     RefPtr<ServiceWorkerRegistrationInfo> reg = registerJob->GetRegistration();
- 
--    mPromise->Resolve(reg->Descriptor(), __func__);
-+    mSuccess(reg->Descriptor());
-   }
- 
- public:
--  ServiceWorkerResolveWindowPromiseOnRegisterCallback()
--    : mPromise(new ServiceWorkerRegistrationPromise::Private(__func__))
--  {}
--
--  RefPtr<ServiceWorkerRegistrationPromise>
--  Promise() const
-+  ServiceWorkerResolveWindowPromiseOnRegisterCallback(ServiceWorkerRegistrationCallback&& aSuccess,
-+                                                      ServiceWorkerErrorCallback&& aError)
-+    : mSuccess(std::move(aSuccess))
-+    , mError(std::move(aError))
-   {
--    return mPromise;
-+    MOZ_DIAGNOSTIC_ASSERT(mSuccess);
-+    MOZ_DIAGNOSTIC_ASSERT(mError);
-   }
- 
-   NS_INLINE_DECL_REFCOUNTING(ServiceWorkerResolveWindowPromiseOnRegisterCallback, override)
- };
- 
- namespace {
- 
- class PropagateSoftUpdateRunnable final : public Runnable
-@@ -728,67 +728,72 @@ private:
-     }
-   }
- 
-   RefPtr<GenericPromise::Private> mPromise;
- };
- 
- } // namespace
- 
--RefPtr<ServiceWorkerRegistrationPromise>
-+void
- ServiceWorkerManager::Register(const ClientInfo& aClientInfo,
-                                const nsACString& aScopeURL,
-                                const nsACString& aScriptURL,
--                               ServiceWorkerUpdateViaCache aUpdateViaCache)
-+                               ServiceWorkerUpdateViaCache aUpdateViaCache,
-+                               ServiceWorkerRegistrationCallback&& aSuccess,
-+                               ServiceWorkerErrorCallback&& aError)
- {
-   nsCOMPtr<nsIURI> scopeURI;
-   nsresult rv = NS_NewURI(getter_AddRefs(scopeURI), aScopeURL, nullptr, nullptr);
-   if (NS_FAILED(rv)) {
--    return ServiceWorkerRegistrationPromise::CreateAndReject(rv, __func__);
-+    aError(CopyableErrorResult(rv));
-+    return;
-   }
- 
-   nsCOMPtr<nsIURI> scriptURI;
-   rv = NS_NewURI(getter_AddRefs(scriptURI), aScriptURL, nullptr, nullptr);
-   if (NS_FAILED(rv)) {
--    return ServiceWorkerRegistrationPromise::CreateAndReject(rv, __func__);
-+    aError(CopyableErrorResult(rv));
-+    return;
-   }
- 
-   rv = ServiceWorkerScopeAndScriptAreValid(aClientInfo, scopeURI, scriptURI);
-   if (NS_FAILED(rv)) {
--    return ServiceWorkerRegistrationPromise::CreateAndReject(rv, __func__);
-+    aError(CopyableErrorResult(rv));
-+    return;
-   }
- 
-   // If the previous validation step passed then we must have a principal.
-   nsCOMPtr<nsIPrincipal> principal = aClientInfo.GetPrincipal();
- 
-   nsAutoCString scopeKey;
-   rv = PrincipalToScopeKey(principal, scopeKey);
-   if (NS_WARN_IF(NS_FAILED(rv))) {
--    return ServiceWorkerRegistrationPromise::CreateAndReject(rv, __func__);
-+    aError(CopyableErrorResult(rv));
-+    return;
-   }
- 
-   RefPtr<ServiceWorkerJobQueue> queue = GetOrCreateJobQueue(scopeKey,
-                                                             aScopeURL);
- 
-   RefPtr<ServiceWorkerResolveWindowPromiseOnRegisterCallback> cb =
--    new ServiceWorkerResolveWindowPromiseOnRegisterCallback();
-+    new ServiceWorkerResolveWindowPromiseOnRegisterCallback(std::move(aSuccess),
-+                                                            std::move(aError));
- 
-   nsCOMPtr<nsILoadGroup> loadGroup = do_CreateInstance(NS_LOADGROUP_CONTRACTID);
-   RefPtr<ServiceWorkerRegisterJob> job = new ServiceWorkerRegisterJob(
-     principal, aScopeURL, aScriptURL, loadGroup,
-     static_cast<ServiceWorkerUpdateViaCache>(aUpdateViaCache)
-   );
- 
-   job->AppendResultCallback(cb);
-   queue->ScheduleJob(job);
- 
-   MOZ_ASSERT(NS_IsMainThread());
-   Telemetry::Accumulate(Telemetry::SERVICE_WORKER_REGISTRATIONS, 1);
--
--  return cb->Promise();
- }
- 
- /*
-  * Implements the async aspects of the getRegistrations algorithm.
-  */
- class GetRegistrationsRunnable final : public Runnable
- {
-   const ClientInfo mClientInfo;
-diff --git a/dom/serviceworkers/ServiceWorkerManager.h b/dom/serviceworkers/ServiceWorkerManager.h
---- a/dom/serviceworkers/ServiceWorkerManager.h
-+++ b/dom/serviceworkers/ServiceWorkerManager.h
-@@ -188,20 +188,22 @@ public:
-   Remove(const nsACString& aHost);
- 
-   void
-   PropagateRemoveAll();
- 
-   void
-   RemoveAll();
- 
--  RefPtr<ServiceWorkerRegistrationPromise>
-+  void
-   Register(const ClientInfo& aClientInfo, const nsACString& aScopeURL,
-            const nsACString& aScriptURL,
--           ServiceWorkerUpdateViaCache aUpdateViaCache);
-+           ServiceWorkerUpdateViaCache aUpdateViaCache,
-+           ServiceWorkerRegistrationCallback&& aSuccess,
-+           ServiceWorkerErrorCallback&& aError);
- 
-   RefPtr<ServiceWorkerRegistrationPromise>
-   GetRegistration(const ClientInfo& aClientInfo, const nsACString& aURL) const;
- 
-   RefPtr<ServiceWorkerRegistrationListPromise>
-   GetRegistrations(const ClientInfo& aClientInfo) const;
- 
-   already_AddRefed<ServiceWorkerRegistrationInfo>
 diff --git a/dom/serviceworkers/ServiceWorkerUtils.h b/dom/serviceworkers/ServiceWorkerUtils.h
 --- a/dom/serviceworkers/ServiceWorkerUtils.h
 +++ b/dom/serviceworkers/ServiceWorkerUtils.h
@@ -338,7 +257,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerUtils.h b/dom/serviceworkers/Servic
 +        ServiceWorkerRegistrationCallback;
 +
 +typedef std::function<void (ErrorResult&)>
-+        ServiceWorkerErrorCallback;
++        ServiceWorkerFailureCallback;
 +
  bool
  ServiceWorkerParentInterceptEnabled();
