@@ -1,0 +1,155 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  ed281f79b51d87a35d0073f1478bfd71f790d9b2
+Bug 1466681 P3 Make ServiceWorkerContainer::Inner::GetReady() use callbacks instead of MozPromise. r=asuth
+
+diff --git a/dom/serviceworkers/ServiceWorkerContainer.cpp b/dom/serviceworkers/ServiceWorkerContainer.cpp
+--- a/dom/serviceworkers/ServiceWorkerContainer.cpp
++++ b/dom/serviceworkers/ServiceWorkerContainer.cpp
+@@ -532,37 +532,32 @@ ServiceWorkerContainer::GetReady(ErrorRe
+ 
+   mReadyPromise = Promise::Create(global, aRv);
+   if (aRv.Failed()) {
+     return nullptr;
+   }
+ 
+   RefPtr<ServiceWorkerContainer> self = this;
+   RefPtr<Promise> outer = mReadyPromise;
+-  RefPtr<DOMMozPromiseRequestHolder<ServiceWorkerRegistrationPromise>> holder =
+-    new DOMMozPromiseRequestHolder<ServiceWorkerRegistrationPromise>(global);
+ 
+-  mInner->GetReady(clientInfo.ref())->Then(
+-    global->EventTargetFor(TaskCategory::Other), __func__,
+-    [self, outer, holder] (const ServiceWorkerRegistrationDescriptor& aDescriptor) {
+-      holder->Complete();
++  mInner->GetReady(clientInfo.ref(),
++    [self, outer] (const ServiceWorkerRegistrationDescriptor& aDescriptor) {
+       ErrorResult rv;
+       nsIGlobalObject* global = self->GetGlobalIfValid(rv);
+       if (rv.Failed()) {
+         outer->MaybeReject(rv);
+         return;
+       }
+       RefPtr<ServiceWorkerRegistration> reg =
+         global->GetOrCreateServiceWorkerRegistration(aDescriptor);
+       NS_ENSURE_TRUE_VOID(reg);
+       outer->MaybeResolve(reg);
+-    }, [self, outer, holder] (const CopyableErrorResult& aRv) {
+-      holder->Complete();
+-      outer->MaybeReject(CopyableErrorResult(aRv));
+-    })->Track(*holder);
++    }, [self, outer] (ErrorResult& aRv) {
++      outer->MaybeReject(aRv);
++    });
+ 
+   return mReadyPromise;
+ }
+ 
+ // Testing only.
+ void
+ ServiceWorkerContainer::GetScopeForUrl(const nsAString& aUrl,
+                                        nsString& aScope,
+diff --git a/dom/serviceworkers/ServiceWorkerContainer.h b/dom/serviceworkers/ServiceWorkerContainer.h
+--- a/dom/serviceworkers/ServiceWorkerContainer.h
++++ b/dom/serviceworkers/ServiceWorkerContainer.h
+@@ -44,18 +44,20 @@ public:
+     GetRegistration(const ClientInfo& aClientInfo,
+                     const nsACString& aURL,
+                     ServiceWorkerRegistrationCallback&& aSuccessCB,
+                     ServiceWorkerFailureCallback&& aFailureCB) const = 0;
+ 
+     virtual RefPtr<ServiceWorkerRegistrationListPromise>
+     GetRegistrations(const ClientInfo& aClientInfo) const = 0;
+ 
+-    virtual RefPtr<ServiceWorkerRegistrationPromise>
+-    GetReady(const ClientInfo& aClientInfo) const = 0;
++    virtual void
++    GetReady(const ClientInfo& aClientInfo,
++             ServiceWorkerRegistrationCallback&& aSuccessCB,
++             ServiceWorkerFailureCallback&& aFailureCB) const = 0;
+ 
+     NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+   };
+ 
+   NS_DECL_ISUPPORTS_INHERITED
+   NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(ServiceWorkerContainer, DOMEventTargetHelper)
+ 
+   IMPL_EVENT_HANDLER(controllerchange)
+diff --git a/dom/serviceworkers/ServiceWorkerContainerImpl.cpp b/dom/serviceworkers/ServiceWorkerContainerImpl.cpp
+--- a/dom/serviceworkers/ServiceWorkerContainerImpl.cpp
++++ b/dom/serviceworkers/ServiceWorkerContainerImpl.cpp
+@@ -112,22 +112,43 @@ ServiceWorkerContainerImpl::GetRegistrat
+   if (NS_WARN_IF(!swm)) {
+     return ServiceWorkerRegistrationListPromise::CreateAndReject(NS_ERROR_DOM_INVALID_STATE_ERR,
+                                                                  __func__);
+   }
+ 
+   return swm->GetRegistrations(aClientInfo);
+ }
+ 
+-RefPtr<ServiceWorkerRegistrationPromise>
+-ServiceWorkerContainerImpl::GetReady(const ClientInfo& aClientInfo) const
++void
++ServiceWorkerContainerImpl::GetReady(const ClientInfo& aClientInfo,
++                                     ServiceWorkerRegistrationCallback&& aSuccessCB,
++                                     ServiceWorkerFailureCallback&& aFailureCB) const
+ {
++  MOZ_DIAGNOSTIC_ASSERT(mOuter);
++
++  nsIGlobalObject* global = mOuter->GetParentObject();
++  if (NS_WARN_IF(!global)) {
++    aFailureCB(CopyableErrorResult(NS_ERROR_DOM_INVALID_STATE_ERR));
++    return;
++  }
++
+   RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+   if (NS_WARN_IF(!swm)) {
+-    return ServiceWorkerRegistrationPromise::CreateAndReject(NS_ERROR_DOM_INVALID_STATE_ERR,
+-                                                             __func__);
++    aFailureCB(CopyableErrorResult(NS_ERROR_DOM_INVALID_STATE_ERR));
++    return;
+   }
+ 
+-  return swm->WhenReady(aClientInfo);
++  auto holder =
++    MakeRefPtr<DOMMozPromiseRequestHolder<ServiceWorkerRegistrationPromise>>(global);
++
++  swm->WhenReady(aClientInfo)->Then(
++    global->EventTargetFor(TaskCategory::Other), __func__,
++    [successCB = std::move(aSuccessCB), holder] (const ServiceWorkerRegistrationDescriptor& aDescriptor) {
++      holder->Complete();
++      successCB(aDescriptor);
++    }, [failureCB = std::move(aFailureCB), holder] (const CopyableErrorResult& aResult) {
++      holder->Complete();
++      failureCB(CopyableErrorResult(aResult));
++    })->Track(*holder);
+ }
+ 
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/serviceworkers/ServiceWorkerContainerImpl.h b/dom/serviceworkers/ServiceWorkerContainerImpl.h
+--- a/dom/serviceworkers/ServiceWorkerContainerImpl.h
++++ b/dom/serviceworkers/ServiceWorkerContainerImpl.h
+@@ -40,18 +40,20 @@ public:
+   GetRegistration(const ClientInfo& aClientInfo,
+                   const nsACString& aURL,
+                   ServiceWorkerRegistrationCallback&& aSuccessCB,
+                   ServiceWorkerFailureCallback&& aFailureCB) const override;
+ 
+   RefPtr<ServiceWorkerRegistrationListPromise>
+   GetRegistrations(const ClientInfo& aClientInfo) const override;
+ 
+-  RefPtr<ServiceWorkerRegistrationPromise>
+-  GetReady(const ClientInfo& aClientInfo) const override;
++  void
++  GetReady(const ClientInfo& aClientInfo,
++           ServiceWorkerRegistrationCallback&& aSuccessCB,
++           ServiceWorkerFailureCallback&& aFailureCB) const override;
+ 
+   NS_INLINE_DECL_REFCOUNTING(ServiceWorkerContainerImpl, override)
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif /* mozilla_dom_serviceworkercontainerimpl_h__ */
