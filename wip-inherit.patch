@@ -1,0 +1,339 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  d3d9047c9cf01fdf89321e6e0d87221f0a08f118
+
+diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
+--- a/docshell/base/nsDocShell.cpp
++++ b/docshell/base/nsDocShell.cpp
+@@ -2827,41 +2827,45 @@ nsDocShell::MaybeCreateInitialClientSour
+ 
+   // We're done if there is no parent controller or if this docshell
+   // is not permitted to control for some reason.
+   Maybe<ServiceWorkerDescriptor> controller(parentInner->GetController());
+   if (controller.isNothing() || !ServiceWorkerAllowedToControlWindow(principal, uri)) {
+     return;
+   }
+ 
+-  nsCOMPtr<nsIServiceWorkerManager> swm = mozilla::services::GetServiceWorkerManager();
+-  if (!swm) {
+-    return;
+-  }
+-
+-  // If the parent is controlled then propagate that controller to the
+-  // initial about:blank client as well.  This will set the controller
+-  // in the ClientManagerService in the parent.
+-  //
+-  // Note: If the registration is missing from the SWM we avoid setting
+-  //       the controller on the client.  We can do this synchronously
+-  //       for now since SWM is in the child process.  In the future
+-  //       when SWM is in the parent process we will probably have to
+-  //       always set the initial client source and then somehow clear
+-  //       it if we find the registration is acutally gone.  Its also
+-  //       possible this race only occurs in cases where the resulting
+-  //       window is no longer exposed.  For example, in theory the SW
+-  //       should not go away if our parent window is controlled.
+-  if (!swm->StartControlling(mInitialClientSource->Info(), controller.ref())) {
+-    return;
+-  }
+-
+-  // Also mark the ClientSource as controlled directly in case script
+-  // immediately accesses navigator.serviceWorker.controller.
+-  mInitialClientSource->SetController(controller.ref());
++  if (ServiceWorkerParentInterceptEnabled()) {
++    mInitialClientSource->InheritController(controller.ref());
++  } else {
++    nsCOMPtr<nsIServiceWorkerManager> swm = mozilla::services::GetServiceWorkerManager();
++    if (!swm) {
++      return;
++    }
++
++    // If the parent is controlled then propagate that controller to the
++    // initial about:blank client as well.  This will set the controller
++    // in the ClientManagerService in the parent.
++    //
++    // Note: If the registration is missing from the SWM we avoid setting
++    //       the controller on the client.  We can do this synchronously
++    //       for now since SWM is in the child process.  In the future
++    //       when SWM is in the parent process we will probably have to
++    //       always set the initial client source and then somehow clear
++    //       it if we find the registration is acutally gone.  Its also
++    //       possible this race only occurs in cases where the resulting
++    //       window is no longer exposed.  For example, in theory the SW
++    //       should not go away if our parent window is controlled.
++    if (!swm->StartControlling(mInitialClientSource->Info(), controller.ref())) {
++      return;
++    }
++
++    // Also mark the ClientSource as controlled directly in case script
++    // immediately accesses navigator.serviceWorker.controller.
++    mInitialClientSource->SetController(controller.ref());
++  }
+ }
+ 
+ Maybe<ClientInfo>
+ nsDocShell::GetInitialClientInfo() const
+ {
+   if (mInitialClientSource) {
+     Maybe<ClientInfo> result;
+     result.emplace(mInitialClientSource->Info());
+diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSource.cpp
+--- a/dom/clients/manager/ClientSource.cpp
++++ b/dom/clients/manager/ClientSource.cpp
+@@ -433,16 +433,25 @@ ClientSource::Control(const ClientContro
+ 
+   SetController(ServiceWorkerDescriptor(aArgs.serviceWorker()));
+ 
+   RefPtr<ClientOpPromise> ref =
+     ClientOpPromise::CreateAndResolve(NS_OK, __func__);
+   return ref.forget();
+ }
+ 
++void
++ClientSource::InheritController(const ServiceWorkerDescriptor& aServiceWorker)
++{
++  SetController(aServiceWorker);
++  MaybeExecute([aServiceWorker](PClientSourceChild* aActor) {
++    aActor->SendInheritController(ClientControlledArgs(aServiceWorker.ToIPC()));
++  });
++}
++
+ const Maybe<ServiceWorkerDescriptor>&
+ ClientSource::GetController() const
+ {
+   return mController;
+ }
+ 
+ RefPtr<ClientOpPromise>
+ ClientSource::Focus(const ClientFocusArgs& aArgs)
+diff --git a/dom/clients/manager/ClientSource.h b/dom/clients/manager/ClientSource.h
+--- a/dom/clients/manager/ClientSource.h
++++ b/dom/clients/manager/ClientSource.h
+@@ -134,16 +134,22 @@ public:
+   void
+   SetController(const ServiceWorkerDescriptor& aServiceWorker);
+ 
+   // Mark the ClientSource as controlled using the remote operation arguments.
+   // This will in turn call SetController().
+   RefPtr<ClientOpPromise>
+   Control(const ClientControlledArgs& aArgs);
+ 
++  // Inherit the controller from a local parent client.  This requires both
++  // setting our immediate controller field and also updating the parent-side
++  // data structure.
++  void
++  InheritController(const ServiceWorkerDescriptor& aServiceWorker);
++
+   // Get the ClientSource's current controlling service worker, if one has
+   // been set.
+   const Maybe<ServiceWorkerDescriptor>&
+   GetController() const;
+ 
+   RefPtr<ClientOpPromise>
+   Focus(const ClientFocusArgs& aArgs);
+ 
+diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/ClientSourceParent.cpp
+--- a/dom/clients/manager/ClientSourceParent.cpp
++++ b/dom/clients/manager/ClientSourceParent.cpp
+@@ -140,16 +140,36 @@ ClientSourceParent::RecvFreeze()
+ IPCResult
+ ClientSourceParent::RecvThaw()
+ {
+   MOZ_DIAGNOSTIC_ASSERT(mFrozen);
+   mFrozen = false;
+   return IPC_OK();
+ }
+ 
++IPCResult
++ClientSourceParent::RecvInheritController(const ClientControlledArgs& aArgs)
++{
++  mController.reset();
++  mController.emplace(aArgs.serviceWorker());
++
++  nsCOMPtr<nsIRunnable> r = NS_NewRunnableFunction(
++    "ClientSourceParent::RecvInheritController",
++    [clientInfo = mClientInfo, controller = mController.ref()] () {
++      RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
++      NS_ENSURE_TRUE_VOID(swm);
++
++      swm->NoteInheritedController(clientInfo, controller);
++    });
++
++  MOZ_ALWAYS_SUCCEEDS(SystemGroup::Dispatch(TaskCategory::Other, r.forget()));
++
++  return IPC_OK();
++}
++
+ void
+ ClientSourceParent::ActorDestroy(ActorDestroyReason aReason)
+ {
+   DebugOnly<bool> removed = mService->RemoveSource(this);
+   MOZ_ASSERT(removed);
+ 
+   nsTArray<ClientHandleParent*> handleList(mHandleList);
+   for (ClientHandleParent* handle : handleList) {
+diff --git a/dom/clients/manager/ClientSourceParent.h b/dom/clients/manager/ClientSourceParent.h
+--- a/dom/clients/manager/ClientSourceParent.h
++++ b/dom/clients/manager/ClientSourceParent.h
+@@ -40,16 +40,19 @@ class ClientSourceParent final : public 
+   RecvExecutionReady(const ClientSourceExecutionReadyArgs& aArgs) override;
+ 
+   mozilla::ipc::IPCResult
+   RecvFreeze() override;
+ 
+   mozilla::ipc::IPCResult
+   RecvThaw() override;
+ 
++  mozilla::ipc::IPCResult
++  RecvInheritController(const ClientControlledArgs& aArgs) override;
++
+   void
+   ActorDestroy(ActorDestroyReason aReason) override;
+ 
+   PClientSourceOpParent*
+   AllocPClientSourceOpParent(const ClientOpConstructorArgs& aArgs) override;
+ 
+   bool
+   DeallocPClientSourceOpParent(PClientSourceOpParent* aActor) override;
+diff --git a/dom/clients/manager/PClientSource.ipdl b/dom/clients/manager/PClientSource.ipdl
+--- a/dom/clients/manager/PClientSource.ipdl
++++ b/dom/clients/manager/PClientSource.ipdl
+@@ -20,16 +20,17 @@ sync protocol PClientSource
+   manages PClientSourceOp;
+ 
+ parent:
+   sync WorkerSyncPing();
+   async Teardown();
+   async ExecutionReady(ClientSourceExecutionReadyArgs aArgs);
+   async Freeze();
+   async Thaw();
++  async InheritController(ClientControlledArgs aArgs);
+ 
+ child:
+   async PClientSourceOp(ClientOpConstructorArgs aArgs);
+ 
+   async __delete__();
+ };
+ 
+ } // namespace dom
+diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/ServiceWorkerManager.cpp
+--- a/dom/serviceworkers/ServiceWorkerManager.cpp
++++ b/dom/serviceworkers/ServiceWorkerManager.cpp
+@@ -304,17 +304,18 @@ ServiceWorkerManager::Init(ServiceWorker
+     return;
+   }
+ 
+   mActor = static_cast<ServiceWorkerManagerChild*>(actor);
+ }
+ 
+ RefPtr<GenericPromise>
+ ServiceWorkerManager::StartControllingClient(const ClientInfo& aClientInfo,
+-                                             ServiceWorkerRegistrationInfo* aRegistrationInfo)
++                                             ServiceWorkerRegistrationInfo* aRegistrationInfo,
++                                             bool aControlClientHandle)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(aRegistrationInfo->GetActive());
+ 
+   RefPtr<GenericPromise> ref;
+ 
+   const ServiceWorkerDescriptor& active =
+     aRegistrationInfo->GetActive()->Descriptor();
+ 
+@@ -335,17 +336,21 @@ ServiceWorkerManager::StartControllingCl
+ 
+     return ref;
+   }
+ 
+   RefPtr<ClientHandle> clientHandle =
+     ClientManager::CreateHandle(aClientInfo,
+                                 SystemGroup::EventTargetFor(TaskCategory::Other));
+ 
+-  ref = clientHandle->Control(active);
++  if (aControlClientHandle) {
++    ref = clientHandle->Control(active);
++  } else {
++    ref = GenericPromise::CreateAndResolve(false, __func__);
++  }
+ 
+   aRegistrationInfo->StartControllingClient();
+ 
+   entry.OrInsert([&] {
+     return new ControlledClientData(clientHandle, aRegistrationInfo);
+   });
+ 
+   RefPtr<ServiceWorkerManager> self(this);
+@@ -1152,16 +1157,39 @@ ServiceWorkerManager::RemovePendingReady
+         prd->mClientHandle->Info().PrincipalInfo() == aClientInfo.PrincipalInfo()) {
+       prd->mPromise->Reject(NS_ERROR_DOM_ABORT_ERR, __func__);
+     } else {
+       mPendingReadyList.AppendElement(std::move(prd));
+     }
+   }
+ }
+ 
++void
++ServiceWorkerManager::NoteInheritedController(const ClientInfo& aClientInfo,
++                                              const ServiceWorkerDescriptor& aController)
++{
++  MOZ_ASSERT(NS_IsMainThread());
++
++  nsCOMPtr<nsIPrincipal> principal =
++    PrincipalInfoToPrincipal(aController.PrincipalInfo());
++  NS_ENSURE_TRUE_VOID(principal);
++
++  nsCOMPtr<nsIURI> scope;
++  nsresult rv =
++    NS_NewURI(getter_AddRefs(scope), aController.Scope(), nullptr, nullptr);
++  NS_ENSURE_SUCCESS_VOID(rv);
++
++  RefPtr<ServiceWorkerRegistrationInfo> registration =
++    GetServiceWorkerRegistrationInfo(principal, scope);
++  NS_ENSURE_TRUE_VOID(registration);
++  NS_ENSURE_TRUE_VOID(registration->GetActive());
++
++  StartControllingClient(aClientInfo, registration, false /* aControlClientHandle */);
++}
++
+ ServiceWorkerInfo*
+ ServiceWorkerManager::GetActiveWorkerInfoForScope(const OriginAttributes& aOriginAttributes,
+                                                   const nsACString& aScope)
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+ 
+   nsCOMPtr<nsIURI> scopeURI;
+   nsresult rv = NS_NewURI(getter_AddRefs(scopeURI), aScope, nullptr, nullptr);
+diff --git a/dom/serviceworkers/ServiceWorkerManager.h b/dom/serviceworkers/ServiceWorkerManager.h
+--- a/dom/serviceworkers/ServiceWorkerManager.h
++++ b/dom/serviceworkers/ServiceWorkerManager.h
+@@ -326,26 +326,31 @@ public:
+   WhenReady(const ClientInfo& aClientInfo);
+ 
+   void
+   CheckPendingReadyPromises();
+ 
+   void
+   RemovePendingReadyPromise(const ClientInfo& aClientInfo);
+ 
++  void
++  NoteInheritedController(const ClientInfo& aClientInfo,
++                          const ServiceWorkerDescriptor& aController);
++
+ private:
+   ServiceWorkerManager();
+   ~ServiceWorkerManager();
+ 
+   void
+   Init(ServiceWorkerRegistrar* aRegistrar);
+ 
+   RefPtr<GenericPromise>
+   StartControllingClient(const ClientInfo& aClientInfo,
+-                         ServiceWorkerRegistrationInfo* aRegistrationInfo);
++                         ServiceWorkerRegistrationInfo* aRegistrationInfo,
++                         bool aControlClientHandle = true);
+ 
+   void
+   StopControllingClient(const ClientInfo& aClientInfo);
+ 
+   void
+   MaybeStartShutdown();
+ 
+   already_AddRefed<ServiceWorkerJobQueue>
