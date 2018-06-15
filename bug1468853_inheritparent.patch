@@ -1,12 +1,48 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  d3d9047c9cf01fdf89321e6e0d87221f0a08f118
+# Parent  1292eccbb113569085bcfb984310e808860e6ecc
 Bug 1468853 Note inherited controller in the parent process when the service worker e10s pref is flipped. r=asuth
 
 diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
 --- a/docshell/base/nsDocShell.cpp
 +++ b/docshell/base/nsDocShell.cpp
-@@ -2827,41 +2827,45 @@ nsDocShell::MaybeCreateInitialClientSour
+@@ -43,17 +43,16 @@
+ #include "mozilla/dom/Element.h"
+ #include "mozilla/dom/HTMLAnchorElement.h"
+ #include "mozilla/dom/PerformanceNavigation.h"
+ #include "mozilla/dom/PermissionMessageUtils.h"
+ #include "mozilla/dom/ProfileTimelineMarkerBinding.h"
+ #include "mozilla/dom/ScreenOrientation.h"
+ #include "mozilla/dom/ScriptSettings.h"
+ #include "mozilla/dom/ServiceWorkerInterceptController.h"
+-#include "mozilla/dom/ServiceWorkerManager.h"
+ #include "mozilla/dom/ServiceWorkerUtils.h"
+ #include "mozilla/dom/TabChild.h"
+ #include "mozilla/dom/TabGroup.h"
+ #include "mozilla/dom/ToJSValue.h"
+ #include "mozilla/dom/ChildSHistory.h"
+ 
+ 
+ #include "mozilla/net/ReferrerPolicy.h"
+@@ -185,17 +184,16 @@
+ #include "nsNetUtil.h"
+ #include "nsObjectLoadingContent.h"
+ #include "nsPingListener.h"
+ #include "nsPoint.h"
+ #include "nsQueryObject.h"
+ #include "nsRect.h"
+ #include "nsRefreshTimer.h"
+ #include "nsSandboxFlags.h"
+-#include "nsIServiceWorkerManager.h"
+ #include "nsSHistory.h"
+ #include "nsStructuredCloneContainer.h"
+ #include "nsSubDocumentFrame.h"
+ #include "nsView.h"
+ #include "nsViewManager.h"
+ #include "nsViewSourceHandler.h"
+ #include "nsWhitespaceTokenizer.h"
+ #include "nsWidgetsCID.h"
+@@ -2827,41 +2825,17 @@ nsDocShell::MaybeCreateInitialClientSour
  
    // We're done if there is no parent controller or if this docshell
    // is not permitted to control for some reason.
@@ -40,35 +76,7 @@ diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
 -  // Also mark the ClientSource as controlled directly in case script
 -  // immediately accesses navigator.serviceWorker.controller.
 -  mInitialClientSource->SetController(controller.ref());
-+  if (ServiceWorkerParentInterceptEnabled()) {
-+    mInitialClientSource->InheritController(controller.ref());
-+  } else {
-+    nsCOMPtr<nsIServiceWorkerManager> swm = mozilla::services::GetServiceWorkerManager();
-+    if (!swm) {
-+      return;
-+    }
-+
-+    // If the parent is controlled then propagate that controller to the
-+    // initial about:blank client as well.  This will set the controller
-+    // in the ClientManagerService in the parent.
-+    //
-+    // Note: If the registration is missing from the SWM we avoid setting
-+    //       the controller on the client.  We can do this synchronously
-+    //       for now since SWM is in the child process.  In the future
-+    //       when SWM is in the parent process we will probably have to
-+    //       always set the initial client source and then somehow clear
-+    //       it if we find the registration is acutally gone.  Its also
-+    //       possible this race only occurs in cases where the resulting
-+    //       window is no longer exposed.  For example, in theory the SW
-+    //       should not go away if our parent window is controlled.
-+    if (!swm->StartControlling(mInitialClientSource->Info(), controller.ref())) {
-+      return;
-+    }
-+
-+    // Also mark the ClientSource as controlled directly in case script
-+    // immediately accesses navigator.serviceWorker.controller.
-+    mInitialClientSource->SetController(controller.ref());
-+  }
++  mInitialClientSource->InheritController(controller.ref());
  }
  
  Maybe<ClientInfo>
@@ -80,7 +88,7 @@ diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
 diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSource.cpp
 --- a/dom/clients/manager/ClientSource.cpp
 +++ b/dom/clients/manager/ClientSource.cpp
-@@ -433,16 +433,25 @@ ClientSource::Control(const ClientContro
+@@ -433,16 +433,49 @@ ClientSource::Control(const ClientContro
  
    SetController(ServiceWorkerDescriptor(aArgs.serviceWorker()));
  
@@ -92,10 +100,34 @@ diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSo
 +void
 +ClientSource::InheritController(const ServiceWorkerDescriptor& aServiceWorker)
 +{
-+  SetController(aServiceWorker);
++  NS_ASSERT_OWNINGTHREAD(ClientSource);
++
++  // If we are in legacy child-side intercept mode then we must tell the current
++  // process SWM that this client inherited a controller.  This will only update
++  // the local SWM data and not send any messages to the ClientManagerService.
++  //
++  // Note, we only do this when inheriting the controller for main thread
++  // windows.  The legacy mode never proprly marked inherited blob URL workers
++  // controlled in the SWM.
++  if (!ServiceWorkerParentInterceptEnabled() && GetDocShell()) {
++    AssertIsOnMainThread();
++    RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
++    if (swm) {
++      swm->NoteInheritedController(mClientInfo, aServiceWorker);
++    }
++  }
++
++  // Also tell the parent-side ClientManagerService that the controller was
++  // inherited.  This is necessary for clients.matchAll() to work properly.
++  // In parent-side intercept mode this will also note the inheritance in
++  // the parent-side SWM.
 +  MaybeExecute([aServiceWorker](PClientSourceChild* aActor) {
 +    aActor->SendInheritController(ClientControlledArgs(aServiceWorker.ToIPC()));
 +  });
++
++  // Finally, record the new controller in our local ClientSource for any
++  // immediate synchronous access.
++  SetController(aServiceWorker);
 +}
 +
  const Maybe<ServiceWorkerDescriptor>&
@@ -135,7 +167,7 @@ diff --git a/dom/clients/manager/ClientSource.h b/dom/clients/manager/ClientSour
 diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/ClientSourceParent.cpp
 --- a/dom/clients/manager/ClientSourceParent.cpp
 +++ b/dom/clients/manager/ClientSourceParent.cpp
-@@ -140,16 +140,36 @@ ClientSourceParent::RecvFreeze()
+@@ -140,16 +140,41 @@ ClientSourceParent::RecvFreeze()
  IPCResult
  ClientSourceParent::RecvThaw()
  {
@@ -150,16 +182,21 @@ diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/Cl
 +  mController.reset();
 +  mController.emplace(aArgs.serviceWorker());
 +
-+  nsCOMPtr<nsIRunnable> r = NS_NewRunnableFunction(
-+    "ClientSourceParent::RecvInheritController",
-+    [clientInfo = mClientInfo, controller = mController.ref()] () {
-+      RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
-+      NS_ENSURE_TRUE_VOID(swm);
++  // In parent-side intercept mode we must tell the parent-side SWM about
++  // this controller inheritence.  In legacy client-side mode this is done
++  // from the ClientSource instead.
++  if (!ServiceWorkerParentInterceptEnabled()) {
++    nsCOMPtr<nsIRunnable> r = NS_NewRunnableFunction(
++      "ClientSourceParent::RecvInheritController",
++      [clientInfo = mClientInfo, controller = mController.ref()] () {
++        RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
++        NS_ENSURE_TRUE_VOID(swm);
 +
-+      swm->NoteInheritedController(clientInfo, controller);
-+    });
++        swm->NoteInheritedController(clientInfo, controller);
++      });
 +
-+  MOZ_ALWAYS_SUCCEEDS(SystemGroup::Dispatch(TaskCategory::Other, r.forget()));
++    MOZ_ALWAYS_SUCCEEDS(SystemGroup::Dispatch(TaskCategory::Other, r.forget()));
++  }
 +
 +  return IPC_OK();
 +}
@@ -219,7 +256,7 @@ diff --git a/dom/clients/manager/PClientSource.ipdl b/dom/clients/manager/PClien
 diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/ServiceWorkerManager.cpp
 --- a/dom/serviceworkers/ServiceWorkerManager.cpp
 +++ b/dom/serviceworkers/ServiceWorkerManager.cpp
-@@ -304,17 +304,18 @@ ServiceWorkerManager::Init(ServiceWorker
+@@ -306,17 +306,18 @@ ServiceWorkerManager::Init(ServiceWorker
      return;
    }
  
@@ -239,7 +276,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/Se
    const ServiceWorkerDescriptor& active =
      aRegistrationInfo->GetActive()->Descriptor();
  
-@@ -335,17 +336,21 @@ ServiceWorkerManager::StartControllingCl
+@@ -337,17 +338,21 @@ ServiceWorkerManager::StartControllingCl
  
      return ref;
    }
@@ -262,7 +299,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/Se
    });
  
    RefPtr<ServiceWorkerManager> self(this);
-@@ -1152,16 +1157,39 @@ ServiceWorkerManager::RemovePendingReady
+@@ -1154,16 +1159,39 @@ ServiceWorkerManager::RemovePendingReady
          prd->mClientHandle->Info().PrincipalInfo() == aClientInfo.PrincipalInfo()) {
        prd->mPromise->Reject(NS_ERROR_DOM_ABORT_ERR, __func__);
      } else {
@@ -305,7 +342,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/Se
 diff --git a/dom/serviceworkers/ServiceWorkerManager.h b/dom/serviceworkers/ServiceWorkerManager.h
 --- a/dom/serviceworkers/ServiceWorkerManager.h
 +++ b/dom/serviceworkers/ServiceWorkerManager.h
-@@ -326,26 +326,31 @@ public:
+@@ -338,26 +338,31 @@ public:
    WhenReady(const ClientInfo& aClientInfo);
  
    void
@@ -338,3 +375,52 @@ diff --git a/dom/serviceworkers/ServiceWorkerManager.h b/dom/serviceworkers/Serv
    MaybeStartShutdown();
  
    already_AddRefed<ServiceWorkerJobQueue>
+diff --git a/dom/workers/WorkerPrivate.cpp b/dom/workers/WorkerPrivate.cpp
+--- a/dom/workers/WorkerPrivate.cpp
++++ b/dom/workers/WorkerPrivate.cpp
+@@ -4,16 +4,17 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "WorkerPrivate.h"
+ 
+ #include "js/MemoryMetrics.h"
+ #include "MessageEventRunnable.h"
+ #include "mozilla/ScopeExit.h"
++#include "mozilla/dom/BlobURLProtocolHandler.h"
+ #include "mozilla/dom/ClientManager.h"
+ #include "mozilla/dom/ClientSource.h"
+ #include "mozilla/dom/ClientState.h"
+ #include "mozilla/dom/Console.h"
+ #include "mozilla/dom/DOMPrefs.h"
+ #include "mozilla/dom/DOMTypes.h"
+ #include "mozilla/dom/ErrorEvent.h"
+ #include "mozilla/dom/ErrorEventBinding.h"
+@@ -3534,17 +3535,26 @@ WorkerPrivate::Control(const ServiceWork
+   MOZ_DIAGNOSTIC_ASSERT(Type() != WorkerTypeService);
+   {
+     MutexAutoLock lock(mMutex);
+     if (mStatus >= Terminating) {
+       return;
+     }
+   }
+   MOZ_DIAGNOSTIC_ASSERT(mClientSource);
+-  mClientSource->SetController(aServiceWorker);
++
++  if (IsBlobURI(mLoadInfo.mBaseURI)) {
++    // Blob URL workers can only become controlled by inheriting from
++    // their parent.  Make sure to note this properly.
++    mClientSource->InheritController(aServiceWorker);
++  } else {
++    // Otherwise this is a normal interception and we simply record the
++    // controller locally.
++    mClientSource->SetController(aServiceWorker);
++  }
+ }
+ 
+ void
+ WorkerPrivate::ExecutionReady()
+ {
+   AssertIsOnWorkerThread();
+   {
+     MutexAutoLock lock(mMutex);
