@@ -1,0 +1,271 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  a1c8f49ca2f9966f32ce573582139d094bf2b895
+Bug 1469941 Note DOMContentLoaded on the ClientSource and trigger service worker update in appropriate process. r=mrbkap
+
+diff --git a/dom/base/nsDocument.cpp b/dom/base/nsDocument.cpp
+--- a/dom/base/nsDocument.cpp
++++ b/dom/base/nsDocument.cpp
+@@ -5107,16 +5107,22 @@ nsIDocument::DispatchContentLoadedEvents
+   // event.
+   Element* root = GetRootElement();
+   if (root && root->HasAttr(kNameSpaceID_None, nsGkAtoms::manifest)) {
+     nsContentUtils::DispatchChromeEvent(this, this,
+                                         NS_LITERAL_STRING("MozApplicationManifest"),
+                                         true, true);
+   }
+ 
++  nsPIDOMWindowInner* inner = GetInnerWindow();
++  if (inner) {
++    inner->NoteDOMContentLoaded();
++  }
++
++  // TODO
+   if (mMaybeServiceWorkerControlled) {
+     using mozilla::dom::ServiceWorkerManager;
+     RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+     if (swm) {
+       Maybe<ClientInfo> clientInfo = GetClientInfo();
+       if (clientInfo.isSome()) {
+         swm->MaybeCheckNavigationUpdate(clientInfo.ref());
+       }
+diff --git a/dom/base/nsGlobalWindowInner.cpp b/dom/base/nsGlobalWindowInner.cpp
+--- a/dom/base/nsGlobalWindowInner.cpp
++++ b/dom/base/nsGlobalWindowInner.cpp
+@@ -2341,16 +2341,22 @@ nsPIDOMWindowInner::GetOrCreateServiceWo
+ }
+ 
+ void
+ nsPIDOMWindowInner::NoteCalledRegisterForServiceWorkerScope(const nsACString& aScope)
+ {
+   nsGlobalWindowInner::Cast(this)->NoteCalledRegisterForServiceWorkerScope(aScope);
+ }
+ 
++void
++nsPIDOMWindowInner::NoteDOMContentLoaded()
++{
++  nsGlobalWindowInner::Cast(this)->NoteDOMContentLoaded();
++}
++
+ bool
+ nsGlobalWindowInner::ShouldReportForServiceWorkerScope(const nsAString& aScope)
+ {
+   bool result = false;
+ 
+   nsPIDOMWindowOuter* topOuter = GetScriptableTop();
+   NS_ENSURE_TRUE(topOuter, false);
+ 
+@@ -2458,16 +2464,26 @@ nsGlobalWindowInner::NoteCalledRegisterF
+   if (!mClientSource) {
+     return;
+   }
+ 
+   mClientSource->NoteCalledRegisterForServiceWorkerScope(aScope);
+ }
+ 
+ void
++nsGlobalWindowInner::NoteDOMContentLoaded()
++{
++  if (!mClientSource) {
++    return;
++  }
++
++  mClientSource->NoteDOMContentLoaded();
++}
++
++void
+ nsGlobalWindowInner::MigrateStateForDocumentOpen(nsGlobalWindowInner* aOldInner)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(aOldInner);
+   MOZ_DIAGNOSTIC_ASSERT(aOldInner != this);
+   MOZ_DIAGNOSTIC_ASSERT(mDoc);
+ 
+   // Rebind DETH objects to the new global created by document.open().
+   // XXX: Is this correct?  We should consider if the spec and our
+diff --git a/dom/base/nsGlobalWindowInner.h b/dom/base/nsGlobalWindowInner.h
+--- a/dom/base/nsGlobalWindowInner.h
++++ b/dom/base/nsGlobalWindowInner.h
+@@ -360,16 +360,18 @@ public:
+   virtual RefPtr<mozilla::dom::ServiceWorker>
+   GetOrCreateServiceWorker(const mozilla::dom::ServiceWorkerDescriptor& aDescriptor) override;
+ 
+   RefPtr<mozilla::dom::ServiceWorkerRegistration>
+   GetOrCreateServiceWorkerRegistration(const mozilla::dom::ServiceWorkerRegistrationDescriptor& aDescriptor) override;
+ 
+   void NoteCalledRegisterForServiceWorkerScope(const nsACString& aScope);
+ 
++  void NoteDOMContentLoaded();
++
+   virtual nsresult FireDelayedDOMEvents() override;
+ 
+   virtual nsresult SetNewDocument(nsIDocument *aDocument,
+                                   nsISupports *aState,
+                                   bool aForceReuseInnerWindow) override;
+ 
+   virtual void SetOpenerWindow(nsPIDOMWindowOuter* aOpener,
+                                bool aOriginalOpener) override;
+diff --git a/dom/base/nsPIDOMWindow.h b/dom/base/nsPIDOMWindow.h
+--- a/dom/base/nsPIDOMWindow.h
++++ b/dom/base/nsPIDOMWindow.h
+@@ -327,16 +327,18 @@ public:
+   mozilla::Maybe<mozilla::dom::ClientState> GetClientState() const;
+   mozilla::Maybe<mozilla::dom::ServiceWorkerDescriptor> GetController() const;
+ 
+   RefPtr<mozilla::dom::ServiceWorker>
+   GetOrCreateServiceWorker(const mozilla::dom::ServiceWorkerDescriptor& aDescriptor);
+ 
+   void NoteCalledRegisterForServiceWorkerScope(const nsACString& aScope);
+ 
++  void NoteDOMContentLoaded();
++
+   mozilla::dom::TabGroup* TabGroup();
+ 
+   virtual nsPIDOMWindowOuter* GetPrivateRoot() = 0;
+ 
+   virtual mozilla::dom::CustomElementRegistry* CustomElements() = 0;
+ 
+   // XXX: This is called on inner windows
+   virtual nsPIDOMWindowOuter* GetScriptableTop() = 0;
+diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSource.cpp
+--- a/dom/clients/manager/ClientSource.cpp
++++ b/dom/clients/manager/ClientSource.cpp
+@@ -472,16 +472,32 @@ ClientSource::InheritController(const Se
+ }
+ 
+ const Maybe<ServiceWorkerDescriptor>&
+ ClientSource::GetController() const
+ {
+   return mController;
+ }
+ 
++void
++ClientSource::NoteDOMContentLoaded()
++{
++  if (mController.isSome() && !ServiceWorkerParentInterceptEnabled()) {
++    AssertIsOnMainThread();
++    RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
++    if (swm) {
++      swm->MaybeCheckNavigationUpdate(mClientInfo);
++    }
++  }
++
++  MaybeExecute([] (PClientSourceChild* aActor) {
++    aActor->SendNoteDOMContentLoaded();
++  });
++}
++
+ RefPtr<ClientOpPromise>
+ ClientSource::Focus(const ClientFocusArgs& aArgs)
+ {
+   NS_ASSERT_OWNINGTHREAD(ClientSource);
+ 
+   RefPtr<ClientOpPromise> ref;
+ 
+   if (mClientInfo.Type() != ClientType::Window) {
+diff --git a/dom/clients/manager/ClientSource.h b/dom/clients/manager/ClientSource.h
+--- a/dom/clients/manager/ClientSource.h
++++ b/dom/clients/manager/ClientSource.h
+@@ -145,16 +145,21 @@ public:
+   void
+   InheritController(const ServiceWorkerDescriptor& aServiceWorker);
+ 
+   // Get the ClientSource's current controlling service worker, if one has
+   // been set.
+   const Maybe<ServiceWorkerDescriptor>&
+   GetController() const;
+ 
++  // Note that the client has reached DOMContentLoaded.  Only applies to window
++  // clients.
++  void
++  NoteDOMContentLoaded();
++
+   RefPtr<ClientOpPromise>
+   Focus(const ClientFocusArgs& aArgs);
+ 
+   RefPtr<ClientOpPromise>
+   PostMessage(const ClientPostMessageArgs& aArgs);
+ 
+   RefPtr<ClientOpPromise>
+   Claim(const ClientClaimArgs& aArgs);
+diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/ClientSourceParent.cpp
+--- a/dom/clients/manager/ClientSourceParent.cpp
++++ b/dom/clients/manager/ClientSourceParent.cpp
+@@ -165,16 +165,34 @@ ClientSourceParent::RecvInheritControlle
+       });
+ 
+     MOZ_ALWAYS_SUCCEEDS(SystemGroup::Dispatch(TaskCategory::Other, r.forget()));
+   }
+ 
+   return IPC_OK();
+ }
+ 
++IPCResult
++ClientSourceParent::RecvNoteDOMContentLoaded()
++{
++  if (mController.isSome() && ServiceWorkerParentInterceptEnabled()) {
++    nsCOMPtr<nsIRunnable> r = NS_NewRunnableFunction(
++      "ClientSourceParent::RecvNoteDOMContentLoaded",
++      [clientInfo = mClientInfo] () {
++        RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
++        NS_ENSURE_TRUE_VOID(swm);
++
++        swm->MaybeCheckNavigationUpdate(clientInfo);
++      });
++
++    MOZ_ALWAYS_SUCCEEDS(SystemGroup::Dispatch(TaskCategory::Other, r.forget()));
++  }
++  return IPC_OK();
++}
++
+ void
+ ClientSourceParent::ActorDestroy(ActorDestroyReason aReason)
+ {
+   DebugOnly<bool> removed = mService->RemoveSource(this);
+   MOZ_ASSERT(removed);
+ 
+   nsTArray<ClientHandleParent*> handleList(mHandleList);
+   for (ClientHandleParent* handle : handleList) {
+diff --git a/dom/clients/manager/ClientSourceParent.h b/dom/clients/manager/ClientSourceParent.h
+--- a/dom/clients/manager/ClientSourceParent.h
++++ b/dom/clients/manager/ClientSourceParent.h
+@@ -43,16 +43,19 @@ class ClientSourceParent final : public 
+   RecvFreeze() override;
+ 
+   mozilla::ipc::IPCResult
+   RecvThaw() override;
+ 
+   mozilla::ipc::IPCResult
+   RecvInheritController(const ClientControlledArgs& aArgs) override;
+ 
++  mozilla::ipc::IPCResult
++  RecvNoteDOMContentLoaded() override;
++
+   void
+   ActorDestroy(ActorDestroyReason aReason) override;
+ 
+   PClientSourceOpParent*
+   AllocPClientSourceOpParent(const ClientOpConstructorArgs& aArgs) override;
+ 
+   bool
+   DeallocPClientSourceOpParent(PClientSourceOpParent* aActor) override;
+diff --git a/dom/clients/manager/PClientSource.ipdl b/dom/clients/manager/PClientSource.ipdl
+--- a/dom/clients/manager/PClientSource.ipdl
++++ b/dom/clients/manager/PClientSource.ipdl
+@@ -21,16 +21,17 @@ sync protocol PClientSource
+ 
+ parent:
+   sync WorkerSyncPing();
+   async Teardown();
+   async ExecutionReady(ClientSourceExecutionReadyArgs aArgs);
+   async Freeze();
+   async Thaw();
+   async InheritController(ClientControlledArgs aArgs);
++  async NoteDOMContentLoaded();
+ 
+ child:
+   async PClientSourceOp(ClientOpConstructorArgs aArgs);
+ 
+   async __delete__();
+ };
+ 
+ } // namespace dom

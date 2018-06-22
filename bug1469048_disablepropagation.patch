@@ -1,7 +1,7 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  99ee247e1270c86d02edc63855f8f03dcca274f7
-Bug 1469046 Disable service worker propagation when e10s pref is enabled. r=asuth
+# Parent  8576b12b4ba7ff7e9e67fee9b7e02672fd5e0ec2
+Bug 1469048 Disable service worker propagation when e10s pref is enabled. r=asuth
 
 diff --git a/dom/ipc/ContentParent.cpp b/dom/ipc/ContentParent.cpp
 --- a/dom/ipc/ContentParent.cpp
@@ -24,7 +24,7 @@ diff --git a/dom/ipc/ContentParent.cpp b/dom/ipc/ContentParent.cpp
  #include "mozilla/hal_sandbox/PHalParent.h"
  #include "mozilla/ipc/BackgroundChild.h"
  #include "mozilla/ipc/BackgroundParent.h"
-@@ -2444,17 +2445,17 @@ ContentParent::InitInternal(ProcessPrior
+@@ -2445,17 +2446,17 @@ ContentParent::InitInternal(ProcessPrior
      }
    }
  #endif
@@ -65,6 +65,88 @@ diff --git a/dom/serviceworkers/ServiceWorkerInfo.cpp b/dom/serviceworkers/Servi
  
    // Scripts of a service worker should always be loaded bypass service workers.
    // Otherwise, we might not be able to update a service worker correctly, if
+diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/ServiceWorkerManager.cpp
+--- a/dom/serviceworkers/ServiceWorkerManager.cpp
++++ b/dom/serviceworkers/ServiceWorkerManager.cpp
+@@ -2286,16 +2286,21 @@ ServiceWorkerManager::SoftUpdate(const O
+                                  const nsACString& aScope)
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+ 
+   if (mShuttingDown) {
+     return;
+   }
+ 
++  if (ServiceWorkerParentInterceptEnabled()) {
++    SoftUpdateInternal(aOriginAttributes, aScope, nullptr);
++    return;
++  }
++
+   RefPtr<GenericPromise::Private> promise =
+     new GenericPromise::Private(__func__);
+ 
+   RefPtr<CancelableRunnable> successRunnable =
+     new SoftUpdateRunnable(aOriginAttributes, aScope, true, promise);
+ 
+   RefPtr<CancelableRunnable> failureRunnable =
+     new ResolvePromiseRunnable(promise);
+@@ -2347,17 +2352,16 @@ public:
+ } // anonymous namespace
+ 
+ void
+ ServiceWorkerManager::SoftUpdateInternal(const OriginAttributes& aOriginAttributes,
+                                          const nsACString& aScope,
+                                          ServiceWorkerUpdateFinishCallback* aCallback)
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+-  MOZ_ASSERT(aCallback);
+ 
+   if (mShuttingDown) {
+     return;
+   }
+ 
+   nsCOMPtr<nsIURI> scopeURI;
+   nsresult rv = NS_NewURI(getter_AddRefs(scopeURI), aScope);
+   if (NS_WARN_IF(NS_FAILED(rv))) {
+@@ -2407,29 +2411,36 @@ ServiceWorkerManager::SoftUpdateInternal
+   RefPtr<ServiceWorkerJobQueue> queue = GetOrCreateJobQueue(scopeKey,
+                                                             aScope);
+ 
+   RefPtr<ServiceWorkerUpdateJob> job =
+     new ServiceWorkerUpdateJob(principal, registration->Scope(),
+                                newest->ScriptSpec(), nullptr,
+                                registration->GetUpdateViaCache());
+ 
+-  RefPtr<UpdateJobCallback> cb = new UpdateJobCallback(aCallback);
+-  job->AppendResultCallback(cb);
++  if (aCallback) {
++    RefPtr<UpdateJobCallback> cb = new UpdateJobCallback(aCallback);
++    job->AppendResultCallback(cb);
++  }
+ 
+   queue->ScheduleJob(job);
+ }
+ 
+ void
+ ServiceWorkerManager::Update(nsIPrincipal* aPrincipal,
+                              const nsACString& aScope,
+                              ServiceWorkerUpdateFinishCallback* aCallback)
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+ 
++  if (ServiceWorkerParentInterceptEnabled()) {
++    UpdateInternal(aPrincipal, aScope, aCallback);
++    return;
++  }
++
+   RefPtr<GenericPromise::Private> promise =
+     new GenericPromise::Private(__func__);
+ 
+   RefPtr<CancelableRunnable> successRunnable =
+     new UpdateRunnable(aPrincipal, aScope, aCallback,
+                        UpdateRunnable::eSuccess, promise);
+ 
+   RefPtr<CancelableRunnable> failureRunnable =
 diff --git a/dom/serviceworkers/ServiceWorkerManagerService.cpp b/dom/serviceworkers/ServiceWorkerManagerService.cpp
 --- a/dom/serviceworkers/ServiceWorkerManagerService.cpp
 +++ b/dom/serviceworkers/ServiceWorkerManagerService.cpp
@@ -173,6 +255,25 @@ diff --git a/dom/serviceworkers/ServiceWorkerManagerService.cpp b/dom/servicewor
  
    DebugOnly<bool> parentFound = false;
    for (auto iter = mAgents.Iter(); !iter.Done(); iter.Next()) {
+@@ -250,16 +270,18 @@ ServiceWorkerManagerService::PropagateRe
+ void
+ ServiceWorkerManagerService::ProcessUpdaterActor(ServiceWorkerUpdaterParent* aActor,
+                                                  const OriginAttributes& aOriginAttributes,
+                                                  const nsACString& aScope,
+                                                  uint64_t aParentId)
+ {
+   AssertIsOnBackgroundThread();
+ 
++  MOZ_DIAGNOSTIC_ASSERT(!ServiceWorkerParentInterceptEnabled());
++
+   nsAutoCString suffix;
+   aOriginAttributes.CreateSuffix(suffix);
+ 
+   nsCString scope(aScope);
+   scope.Append(suffix);
+ 
+   for (uint32_t i = 0; i < mPendingUpdaterActors.Length(); ++i) {
+     // We already have an actor doing this update on another process.
 diff --git a/dom/serviceworkers/ServiceWorkerRegistrationInfo.cpp b/dom/serviceworkers/ServiceWorkerRegistrationInfo.cpp
 --- a/dom/serviceworkers/ServiceWorkerRegistrationInfo.cpp
 +++ b/dom/serviceworkers/ServiceWorkerRegistrationInfo.cpp
@@ -198,3 +299,25 @@ diff --git a/dom/serviceworkers/ServiceWorkerRegistrationInfo.cpp b/dom/servicew
  
  void
  ServiceWorkerRegistrationInfo::AddInstance(ServiceWorkerRegistrationListener* aInstance,
+diff --git a/dom/serviceworkers/ServiceWorkerUpdaterChild.cpp b/dom/serviceworkers/ServiceWorkerUpdaterChild.cpp
+--- a/dom/serviceworkers/ServiceWorkerUpdaterChild.cpp
++++ b/dom/serviceworkers/ServiceWorkerUpdaterChild.cpp
+@@ -14,16 +14,18 @@ ServiceWorkerUpdaterChild::ServiceWorker
+                                                      CancelableRunnable* aSuccessRunnable,
+                                                      CancelableRunnable* aFailureRunnable)
+   : mSuccessRunnable(aSuccessRunnable)
+   , mFailureRunnable(aFailureRunnable)
+ {
+   // TODO: remove the main thread restriction after fixing bug 1364821.
+   MOZ_ASSERT(NS_IsMainThread());
+ 
++  MOZ_DIAGNOSTIC_ASSERT(!ServiceWorkerParentInterceptEnabled());
++
+   MOZ_ASSERT(aPromise);
+   MOZ_ASSERT(aSuccessRunnable);
+   MOZ_ASSERT(aFailureRunnable);
+ 
+   aPromise->Then(GetMainThreadSerialEventTarget(), __func__,
+     [this]() {
+       mPromiseHolder.Complete();
+       Unused << Send__delete__(this);

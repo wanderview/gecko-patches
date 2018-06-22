@@ -1,0 +1,278 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  8db16237d96644f7c57dde08f3d9c096f9709233
+Bug 1470286 Propagate channel creation and async open time across internal redirects. r=valentin
+
+diff --git a/netwerk/base/nsITimedChannel.idl b/netwerk/base/nsITimedChannel.idl
+--- a/netwerk/base/nsITimedChannel.idl
++++ b/netwerk/base/nsITimedChannel.idl
+@@ -31,18 +31,22 @@ interface nsITimedChannel : nsISupports 
+   // channelCreationTime will be available even with this attribute set to
+   // false.
+   attribute boolean timingEnabled;
+ 
+   // The number of redirects
+   attribute uint8_t redirectCount;
+   attribute uint8_t internalRedirectCount;
+ 
+-  [noscript] readonly attribute TimeStamp channelCreation;
+-  [noscript] readonly attribute TimeStamp asyncOpen;
++  // These properties should only be written externally when they must be
++  // propagated across an internal redirect.  For example, when a service
++  // worker interception falls back to network we need to copy the original
++  // timing values to the new nsHttpChannel.
++  [noscript] attribute TimeStamp channelCreation;
++  [noscript] attribute TimeStamp asyncOpen;
+ 
+   // The following are only set when the request is intercepted by a service
+   // worker no matter the response is synthesized.
+   [noscript] attribute TimeStamp launchServiceWorkerStart;
+   [noscript] attribute TimeStamp launchServiceWorkerEnd;
+   [noscript] attribute TimeStamp dispatchFetchEventStart;
+   [noscript] attribute TimeStamp dispatchFetchEventEnd;
+   [noscript] attribute TimeStamp handleFetchEventStart;
+diff --git a/netwerk/protocol/http/HttpBaseChannel.cpp b/netwerk/protocol/http/HttpBaseChannel.cpp
+--- a/netwerk/protocol/http/HttpBaseChannel.cpp
++++ b/netwerk/protocol/http/HttpBaseChannel.cpp
+@@ -195,16 +195,17 @@ HttpBaseChannel::HttpBaseChannel()
+   , mInitialRwin(0)
+   , mProxyResolveFlags(0)
+   , mContentDispositionHint(UINT32_MAX)
+   , mHttpHandler(gHttpHandler)
+   , mReferrerPolicy(NS_GetDefaultReferrerPolicy())
+   , mRedirectCount(0)
+   , mInternalRedirectCount(0)
+   , mChannelCreationTime(0)
++  , mAsyncOpenTimeOverriden(false)
+   , mForcePending(false)
+   , mCorsIncludeCredentials(false)
+   , mCorsMode(nsIHttpChannelInternal::CORS_MODE_NO_CORS)
+   , mRedirectMode(nsIHttpChannelInternal::REDIRECT_MODE_FOLLOW)
+   , mOnStartRequestCalled(false)
+   , mOnStopRequestCalled(false)
+   , mUpgradableToSecure(true)
+   , mAfterOnStartRequestBegun(false)
+@@ -3778,24 +3779,38 @@ HttpBaseChannel::SetupReplacementChannel
+         std::max(newCount, mInternalRedirectCount));
+     } else {
+       int8_t newCount = mRedirectCount + 1;
+       newTimedChannel->SetRedirectCount(
+         std::max(newCount, mRedirectCount));
+       newTimedChannel->SetInternalRedirectCount(mInternalRedirectCount);
+     }
+ 
++    TimeStamp oldAsyncOpenTime;
++    oldTimedChannel->GetAsyncOpen(&oldAsyncOpenTime);
++
++    if (redirectFlags & nsIChannelEventSink::REDIRECT_INTERNAL) {
++      TimeStamp oldChannelCreationTimestamp;
++      oldTimedChannel->GetChannelCreation(&oldChannelCreationTimestamp);
++
++      if (!oldChannelCreationTimestamp.IsNull()) {
++        newTimedChannel->SetChannelCreation(oldChannelCreationTimestamp);
++      }
++
++      if (!oldAsyncOpenTime.IsNull()) {
++        newTimedChannel->SetAsyncOpen(oldAsyncOpenTime);
++      }
++    }
++
+     // If the RedirectStart is null, we will use the AsyncOpen value of the
+     // previous channel (this is the first redirect in the redirects chain).
+     if (mRedirectStartTimeStamp.IsNull()) {
+       // Only do this for real redirects.  Internal redirects should be hidden.
+       if (!(redirectFlags & nsIChannelEventSink::REDIRECT_INTERNAL)) {
+-        TimeStamp asyncOpen;
+-        oldTimedChannel->GetAsyncOpen(&asyncOpen);
+-        newTimedChannel->SetRedirectStart(asyncOpen);
++        newTimedChannel->SetRedirectStart(oldAsyncOpenTime);
+       }
+     } else {
+       newTimedChannel->SetRedirectStart(mRedirectStartTimeStamp);
+     }
+ 
+     // For internal redirects just propagate the last redirect end time
+     // forward.  Otherwise the new redirect end time is the last response
+     // end time.
+@@ -3923,21 +3938,38 @@ HttpBaseChannel::GetTimingEnabled(bool* 
+ 
+ NS_IMETHODIMP
+ HttpBaseChannel::GetChannelCreation(TimeStamp* _retval) {
+   *_retval = mChannelCreationTimestamp;
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
++HttpBaseChannel::SetChannelCreation(TimeStamp aValue) {
++  MOZ_DIAGNOSTIC_ASSERT(!aValue.IsNull());
++  TimeDuration adjust = aValue - mChannelCreationTimestamp;
++  mChannelCreationTimestamp = aValue;
++  mChannelCreationTime += (PRTime)adjust.ToMicroseconds();
++  return NS_OK;
++}
++
++NS_IMETHODIMP
+ HttpBaseChannel::GetAsyncOpen(TimeStamp* _retval) {
+   *_retval = mAsyncOpenTime;
+   return NS_OK;
+ }
+ 
++NS_IMETHODIMP
++HttpBaseChannel::SetAsyncOpen(TimeStamp aValue) {
++  MOZ_DIAGNOSTIC_ASSERT(!aValue.IsNull());
++  mAsyncOpenTime = aValue;
++  mAsyncOpenTimeOverriden = true;
++  return NS_OK;
++}
++
+ /**
+  * @return the number of redirects. There is no check for cross-domain
+  * redirects. This check must be done by the consumers.
+  */
+ NS_IMETHODIMP
+ HttpBaseChannel::GetRedirectCount(uint8_t *aRedirectCount)
+ {
+   *aRedirectCount = mRedirectCount;
+diff --git a/netwerk/protocol/http/HttpBaseChannel.h b/netwerk/protocol/http/HttpBaseChannel.h
+--- a/netwerk/protocol/http/HttpBaseChannel.h
++++ b/netwerk/protocol/http/HttpBaseChannel.h
+@@ -671,16 +671,17 @@ protected:
+   TimeStamp                         mDispatchFetchEventStart;
+   TimeStamp                         mDispatchFetchEventEnd;
+   TimeStamp                         mHandleFetchEventStart;
+   TimeStamp                         mHandleFetchEventEnd;
+   // copied from the transaction before we null out mTransaction
+   // so that the timing can still be queried from OnStopRequest
+   TimingStruct                      mTransactionTimings;
+ 
++  bool                              mAsyncOpenTimeOverriden;
+   bool                              mForcePending;
+ 
+   bool mCorsIncludeCredentials;
+   uint32_t mCorsMode;
+   uint32_t mRedirectMode;
+ 
+   // These parameters are used to ensure that we do not call OnStartRequest and
+   // OnStopRequest more than once.
+diff --git a/netwerk/protocol/http/HttpChannelChild.cpp b/netwerk/protocol/http/HttpChannelChild.cpp
+--- a/netwerk/protocol/http/HttpChannelChild.cpp
++++ b/netwerk/protocol/http/HttpChannelChild.cpp
+@@ -2497,17 +2497,20 @@ HttpChannelChild::AsyncOpen(nsIStreamLis
+   NS_ENSURE_ARG_POINTER(listener);
+   NS_ENSURE_TRUE(!mIsPending, NS_ERROR_IN_PROGRESS);
+   NS_ENSURE_TRUE(!mWasOpened, NS_ERROR_ALREADY_OPENED);
+ 
+   if (MaybeWaitForUploadStreamLength(listener, aContext)) {
+     return NS_OK;
+   }
+ 
+-  mAsyncOpenTime = TimeStamp::Now();
++  if (!mAsyncOpenTimeOverriden) {
++    mAsyncOpenTime = TimeStamp::Now();
++  }
++
+ #ifdef MOZ_TASK_TRACER
+   if (tasktracer::IsStartLogging()) {
+     nsCOMPtr<nsIURI> uri;
+     GetURI(getter_AddRefs(uri));
+     nsAutoCString urispec;
+     uri->GetSpec(urispec);
+     tasktracer::AddLabel("HttpChannelChild::AsyncOpen %s", urispec.get());
+   }
+diff --git a/netwerk/protocol/http/InterceptedHttpChannel.cpp b/netwerk/protocol/http/InterceptedHttpChannel.cpp
+--- a/netwerk/protocol/http/InterceptedHttpChannel.cpp
++++ b/netwerk/protocol/http/InterceptedHttpChannel.cpp
+@@ -680,16 +680,26 @@ InterceptedHttpChannel::ResetInterceptio
+                                       nullptr, // aLoadGroup
+                                       nullptr, // aCallbacks
+                                       mLoadFlags);
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   rv = SetupReplacementChannel(mURI, newChannel, true, flags);
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
++  nsCOMPtr<nsITimedChannel> newTimedChannel = do_QueryInterface(newChannel);
++  if (newTimedChannel) {
++    if (!mAsyncOpenTime.IsNull()) {
++      newTimedChannel->SetAsyncOpen(mAsyncOpenTime);
++    }
++    if (!mChannelCreationTimestamp.IsNull()) {
++      newTimedChannel->SetChannelCreation(mChannelCreationTimestamp);
++    }
++  }
++
+   if (mRedirectMode != nsIHttpChannelInternal::REDIRECT_MODE_MANUAL) {
+     nsLoadFlags loadFlags = nsIRequest::LOAD_NORMAL;
+     rv = newChannel->GetLoadFlags(&loadFlags);
+     NS_ENSURE_SUCCESS(rv, rv);
+     loadFlags |= nsIChannel::LOAD_BYPASS_SERVICE_WORKER;
+     rv = newChannel->SetLoadFlags(loadFlags);
+     NS_ENSURE_SUCCESS(rv, rv);
+   }
+diff --git a/netwerk/protocol/http/NullHttpChannel.cpp b/netwerk/protocol/http/NullHttpChannel.cpp
+--- a/netwerk/protocol/http/NullHttpChannel.cpp
++++ b/netwerk/protocol/http/NullHttpChannel.cpp
+@@ -606,23 +606,39 @@ NullHttpChannel::SetInternalRedirectCoun
+ NS_IMETHODIMP
+ NullHttpChannel::GetChannelCreation(mozilla::TimeStamp *aChannelCreation)
+ {
+   *aChannelCreation = mChannelCreationTimestamp;
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
++NullHttpChannel::SetChannelCreation(TimeStamp aValue) {
++  MOZ_DIAGNOSTIC_ASSERT(!aValue.IsNull());
++  TimeDuration adjust = aValue - mChannelCreationTimestamp;
++  mChannelCreationTimestamp = aValue;
++  mChannelCreationTime += (PRTime)adjust.ToMicroseconds();
++  return NS_OK;
++}
++
++NS_IMETHODIMP
+ NullHttpChannel::GetAsyncOpen(mozilla::TimeStamp *aAsyncOpen)
+ {
+   *aAsyncOpen = mAsyncOpenTime;
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
++NullHttpChannel::SetAsyncOpen(TimeStamp aValue) {
++  MOZ_DIAGNOSTIC_ASSERT(!aValue.IsNull());
++  mAsyncOpenTime = aValue;
++  return NS_OK;
++}
++
++NS_IMETHODIMP
+ NullHttpChannel::GetLaunchServiceWorkerStart(mozilla::TimeStamp *_retval)
+ {
+   MOZ_ASSERT(_retval);
+   *_retval = mAsyncOpenTime;
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+diff --git a/netwerk/protocol/http/nsHttpChannel.cpp b/netwerk/protocol/http/nsHttpChannel.cpp
+--- a/netwerk/protocol/http/nsHttpChannel.cpp
++++ b/netwerk/protocol/http/nsHttpChannel.cpp
+@@ -6018,17 +6018,19 @@ nsHttpChannel::AsyncOpen(nsIStreamListen
+ 
+     if (mLoadGroup)
+         mLoadGroup->AddRequest(this, nullptr);
+ 
+     // record asyncopen time unconditionally and clear it if we
+     // don't want it after OnModifyRequest() weighs in. But waiting for
+     // that to complete would mean we don't include proxy resolution in the
+     // timing.
+-    mAsyncOpenTime = TimeStamp::Now();
++    if (!mAsyncOpenTimeOverriden) {
++      mAsyncOpenTime = TimeStamp::Now();
++    }
+ 
+     // Remember we have Authorization header set here.  We need to check on it
+     // just once and early, AsyncOpen is the best place.
+     mCustomAuthHeader = mRequestHead.HasHeader(nsHttp::Authorization);
+ 
+     // The common case for HTTP channels is to begin proxy resolution and return
+     // at this point. The only time we know mProxyInfo already is if we're
+     // proxying a non-http protocol like ftp. We don't need to discover proxy
