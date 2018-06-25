@@ -1,8 +1,30 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  d69b7fc884fbe7429517e6e22a651ee099dabb11
+# Parent  4f6e597104dabedfecfafa2ab63dc79fd7f8bc7a
 Bug 1469873 Make ClientSource::Control() fail if storage access is not available and make claim() respect the result. r=mrbkap
 
+diff --git a/dom/clients/manager/ClientManagerService.cpp b/dom/clients/manager/ClientManagerService.cpp
+--- a/dom/clients/manager/ClientManagerService.cpp
++++ b/dom/clients/manager/ClientManagerService.cpp
+@@ -470,16 +470,18 @@ ClaimOnMainThread(const ClientInfo& aCli
+ 
+       RefPtr<GenericPromise> inner = swm->MaybeClaimClient(clientInfo, desc);
+       inner->Then(SystemGroup::EventTargetFor(TaskCategory::Other), __func__,
+         [promise] (bool aResult) {
+           promise->Resolve(NS_OK, __func__);
+         }, [promise] (nsresult aRv) {
+           promise->Reject(aRv, __func__);
+         });
++
++      scopeExit.release();
+     });
+ 
+   MOZ_ALWAYS_SUCCEEDS(SystemGroup::Dispatch(TaskCategory::Other, r.forget()));
+ 
+   return promise.forget();
+ }
+ 
+ } // anonymous namespace
 diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSource.cpp
 --- a/dom/clients/manager/ClientSource.cpp
 +++ b/dom/clients/manager/ClientSource.cpp
@@ -45,7 +67,7 @@ diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSo
      // Force the create of the initial document if it does not exist yet.
      Unused << docshell->GetDocument();
  
-@@ -426,20 +448,50 @@ ClientSource::SetController(const Servic
+@@ -426,20 +448,57 @@ ClientSource::SetController(const Servic
    }
  }
  
@@ -58,23 +80,30 @@ diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSo
 +  // prevent service workers from controlling clients that cannot access
 +  // storage.  We exempt this restriction for local URL clients, like about:blank
 +  // and blob:, since access to service workers is dictated by their parent.
-+  bool controlAllowed = false;
++  //
++  // Note, we default to allowing the client to be controlled in the case
++  // where we are not execution ready yet.  This can only happen if the
++  // the non-subresource load is intercepted by a service worker.  Since
++  // ServiceWorkerInterceptController() uses StorageAllowedForChannel()
++  // it should be fine to accept these control messages.
++  //
++  // Its also fine to default to allowing ClientSource attached to a docshell
++  // to be controlled.  These clients represent inital about:blank windows
++  // that do not have an inner window created yet.  We explicitly allow initial
++  // about:blank.
++  bool controlAllowed = true;
 +  if (GetInnerWindow()) {
++
 +    // Local URL windows and windows with access to storage can be controlled.
 +    controlAllowed = Info().URL().LowerCaseEqualsLiteral("about:blank") ||
 +                     StringBeginsWith(Info().URL(), NS_LITERAL_CSTRING("blob:")) ||
 +                     nsContentUtils::StorageAllowedForWindow(GetInnerWindow()) ==
-+                                                             nsContentUtils::StorageAccess::eAllow;
++                      nsContentUtils::StorageAccess::eAllow;
 +  } else if (GetWorkerPrivate()) {
 +    // Local URL workers and workers with access to storage cna be controlled.
 +    controlAllowed = GetWorkerPrivate()->IsStorageAllowed() ||
 +                     StringBeginsWith(GetWorkerPrivate()->ScriptURL(),
 +                                      NS_LITERAL_STRING("blob:"));
-+  } else if (GetDocShell()) {
-+    // Initial about:blank windows that are not attached to an inner window
-+    // are allowed to be controlled just like about:blank clients attached
-+    // to a real window.
-+    controlAllowed = true;
 +  }
 +
 +  RefPtr<ClientOpPromise> ref;
@@ -98,7 +127,7 @@ diff --git a/dom/clients/manager/ClientSource.cpp b/dom/clients/manager/ClientSo
  {
    NS_ASSERT_OWNINGTHREAD(ClientSource);
  
-@@ -665,45 +717,65 @@ ClientSource::PostMessage(const ClientPo
+@@ -665,45 +724,65 @@ ClientSource::PostMessage(const ClientPo
  
    ref = ClientOpPromise::CreateAndResolve(NS_OK, __func__);
    return ref.forget();
@@ -224,6 +253,164 @@ diff --git a/dom/clients/manager/ClientSource.h b/dom/clients/manager/ClientSour
  
    // Private methods called by ClientManager
    ClientSource(ClientManager* aManager,
+diff --git a/dom/clients/manager/ClientSourceOpParent.cpp b/dom/clients/manager/ClientSourceOpParent.cpp
+--- a/dom/clients/manager/ClientSourceOpParent.cpp
++++ b/dom/clients/manager/ClientSourceOpParent.cpp
+@@ -1,16 +1,18 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "ClientSourceOpParent.h"
+ 
++#include "ClientSourceParent.h"
++
+ namespace mozilla {
+ namespace dom {
+ 
+ using mozilla::ipc::IPCResult;
+ 
+ void
+ ClientSourceOpParent::ActorDestroy(ActorDestroyReason aReason)
+ {
+@@ -20,28 +22,41 @@ ClientSourceOpParent::ActorDestroy(Actor
+   }
+ }
+ 
+ IPCResult
+ ClientSourceOpParent::Recv__delete__(const ClientOpResult& aResult)
+ {
+   if (aResult.type() == ClientOpResult::Tnsresult &&
+       NS_FAILED(aResult.get_nsresult())) {
++
++    // If a control message fails then clear the controller from
++    // the ClientSourceParent.  We eagerly marked it controlled at
++    // the start of the operation.
++    if (mArgs.type() == ClientOpConstructorArgs::TClientControlledArgs) {
++      auto source = static_cast<ClientSourceParent*>(Manager());
++      if (source) {
++        source->ClearController();
++      }
++    }
++
+     mPromise->Reject(aResult.get_nsresult(), __func__);
+     mPromise = nullptr;
+     return IPC_OK();
+   }
++
+   mPromise->Resolve(aResult, __func__);
+   mPromise = nullptr;
+   return IPC_OK();
+ }
+ 
+ ClientSourceOpParent::ClientSourceOpParent(const ClientOpConstructorArgs& aArgs,
+                                            ClientOpPromise::Private* aPromise)
+-  : mPromise(aPromise)
++  : mArgs(aArgs)
++  , mPromise(aPromise)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(mPromise);
+ }
+ 
+ ClientSourceOpParent::~ClientSourceOpParent()
+ {
+   MOZ_DIAGNOSTIC_ASSERT(!mPromise);
+ }
+diff --git a/dom/clients/manager/ClientSourceOpParent.h b/dom/clients/manager/ClientSourceOpParent.h
+--- a/dom/clients/manager/ClientSourceOpParent.h
++++ b/dom/clients/manager/ClientSourceOpParent.h
+@@ -9,16 +9,17 @@
+ #include "mozilla/dom/ClientOpPromise.h"
+ #include "mozilla/dom/PClientSourceOpParent.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ class ClientSourceOpParent final : public PClientSourceOpParent
+ {
++  const ClientOpConstructorArgs mArgs;
+   RefPtr<ClientOpPromise::Private> mPromise;
+ 
+   // PClientSourceOpParent interface
+   void
+   ActorDestroy(ActorDestroyReason aReason) override;
+ 
+   mozilla::ipc::IPCResult
+   Recv__delete__(const ClientOpResult& aResult) override;
+diff --git a/dom/clients/manager/ClientSourceParent.cpp b/dom/clients/manager/ClientSourceParent.cpp
+--- a/dom/clients/manager/ClientSourceParent.cpp
++++ b/dom/clients/manager/ClientSourceParent.cpp
+@@ -270,16 +270,22 @@ ClientSourceParent::ExecutionReady() con
+ 
+ const Maybe<ServiceWorkerDescriptor>&
+ ClientSourceParent::GetController() const
+ {
+   return mController;
+ }
+ 
+ void
++ClientSourceParent::ClearController()
++{
++  mController.reset();
++}
++
++void
+ ClientSourceParent::AttachHandle(ClientHandleParent* aClientHandle)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(aClientHandle);
+   MOZ_DIAGNOSTIC_ASSERT(!mFrozen);
+   MOZ_ASSERT(!mHandleList.Contains(aClientHandle));
+   mHandleList.AppendElement(aClientHandle);
+ }
+ 
+@@ -293,17 +299,21 @@ ClientSourceParent::DetachHandle(ClientH
+ 
+ RefPtr<ClientOpPromise>
+ ClientSourceParent::StartOp(const ClientOpConstructorArgs& aArgs)
+ {
+   RefPtr<ClientOpPromise::Private> promise =
+     new ClientOpPromise::Private(__func__);
+ 
+   // If we are being controlled, remember that data before propagating
+-  // on to the ClientSource.
++  // on to the ClientSource.  This must be set prior to triggering
++  // the controllerchange event from the ClientSource since some tests
++  // expect matchAll() to find the controlled client immediately after.
++  // If the control operation fails, then we reset the controller value
++  // to reflect the final state.
+   if (aArgs.type() == ClientOpConstructorArgs::TClientControlledArgs) {
+     mController.reset();
+     mController.emplace(aArgs.get_ClientControlledArgs().serviceWorker());
+   }
+ 
+   // Constructor failure will reject the promise via ActorDestroy().
+   ClientSourceOpParent* actor = new ClientSourceOpParent(aArgs, promise);
+   Unused << SendPClientSourceOpConstructor(actor, aArgs);
+diff --git a/dom/clients/manager/ClientSourceParent.h b/dom/clients/manager/ClientSourceParent.h
+--- a/dom/clients/manager/ClientSourceParent.h
++++ b/dom/clients/manager/ClientSourceParent.h
+@@ -75,16 +75,19 @@ public:
+ 
+   bool
+   ExecutionReady() const;
+ 
+   const Maybe<ServiceWorkerDescriptor>&
+   GetController() const;
+ 
+   void
++  ClearController();
++
++  void
+   AttachHandle(ClientHandleParent* aClientSource);
+ 
+   void
+   DetachHandle(ClientHandleParent* aClientSource);
+ 
+   RefPtr<ClientOpPromise>
+   StartOp(const ClientOpConstructorArgs& aArgs);
+ };
 diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/ServiceWorkerManager.cpp
 --- a/dom/serviceworkers/ServiceWorkerManager.cpp
 +++ b/dom/serviceworkers/ServiceWorkerManager.cpp
@@ -328,3 +515,21 @@ diff --git a/dom/serviceworkers/ServiceWorkerManager.cpp b/dom/serviceworkers/Se
                                        const nsACString& aScope) const
  {
    MOZ_ASSERT(aPrincipal);
+diff --git a/dom/serviceworkers/test/claim_worker_1.js b/dom/serviceworkers/test/claim_worker_1.js
+--- a/dom/serviceworkers/test/claim_worker_1.js
++++ b/dom/serviceworkers/test/claim_worker_1.js
+@@ -16,12 +16,13 @@ onactivate = function(e) {
+     return self.clients.matchAll();
+   }).then(function(matched) {
+     // should be 2
+     result.match_count_after = matched.length;
+     for (i = 0; i < matched.length; i++) {
+       matched[i].postMessage(result);
+     }
+     if (result.match_count_after !== 2) {
+-      dump("ERROR: claim_worker_1 failed to capture clients.\n");
++      dump("ERROR: claim_worker_1 failed to capture clients.  Got " +
++           JSON.stringify(result) + "\n");
+     }
+   });
+ }
