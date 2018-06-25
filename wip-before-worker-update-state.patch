@@ -1,0 +1,204 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  639e0a7c44dfd151e3de9a4e30ff1a685709bb33
+
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationImpl.cpp b/dom/serviceworkers/ServiceWorkerRegistrationImpl.cpp
+--- a/dom/serviceworkers/ServiceWorkerRegistrationImpl.cpp
++++ b/dom/serviceworkers/ServiceWorkerRegistrationImpl.cpp
+@@ -100,17 +100,17 @@ ServiceWorkerRegistrationMainThread::Reg
+     mOuter->RegistrationRemoved();
+   }
+   StopListeningForEvents();
+ }
+ 
+ void
+ ServiceWorkerRegistrationMainThread::UpdateFound()
+ {
+-  mOuter->DispatchTrustedEvent(NS_LITERAL_STRING("updatefound"));
++  //mOuter->DispatchTrustedEvent(NS_LITERAL_STRING("updatefound"));
+ }
+ 
+ void
+ ServiceWorkerRegistrationMainThread::UpdateState(const ServiceWorkerRegistrationDescriptor& aDescriptor)
+ {
+   NS_ENSURE_TRUE_VOID(mOuter);
+ 
+   nsIGlobalObject* global = mOuter->GetParentObject();
+@@ -630,34 +630,38 @@ ServiceWorkerRegistrationMainThread::Unr
+ 
+ ////////////////////////////////////////////////////
+ // Worker Thread implementation
+ 
+ class WorkerListener final : public ServiceWorkerRegistrationListener
+ {
+   ServiceWorkerRegistrationDescriptor mDescriptor;
+   RefPtr<ServiceWorkerRegistrationInfo> mInfo;
++  nsCOMPtr<nsISerialEventTarget> mEventTarget;
+   bool mListeningForEvents;
+ 
+   // Set and unset on worker thread, used on main-thread and protected by mutex.
+   ServiceWorkerRegistrationWorkerThread* mRegistration;
+ 
+   Mutex mMutex;
+ 
+ public:
+   NS_INLINE_DECL_THREADSAFE_REFCOUNTING(WorkerListener, override)
+ 
+   WorkerListener(ServiceWorkerRegistrationWorkerThread* aReg,
+-                 const ServiceWorkerRegistrationDescriptor& aDescriptor)
++                 const ServiceWorkerRegistrationDescriptor& aDescriptor,
++                 nsISerialEventTarget* aEventTarget)
+     : mDescriptor(aDescriptor)
++    , mEventTarget(aEventTarget)
+     , mListeningForEvents(false)
+     , mRegistration(aReg)
+     , mMutex("WorkerListener::mMutex")
+   {
+     MOZ_ASSERT(IsCurrentThreadRunningWorker());
++    MOZ_ASSERT(mEventTarget);
+     MOZ_ASSERT(mRegistration);
+   }
+ 
+   void
+   StartListeningForEvents()
+   {
+     MOZ_ASSERT(NS_IsMainThread());
+     MOZ_DIAGNOSTIC_ASSERT(!mListeningForEvents);
+@@ -691,18 +695,36 @@ public:
+   // ServiceWorkerRegistrationListener
+   void
+   UpdateFound() override;
+ 
+   void
+   UpdateState(const ServiceWorkerRegistrationDescriptor& aDescriptor) override
+   {
+     MOZ_ASSERT(NS_IsMainThread());
++
+     mDescriptor = aDescriptor;
+-    // TODO: Not implemented
++
++    nsCOMPtr<nsIRunnable> r =
++      NewCancelableRunnableMethod<ServiceWorkerRegistrationDescriptor>(
++        "WorkerListener::UpdateState",
++        this,
++        &WorkerListener::UpdateStateOnWorkerThread,
++        aDescriptor);
++
++    Unused << mEventTarget->Dispatch(r.forget(), NS_DISPATCH_NORMAL);
++  }
++
++  void
++  UpdateStateOnWorkerThread(const ServiceWorkerRegistrationDescriptor& aDescriptor)
++  {
++    MOZ_ASSERT(IsCurrentThreadRunningWorker());
++    if (mRegistration) {
++      mRegistration->UpdateState(aDescriptor);
++    }
+   }
+ 
+   void
+   RegistrationRemoved() override;
+ 
+   void
+   GetScope(nsAString& aScope) const override
+   {
+@@ -907,17 +929,17 @@ ServiceWorkerRegistrationWorkerThread::I
+     // late.
+     self->mOuter = nullptr;
+   });
+ 
+   if (NS_WARN_IF(!mWorkerRef)) {
+     return;
+   }
+ 
+-  mListener = new WorkerListener(this, mDescriptor);
++  mListener = new WorkerListener(this, mDescriptor, worker->HybridEventTarget());
+ 
+   nsCOMPtr<nsIRunnable> r =
+     NewRunnableMethod("dom::WorkerListener::StartListeningForEvents",
+                       mListener,
+                       &WorkerListener::StartListeningForEvents);
+   MOZ_ALWAYS_SUCCEEDS(worker->DispatchToMainThread(r.forget()));
+ }
+ 
+@@ -928,27 +950,35 @@ ServiceWorkerRegistrationWorkerThread::R
+     return;
+   }
+ 
+   MOZ_ASSERT(IsCurrentThreadRunningWorker());
+ 
+   mListener->ClearRegistration();
+ 
+   nsCOMPtr<nsIRunnable> r =
+-    NewRunnableMethod("dom::WorkerListener::StopListeningForEvents",
+-                      mListener,
+-                      &WorkerListener::StopListeningForEvents);
++    NewCancelableRunnableMethod("dom::WorkerListener::StopListeningForEvents",
++                                mListener,
++                                &WorkerListener::StopListeningForEvents);
+   // Calling GetPrivate() is safe because this method is called when the
+   // WorkerRef is notified.
+   MOZ_ALWAYS_SUCCEEDS(mWorkerRef->GetPrivate()->DispatchToMainThread(r.forget()));
+ 
+   mListener = nullptr;
+   mWorkerRef = nullptr;
+ }
+ 
++void
++ServiceWorkerRegistrationWorkerThread::UpdateState(const ServiceWorkerRegistrationDescriptor& aDescriptor)
++{
++  if (mOuter) {
++    mOuter->UpdateState(aDescriptor);
++  }
++}
++
+ class FireUpdateFoundRunnable final : public WorkerRunnable
+ {
+   RefPtr<WorkerListener> mListener;
+ public:
+   FireUpdateFoundRunnable(WorkerPrivate* aWorkerPrivate,
+                           WorkerListener* aListener)
+     : WorkerRunnable(aWorkerPrivate)
+     , mListener(aListener)
+@@ -1030,17 +1060,17 @@ WorkerListener::RegistrationRemoved()
+   }
+ 
+   mRegistration->RegistrationRemoved();
+ }
+ 
+ void
+ ServiceWorkerRegistrationWorkerThread::UpdateFound()
+ {
+-  mOuter->DispatchTrustedEvent(NS_LITERAL_STRING("updatefound"));
++  //mOuter->DispatchTrustedEvent(NS_LITERAL_STRING("updatefound"));
+ }
+ 
+ WorkerPrivate*
+ ServiceWorkerRegistrationWorkerThread::GetWorkerPrivate(const MutexAutoLock& aProofOfLock)
+ {
+   // In this case, calling GetUnsafePrivate() is ok because we have a proof of
+   // mutex lock.
+   MOZ_ASSERT(mWorkerRef && mWorkerRef->GetUnsafePrivate());
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationImpl.h b/dom/serviceworkers/ServiceWorkerRegistrationImpl.h
+--- a/dom/serviceworkers/ServiceWorkerRegistrationImpl.h
++++ b/dom/serviceworkers/ServiceWorkerRegistrationImpl.h
+@@ -127,16 +127,19 @@ private:
+   ~ServiceWorkerRegistrationWorkerThread();
+ 
+   void
+   InitListener();
+ 
+   void
+   ReleaseListener();
+ 
++  void
++  UpdateState(const ServiceWorkerRegistrationDescriptor& aDescriptor);
++
+   // This can be called only by WorkerListener.
+   WorkerPrivate*
+   GetWorkerPrivate(const MutexAutoLock& aProofOfLock);
+ 
+   ServiceWorkerRegistration* mOuter;
+   const ServiceWorkerRegistrationDescriptor mDescriptor;
+   const nsString mScope;
+   RefPtr<WorkerListener> mListener;
