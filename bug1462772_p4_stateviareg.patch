@@ -1,6 +1,7 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  9dcb1df9631baa7c8eba9ebda93c61e622d6cc3e
+# Parent  805123a4bb94d8c23708e194b9869b59229ba043
+Bug 1462772 P4 Route ServiceWorker state changes through the ServiceWorkerRegistration. r=mrbkap
 
 diff --git a/dom/serviceworkers/ServiceWorker.cpp b/dom/serviceworkers/ServiceWorker.cpp
 --- a/dom/serviceworkers/ServiceWorker.cpp
@@ -23,7 +24,7 @@ diff --git a/dom/serviceworkers/ServiceWorker.cpp b/dom/serviceworkers/ServiceWo
  #include "mozilla/dom/ServiceWorkerGlobalScopeBinding.h"
  #include "mozilla/dom/WorkerPrivate.h"
  
-@@ -69,44 +70,49 @@ ServiceWorker::Create(nsIGlobalObject* a
+@@ -69,16 +70,17 @@ ServiceWorker::Create(nsIGlobalObject* a
  }
  
  ServiceWorker::ServiceWorker(nsIGlobalObject* aGlobal,
@@ -41,42 +42,7 @@ diff --git a/dom/serviceworkers/ServiceWorker.cpp b/dom/serviceworkers/ServiceWo
    KeepAliveIfHasListenersFor(NS_LITERAL_STRING("statechange"));
  
    // The error event handler is required by the spec currently, but is not used
-   // anywhere.  Don't keep the object alive in that case.
- 
-   // This will update our state too.
-   mInner->AddServiceWorker(this);
- 
-   // Attempt to get an existing binding object for the registration
-   // associated with this ServiceWorker.
--  mRegistration = aGlobal->GetServiceWorkerRegistration(
-+  RefPtr<ServiceWorkerRegistration> reg = aGlobal->GetServiceWorkerRegistration(
-     ServiceWorkerRegistrationDescriptor(mDescriptor.RegistrationId(),
-                                         mDescriptor.PrincipalInfo(),
-                                         mDescriptor.Scope(),
-                                         ServiceWorkerUpdateViaCache::Imports));
--  if (!mRegistration) {
-+  if (reg) {
-+    MaybeAttachToRegistration(reg);
-+  } else {
-     RefPtr<ServiceWorker> self = this;
- 
-     mInner->GetRegistration(
-       [self = std::move(self)] (const ServiceWorkerRegistrationDescriptor& aDescriptor) {
-         nsIGlobalObject* global = self->GetParentObject();
--        self->mRegistration =
-+        NS_ENSURE_TRUE_VOID(global);
-+        RefPtr<ServiceWorkerRegistration> reg =
-           global->GetOrCreateServiceWorkerRegistration(aDescriptor);
-+        self->MaybeAttachToRegistration(reg);
-       }, [] (ErrorResult& aRv) {
-         // do nothing
-         aRv.SuppressException();
-       });
-   }
- }
- 
- ServiceWorker::~ServiceWorker()
-@@ -138,28 +144,34 @@ ServiceWorkerState
+@@ -142,28 +144,34 @@ ServiceWorkerState
  ServiceWorker::State() const
  {
    return mDescriptor.State();
@@ -114,37 +80,26 @@ diff --git a/dom/serviceworkers/ServiceWorker.cpp b/dom/serviceworkers/ServiceWo
  ServiceWorker::GetScriptURL(nsString& aURL) const
  {
    CopyUTF8toUTF16(mDescriptor.ScriptURL(), aURL);
-@@ -221,10 +233,32 @@ ServiceWorker::Descriptor() const
+@@ -231,13 +239,21 @@ ServiceWorker::DisconnectFromOwner()
  }
  
  void
- ServiceWorker::DisconnectFromOwner()
+ ServiceWorker::MaybeAttachToRegistration(ServiceWorkerRegistration* aRegistration)
  {
-   DOMEventTargetHelper::DisconnectFromOwner();
- }
+   MOZ_DIAGNOSTIC_ASSERT(aRegistration);
+   MOZ_DIAGNOSTIC_ASSERT(!mRegistration);
  
-+void
-+ServiceWorker::MaybeAttachToRegistration(ServiceWorkerRegistration* aRegistration)
-+{
-+  MOZ_DIAGNOSTIC_ASSERT(aRegistration);
-+  MOZ_DIAGNOSTIC_ASSERT(!mRegistration);
-+
-+  auto& desc = aRegistration->Descriptor();
-+  Maybe<ServiceWorkerDescriptor> installing = desc.GetInstalling();
-+  Maybe<ServiceWorkerDescriptor> waiting = desc.GetWaiting();
-+  Maybe<ServiceWorkerDescriptor> active = desc.GetActive();
-+
-+  if ((installing.isNothing() || !installing.ref().Matches(mDescriptor)) &&
-+      (waiting.isNothing() || !waiting.ref().Matches(mDescriptor)) &&
-+      (active.isNothing() || !active.ref().Matches(mDescriptor))) {
++  // If the registration no longer actually references this ServiceWorker
++  // then we must be in the redundant state.
++  if (!aRegistration->Descriptor().HasWorker(mDescriptor)) {
 +    SetState(ServiceWorkerState::Redundant);
 +    MaybeDispatchStateChangeEvent();
 +    return;
 +  }
 +
-+  mRegistration = aRegistration;
-+}
-+
+   mRegistration = aRegistration;
+ }
+ 
  } // namespace dom
  } // namespace mozilla
 diff --git a/dom/serviceworkers/ServiceWorker.h b/dom/serviceworkers/ServiceWorker.h
@@ -170,18 +125,11 @@ diff --git a/dom/serviceworkers/ServiceWorker.h b/dom/serviceworkers/ServiceWork
  
    const ServiceWorkerDescriptor&
    Descriptor() const;
-@@ -104,20 +107,24 @@ public:
- private:
-   ServiceWorker(nsIGlobalObject* aWindow,
-                 const ServiceWorkerDescriptor& aDescriptor,
-                 Inner* aInner);
+@@ -111,16 +114,17 @@ private:
  
-   // This class is reference-counted and will be destroyed from Release().
-   ~ServiceWorker();
+   void
+   MaybeAttachToRegistration(ServiceWorkerRegistration* aRegistration);
  
-+  void
-+  MaybeAttachToRegistration(ServiceWorkerRegistration* aRegistration);
-+
    ServiceWorkerDescriptor mDescriptor;
  
    RefPtr<Inner> mInner;
@@ -198,7 +146,7 @@ diff --git a/dom/serviceworkers/ServiceWorker.h b/dom/serviceworkers/ServiceWork
 diff --git a/dom/serviceworkers/ServiceWorkerImpl.cpp b/dom/serviceworkers/ServiceWorkerImpl.cpp
 --- a/dom/serviceworkers/ServiceWorkerImpl.cpp
 +++ b/dom/serviceworkers/ServiceWorkerImpl.cpp
-@@ -7,30 +7,31 @@
+@@ -7,30 +7,24 @@
  #include "ServiceWorkerImpl.h"
  
  namespace mozilla {
@@ -208,8 +156,6 @@ diff --git a/dom/serviceworkers/ServiceWorkerImpl.cpp b/dom/serviceworkers/Servi
  {
    MOZ_DIAGNOSTIC_ASSERT(!mOuter);
 -  mInfo->RemoveListener(this);
-+  // TODO
-+  //mInfo->RemoveListener(this);
  }
  
  void
@@ -218,12 +164,11 @@ diff --git a/dom/serviceworkers/ServiceWorkerImpl.cpp b/dom/serviceworkers/Servi
    MOZ_DIAGNOSTIC_ASSERT(!mOuter);
    MOZ_DIAGNOSTIC_ASSERT(aWorker);
    mOuter = aWorker;
- 
-   // Wait to attach to the info as a listener until we have the outer
-   // set.  This is important because the info will try to set the
-   // state immediately.
+-
+-  // Wait to attach to the info as a listener until we have the outer
+-  // set.  This is important because the info will try to set the
+-  // state immediately.
 -  mInfo->AddListener(this);
-+  //mInfo->AddListener(this);
  }
  
  void
@@ -232,34 +177,10 @@ diff --git a/dom/serviceworkers/ServiceWorkerImpl.cpp b/dom/serviceworkers/Servi
    MOZ_DIAGNOSTIC_ASSERT(mOuter);
    MOZ_DIAGNOSTIC_ASSERT(mOuter == aWorker);
    mOuter = nullptr;
-diff --git a/dom/serviceworkers/ServiceWorkerInfo.cpp b/dom/serviceworkers/ServiceWorkerInfo.cpp
---- a/dom/serviceworkers/ServiceWorkerInfo.cpp
-+++ b/dom/serviceworkers/ServiceWorkerInfo.cpp
-@@ -167,18 +167,18 @@ ServiceWorkerInfo::UpdateState(ServiceWo
-   // Flush any pending functional events to the worker when it transitions to the
-   // activated state.
-   // TODO: Do we care that these events will race with the propagation of the
-   //       state change?
-   if (State() != aState) {
-     mServiceWorkerPrivate->UpdateState(aState);
-   }
-   mDescriptor.SetState(aState);
--  nsCOMPtr<nsIRunnable> r = new ChangeStateUpdater(mInstances, State());
--  MOZ_ALWAYS_SUCCEEDS(NS_DispatchToMainThread(r.forget()));
-+  //nsCOMPtr<nsIRunnable> r = new ChangeStateUpdater(mInstances, State());
-+  //MOZ_ALWAYS_SUCCEEDS(NS_DispatchToMainThread(r.forget()));
-   if (State() == ServiceWorkerState::Redundant) {
-     serviceWorkerScriptCache::PurgeCache(mPrincipal, mCacheName);
-   }
- }
- 
- ServiceWorkerInfo::ServiceWorkerInfo(nsIPrincipal* aPrincipal,
-                                      const nsACString& aScope,
-                                      uint64_t aRegistrationId,
 diff --git a/dom/serviceworkers/ServiceWorkerRegistration.cpp b/dom/serviceworkers/ServiceWorkerRegistration.cpp
 --- a/dom/serviceworkers/ServiceWorkerRegistration.cpp
 +++ b/dom/serviceworkers/ServiceWorkerRegistration.cpp
-@@ -135,44 +135,81 @@ void
+@@ -135,44 +135,80 @@ void
  ServiceWorkerRegistration::UpdateState(const ServiceWorkerRegistrationDescriptor& aDescriptor)
  {
    MOZ_DIAGNOSTIC_ASSERT(MatchesDescriptor(aDescriptor));
@@ -268,23 +189,23 @@ diff --git a/dom/serviceworkers/ServiceWorkerRegistration.cpp b/dom/serviceworke
  
    nsCOMPtr<nsIGlobalObject> global = GetParentObject();
  
-+  RefPtr<ServiceWorker> oldInstalling = mInstallingWorker.forget();
-+  RefPtr<ServiceWorker> oldWaiting = mWaitingWorker.forget();
-+  RefPtr<ServiceWorker> oldActive = mActiveWorker.forget();
++  AutoTArray<RefPtr<ServiceWorker>, 3> oldWorkerList;
++  oldWorkerList.AppendElement(mInstallingWorker.forget());
++  oldWorkerList.AppendElement(mWaitingWorker.forget());
++  oldWorkerList.AppendElement(mActiveWorker.forget());
 +
 +  auto scopeExit = MakeScopeExit([&] {
-+    if (oldActive && oldActive != mActiveWorker) {
-+      oldActive->SetState(ServiceWorkerState::Redundant);
++    for (auto& oldWorker : oldWorkerList) {
++      if (!oldWorker ||
++           oldWorker == mInstallingWorker ||
++           oldWorker == mWaitingWorker ||
++           oldWorker == mActiveWorker) {
++        continue;
++      }
++
++      oldWorker->SetState(ServiceWorkerState::Redundant);
 +    }
-+    if (oldWaiting && oldWaiting != mWaitingWorker &&
-+                      oldWaiting != mActiveWorker) {
-+      oldWaiting->SetState(ServiceWorkerState::Redundant);
-+    }
-+    if (oldInstalling && oldInstalling != mInstallingWorker &&
-+                         oldInstalling != mWaitingWorker &&
-+                         oldInstalling != mActiveWorker) {
-+      oldInstalling->SetState(ServiceWorkerState::Redundant);
-+    }
++
 +    if (mInstallingWorker) {
 +      mInstallingWorker->MaybeDispatchStateChangeEvent();
 +    }
@@ -294,14 +215,13 @@ diff --git a/dom/serviceworkers/ServiceWorkerRegistration.cpp b/dom/serviceworke
 +    if (mActiveWorker) {
 +      mActiveWorker->MaybeDispatchStateChangeEvent();
 +    }
-+    if (oldInstalling) {
-+      oldInstalling->MaybeDispatchStateChangeEvent();
-+    }
-+    if (oldWaiting) {
-+      oldWaiting->MaybeDispatchStateChangeEvent();
-+    }
-+    if (oldActive) {
-+      oldActive->MaybeDispatchStateChangeEvent();
++
++    for (auto& oldWorker : oldWorkerList) {
++      if (!oldWorker) {
++        continue;
++      }
++
++      oldWorker->MaybeDispatchStateChangeEvent();
 +    }
 +  });
 +
@@ -344,7 +264,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerRegistration.cpp b/dom/serviceworke
  bool
  ServiceWorkerRegistration::MatchesDescriptor(const ServiceWorkerRegistrationDescriptor& aDescriptor) const
  {
-@@ -340,10 +377,16 @@ ServiceWorkerRegistration::GetNotificati
+@@ -340,10 +376,16 @@ ServiceWorkerRegistration::GetNotificati
      return Notification::Get(window, aOptions, scope, aRv);
    }
  
@@ -384,29 +304,60 @@ diff --git a/dom/serviceworkers/ServiceWorkerRegistration.h b/dom/serviceworkers
    ~ServiceWorkerRegistration();
  
    ServiceWorkerRegistrationDescriptor mDescriptor;
+diff --git a/dom/serviceworkers/ServiceWorkerRegistrationDescriptor.cpp b/dom/serviceworkers/ServiceWorkerRegistrationDescriptor.cpp
+--- a/dom/serviceworkers/ServiceWorkerRegistrationDescriptor.cpp
++++ b/dom/serviceworkers/ServiceWorkerRegistrationDescriptor.cpp
+@@ -192,16 +192,27 @@ ServiceWorkerRegistrationDescriptor::New
+   Maybe<ServiceWorkerDescriptor> result;
+   Maybe<IPCServiceWorkerDescriptor> newest(NewestInternal());
+   if (newest.isSome()) {
+     result.emplace(ServiceWorkerDescriptor(newest.ref()));
+   }
+   return result;
+ }
+ 
++bool
++ServiceWorkerRegistrationDescriptor::HasWorker(const ServiceWorkerDescriptor& aDescriptor) const
++{
++  Maybe<ServiceWorkerDescriptor> installing = GetInstalling();
++  Maybe<ServiceWorkerDescriptor> waiting = GetWaiting();
++  Maybe<ServiceWorkerDescriptor> active = GetActive();
++  return (installing.isSome() && installing.ref().Matches(aDescriptor)) ||
++         (waiting.isSome() && waiting.ref().Matches(aDescriptor)) ||
++         (active.isSome() && active.ref().Matches(aDescriptor));
++}
++
+ namespace {
+ 
+ bool
+ IsValidWorker(const OptionalIPCServiceWorkerDescriptor& aWorker,
+               const nsACString& aScope,
+               const mozilla::ipc::ContentPrincipalInfo& aContentPrincipal)
+ {
+   if (aWorker.type() == OptionalIPCServiceWorkerDescriptor::Tvoid_t) {
 diff --git a/dom/serviceworkers/ServiceWorkerRegistrationDescriptor.h b/dom/serviceworkers/ServiceWorkerRegistrationDescriptor.h
 --- a/dom/serviceworkers/ServiceWorkerRegistrationDescriptor.h
 +++ b/dom/serviceworkers/ServiceWorkerRegistrationDescriptor.h
-@@ -83,16 +83,19 @@ public:
-   GetInstalling() const;
- 
-   Maybe<ServiceWorkerDescriptor>
-   GetWaiting() const;
+@@ -87,16 +87,19 @@ public:
  
    Maybe<ServiceWorkerDescriptor>
    GetActive() const;
  
-+  bool
-+  HasWorker(const ServiceWorkerDescriptor& aWorker) const;
-+
    Maybe<ServiceWorkerDescriptor>
    Newest() const;
  
    bool
++  HasWorker(const ServiceWorkerDescriptor& aDescriptor) const;
++
++  bool
    IsValid() const;
  
    void
    SetUpdateViaCache(ServiceWorkerUpdateViaCache aUpdateViaCache);
+ 
+   void
+   SetWorkers(ServiceWorkerInfo* aInstalling,
+              ServiceWorkerInfo* aWaiting,
 diff --git a/dom/serviceworkers/ServiceWorkerRegistrationImpl.cpp b/dom/serviceworkers/ServiceWorkerRegistrationImpl.cpp
 --- a/dom/serviceworkers/ServiceWorkerRegistrationImpl.cpp
 +++ b/dom/serviceworkers/ServiceWorkerRegistrationImpl.cpp

@@ -1,0 +1,286 @@
+# HG changeset patch
+# User Ben Kelly <ben@wanderview.com>
+# Parent  e89e1afbfd8ec4337a0fb9446a47e14ba14f7162
+Bug 1462772 P5 Remove now-unused Listener logic in ServiceWorkerInfo. r=mrbkap
+
+diff --git a/dom/serviceworkers/ServiceWorkerImpl.cpp b/dom/serviceworkers/ServiceWorkerImpl.cpp
+--- a/dom/serviceworkers/ServiceWorkerImpl.cpp
++++ b/dom/serviceworkers/ServiceWorkerImpl.cpp
+@@ -1,16 +1,18 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "ServiceWorkerImpl.h"
+ 
++#include "ServiceWorkerInfo.h"
++
+ namespace mozilla {
+ namespace dom {
+ 
+ ServiceWorkerImpl::~ServiceWorkerImpl()
+ {
+   MOZ_DIAGNOSTIC_ASSERT(!mOuter);
+ }
+ 
+@@ -40,26 +42,16 @@ ServiceWorkerImpl::GetRegistration(Servi
+ void
+ ServiceWorkerImpl::PostMessage(RefPtr<ServiceWorkerCloneData>&& aData,
+                                const ClientInfo& aClientInfo,
+                                const ClientState& aClientState)
+ {
+   mInfo->PostMessage(std::move(aData), aClientInfo, aClientState);
+ }
+ 
+-void
+-ServiceWorkerImpl::SetState(ServiceWorkerState aState)
+-{
+-  if (!mOuter) {
+-    return;
+-  }
+-  mOuter->SetState(aState);
+-}
+-
+-
+ ServiceWorkerImpl::ServiceWorkerImpl(ServiceWorkerInfo* aInfo,
+                                      ServiceWorkerRegistrationInfo* aReg)
+   : mInfo(aInfo)
+   , mReg(aReg)
+   , mOuter(nullptr)
+ {
+   MOZ_DIAGNOSTIC_ASSERT(mInfo);
+   MOZ_DIAGNOSTIC_ASSERT(mReg);
+diff --git a/dom/serviceworkers/ServiceWorkerImpl.h b/dom/serviceworkers/ServiceWorkerImpl.h
+--- a/dom/serviceworkers/ServiceWorkerImpl.h
++++ b/dom/serviceworkers/ServiceWorkerImpl.h
+@@ -3,26 +3,24 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_ServiceWorkerImpl_h
+ #define mozilla_dom_ServiceWorkerImpl_h
+ 
+ #include "ServiceWorker.h"
+-#include "ServiceWorkerInfo.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ class ServiceWorkerInfo;
+ class ServiceWorkerRegistrationInfo;
+ 
+ class ServiceWorkerImpl final : public ServiceWorker::Inner
+-                              , public ServiceWorkerInfo::Listener
+ {
+   RefPtr<ServiceWorkerInfo> mInfo;
+   RefPtr<ServiceWorkerRegistrationInfo> mReg;
+   ServiceWorker* mOuter;
+ 
+   ~ServiceWorkerImpl();
+ 
+   // ServiceWorker::Inner interface
+@@ -36,20 +34,16 @@ class ServiceWorkerImpl final : public S
+   GetRegistration(ServiceWorkerRegistrationCallback&& aSuccessCB,
+                   ServiceWorkerFailureCallback&& aFailureCB) override;
+ 
+   void
+   PostMessage(RefPtr<ServiceWorkerCloneData>&& aData,
+               const ClientInfo& aClientInfo,
+               const ClientState& aClientState) override;
+ 
+-  // ServiceWorkerInfo::Listener interface
+-  void
+-  SetState(ServiceWorkerState aState) override;
+-
+ public:
+   ServiceWorkerImpl(ServiceWorkerInfo* aInfo,
+                     ServiceWorkerRegistrationInfo* aReg);
+ 
+   NS_INLINE_DECL_REFCOUNTING(ServiceWorkerImpl, override);
+ };
+ 
+ } // namespace dom
+diff --git a/dom/serviceworkers/ServiceWorkerInfo.cpp b/dom/serviceworkers/ServiceWorkerInfo.cpp
+--- a/dom/serviceworkers/ServiceWorkerInfo.cpp
++++ b/dom/serviceworkers/ServiceWorkerInfo.cpp
+@@ -108,46 +108,16 @@ ServiceWorkerInfo::AttachDebugger()
+ }
+ 
+ NS_IMETHODIMP
+ ServiceWorkerInfo::DetachDebugger()
+ {
+   return mServiceWorkerPrivate->DetachDebugger();
+ }
+ 
+-namespace {
+-
+-class ChangeStateUpdater final : public Runnable
+-{
+-public:
+-  ChangeStateUpdater(const nsTArray<ServiceWorkerInfo::Listener*>& aInstances,
+-                     ServiceWorkerState aState)
+-    : Runnable("dom::ChangeStateUpdater")
+-    , mState(aState)
+-  {
+-    for (size_t i = 0; i < aInstances.Length(); ++i) {
+-      mInstances.AppendElement(aInstances[i]);
+-    }
+-  }
+-
+-  NS_IMETHOD Run() override
+-  {
+-    for (size_t i = 0; i < mInstances.Length(); ++i) {
+-      mInstances[i]->SetState(mState);
+-    }
+-    return NS_OK;
+-  }
+-
+-private:
+-  AutoTArray<RefPtr<ServiceWorkerInfo::Listener>, 1> mInstances;
+-  ServiceWorkerState mState;
+-};
+-
+-}
+-
+ void
+ ServiceWorkerInfo::UpdateState(ServiceWorkerState aState)
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+ #ifdef DEBUG
+   // Any state can directly transition to redundant, but everything else is
+   // ordered.
+   if (aState != ServiceWorkerState::Redundant) {
+@@ -167,18 +137,16 @@ ServiceWorkerInfo::UpdateState(ServiceWo
+   // Flush any pending functional events to the worker when it transitions to the
+   // activated state.
+   // TODO: Do we care that these events will race with the propagation of the
+   //       state change?
+   if (State() != aState) {
+     mServiceWorkerPrivate->UpdateState(aState);
+   }
+   mDescriptor.SetState(aState);
+-  nsCOMPtr<nsIRunnable> r = new ChangeStateUpdater(mInstances, State());
+-  MOZ_ALWAYS_SUCCEEDS(NS_DispatchToMainThread(r.forget()));
+   if (State() == ServiceWorkerState::Redundant) {
+     serviceWorkerScriptCache::PurgeCache(mPrincipal, mCacheName);
+   }
+ }
+ 
+ ServiceWorkerInfo::ServiceWorkerInfo(nsIPrincipal* aPrincipal,
+                                      const nsACString& aScope,
+                                      uint64_t aRegistrationId,
+@@ -221,34 +189,16 @@ static uint64_t gServiceWorkerInfoCurren
+ 
+ uint64_t
+ ServiceWorkerInfo::GetNextID() const
+ {
+   return ++gServiceWorkerInfoCurrentID;
+ }
+ 
+ void
+-ServiceWorkerInfo::AddListener(Listener* aListener)
+-{
+-  MOZ_DIAGNOSTIC_ASSERT(aListener);
+-  MOZ_ASSERT(!mInstances.Contains(aListener));
+-
+-  mInstances.AppendElement(aListener);
+-  aListener->SetState(State());
+-}
+-
+-void
+-ServiceWorkerInfo::RemoveListener(Listener* aListener)
+-{
+-  MOZ_DIAGNOSTIC_ASSERT(aListener);
+-  DebugOnly<bool> removed = mInstances.RemoveElement(aListener);
+-  MOZ_ASSERT(removed);
+-}
+-
+-void
+ ServiceWorkerInfo::PostMessage(RefPtr<ServiceWorkerCloneData>&& aData,
+                                const ClientInfo& aClientInfo,
+                                const ClientState& aClientState)
+ {
+   mServiceWorkerPrivate->SendMessageEvent(std::move(aData),
+                                           ClientInfoAndState(aClientInfo.ToIPC(),
+                                                              aClientState.ToIPC()));
+ }
+diff --git a/dom/serviceworkers/ServiceWorkerInfo.h b/dom/serviceworkers/ServiceWorkerInfo.h
+--- a/dom/serviceworkers/ServiceWorkerInfo.h
++++ b/dom/serviceworkers/ServiceWorkerInfo.h
+@@ -24,26 +24,16 @@ class ServiceWorkerPrivate;
+ /*
+  * Wherever the spec treats a worker instance and a description of said worker
+  * as the same thing; i.e. "Resolve foo with
+  * _GetNewestWorker(serviceWorkerRegistration)", we represent the description
+  * by this class and spawn a ServiceWorker in the right global when required.
+  */
+ class ServiceWorkerInfo final : public nsIServiceWorkerInfo
+ {
+-public:
+-  class Listener
+-  {
+-  public:
+-    virtual void
+-    SetState(ServiceWorkerState aState) = 0;
+-
+-    NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+-  };
+-
+ private:
+   nsCOMPtr<nsIPrincipal> mPrincipal;
+   ServiceWorkerDescriptor mDescriptor;
+   const nsString mCacheName;
+   OriginAttributes mOriginAttributes;
+ 
+   // This LoadFlags is only applied to imported scripts, since the main script
+   // has already been downloaded when performing the bytecheck. This LoadFlag is
+@@ -60,23 +50,16 @@ private:
+   TimeStamp mCreationTimeStamp;
+ 
+   // The time of states are 0, if SW has not reached that state yet. Besides, we
+   // update each of them after UpdateState() is called in SWRegistrationInfo.
+   PRTime mInstalledTime;
+   PRTime mActivatedTime;
+   PRTime mRedundantTime;
+ 
+-  // We hold rawptrs since the ServiceWorker constructor and destructor ensure
+-  // addition and removal.
+-  //
+-  // There is a high chance of there being at least one ServiceWorker
+-  // associated with this all the time.
+-  AutoTArray<Listener*, 1> mInstances;
+-
+   RefPtr<ServiceWorkerPrivate> mServiceWorkerPrivate;
+   bool mSkipWaitingFlag;
+ 
+   enum {
+     Unknown,
+     Enabled,
+     Disabled
+   } mHandlesFetch;
+@@ -88,22 +71,16 @@ private:
+   uint64_t
+   GetNextID() const;
+ 
+ public:
+   NS_DECL_ISUPPORTS
+   NS_DECL_NSISERVICEWORKERINFO
+ 
+   void
+-  AddListener(Listener* aListener);
+-
+-  void
+-  RemoveListener(Listener* aListener);
+-
+-  void
+   PostMessage(RefPtr<ServiceWorkerCloneData>&& aData,
+               const ClientInfo& aClientInfo,
+               const ClientState& aClientState);
+ 
+   class ServiceWorkerPrivate*
+   WorkerPrivate() const
+   {
+     MOZ_ASSERT(mServiceWorkerPrivate);
