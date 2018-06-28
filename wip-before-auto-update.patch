@@ -1,11 +1,11 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  cc79acbc543721fd5fa03679a42df6cc737c1047
+# Parent  0ff4e6ab6cb8835e349cfbca093f51d5af9c1fcc
 
 diff --git a/dom/serviceworkers/ServiceWorkerRegistration.cpp b/dom/serviceworkers/ServiceWorkerRegistration.cpp
 --- a/dom/serviceworkers/ServiceWorkerRegistration.cpp
 +++ b/dom/serviceworkers/ServiceWorkerRegistration.cpp
-@@ -30,22 +30,27 @@ NS_IMPL_CYCLE_COLLECTION_INHERITED(Servi
+@@ -30,22 +30,28 @@ NS_IMPL_CYCLE_COLLECTION_INHERITED(Servi
  
  NS_IMPL_ADDREF_INHERITED(ServiceWorkerRegistration, DOMEventTargetHelper)
  NS_IMPL_RELEASE_INHERITED(ServiceWorkerRegistration, DOMEventTargetHelper)
@@ -15,7 +15,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerRegistration.cpp b/dom/serviceworke
  NS_INTERFACE_MAP_END_INHERITING(DOMEventTargetHelper)
  
 +namespace {
-+const uint64_t kNoInstallingWorkerId = 0;
++const uint64_t kInvalidUpdateFoundId = 0;
 +} // anonymous namespace
 +
  ServiceWorkerRegistration::ServiceWorkerRegistration(nsIGlobalObject* aGlobal,
@@ -24,7 +24,8 @@ diff --git a/dom/serviceworkers/ServiceWorkerRegistration.cpp b/dom/serviceworke
    : DOMEventTargetHelper(aGlobal)
    , mDescriptor(aDescriptor)
    , mInner(aInner)
-+  , mInstallingWorkerId(kNoInstallingWorkerId)
++  , mScheduledUpdateFoundId(kInvalidUpdateFoundId)
++  , mDispatchedUpdateFoundId(kInvalidUpdateFoundId)
  {
    MOZ_DIAGNOSTIC_ASSERT(mInner);
  
@@ -33,7 +34,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerRegistration.cpp b/dom/serviceworke
    UpdateState(mDescriptor);
    mInner->SetServiceWorkerRegistration(this);
  }
-@@ -327,16 +332,49 @@ ServiceWorkerRegistration::GetNotificati
+@@ -327,20 +333,76 @@ ServiceWorkerRegistration::GetNotificati
  
  const ServiceWorkerRegistrationDescriptor&
  ServiceWorkerRegistration::Descriptor() const
@@ -46,31 +47,49 @@ diff --git a/dom/serviceworkers/ServiceWorkerRegistration.cpp b/dom/serviceworke
 +{
 +  uint64_t newId = aInstallingDescriptor.isSome()
 +                 ? aInstallingDescriptor.ref().Id()
-+                 : kNoInstallingWorkerId;
++                 : kInvalidUpdateFoundId;
 +
-+  bool updateFound = newId != kNoInstallingWorkerId &&
-+                     mInstallingWorkerId != newId;
-+  mInstallingWorkerId = newId;
++  if (mScheduledUpdateFoundId != kInvalidUpdateFoundId) {
++    if (mScheduledUpdateFoundId == newId) {
++      return;
++    }
++    MaybeDispatchUpdateFound();
++    MOZ_DIAGNOSTIC_ASSERT(mScheduledUpdateFoundId == kInvalidUpdateFoundId);
++  }
++
++  bool updateFound = newId != kInvalidUpdateFoundId &&
++                     mDispatchedUpdateFoundId != newId;
 +
 +  if (!updateFound) {
 +    return;
 +  }
 +
++  mScheduledUpdateFoundId = newId;
++
 +  nsIGlobalObject* global = GetParentObject();
 +  NS_ENSURE_TRUE_VOID(global);
 +
 +  nsCOMPtr<nsIRunnable> r = NewCancelableRunnableMethod(
-+    "ServiceWorkerRegistration::UpdateState",
++    "ServiceWorkerRegistration::MaybeDispatchUpdateFound",
 +    this,
-+    &ServiceWorkerRegistration::DispatchUpdateFound);
++    &ServiceWorkerRegistration::MaybeDispatchUpdateFound);
 +
 +  Unused << global->EventTargetFor(TaskCategory::Other)->Dispatch(
 +    r.forget(), NS_DISPATCH_NORMAL);
 +}
 +
 +void
-+ServiceWorkerRegistration::DispatchUpdateFound()
++ServiceWorkerRegistration::MaybeDispatchUpdateFound()
 +{
++  uint64_t scheduledId = mScheduledUpdateFoundId;
++  mScheduledUpdateFoundId = kInvalidUpdateFoundId;
++
++  if (scheduledId == kInvalidUpdateFoundId ||
++      scheduledId == mDispatchedUpdateFoundId) {
++    return;
++  }
++
++  mDispatchedUpdateFoundId = scheduledId;
 +  DispatchTrustedEvent(NS_LITERAL_STRING("updatefound"));
 +}
 +
@@ -79,33 +98,23 @@ diff --git a/dom/serviceworkers/ServiceWorkerRegistration.cpp b/dom/serviceworke
                                                 const Maybe<ServiceWorkerDescriptor>& aWaiting,
                                                 const Maybe<ServiceWorkerDescriptor>& aActive)
  {
++  // Do this immediately as it may flush an already pending updatefound
++  // event.  In that case we want to fire the pending event before
++  // modifying any of the registration properties.
++  MaybeScheduleUpdateFound(aInstalling);
++
    // Move the currently exposed workers into a separate list
    // of "old" workers.  We will then potentially add them
    // back to the registration properties below based on the
    // given descriptor.  Any that are not restored will need
-@@ -383,16 +421,18 @@ ServiceWorkerRegistration::UpdateStateIn
-       if (!oldWorker) {
-         continue;
-       }
- 
-       oldWorker->MaybeDispatchStateChangeEvent();
-     }
-   });
- 
-+  MaybeScheduleUpdateFound(mDescriptor.GetInstalling());
-+
-   // Clear all workers if the registration has been detached from the global.
-   // Also, we cannot expose ServiceWorker objects on worker threads yet, so
-   // do the same on when off-main-thread.  This main thread check should be
-   // removed as part of bug 1113522.
-   nsCOMPtr<nsIGlobalObject> global = GetParentObject();
-   if (!global || !NS_IsMainThread()) {
-     return;
-   }
+   // to be moved to the redundant state.
+   AutoTArray<RefPtr<ServiceWorker>, 3> oldWorkerList;
+   oldWorkerList.AppendElement(mInstallingWorker.forget());
+   oldWorkerList.AppendElement(mWaitingWorker.forget());
 diff --git a/dom/serviceworkers/ServiceWorkerRegistration.h b/dom/serviceworkers/ServiceWorkerRegistration.h
 --- a/dom/serviceworkers/ServiceWorkerRegistration.h
 +++ b/dom/serviceworkers/ServiceWorkerRegistration.h
-@@ -126,23 +126,31 @@ private:
+@@ -126,23 +126,32 @@ private:
  
    ~ServiceWorkerRegistration();
  
@@ -118,7 +127,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerRegistration.h b/dom/serviceworkers
 +  MaybeScheduleUpdateFound(const Maybe<ServiceWorkerDescriptor>& aInstallingDescriptor);
 +
 +  void
-+  DispatchUpdateFound();
++  MaybeDispatchUpdateFound();
 +
    ServiceWorkerRegistrationDescriptor mDescriptor;
    RefPtr<Inner> mInner;
@@ -128,7 +137,8 @@ diff --git a/dom/serviceworkers/ServiceWorkerRegistration.h b/dom/serviceworkers
    RefPtr<ServiceWorker> mActiveWorker;
    RefPtr<PushManager> mPushManager;
 +
-+  uint64_t mInstallingWorkerId;
++  uint64_t mScheduledUpdateFoundId;
++  uint64_t mDispatchedUpdateFoundId;
  };
  
  NS_DEFINE_STATIC_IID_ACCESSOR(ServiceWorkerRegistration, NS_DOM_SERVICEWORKERREGISTRATION_IID)
