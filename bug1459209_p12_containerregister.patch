@@ -1,21 +1,33 @@
 # HG changeset patch
 # User Ben Kelly <ben@wanderview.com>
-# Parent  a18268cdecfd9e88455d6634b7dfba0816ad6a68
-Bug 1459209 P19 Implement RemoteServiceWorkerContainerImpl::GetReady() across IPC to the parent-side SWM. r=baku
+# Parent  2d382ffd07cf5aa0ae1bdbd4dcaa0fbdbe3b8de8
+Bug 1459209 P12 Implement RemoteServiceWorkerContainerImpl::Register() across IPC to the parent-side SWM. r=mrbkap
 
 diff --git a/dom/serviceworkers/PServiceWorkerContainer.ipdl b/dom/serviceworkers/PServiceWorkerContainer.ipdl
 --- a/dom/serviceworkers/PServiceWorkerContainer.ipdl
 +++ b/dom/serviceworkers/PServiceWorkerContainer.ipdl
-@@ -22,14 +22,17 @@ parent:
-         returns (IPCServiceWorkerRegistrationDescriptorOrCopyableErrorResult aResult);
+@@ -1,22 +1,29 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
  
-   async GetRegistration(IPCClientInfo aClientInfo, nsCString aURL)
-         returns (IPCServiceWorkerRegistrationDescriptorOrCopyableErrorResult aResult);
+ include protocol PBackground;
  
-   async GetRegistrations(IPCClientInfo aClientInfo)
-         returns (IPCServiceWorkerRegistrationDescriptorListOrCopyableErrorResult aResult);
++include ClientIPCTypes;
++include IPCServiceWorkerRegistrationDescriptor;
++
+ namespace mozilla {
+ namespace dom {
  
-+  async GetReady(IPCClientInfo aClientInfo)
+ protocol PServiceWorkerContainer
+ {
+   manager PBackground;
+ 
+ parent:
+   async Teardown();
+ 
++  async Register(IPCClientInfo aClientInfo, nsCString aScopeURL, nsCString aScriptURL,
++                 ServiceWorkerUpdateViaCache aUpdateViaCache)
 +        returns (IPCServiceWorkerRegistrationDescriptorOrCopyableErrorResult aResult);
 +
  child:
@@ -27,12 +39,30 @@ diff --git a/dom/serviceworkers/PServiceWorkerContainer.ipdl b/dom/serviceworker
 diff --git a/dom/serviceworkers/RemoteServiceWorkerContainerImpl.cpp b/dom/serviceworkers/RemoteServiceWorkerContainerImpl.cpp
 --- a/dom/serviceworkers/RemoteServiceWorkerContainerImpl.cpp
 +++ b/dom/serviceworkers/RemoteServiceWorkerContainerImpl.cpp
-@@ -152,17 +152,38 @@ RemoteServiceWorkerContainerImpl::GetReg
-     });
+@@ -10,16 +10,17 @@
+ #include "mozilla/ipc/PBackgroundChild.h"
+ #include "ServiceWorkerContainerChild.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ using mozilla::ipc::BackgroundChild;
+ using mozilla::ipc::PBackgroundChild;
++using mozilla::ipc::ResponseRejectReason;
+ 
+ RemoteServiceWorkerContainerImpl::~RemoteServiceWorkerContainerImpl()
+ {
+   Shutdown();
+   MOZ_DIAGNOSTIC_ASSERT(!mOuter);
  }
  
  void
- RemoteServiceWorkerContainerImpl::GetReady(const ClientInfo& aClientInfo,
+@@ -56,17 +57,40 @@ RemoteServiceWorkerContainerImpl::Remove
+ void
+ RemoteServiceWorkerContainerImpl::Register(const ClientInfo& aClientInfo,
+                                            const nsACString& aScopeURL,
+                                            const nsACString& aScriptURL,
+                                            ServiceWorkerUpdateViaCache aUpdateViaCache,
                                             ServiceWorkerRegistrationCallback&& aSuccessCB,
                                             ServiceWorkerFailureCallback&& aFailureCB) const
  {
@@ -42,7 +72,9 @@ diff --git a/dom/serviceworkers/RemoteServiceWorkerContainerImpl.cpp b/dom/servi
 +    return;
 +  }
 +
-+  mActor->SendGetReady(aClientInfo.ToIPC(),
++  mActor->SendRegister(
++    aClientInfo.ToIPC(), nsCString(aScopeURL), nsCString(aScriptURL),
++    aUpdateViaCache,
 +    [successCB = std::move(aSuccessCB), aFailureCB]
 +    (const IPCServiceWorkerRegistrationDescriptorOrCopyableErrorResult& aResult) {
 +      if (aResult.type() == IPCServiceWorkerRegistrationDescriptorOrCopyableErrorResult::TCopyableErrorResult) {
@@ -61,34 +93,37 @@ diff --git a/dom/serviceworkers/RemoteServiceWorkerContainerImpl.cpp b/dom/servi
 +    });
  }
  
- RemoteServiceWorkerContainerImpl::RemoteServiceWorkerContainerImpl()
-   : mActor(nullptr)
-   , mOuter(nullptr)
-   , mShutdown(false)
+ void
+ RemoteServiceWorkerContainerImpl::GetRegistration(const ClientInfo& aClientInfo,
+                                                   const nsACString& aURL,
+                                                   ServiceWorkerRegistrationCallback&& aSuccessCB,
+                                                   ServiceWorkerFailureCallback&& aFailureCB) const
  {
-   PBackgroundChild* parentActor = BackgroundChild::GetOrCreateForCurrentThread();
 diff --git a/dom/serviceworkers/ServiceWorkerContainerParent.cpp b/dom/serviceworkers/ServiceWorkerContainerParent.cpp
 --- a/dom/serviceworkers/ServiceWorkerContainerParent.cpp
 +++ b/dom/serviceworkers/ServiceWorkerContainerParent.cpp
-@@ -92,16 +92,36 @@ ServiceWorkerContainerParent::RecvGetReg
-       aResolver(std::move(ipcList));
-     }, [aResolver] (const CopyableErrorResult& aResult) {
-       aResolver(aResult);
-     });
+@@ -24,16 +24,39 @@ ServiceWorkerContainerParent::ActorDestr
  
+ IPCResult
+ ServiceWorkerContainerParent::RecvTeardown()
+ {
+   Unused << Send__delete__(this);
    return IPC_OK();
  }
  
 +IPCResult
-+ServiceWorkerContainerParent::RecvGetReady(const IPCClientInfo& aClientInfo,
-+                                           GetReadyResolver&& aResolver)
++ServiceWorkerContainerParent::RecvRegister(const IPCClientInfo& aClientInfo,
++                                           const nsCString& aScopeURL,
++                                           const nsCString& aScriptURL,
++                                           const ServiceWorkerUpdateViaCache& aUpdateViaCache,
++                                           RegisterResolver&& aResolver)
 +{
 +  if (!mProxy) {
 +    aResolver(CopyableErrorResult(NS_ERROR_DOM_INVALID_STATE_ERR));
 +    return IPC_OK();
 +  }
 +
-+  mProxy->GetReady(ClientInfo(aClientInfo))->Then(
++  mProxy->Register(ClientInfo(aClientInfo), aScopeURL, aScriptURL, aUpdateViaCache)->Then(
 +    GetCurrentThreadSerialEventTarget(), __func__,
 +    [aResolver] (const ServiceWorkerRegistrationDescriptor& aDescriptor) {
 +      aResolver(aDescriptor.ToIPC());
@@ -110,18 +145,20 @@ diff --git a/dom/serviceworkers/ServiceWorkerContainerParent.cpp b/dom/servicewo
 diff --git a/dom/serviceworkers/ServiceWorkerContainerParent.h b/dom/serviceworkers/ServiceWorkerContainerParent.h
 --- a/dom/serviceworkers/ServiceWorkerContainerParent.h
 +++ b/dom/serviceworkers/ServiceWorkerContainerParent.h
-@@ -36,16 +36,20 @@ class ServiceWorkerContainerParent final
-   RecvGetRegistration(const IPCClientInfo& aClientInfo,
-                       const nsCString& aURL,
-                       GetRegistrationResolver&& aResolver) override;
+@@ -21,16 +21,22 @@ class ServiceWorkerContainerParent final
+ 
+   // PServiceWorkerContainerParent
+   void
+   ActorDestroy(ActorDestroyReason aReason) override;
  
    mozilla::ipc::IPCResult
-   RecvGetRegistrations(const IPCClientInfo& aClientInfo,
-                        GetRegistrationsResolver&& aResolver) override;
+   RecvTeardown() override;
  
 +  mozilla::ipc::IPCResult
-+  RecvGetReady(const IPCClientInfo& aClientInfo,
-+               GetReadyResolver&& aResolver) override;
++  RecvRegister(const IPCClientInfo& aClientInfo, const nsCString& aScopeURL,
++               const nsCString& aScriptURL,
++               const ServiceWorkerUpdateViaCache& aUpdateViaCache,
++               RegisterResolver&& aResolver) override;
 +
  public:
    ServiceWorkerContainerParent();
@@ -134,17 +171,20 @@ diff --git a/dom/serviceworkers/ServiceWorkerContainerParent.h b/dom/servicework
 diff --git a/dom/serviceworkers/ServiceWorkerContainerProxy.cpp b/dom/serviceworkers/ServiceWorkerContainerProxy.cpp
 --- a/dom/serviceworkers/ServiceWorkerContainerProxy.cpp
 +++ b/dom/serviceworkers/ServiceWorkerContainerProxy.cpp
-@@ -121,10 +121,37 @@ ServiceWorkerContainerProxy::GetRegistra
-       scopeExit.release();
-     });
- 
-   MOZ_ALWAYS_SUCCEEDS(SystemGroup::Dispatch(TaskCategory::Other, r.forget()));
- 
-   return promise;
+@@ -34,10 +34,41 @@ void
+ ServiceWorkerContainerProxy::RevokeActor(ServiceWorkerContainerParent* aActor)
+ {
+   AssertIsOnBackgroundThread();
+   MOZ_DIAGNOSTIC_ASSERT(mActor);
+   MOZ_DIAGNOSTIC_ASSERT(mActor == aActor);
+   mActor = nullptr;
  }
  
 +RefPtr<ServiceWorkerRegistrationPromise>
-+ServiceWorkerContainerProxy::GetReady(const ClientInfo& aClientInfo)
++ServiceWorkerContainerProxy::Register(const ClientInfo& aClientInfo,
++                                      const nsCString& aScopeURL,
++                                      const nsCString& aScriptURL,
++                                      ServiceWorkerUpdateViaCache aUpdateViaCache)
 +{
 +  AssertIsOnBackgroundThread();
 +
@@ -152,7 +192,7 @@ diff --git a/dom/serviceworkers/ServiceWorkerContainerProxy.cpp b/dom/servicewor
 +    new ServiceWorkerRegistrationPromise::Private(__func__);
 +
 +  nsCOMPtr<nsIRunnable> r = NS_NewRunnableFunction(__func__,
-+    [aClientInfo, promise] () mutable {
++    [aClientInfo, aScopeURL, aScriptURL, aUpdateViaCache, promise] () mutable {
 +      auto scopeExit = MakeScopeExit([&] {
 +        promise->Reject(NS_ERROR_DOM_INVALID_STATE_ERR, __func__);
 +      });
@@ -160,7 +200,8 @@ diff --git a/dom/serviceworkers/ServiceWorkerContainerProxy.cpp b/dom/servicewor
 +      RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
 +      NS_ENSURE_TRUE_VOID(swm);
 +
-+      swm->WhenReady(aClientInfo)->ChainTo(promise.forget(), __func__);
++      swm->Register(aClientInfo, aScopeURL, aScriptURL, aUpdateViaCache)
++         ->ChainTo(promise.forget(), __func__);
 +
 +      scopeExit.release();
 +    });
@@ -175,17 +216,19 @@ diff --git a/dom/serviceworkers/ServiceWorkerContainerProxy.cpp b/dom/servicewor
 diff --git a/dom/serviceworkers/ServiceWorkerContainerProxy.h b/dom/serviceworkers/ServiceWorkerContainerProxy.h
 --- a/dom/serviceworkers/ServiceWorkerContainerProxy.h
 +++ b/dom/serviceworkers/ServiceWorkerContainerProxy.h
-@@ -31,15 +31,18 @@ public:
-            ServiceWorkerUpdateViaCache aUpdateViaCache);
+@@ -20,15 +20,20 @@ class ServiceWorkerContainerProxy final
+   ~ServiceWorkerContainerProxy();
  
-   RefPtr<ServiceWorkerRegistrationPromise>
-   GetRegistration(const ClientInfo& aClientInfo, const nsCString& aURL);
+ public:
+   explicit ServiceWorkerContainerProxy(ServiceWorkerContainerParent* aActor);
  
-   RefPtr<ServiceWorkerRegistrationListPromise>
-   GetRegistrations(const ClientInfo& aClientInfo);
+   void
+   RevokeActor(ServiceWorkerContainerParent* aActor);
  
 +  RefPtr<ServiceWorkerRegistrationPromise>
-+  GetReady(const ClientInfo& aClientInfo);
++  Register(const ClientInfo& aClientInfo, const nsCString& aScopeURL,
++           const nsCString& aScriptURL,
++           ServiceWorkerUpdateViaCache aUpdateViaCache);
 +
    NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ServiceWorkerContainerProxy);
  };
